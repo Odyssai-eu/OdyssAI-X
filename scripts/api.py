@@ -314,12 +314,46 @@ def get_cluster_def(cluster_id: str) -> dict:
     default = DEFAULT_CLUSTER_DEFS.get(cluster_id, {})
     overlay = cfg.get(cluster_id, {})
     merged = json.loads(json.dumps(default))  # deep copy
-    for k in ("name", "kind", "backend", "max_nodes", "models_dir", "enabled"):
+    for k in ("name", "kind", "backend", "max_nodes", "models_dir", "enabled", "upstream"):
         if k in overlay:
             merged[k] = overlay[k]
     if "nodes" in overlay and overlay["nodes"]:
         merged["nodes"] = overlay["nodes"]
     return merged
+
+
+def _is_cluster_tombstoned(cluster_id: str) -> bool:
+    """True if cluster-config.json marked this cluster as removed via UI."""
+    return bool(_load_cluster_config().get(cluster_id, {}).get("_removed"))
+
+
+def cluster_exists(cluster_id: str) -> bool:
+    """Cluster is active (visible in dashboard) when it has a definition AND
+    isn't tombstoned. Definitions come from either topology.yaml seed OR a
+    dashboard-added entry in cluster-config.json."""
+    if _is_cluster_tombstoned(cluster_id):
+        return False
+    if cluster_id in DEFAULT_CLUSTER_DEFS:
+        return True
+    overlay = _load_cluster_config().get(cluster_id, {})
+    # A meaningful overlay entry (has nodes, or has kind=telemak with upstream)
+    if overlay.get("nodes"):
+        return True
+    if overlay.get("kind") == "telemak" and overlay.get("upstream"):
+        return True
+    return False
+
+
+def active_cluster_ids() -> list[str]:
+    """Union of topology.yaml clusters + dashboard-added entries, minus
+    tombstones. Source of truth for "which clusters does Odysseus publish"."""
+    seen: dict[str, bool] = {}
+    for cid in DEFAULT_CLUSTER_DEFS.keys():
+        seen[cid] = True
+    for cid in _load_cluster_config().keys():
+        if cid not in seen:
+            seen[cid] = True
+    return [cid for cid in seen if not _is_cluster_tombstoned(cid)]
 
 
 def _cluster_enabled(cluster_id: str) -> bool:
@@ -419,14 +453,27 @@ def build_topology_from_indices(cluster_id: str,
 
 def validate_cluster_def(cluster_id: str, new_def: dict) -> Optional[str]:
     """Return error string if invalid, else None."""
+    kind = new_def.get("kind", "mlx-distributed")
+    backend = new_def.get("backend", "jaccl")
     nodes = new_def.get("nodes") or []
     if not isinstance(nodes, list) or len(nodes) == 0:
         return "nodes must be a non-empty list"
     masters = [n for n in nodes if n.get("master")]
     if len(masters) != 1:
         return f"exactly 1 master required (got {len(masters)})"
-    kind = new_def.get("kind", "mlx-distributed")
-    backend = new_def.get("backend", "jaccl")
+
+    # Telemak (single-Mac native runtime) — http-proxy passthrough to a Swift
+    # binary running on a Mac on the LAN. The Odysseus orchestrator does not
+    # spawn the runner — it just proxies HTTP requests. Single node by design.
+    if kind == "telemak":
+        if backend != "http-proxy":
+            return f"telemak kind requires backend=http-proxy (got {backend})"
+        if len(nodes) != 1:
+            return f"telemak kind requires exactly 1 node (got {len(nodes)})"
+        if not (new_def.get("upstream") or "").strip():
+            return "telemak kind requires non-empty 'upstream' (e.g. http://host.lan:8003)"
+        return None
+
     if kind != "mlx-distributed":
         return f"unknown kind: {kind}"
     if backend not in ("jaccl", "ring"):
@@ -4644,6 +4691,31 @@ async def list_models(include_unloaded: bool = False):
     for cid, alias, pool in list_all_pools():
         await _push_loaded(pool, cid, alias)
 
+    # kind=telemak clusters: query the upstream's /v1/models. Emit one entry
+    # per cluster (the cluster_id is the public alias; the upstream's id is
+    # stashed in alias_for so callers know what concrete model is serving).
+    for cid in active_cluster_ids():
+        cd = get_cluster_def(cid)
+        if cd.get("kind") != "telemak":
+            continue
+        loaded = await _telemak_loaded_models(cid, cd)
+        if not loaded:
+            continue
+        data.append({
+            "id": cid, "object": "model",
+            "created": _now(), "owned_by": f"odysseus-telemak",
+            "x_concrete": loaded[0],
+            "x_odyssai": {
+                "ready": True,
+                "alias_for": loaded[0],
+                "kind": "telemak",
+                "stream": True,
+                "tools": False,
+                "backend": "http-proxy",
+                "upstream": cd.get("upstream"),
+            },
+        })
+
     # Published cloud aliases (Odysseus-as-gateway). Always advertised
     # because they're always servable — the upstream takes care of itself.
     cloud = _cloud_entries_for_v1_models()
@@ -4822,6 +4894,14 @@ def _strip_tool_calls_from_text(text: str) -> str:
 
 @app.post("/v1/chat/completions")
 async def chat_completions(req: ChatCompletionRequest, request: Request):
+    # 0. Telemak passthrough? If the model id matches a kind=telemak cluster,
+    # proxy the request to that cluster's upstream Swift binary.
+    if req.model and cluster_exists(req.model):
+        cd_t = get_cluster_def(req.model)
+        if cd_t.get("kind") == "telemak":
+            body = req.model_dump(exclude_none=True)
+            return await _telemak_proxy_chat_completion(req.model, cd_t, body, bool(req.stream))
+
     # 1. Cloud passthrough? If the model id matches a published cloud alias
     # (e.g. "or:claude-haiku"), proxy to the configured upstream. No local
     # compute. OpenAI-compat in / out — no protocol translation.
@@ -6614,9 +6694,12 @@ class ClusterConfigUpdate(BaseModel):
     models_dir: Optional[str] = None
     # Full editable definition
     name: Optional[str] = None
-    kind: Optional[str] = None        # "mlx-distributed"
-    backend: Optional[str] = None     # "jaccl" (RDMA TB5) | "ring" (TCP)
+    kind: Optional[str] = None        # "mlx-distributed" | "telemak"
+    backend: Optional[str] = None     # "jaccl" | "ring" | "http-proxy"
     nodes: Optional[list[ClusterNodeIn]] = None
+    # Upstream URL — required for kind=telemak (http-proxy passthrough to a
+    # Swift single-node runtime). Empty / None for mlx-distributed.
+    upstream: Optional[str] = None
     # Optional cloud fallback (cloud alias to redirect to when the pool is
     # unreachable). Empty string clears it.
     fallback: Optional[str] = None
@@ -6666,9 +6749,13 @@ async def admin_clusters_list():
     """Compact list of every cluster Odysseus publishes — id, display name,
     backend, master SSH/host, total node count, enabled flag. Used by
     external bench/cockpit UIs (odyssai-services) so they don't have to
-    hardcode the cluster IDs."""
+    hardcode the cluster IDs.
+
+    Includes BOTH topology.yaml-seeded clusters AND dashboard-added entries
+    (kind=telemak, etc.). Tombstoned clusters (DELETE'd via UI) are hidden.
+    """
     out = []
-    for cid in DEFAULT_CLUSTER_DEFS.keys():
+    for cid in active_cluster_ids():
         cd = get_cluster_def(cid)
         nodes = cd.get("nodes") or []
         master = next((n for n in nodes if n.get("master")), nodes[0] if nodes else {})
@@ -6679,6 +6766,7 @@ async def admin_clusters_list():
             "name": cd.get("name", cid),
             "kind": cd.get("kind"),
             "backend": cd.get("backend"),
+            "upstream": cd.get("upstream") or None,
             "enabled": _cluster_enabled(cid),
             "master_host": master.get("host"),
             "master_ssh": master.get("ssh"),
@@ -6690,7 +6778,7 @@ async def admin_clusters_list():
 
 @app.get("/admin/clusters/{cluster_id}")
 async def admin_cluster_get(cluster_id: str):
-    if cluster_id not in DEFAULT_CLUSTER_DEFS:
+    if not cluster_exists(cluster_id):
         raise HTTPException(404, f"unknown cluster {cluster_id}")
     cd = get_cluster_def(cluster_id)
     cluster_max = len(cd.get("nodes", [])) or 1
@@ -6754,12 +6842,21 @@ async def admin_cluster_update(cluster_id: str, req: ClusterConfigUpdate):
     with >1 node, etc).
 
     Refuses topology changes while a pool is loaded — user must unload first.
+
+    Upsert: if cluster_id doesn't exist (neither in topology.yaml nor in
+    cluster-config.json), CREATE it. Used by the "+ Add Telemak" flow in
+    the dashboard.
     """
-    if cluster_id not in DEFAULT_CLUSTER_DEFS:
-        raise HTTPException(404, f"unknown cluster {cluster_id}")
+    creating = not cluster_exists(cluster_id)
+    if creating:
+        # On create, validate the cluster_id slug shape (URL-safe, no weird chars).
+        if not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,40}", cluster_id):
+            raise HTTPException(400, f"cluster_id {cluster_id!r} must match [a-z0-9][a-z0-9-]{{0,40}} (URL-safe slug)")
+        # Lift any tombstone if one existed for this id.
+        _save_cluster_config({**_load_cluster_config(), cluster_id: {}})
 
     pool = _pool_for_cluster(cluster_id)
-    current = get_cluster_def(cluster_id)
+    current = get_cluster_def(cluster_id) if not creating else {}
 
     # Build the candidate (full) def by merging requested fields onto current.
     candidate = json.loads(json.dumps(current))
@@ -6777,6 +6874,20 @@ async def admin_cluster_update(cluster_id: str, req: ClusterConfigUpdate):
         topo_changed = True
     if req.nodes is not None:
         candidate["nodes"] = [n.model_dump() for n in req.nodes]
+        topo_changed = True
+    if req.upstream is not None:
+        # http-proxy passthrough target — only meaningful for kind=telemak.
+        candidate["upstream"] = req.upstream.strip()
+        topo_changed = True
+
+    # On create, kind/backend/nodes are required. Stamp them on the candidate.
+    if creating:
+        if not candidate.get("kind"):
+            raise HTTPException(400, "create requires `kind` (mlx-distributed or telemak)")
+        if not candidate.get("backend"):
+            raise HTTPException(400, "create requires `backend`")
+        if not candidate.get("nodes"):
+            raise HTTPException(400, "create requires `nodes`")
         topo_changed = True
 
     # Validate when topology fields changed
@@ -6814,6 +6925,7 @@ async def admin_cluster_update(cluster_id: str, req: ClusterConfigUpdate):
         if req.enabled is False and pool is not None and getattr(pool, "loaded", False):
             raise HTTPException(409, f"{cluster_id} is loaded — unload first to disable")
         persist["enabled"] = bool(req.enabled)
+    if req.upstream is not None: persist["upstream"] = candidate["upstream"]
     if req.fallback is not None:
         # Empty string clears the fallback; non-empty validates against published cloud aliases.
         if req.fallback == "":
@@ -6829,6 +6941,28 @@ async def admin_cluster_update(cluster_id: str, req: ClusterConfigUpdate):
         set_models_dir(cluster_id, req.models_dir)
 
     return await admin_cluster_get(cluster_id)
+
+
+@app.delete("/admin/clusters/{cluster_id}")
+async def admin_cluster_delete(cluster_id: str):
+    """Remove a cluster via UI. Auto-unloads first if loaded.
+
+    Tombstone semantics: the cluster's overlay entry in cluster-config.json is
+    overwritten with `{_removed: true}`. At next list/lookup, active_cluster_ids()
+    filters it out. This works for both dashboard-added clusters AND for
+    topology.yaml-declared clusters (the tombstone shadows the seed). To
+    un-remove a topology.yaml cluster, the operator edits cluster-config.json
+    by hand or re-adds it via the UI.
+    """
+    if not cluster_exists(cluster_id):
+        raise HTTPException(404, f"unknown cluster {cluster_id}")
+    pool = _pool_for_cluster(cluster_id)
+    if pool is not None and getattr(pool, "loaded", False):
+        await _auto_unload_cluster(cluster_id, reason="cluster removed via UI")
+    cfg = _load_cluster_config()
+    cfg[cluster_id] = {"_removed": True}
+    _save_cluster_config(cfg)
+    return {"ok": True, "removed": cluster_id}
 
 
 @app.post("/admin/clusters/{cluster_id}/reboot-all")
@@ -6975,8 +7109,15 @@ def _pool_per_rank_phases(pool) -> Optional[list[dict]]:
 
 @app.get("/admin/clusters/{cluster_id}/status")
 async def admin_cluster_status(cluster_id: str):
-    if cluster_id not in DEFAULT_CLUSTER_DEFS:
+    if not cluster_exists(cluster_id):
         raise HTTPException(404, f"unknown cluster {cluster_id}")
+    # kind=telemak: short-circuit to a single-node "what's loaded" view.
+    # The upstream is the source of truth — we query it once and shape the
+    # response into Odysseus' status format so the dashboard reuses the
+    # mlx-distributed renderers without crashing.
+    cd_t = get_cluster_def(cluster_id)
+    if cd_t.get("kind") == "telemak":
+        return await _telemak_status(cluster_id, cd_t)
     loading = _loading_snapshot(_loading_state_for(cluster_id))
     default_pool = get_pool(cluster_id)
     # During a load, expose per-rank phase. After load completes the snapshot
@@ -7068,7 +7209,7 @@ async def admin_cluster_models(cluster_id: str, dir: Optional[str] = None):
     can show the user how big each model is BEFORE they attempt to load it.
     Sizes are gathered in one batched SSH call to avoid the per-model fanout.
     """
-    if cluster_id not in DEFAULT_CLUSTER_DEFS:
+    if not cluster_exists(cluster_id):
         raise HTTPException(404, f"unknown cluster {cluster_id}")
     rank0 = rank0_ssh_for_cluster(cluster_id, 1)
     target_dir = dir or models_dir_for(cluster_id)
@@ -7088,7 +7229,7 @@ async def admin_cluster_models(cluster_id: str, dir: Optional[str] = None):
 
 @app.post("/admin/clusters/{cluster_id}/models-dir")
 async def admin_cluster_models_dir(cluster_id: str, req: ModelsDirRequest):
-    if cluster_id not in DEFAULT_CLUSTER_DEFS:
+    if not cluster_exists(cluster_id):
         raise HTTPException(404, f"unknown cluster {cluster_id}")
     set_models_dir(cluster_id, req.dir)
     return {"cluster": cluster_id, "models_dir": req.dir}
@@ -7127,10 +7268,16 @@ class ArgoLoadRequest(BaseModel):
 
 @app.post("/admin/clusters/{cluster_id}/load")
 async def admin_cluster_load(cluster_id: str, req: ArgoLoadRequest):
-    if cluster_id not in DEFAULT_CLUSTER_DEFS:
+    if not cluster_exists(cluster_id):
         raise HTTPException(404, f"unknown cluster {cluster_id}")
     if not _cluster_enabled(cluster_id):
         raise HTTPException(409, f"{cluster_id} is disabled — toggle enable in cluster settings to load")
+    # kind=telemak: proxy load to the Swift binary's /admin/load endpoint.
+    # Telemak is single-node http-proxy — no pipeline/tensor parallel, no node
+    # selection. We just POST {model} upstream and return its response.
+    cd = get_cluster_def(cluster_id)
+    if cd.get("kind") == "telemak":
+        return await _telemak_proxy_load(cluster_id, cd, req)
     # Block reload if the cluster is currently flagged degraded — a JACCL
     # queue-pair stuck in TIME_WAIT or a wired-memory leak makes the next
     # load almost certain to crash the same way. Operator runs
@@ -7270,6 +7417,183 @@ class _ArgoUnloadBody(BaseModel):
     alias: Optional[str] = None
 
 
+_TELEMAK_MODELS_CACHE: dict[str, tuple[float, list[str]]] = {}
+_TELEMAK_CACHE_TTL_S = 8.0  # seconds — debounce dashboard polls without staleness
+
+
+async def _telemak_loaded_models(cluster_id: str, cd: dict, force: bool = False) -> list[str]:
+    """Query the Telemak upstream's /v1/models — return the list of model ids
+    currently loaded. Empty list if upstream unreachable or has no models.
+
+    Cached for ~8s per cluster to avoid hammering the upstream during dashboard
+    refreshes (every status poll, /v1/models call, etc.). Set force=True to
+    bypass the cache — used right after /admin/load and /admin/unload."""
+    now = time.time()
+    cached = _TELEMAK_MODELS_CACHE.get(cluster_id)
+    if not force and cached and (now - cached[0]) < _TELEMAK_CACHE_TTL_S:
+        return cached[1]
+    upstream = (cd.get("upstream") or "").rstrip("/")
+    if not upstream:
+        return []
+    import httpx
+    try:
+        async with httpx.AsyncClient(timeout=4.0) as client:
+            r = await client.get(f"{upstream}/v1/models")
+            if r.status_code != 200:
+                models = []
+            else:
+                data = r.json().get("data", [])
+                models = [m.get("id") for m in data if m.get("id")]
+    except Exception:
+        models = []
+    _TELEMAK_MODELS_CACHE[cluster_id] = (now, models)
+    return models
+
+
+def _telemak_cache_invalidate(cluster_id: str) -> None:
+    """Invalidate the cached /v1/models list for a cluster — call after
+    load/unload so the next status poll sees the new state."""
+    _TELEMAK_MODELS_CACHE.pop(cluster_id, None)
+
+
+async def _telemak_proxy_chat_completion(cluster_id: str, cd: dict, body: dict, stream: bool):
+    """Proxy a /v1/chat/completions request to the Telemak upstream.
+
+    Returns either a JSON dict (non-streaming) or a StreamingResponse (SSE
+    streaming). The `model` field in the body is rewritten to the actually-
+    loaded upstream model id — the client used `cluster_id` as the alias.
+    """
+    upstream = (cd.get("upstream") or "").rstrip("/")
+    if not upstream:
+        raise HTTPException(400, f"{cluster_id}: missing upstream URL")
+    # Rewrite model id: pick the first loaded model from upstream.
+    loaded = await _telemak_loaded_models(cluster_id, cd)
+    if not loaded:
+        raise HTTPException(503, f"{cluster_id}: no model loaded on upstream — POST /admin/clusters/{cluster_id}/load first")
+    forward_body = dict(body)
+    forward_body["model"] = loaded[0]
+    import httpx
+    if not stream:
+        try:
+            async with httpx.AsyncClient(timeout=300.0) as client:
+                r = await client.post(f"{upstream}/v1/chat/completions", json=forward_body)
+        except Exception as e:
+            raise HTTPException(502, f"telemak upstream unreachable: {e}")
+        if r.status_code >= 400:
+            raise HTTPException(r.status_code, f"telemak upstream error: {r.text[:300]}")
+        out = r.json()
+        # Re-stamp the public model id with the cluster alias so the client
+        # sees the alias it asked for, not the internal upstream id.
+        out["model"] = cluster_id
+        return out
+
+    async def _gen():
+        async with httpx.AsyncClient(timeout=None) as client:
+            async with client.stream("POST", f"{upstream}/v1/chat/completions", json=forward_body) as r:
+                if r.status_code >= 400:
+                    err_body = (await r.aread()).decode(errors="replace")[:500]
+                    yield f"data: {json.dumps({'error': {'message': f'telemak upstream {r.status_code}: {err_body}'}})}\n\n"
+                    return
+                async for chunk in r.aiter_raw():
+                    if chunk:
+                        yield chunk
+    from fastapi.responses import StreamingResponse
+    return StreamingResponse(_gen(), media_type="text/event-stream")
+
+
+async def _telemak_status(cluster_id: str, cd: dict) -> dict:
+    """Return a status snapshot for a kind=telemak cluster.
+
+    Queries the upstream Telemak binary's /v1/models. If reachable AND has a
+    loaded model, returns loaded:true with the model id. Otherwise returns
+    loaded:false (and reachable:false on connection errors). Shape matches
+    Odysseus' mlx-distributed status so the dashboard renderers don't crash.
+    """
+    upstream = (cd.get("upstream") or "").rstrip("/")
+    loaded_model = None
+    reachable = False
+    if upstream:
+        import httpx
+        try:
+            async with httpx.AsyncClient(timeout=4.0) as client:
+                r = await client.get(f"{upstream}/v1/models")
+                if r.status_code == 200:
+                    reachable = True
+                    data = r.json().get("data", [])
+                    if data:
+                        loaded_model = data[0].get("id")
+        except Exception:
+            reachable = False
+    nodes = cd.get("nodes") or []
+    master_ssh = (nodes[0] or {}).get("ssh") if nodes else None
+    return {
+        "loaded": bool(loaded_model),
+        "cluster": cluster_id,
+        "loading": None,
+        "available_node_counts": [1],
+        "max_nodes": 1,
+        "nodes": 1 if loaded_model else 0,
+        "model": loaded_model,
+        "mode": "telemak",
+        "topologies": {"1": [{"rank": 0, "ssh": master_ssh}]} if master_ssh else {"1": []},
+        "models_dir": cd.get("models_dir"),
+        "degraded": None,
+        "kind": "telemak",
+        "upstream": upstream,
+        "upstream_reachable": reachable,
+    }
+
+
+async def _telemak_proxy_load(cluster_id: str, cd: dict, req) -> dict:
+    """Proxy POST /admin/load to the Telemak upstream and reshape the response
+    into Odysseus' standard load-response shape so the dashboard renders it
+    without a special-case."""
+    upstream = (cd.get("upstream") or "").rstrip("/")
+    if not upstream:
+        raise HTTPException(400, f"{cluster_id}: missing upstream URL")
+    if not req.model:
+        raise HTTPException(400, "model is required")
+    import httpx
+    try:
+        async with httpx.AsyncClient(timeout=300.0) as client:
+            r = await client.post(f"{upstream}/admin/load", json={"model": req.model})
+    except Exception as e:
+        raise HTTPException(502, f"telemak upstream unreachable: {e}")
+    if r.status_code >= 400:
+        raise HTTPException(r.status_code, f"telemak upstream error: {r.text[:200]}")
+    body = r.json() if r.text else {}
+    # Stash the loaded model in cluster-config so /status & dashboard can show it
+    save_cluster_def(cluster_id, {"_telemak_loaded_model": req.model})
+    _telemak_cache_invalidate(cluster_id)
+    return {
+        "loaded": True,
+        "cluster": cluster_id,
+        "model": req.model,
+        "nodes": 1,
+        "mode": "telemak",
+        "load_s": float(body.get("load_s") or 0.0),
+        "upstream_response": body,
+    }
+
+
+async def _telemak_proxy_unload(cluster_id: str, cd: dict) -> dict:
+    """Proxy POST /admin/unload to the Telemak upstream."""
+    upstream = (cd.get("upstream") or "").rstrip("/")
+    if not upstream:
+        raise HTTPException(400, f"{cluster_id}: missing upstream URL")
+    import httpx
+    try:
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            r = await client.post(f"{upstream}/admin/unload")
+    except Exception as e:
+        raise HTTPException(502, f"telemak upstream unreachable: {e}")
+    save_cluster_def(cluster_id, {"_telemak_loaded_model": None})
+    _telemak_cache_invalidate(cluster_id)
+    if r.status_code >= 400 and r.status_code != 404:
+        raise HTTPException(r.status_code, f"telemak upstream error: {r.text[:200]}")
+    return {"unloaded": True, "cluster": cluster_id}
+
+
 @app.post("/admin/clusters/{cluster_id}/unload")
 async def admin_cluster_unload(
     cluster_id: str,
@@ -7289,8 +7613,12 @@ async def admin_cluster_unload(
     were live, so a stale runner from a previous container life gets killed
     even if our state says nothing was loaded.
     """
-    if cluster_id not in DEFAULT_CLUSTER_DEFS:
+    if not cluster_exists(cluster_id):
         raise HTTPException(404, f"unknown cluster {cluster_id}")
+    # kind=telemak: proxy to upstream /admin/unload.
+    cd_proxy = get_cluster_def(cluster_id)
+    if cd_proxy.get("kind") == "telemak":
+        return await _telemak_proxy_unload(cluster_id, cd_proxy)
     body_alias: Optional[str] = None
     if alias is None:
         try:
@@ -7439,7 +7767,7 @@ async def _cluster_reset(cluster_id: str) -> dict:
 
 @app.post("/admin/clusters/{cluster_id}/reset")
 async def admin_cluster_reset(cluster_id: str):
-    if cluster_id not in DEFAULT_CLUSTER_DEFS:
+    if not cluster_exists(cluster_id):
         raise HTTPException(404, f"unknown cluster {cluster_id}")
     return await _cluster_reset(cluster_id)
 
