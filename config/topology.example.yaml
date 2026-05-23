@@ -1,0 +1,121 @@
+# Odysseus cluster topology
+#
+# Lives at ~/.odysseus/topology.yaml. Copy this file there and edit
+# for your hardware. The Odysseus container reads it at boot to know
+# which Macs are in which cluster, how to reach them over SSH, and
+# (for JACCL backend) how the Thunderbolt 5 cabling maps to network
+# interfaces.
+#
+# Three backends are supported per cluster:
+#   - jaccl  : RDMA over Thunderbolt 5 (fastest, requires cabling)
+#   - ring   : TCP collectives, no special hardware
+#   - (none) : single-node (skipped — world_size=1 has no collectives)
+#
+# Each cluster can publish multiple pool sizes. The API exposes one
+# alias per cluster; pool size is requested per inference (or fixed
+# via dashboard). Larger pools shard the model across more nodes.
+#
+# Cluster IDs (the YAML keys below) are arbitrary identifiers chosen
+# by the operator. They appear in dashboard URLs and admin routes
+# (/admin/clusters/<id>/…). Pick short, role-descriptive names — the
+# examples here are just suggestions.
+
+clusters:
+  # ── default — the primary cluster ──
+  default:
+    # Optional. Tag for the dashboard. Defaults to the key name.
+    label: "Primary"
+
+    # Optional. Pre-flight backend. Choose based on your hardware:
+    #   - jaccl : you have TB5 cables forming a full mesh
+    #   - ring  : nodes are on the same LAN but no TB5 mesh
+    # Single-node pools (size: 1) skip the backend entirely.
+    backend: ring
+
+    pools:
+      # Single-node pool — runs everything on rank 0.
+      #
+      # ssh: the orchestrator runs inside Docker, so `localhost` inside
+      # the container is the container itself — NOT the Mac. To reach
+      # your own Mac, enable Remote Login (System Settings → Sharing)
+      # and use `host.docker.internal` as the host. See AGENTS.md step 2.
+      #
+      # ${ODYSSEUS_NODE_USER} is set by docker-compose.yml from the
+      # host environment (defaults to $USER). Do NOT use ${USER}
+      # directly here — it expands inside the container, where the
+      # process runs as root.
+      - size: 1
+        nodes:
+          - rank: 0
+            id: local
+            label: Local Mac
+            ssh: ${ODYSSEUS_NODE_USER}@host.docker.internal
+            models_dir: /Users/${ODYSSEUS_NODE_USER}/mlx-models
+
+      # 2-node ring (TCP) — uncomment + edit if you have a 2nd Mac.
+      # - size: 2
+      #   nodes:
+      #     - rank: 0
+      #       id: host-a
+      #       ssh: user@host-a.lan
+      #     - rank: 1
+      #       id: host-b
+      #       ssh: user@host-b.lan
+
+      # 3-node JACCL example — uncomment + adapt to your cabling.
+      # The rdma_to map says: "on this node, which HCA name
+      # corresponds to the cable going to peer rank N?" macOS
+      # enumerates Thunderbolt ports differently per boot, so the
+      # mapping is hardware-specific.
+      #
+      # Don't try to fill this map by hand — run the discovery script:
+      #   scripts/discover-rdma-wiring.py 0=user@host-a 1=user@host-b 2=user@host-c
+      # It SSHes into each node, lists active HCAs, cross-references
+      # peer MACs via NDP, and outputs the rdma_to: blocks ready to
+      # paste below.
+      #
+      # - size: 3
+      #   nodes:
+      #     - rank: 0
+      #       id: host-a
+      #       ssh: user@host-a.lan
+      #       rdma_to:
+      #         1: rdma_en5   # cable from host-a to host-b
+      #         2: rdma_en4   # cable from host-a to host-c
+      #     - rank: 1
+      #       id: host-b
+      #       ssh: user@host-b.lan
+      #       rdma_to:
+      #         0: rdma_en5
+      #         2: rdma_en4
+      #     - rank: 2
+      #       id: host-c
+      #       ssh: user@host-c.lan
+      #       rdma_to:
+      #         0: rdma_en5
+      #         1: rdma_en4
+
+  # ── Second cluster example: a dedicated coding pool ──
+  # coder:
+  #   label: "Code specialist"
+  #   backend: jaccl
+  #   pools:
+  #     - size: 1
+  #       nodes:
+  #         - rank: 0
+  #           id: code-host
+  #           ssh: user@code-host.lan
+
+  # ── Third example: a vision-language pool via http-proxy ──
+  # vision:
+  #   label: "Vision"
+  #   backend: http-proxy
+  #   upstream: http://vision-host.lan:8080
+  #   models_dir: /Volumes/models/vision
+  #   pools:
+  #     - size: 1
+  #       nodes:
+  #         - rank: 0
+  #           id: vision-host
+  #           ssh: user@vision-host.lan
+  #           port: 8080

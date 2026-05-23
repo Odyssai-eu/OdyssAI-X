@@ -1,0 +1,37 @@
+.DS_Store
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+.claude/
+.claude-memory
+
+# Local/private project notes and generated site drafts.
+#
+# `docs/` is mostly internal (SESSION notes, design briefs, internal
+# audits, content with personal infra refs). We ignore the directory by
+# default and explicitly track just the user-facing pages with `!`
+# below. If you add a new public doc, add an exception here.
+docs/*
+!docs/README.md
+!docs/GETTING-STARTED.md
+!docs/DEPLOY.md
+!docs/bug-reports/
+audit/
+onepage/
+ABOUT.md
+ABOUT-companion.md
+CLAUDE.md
+MIGRATION.md
+MORNING-SUMMARY.md
+# Legacy branding from the previous project name (Nautilus → Odysseus).
+nautilus.png
+
+# Local SQLite history file created when running api.py outside Docker
+# (e.g. for compile checks or dev shells). In the container it lives at
+# /app/data/odysseus.db — irrelevant to the repo.
+scripts/odysseus.db
+scripts/odysseus.db-*

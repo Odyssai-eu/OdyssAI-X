@@ -1,0 +1,9 @@
+{
+  "backend": "jaccl",
+  "envs": [],
+  "hosts": [
+    {"ssh": "user@host-a.lan", "ips": ["10.0.0.11"], "rdma": [null, "rdma_en5", "rdma_en4"]},
+    {"ssh": "user@host-b.lan", "ips": ["10.0.0.12"], "rdma": ["rdma_en5", null, "rdma_en4"]},
+    {"ssh": "user@host-c.lan", "ips": ["10.0.0.13"], "rdma": ["rdma_en5", "rdma_en4", null]}
+  ]
+}

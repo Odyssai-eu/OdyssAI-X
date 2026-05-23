@@ -1,0 +1,9 @@
+{
+  "backend": "ring",
+  "envs": [],
+  "hosts": [
+    {"ssh": "user@host-a.lan", "ips": ["10.0.0.11"], "rdma": []},
+    {"ssh": "user@host-b.lan", "ips": ["10.0.0.12"], "rdma": []},
+    {"ssh": "user@host-c.lan", "ips": ["10.0.0.13"], "rdma": []}
+  ]
+}

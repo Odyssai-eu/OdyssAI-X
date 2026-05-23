@@ -1,0 +1,42 @@
+services:
+  engine:
+    build: .
+    image: odyssai-odysseus:latest
+    container_name: odyssai-odysseus
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    environment:
+      # /admin/* is OPEN by default — Odysseus is meant for a trusted
+      # LAN install, where whoever can reach :8000 is the operator.
+      #
+      # Set ODYSSEUS_ADMIN_TOKEN if you expose the engine beyond your
+      # LAN (Cloudflare tunnel, port-forward, multi-tenant deploy). Any
+      # non-empty value flips /admin/* to require `Authorization: Bearer
+      # <token>`. EventSource also accepts ?token=… as a fallback.
+      ODYSSEUS_ADMIN_TOKEN: ${ODYSSEUS_ADMIN_TOKEN:-}
+      ODYSSEUS_TOPOLOGY: /root/.odysseus/topology.yaml
+      # The Mac user the container should SSH back as for single-node
+      # installs. topology.example.yaml expands ${ODYSSEUS_NODE_USER}
+      # rather than ${USER} so the in-container expansion doesn't
+      # collapse to root@host.docker.internal.
+      ODYSSEUS_NODE_USER: ${ODYSSEUS_NODE_USER:-${USER:-}}
+    volumes:
+      # SSH keys + known_hosts for spawning runners on cluster nodes
+      - ${HOME}/.ssh:/root/.ssh:ro
+      # Operator topology: clusters, SSH targets, RDMA wiring.
+      - ${HOME}/.odysseus:/root/.odysseus:ro
+      # Persisted state (per-cluster state JSON + cluster-config.json).
+      - odysseus-data:/app/data
+    # `host.docker.internal` is the Mac host from inside the container.
+    # On Docker Desktop (macOS/Windows) it resolves automatically; on
+    # Linux it requires the explicit mapping below.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    # The container needs to reach the cluster nodes on the LAN.
+    # Default bridge network is sufficient — the cluster nodes are on
+    # the host's LAN and the host bridges to it.
+    network_mode: bridge
+
+volumes:
+  odysseus-data:

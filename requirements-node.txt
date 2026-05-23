@@ -1,0 +1,16 @@
+# Python dependencies for each Apple Silicon cluster node.
+#
+# `scripts/bootstrap-node.sh` installs these inside ~/mlx-cluster/.venv
+# on each node. Pinning the versions keeps `runner.py` stable against
+# upstream changes — bump intentionally, not by accident.
+#
+# Tested against the orchestrator at the version of api.py shipped in
+# this repo. If you bump these, re-run bench + at least one multi-node
+# load on a 100B+ MoE before merging.
+
+mlx==0.31.2
+mlx-lm==0.31.3
+
+# Hugging Face support — used by the runner when loading directly from
+# a repo id (the dashboard's "Download from Hugging Face" path).
+huggingface_hub>=0.28
