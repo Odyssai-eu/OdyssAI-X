@@ -4704,6 +4704,12 @@ async def list_models(include_unloaded: bool = False):
         loaded = await _telemak_loaded_models(cid, cd)
         if not loaded:
             continue
+        # Auto-discover capabilities from upstream /.well-known/. Falls back
+        # to legacy hardcoded (stream=True, tools=False) when the endpoint
+        # is missing or unreachable (older Telemak builds).
+        caps = (await _telemak_capabilities(cid, cd)).get("capabilities") or {}
+        stream_cap = caps.get("stream", True)
+        tools_cap = caps.get("tools", False)
         if len(loaded) == 1:
             data.append({
                 "id": cid, "object": "model",
@@ -4713,8 +4719,8 @@ async def list_models(include_unloaded: bool = False):
                     "ready": True,
                     "alias_for": loaded[0],
                     "kind": "telemak",
-                    "stream": True,
-                    "tools": False,
+                    "stream": stream_cap,
+                    "tools": tools_cap,
                     "backend": "http-proxy",
                     "upstream": cd.get("upstream"),
                 },
@@ -4732,8 +4738,8 @@ async def list_models(include_unloaded: bool = False):
                         "kind": "telemak",
                         "cluster": cid,
                         "short_id": short,
-                        "stream": True,
-                        "tools": False,
+                        "stream": stream_cap,
+                        "tools": tools_cap,
                         "backend": "http-proxy",
                         "upstream": cd.get("upstream"),
                     },
@@ -7506,6 +7512,44 @@ def _telemak_cache_invalidate(cluster_id: str) -> None:
     """Invalidate the cached /v1/models list for a cluster — call after
     load/unload so the next status poll sees the new state."""
     _TELEMAK_MODELS_CACHE.pop(cluster_id, None)
+    _TELEMAK_CAPS_CACHE.pop(cluster_id, None)
+
+
+_TELEMAK_CAPS_CACHE: dict[str, tuple[float, dict]] = {}
+_TELEMAK_CAPS_TTL_S = 60.0
+
+
+async def _telemak_capabilities(cluster_id: str, cd: dict) -> dict:
+    """Fetch `/.well-known/inference-engine.json` from the Telemak upstream.
+
+    Cached 60s per cluster. Returns `{}` on any failure — the caller falls
+    back to the legacy hardcoded `stream: True, tools: False` shape, so
+    older Telemak builds without the well-known endpoint keep working.
+
+    Schema produced by Telemak >= 0.2.0:
+      {engine: "telemak", version, capabilities: {stream, tools, vision,
+       max_context, session_cache, openai_compat, anthropic_compat}, models}
+    """
+    now = time.time()
+    cached = _TELEMAK_CAPS_CACHE.get(cluster_id)
+    if cached and (now - cached[0]) < _TELEMAK_CAPS_TTL_S:
+        return cached[1]
+    upstream = (cd.get("upstream") or "").rstrip("/")
+    if not upstream:
+        return {}
+    import httpx
+    try:
+        async with httpx.AsyncClient(timeout=3.0) as client:
+            r = await client.get(f"{upstream}/.well-known/inference-engine.json")
+            if r.status_code != 200:
+                _TELEMAK_CAPS_CACHE[cluster_id] = (now, {})
+                return {}
+            data = r.json()
+    except Exception:
+        _TELEMAK_CAPS_CACHE[cluster_id] = (now, {})
+        return {}
+    _TELEMAK_CAPS_CACHE[cluster_id] = (now, data)
+    return data
 
 
 async def _telemak_proxy_chat_completion(
