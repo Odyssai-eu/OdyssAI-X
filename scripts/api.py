@@ -5400,6 +5400,20 @@ def _antc_tools_to_openai(tools: Optional[list[AnthropicTool]]) -> Optional[list
 
 @app.post("/v1/messages")
 async def anthropic_messages(req: AnthropicMessagesRequest, request: Request):
+    # 0. Telemak passthrough? kind=telemak clusters expose /v1/messages
+    # natively (V1, Block 4). Same cluster_id / cluster:short alias
+    # convention as /v1/chat/completions.
+    if req.model:
+        tele_cluster, tele_short = _telemak_split_alias(req.model)
+        if tele_cluster and cluster_exists(tele_cluster):
+            cd_t = get_cluster_def(tele_cluster)
+            if cd_t.get("kind") == "telemak":
+                body = req.model_dump(exclude_none=True)
+                return await _telemak_proxy_messages(
+                    tele_cluster, cd_t, body, bool(req.stream),
+                    requested_short_id=tele_short,
+                )
+
     # If the model alias maps to a cloud provider, proxy to upstream.
     # Anthropic-protocol upstreams (api.anthropic.com) get a direct
     # passthrough — same wire format on both ends. OpenAI-protocol
@@ -7683,6 +7697,79 @@ async def _telemak_proxy_chat_completion(
                             yield out_line
                     async for f in _telemak_emit_flush(state, cluster_id):
                         yield f
+    from fastapi.responses import StreamingResponse
+    return StreamingResponse(_gen(), media_type="text/event-stream")
+
+
+async def _telemak_proxy_messages(
+    cluster_id: str,
+    cd: dict,
+    body: dict,
+    stream: bool,
+    requested_short_id: Optional[str] = None,
+):
+    """Proxy a /v1/messages (Anthropic shape) request to the Telemak upstream.
+
+    Mirror of `_telemak_proxy_chat_completion` for the Anthropic surface
+    (Telemak V1 Block 4 ships /v1/messages natively). We don't translate
+    the body — Telemak speaks Anthropic on the same model.
+
+    For streaming, Anthropic SSE events (`message_start`, `content_block_*`,
+    `message_*`) are piped through verbatim. No `<think>` filtering for now —
+    that's a `/v1/chat/completions` concern.
+    """
+    upstream = (cd.get("upstream") or "").rstrip("/")
+    if not upstream:
+        raise HTTPException(400, f"{cluster_id}: missing upstream URL")
+    loaded = await _telemak_loaded_models(cluster_id, cd)
+    if not loaded:
+        raise HTTPException(503, f"{cluster_id}: no model loaded on upstream")
+
+    if requested_short_id:
+        match = next((m for m in loaded if _telemak_short_id(m) == requested_short_id), None)
+        if not match:
+            available = [f"{cluster_id}:{_telemak_short_id(m)}" for m in loaded]
+            raise HTTPException(
+                404,
+                f"{cluster_id}: no loaded model matches '{requested_short_id}'. available: {available}",
+            )
+        upstream_model = match
+    elif len(loaded) > 1:
+        available = [f"{cluster_id}:{_telemak_short_id(m)}" for m in loaded]
+        raise HTTPException(
+            400,
+            f"{cluster_id}: ambiguous model — {len(loaded)} loaded. use cluster:short form. available: {available}",
+        )
+    else:
+        upstream_model = loaded[0]
+
+    forward_body = dict(body)
+    forward_body["model"] = upstream_model
+
+    import httpx
+    if not stream:
+        try:
+            async with httpx.AsyncClient(timeout=300.0) as client:
+                r = await client.post(f"{upstream}/v1/messages", json=forward_body)
+        except Exception as e:
+            raise HTTPException(502, f"telemak upstream unreachable: {e}")
+        if r.status_code >= 400:
+            raise HTTPException(r.status_code, f"telemak upstream error: {r.text[:300]}")
+        out = r.json()
+        out["model"] = f"{cluster_id}:{requested_short_id}" if requested_short_id else cluster_id
+        return out
+
+    async def _gen():
+        async with httpx.AsyncClient(timeout=None) as client:
+            async with client.stream("POST", f"{upstream}/v1/messages", json=forward_body) as r:
+                if r.status_code >= 400:
+                    err_body = (await r.aread()).decode(errors="replace")[:500]
+                    yield f"event: error\ndata: {json.dumps({'type':'error','error':{'type':'api_error','message': f'telemak upstream {r.status_code}: {err_body}'}})}\n\n".encode()
+                    return
+                async for chunk in r.aiter_raw():
+                    if chunk:
+                        yield chunk
+
     from fastapi.responses import StreamingResponse
     return StreamingResponse(_gen(), media_type="text/event-stream")
 
