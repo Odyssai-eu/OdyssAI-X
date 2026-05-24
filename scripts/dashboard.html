@@ -1327,6 +1327,14 @@ function render() {
   // independent overflow.
   const settingsBody = document.querySelector('.settings-body');
   const savedSettingsScroll = settingsBody ? settingsBody.scrollTop : null;
+  // Generic scroll-preservation: any element marked with data-scroll-key
+  // has its scrollTop captured before render and restored after. Used for
+  // nested scrollable panels (cluster editor body, models matrix card)
+  // that the 5-second polling render would otherwise yank back to top.
+  const savedScrollKeys = {};
+  document.querySelectorAll('[data-scroll-key]').forEach(el => {
+    savedScrollKeys[el.dataset.scrollKey] = el.scrollTop;
+  });
 
   $("root").innerHTML = `
     <div class="stage">
@@ -1359,10 +1367,22 @@ function render() {
   if (savedScrollY) {
     window.scrollTo(0, savedScrollY);
   }
-  if (savedSettingsScroll !== null) {
-    const sb = document.querySelector('.settings-body');
-    if (sb) sb.scrollTop = savedSettingsScroll;
-  }
+  // Restore in rAF so layout has computed scroll dimensions — without this,
+  // setting scrollTop on a freshly-created element with overflow:auto can be
+  // clamped to 0 if scrollHeight wasn't yet resolved.
+  const restoreAll = () => {
+    if (savedSettingsScroll !== null) {
+      const sb = document.querySelector('.settings-body');
+      if (sb) sb.scrollTop = savedSettingsScroll;
+    }
+    Object.entries(savedScrollKeys).forEach(([key, top]) => {
+      const el = document.querySelector(`[data-scroll-key="${key}"]`);
+      if (el) el.scrollTop = top;
+    });
+  };
+  // Sync (immediate) + async (post-layout) — covers both fast and slow cases.
+  restoreAll();
+  requestAnimationFrame(restoreAll);
 }
 
 // ─── Settings modal ────────────────────────────────────────────────
@@ -1838,7 +1858,7 @@ function renderClusterEditor(id) {
       ${cfg.enabled === false ? `<div style="margin:0 16px 12px;padding:8px 12px;background:var(--ink-soft, #f5f5f5);border-radius:6px;font-size:12px;color:var(--ink-2)">Cluster is <b>disabled</b> — it won't appear in the ribbon and load endpoints refuse. Click <b>Enable</b> to bring it back.</div>` : ""}
       ${err ? `<div class="editor-error" style="margin:0 16px 12px;padding:10px 12px;background:#fff5f5;border:1px solid var(--rust);border-radius:6px;color:var(--rust);font-size:13px">${escapeHtml(err)}</div>` : ""}
       ${poolLoaded ? `<div style="margin:0 16px 12px;padding:8px 12px;background:var(--blue-soft);border-radius:6px;font-size:12px;color:var(--ink-2)">Pool is loaded — topology fields are locked. Unload first to edit nodes/kind/backend.</div>` : ""}
-      <div class="editor-body">
+      <div class="editor-body" data-scroll-key="cluster-editor-${id}">
         ${draft.kind === "telemak" ? renderTelemakEditorBody(id, draft, cfg, poolLoaded) : renderMlxClusterEditorBody(id, draft, cfg, poolLoaded, kindOpts, backendOpts)}
       </div>
     </div>
@@ -2426,10 +2446,12 @@ function renderSettingsModels() {
       </div>
       <button class="btn btn-sm" data-act="matrix-refresh">${Icon.refresh}<span>${loading?"Probing…":"Refresh"}</span></button>
     </div>
-    ${m ? renderMatrixCard(m, group) : (loading ? `<div class="empty-state">Probing 6 hosts via SSH… (~10 s)</div>` : `<div class="empty-state">Click <b>Refresh</b> to probe hosts.</div>`)}
-    ${renderActiveSyncJobs()}
-    ${state.sync_picker?.open ? renderSyncPicker() : ""}
-    ${renderSettingsHFDownload(group)}
+    <div data-scroll-key="models-matrix-content">
+      ${m ? renderMatrixCard(m, group) : (loading ? `<div class="empty-state">Probing 6 hosts via SSH… (~10 s)</div>` : `<div class="empty-state">Click <b>Refresh</b> to probe hosts.</div>`)}
+      ${renderActiveSyncJobs()}
+      ${state.sync_picker?.open ? renderSyncPicker() : ""}
+      ${renderSettingsHFDownload(group)}
+    </div>
   `;
 }
 
