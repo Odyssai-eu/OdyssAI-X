@@ -7526,36 +7526,60 @@ async def _telemak_proxy_chat_completion(cluster_id: str, cd: dict, body: dict, 
                 # Auto-think filter mode: line-buffer the SSE stream so we
                 # can parse each `data: {...}` event, extract delta.content,
                 # filter, and re-emit as content + reasoning_content deltas.
+                #
+                # Important: flush any residual think-stream carry BEFORE
+                # passing `data: [DONE]` through, so the final reasoning
+                # bytes never land after the [DONE] sentinel (which some
+                # clients treat as end-of-stream and discard later events).
                 buf = b""
+                done_seen = False
                 async for chunk in r.aiter_raw():
                     if not chunk:
                         continue
                     buf += chunk
                     while b"\n" in buf:
                         line, buf = buf.split(b"\n", 1)
+                        if line.strip() == b"data: [DONE]":
+                            # Flush + emit DONE last.
+                            async for f in _telemak_emit_flush(state, cluster_id):
+                                yield f
+                            yield b"data: [DONE]\n"
+                            done_seen = True
+                            break
                         out_line = _telemak_filter_sse_line(line, state, cluster_id)
                         if out_line is not None:
                             yield out_line
-                if buf:
-                    out_line = _telemak_filter_sse_line(buf, state, cluster_id)
-                    if out_line is not None:
-                        yield out_line
-                # Flush any residual carry as a final delta event.
-                vis, reas = _flush_think_stream(state)
-                if vis or reas:
-                    delta: dict = {}
-                    if vis: delta["content"] = vis
-                    if reas: delta["reasoning_content"] = reas
-                    final = {
-                        "id": "chatcmpl-telemak-flush",
-                        "object": "chat.completion.chunk",
-                        "created": _now(),
-                        "model": cluster_id,
-                        "choices": [{"index": 0, "delta": delta, "finish_reason": None}],
-                    }
-                    yield f"data: {json.dumps(final, ensure_ascii=False)}\n\n".encode()
+                    if done_seen:
+                        break
+                if not done_seen:
+                    # Upstream closed without [DONE] — flush what we have.
+                    if buf:
+                        out_line = _telemak_filter_sse_line(buf, state, cluster_id)
+                        if out_line is not None:
+                            yield out_line
+                    async for f in _telemak_emit_flush(state, cluster_id):
+                        yield f
     from fastapi.responses import StreamingResponse
     return StreamingResponse(_gen(), media_type="text/event-stream")
+
+
+async def _telemak_emit_flush(state: dict, cluster_id: str):
+    """Yield the residual carry from the think-stream filter as a final delta
+    chunk, before [DONE]. No-op if there's nothing to flush."""
+    vis, reas = _flush_think_stream(state)
+    if not vis and not reas:
+        return
+    delta: dict = {}
+    if vis: delta["content"] = vis
+    if reas: delta["reasoning_content"] = reas
+    final = {
+        "id": "chatcmpl-telemak-flush",
+        "object": "chat.completion.chunk",
+        "created": _now(),
+        "model": cluster_id,
+        "choices": [{"index": 0, "delta": delta, "finish_reason": None}],
+    }
+    yield f"data: {json.dumps(final, ensure_ascii=False)}\n\n".encode()
 
 
 def _telemak_filter_sse_line(line: bytes, state: dict, cluster_id: str) -> Optional[bytes]:
