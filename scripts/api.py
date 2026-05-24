@@ -2412,7 +2412,14 @@ def _initial_default_config() -> Optional[dict]:
 # Version is the single source of truth for the server identity. Bump at
 # each meaningful release (engine behaviour change, API contract change,
 # user-visible feature). Surfaced via /admin/version + dashboard About tab.
-ODYSSEUS_VERSION = "1.7.2"
+#
+# Bump conventions:
+#   patch (1.7.2 → 1.7.3) — bugfix only
+#   minor (1.7.2 → 1.8.0) — new feature, new endpoint, behaviour change
+#   major (1.7.2 → 2.0.0) — breaking API or topology change
+#
+# Use `./scripts/bump-version.sh patch|minor|major` to bump + auto-commit.
+ODYSSEUS_VERSION = "1.8.0"
 
 app = FastAPI(
     title="Odysseus (odyssai.eu)",
