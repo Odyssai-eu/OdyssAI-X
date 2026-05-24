@@ -1892,7 +1892,7 @@ _THINK_MAX_PARTIAL = max(len(_THINK_OPEN), len(_THINK_CLOSE)) - 1  # 7
 #    content field. Do not modify the content field."
 # i.e. their stance is "don't disable thinking" — we route around them
 # by treating the auto-opened block as reasoning and stripping the close.
-_MODELS_AUTO_OPEN_THINK = ("minimax",)
+_MODELS_AUTO_OPEN_THINK = ("minimax", "qwen3.5", "qwen3.6")
 
 
 def _model_auto_opens_think(model_id: Optional[str]) -> bool:
@@ -7462,6 +7462,10 @@ async def _telemak_proxy_chat_completion(cluster_id: str, cd: dict, body: dict, 
     Returns either a JSON dict (non-streaming) or a StreamingResponse (SSE
     streaming). The `model` field in the body is rewritten to the actually-
     loaded upstream model id — the client used `cluster_id` as the alias.
+
+    If the upstream model auto-opens a `<think>` block (Qwen3.5, Qwen3.6,
+    MiniMax), this proxy filters reasoning out of `content` and routes it
+    into `reasoning_content`, both for the non-stream and stream paths.
     """
     upstream = (cd.get("upstream") or "").rstrip("/")
     if not upstream:
@@ -7470,8 +7474,10 @@ async def _telemak_proxy_chat_completion(cluster_id: str, cd: dict, body: dict, 
     loaded = await _telemak_loaded_models(cluster_id, cd)
     if not loaded:
         raise HTTPException(503, f"{cluster_id}: no model loaded on upstream — POST /admin/clusters/{cluster_id}/load first")
+    upstream_model = loaded[0]
+    auto_think = _model_auto_opens_think(upstream_model)
     forward_body = dict(body)
-    forward_body["model"] = loaded[0]
+    forward_body["model"] = upstream_model
     import httpx
     if not stream:
         try:
@@ -7482,23 +7488,122 @@ async def _telemak_proxy_chat_completion(cluster_id: str, cd: dict, body: dict, 
         if r.status_code >= 400:
             raise HTTPException(r.status_code, f"telemak upstream error: {r.text[:300]}")
         out = r.json()
-        # Re-stamp the public model id with the cluster alias so the client
-        # sees the alias it asked for, not the internal upstream id.
+        # Filter <think>...</think> out of content. Seed in_think=True for
+        # auto-opening models so reasoning before the first </think> close
+        # gets routed to reasoning_content instead of leaking into content.
+        if auto_think:
+            for choice in out.get("choices", []) or []:
+                msg = choice.get("message") or {}
+                raw = msg.get("content") or ""
+                state = {"in_think": True, "carry": ""}
+                vis, reas = _split_think_stream(raw, state)
+                vis2, reas2 = _flush_think_stream(state)
+                visible = (vis + vis2).lstrip()
+                reasoning = (reas + reas2).strip()
+                msg["content"] = visible
+                if reasoning:
+                    msg["reasoning_content"] = reasoning
+                choice["message"] = msg
         out["model"] = cluster_id
         return out
 
+    # Streaming path — parse SSE chunks, route delta.content through the
+    # think filter, re-emit content + reasoning_content as separate deltas.
     async def _gen():
+        state = {"in_think": True, "carry": ""} if auto_think else None
         async with httpx.AsyncClient(timeout=None) as client:
             async with client.stream("POST", f"{upstream}/v1/chat/completions", json=forward_body) as r:
                 if r.status_code >= 400:
                     err_body = (await r.aread()).decode(errors="replace")[:500]
-                    yield f"data: {json.dumps({'error': {'message': f'telemak upstream {r.status_code}: {err_body}'}})}\n\n"
+                    yield f"data: {json.dumps({'error': {'message': f'telemak upstream {r.status_code}: {err_body}'}})}\n\n".encode()
                     return
+                if not auto_think:
+                    # No filter needed — just pipe bytes through.
+                    async for chunk in r.aiter_raw():
+                        if chunk:
+                            yield chunk
+                    return
+                # Auto-think filter mode: line-buffer the SSE stream so we
+                # can parse each `data: {...}` event, extract delta.content,
+                # filter, and re-emit as content + reasoning_content deltas.
+                buf = b""
                 async for chunk in r.aiter_raw():
-                    if chunk:
-                        yield chunk
+                    if not chunk:
+                        continue
+                    buf += chunk
+                    while b"\n" in buf:
+                        line, buf = buf.split(b"\n", 1)
+                        out_line = _telemak_filter_sse_line(line, state, cluster_id)
+                        if out_line is not None:
+                            yield out_line
+                if buf:
+                    out_line = _telemak_filter_sse_line(buf, state, cluster_id)
+                    if out_line is not None:
+                        yield out_line
+                # Flush any residual carry as a final delta event.
+                vis, reas = _flush_think_stream(state)
+                if vis or reas:
+                    delta: dict = {}
+                    if vis: delta["content"] = vis
+                    if reas: delta["reasoning_content"] = reas
+                    final = {
+                        "id": "chatcmpl-telemak-flush",
+                        "object": "chat.completion.chunk",
+                        "created": _now(),
+                        "model": cluster_id,
+                        "choices": [{"index": 0, "delta": delta, "finish_reason": None}],
+                    }
+                    yield f"data: {json.dumps(final, ensure_ascii=False)}\n\n".encode()
     from fastapi.responses import StreamingResponse
     return StreamingResponse(_gen(), media_type="text/event-stream")
+
+
+def _telemak_filter_sse_line(line: bytes, state: dict, cluster_id: str) -> Optional[bytes]:
+    """Parse one SSE line. If it's a `data: {...}` chat-completion chunk with a
+    delta.content, run the content through the think-stream filter and re-emit
+    with content + reasoning_content separated. Other lines (blank, [DONE],
+    role-only deltas, finish-reason chunks) pass through unchanged.
+
+    Returns the line to emit (bytes including the trailing `\n`), or None if
+    fully consumed (e.g. content all routed to carry, no visible output yet)."""
+    raw = line.rstrip(b"\r")
+    if not raw.startswith(b"data: "):
+        # Pass through unchanged (blank lines between events, comments, etc.)
+        return raw + b"\n"
+    payload = raw[len(b"data: "):]
+    if payload.strip() == b"[DONE]":
+        return raw + b"\n"
+    try:
+        obj = json.loads(payload)
+    except Exception:
+        return raw + b"\n"
+    # Find the delta.content if present.
+    try:
+        choices = obj.get("choices") or []
+        if not choices:
+            obj["model"] = cluster_id
+            return (b"data: " + json.dumps(obj, ensure_ascii=False).encode() + b"\n")
+        choice0 = choices[0]
+        delta = choice0.get("delta") or {}
+        content = delta.get("content")
+        if not isinstance(content, str) or content == "":
+            # Pass through (role-only chunk, finish_reason chunk, etc.)
+            obj["model"] = cluster_id
+            return (b"data: " + json.dumps(obj, ensure_ascii=False).encode() + b"\n")
+        vis, reas = _split_think_stream(content, state)
+        if not vis and not reas:
+            return None  # all carried over, nothing to emit yet
+        new_delta = {k: v for k, v in delta.items() if k != "content"}
+        if vis:
+            new_delta["content"] = vis
+        if reas:
+            new_delta["reasoning_content"] = reas
+        new_obj = dict(obj)
+        new_obj["model"] = cluster_id
+        new_obj["choices"] = [dict(choice0, delta=new_delta)]
+        return (b"data: " + json.dumps(new_obj, ensure_ascii=False).encode() + b"\n")
+    except Exception:
+        return raw + b"\n"
 
 
 async def _telemak_status(cluster_id: str, cd: dict) -> dict:
