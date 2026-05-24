@@ -2705,32 +2705,51 @@ function renderMatrixCard(m, group) {
 // the upstream URL, with a pointer to the Home Load/Unload UI.
 function renderTelemakModelsCard(cid, cdef) {
   const status = state.cluster_status?.[cid];
-  const loadedModel = status?.model;
+  const modelsLoaded = Array.isArray(status?.models_loaded)
+    ? status.models_loaded.filter(Boolean)
+    : (status?.model ? [status.model] : []);
   const upstream = cdef?.upstream || status?.upstream || "";
   const reachable = status?.upstream_reachable !== false;
   const name = CLUSTERS.find(c => c.id === cid)?.name || cid;
+  const wiredUsed = (typeof status?.wired_memory_used_gb === "number") ? status.wired_memory_used_gb : null;
+  const wiredFree = (typeof status?.wired_memory_free_gb === "number") ? status.wired_memory_free_gb : null;
+  const wiredTotal = (wiredUsed != null && wiredFree != null) ? (wiredUsed + wiredFree) : null;
+  const rows = modelsLoaded.map((id) => {
+    const short = (id.split("/").pop() || id).toLowerCase();
+    const alias = modelsLoaded.length === 1 ? cid : `${cid}:${short}`;
+    return `
+      <div style="display:flex;align-items:center;gap:12px;padding:8px 12px;background:var(--surface);border:1px solid var(--line);border-radius:6px;font-family:var(--font-mono);font-size:12px">
+        <span style="font-weight:600;color:var(--ink);flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${escapeHtml(id)}</span>
+        <span style="color:var(--ink-3);font-size:11px;white-space:nowrap">alias: <span style="color:var(--ink-2)">${escapeHtml(alias)}</span></span>
+        <button class="btn btn-xs btn-destructive" data-act="telemak-unload" data-cluster="${cid}" data-model="${escapeHtml(id)}" title="Unload ${escapeHtml(id)}">${Icon.x}<span>Unload</span></button>
+      </div>
+    `;
+  }).join("");
   return `
     <div class="matrix-card" style="padding:24px">
       <div style="display:flex;flex-direction:column;gap:12px">
-        <div style="display:flex;align-items:center;gap:10px">
+        <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
           <span style="font-size:18px;font-weight:600;color:var(--ink)">${escapeHtml(name)}</span>
           <span style="font-size:11px;padding:3px 8px;border-radius:4px;background:var(--blue-soft);color:var(--blue-deep);font-weight:600;letter-spacing:0.04em;text-transform:uppercase">telemak</span>
           ${reachable
             ? `<span style="font-size:11px;color:var(--green-deep);font-weight:600">● reachable</span>`
             : `<span style="font-size:11px;color:var(--rust);font-weight:600">● unreachable</span>`}
+          ${(wiredUsed != null && wiredTotal != null)
+            ? `<span style="font-size:11px;color:var(--ink-2);padding:2px 8px;background:var(--ground);border-radius:4px;font-weight:600">${wiredUsed.toFixed(1)} / ${wiredTotal.toFixed(1)} GB wired</span>`
+            : ""}
         </div>
         <div style="font-size:12px;color:var(--ink-2)">
           Telemak runs as a native Swift binary on a single Mac. Its model store is local — no rsync between hosts.
-          Use the Home tab's Load form to bring models up explicitly.
+          Use the Home tab to load or unload models.
         </div>
         <div style="margin-top:8px;padding:12px 14px;background:var(--ground);border-radius:8px;display:flex;flex-direction:column;gap:6px">
           <div style="font-size:11px;font-weight:600;color:var(--ink-2);letter-spacing:0.04em;text-transform:uppercase">Upstream</div>
           <div class="mono" style="font-size:13px;color:var(--ink)">${escapeHtml(upstream || "—")}</div>
         </div>
         <div style="padding:12px 14px;background:var(--ground);border-radius:8px;display:flex;flex-direction:column;gap:6px">
-          <div style="font-size:11px;font-weight:600;color:var(--ink-2);letter-spacing:0.04em;text-transform:uppercase">Currently loaded</div>
-          ${loadedModel
-            ? `<div class="mono" style="font-size:13px;color:var(--ink);font-weight:600">${escapeHtml(loadedModel)}</div>`
+          <div style="font-size:11px;font-weight:600;color:var(--ink-2);letter-spacing:0.04em;text-transform:uppercase">Currently loaded (${modelsLoaded.length})</div>
+          ${modelsLoaded.length > 0
+            ? `<div style="display:flex;flex-direction:column;gap:6px">${rows}</div>`
             : `<div style="font-size:13px;color:var(--ink-2);font-style:italic">No model loaded — open the Home tab and click Load.</div>`}
         </div>
       </div>
@@ -2905,19 +2924,58 @@ function renderArgoCard() {
   `;
 }
 
-// ─── Telemak Home card — single-node, no pools, no mode/nodes selectors ───
+// ─── Telemak Home card — single-node, multi-model (V1.x). Renders an
+// N-row "Loaded models" list with per-row Unload + "+ Load another
+// model" inline form. Empty state collapses to the same simple Load
+// form as before so single-model users see no extra chrome.
 function renderTelemakHomeCard(a, cid, label) {
-  const loaded = !!a.loaded;
   const upstream = a.upstream || "";
   const reachable = a.upstream_reachable !== false;
-  const model = a.model || null;
+  const modelsLoaded = Array.isArray(a.models_loaded) ? a.models_loaded.filter(Boolean) : (a.model ? [a.model] : []);
+  const loaded = modelsLoaded.length > 0;
+  const wiredUsed = (typeof a.wired_memory_used_gb === "number") ? a.wired_memory_used_gb : null;
+  const wiredFree = (typeof a.wired_memory_free_gb === "number") ? a.wired_memory_free_gb : null;
+  const wiredTotal = (wiredUsed != null && wiredFree != null) ? (wiredUsed + wiredFree) : null;
+  const memWarn = (wiredFree != null && wiredFree < 5);
   const statusPill = !reachable
     ? `<div class="pill-status" style="background:#fff5f5;border-color:var(--rust);color:var(--rust);font-weight:600;padding:3px 10px;border-radius:6px;font-size:11px;letter-spacing:0.04em;text-transform:uppercase">Upstream unreachable</div>`
     : loaded
-      ? `<div class="pill-status"><div class="pip"></div><div class="label">Loaded</div></div>`
+      ? `<div class="pill-status"><div class="pip"></div><div class="label">${modelsLoaded.length} loaded</div></div>`
       : `<div class="pill-status idle"><div class="pip"></div><div class="label">Idle</div></div>`;
-  const f = state.telemak_load_form?.[cid] || { model: "" };
+  const memPill = (wiredUsed != null && wiredTotal != null)
+    ? `<div class="pill-status" style="background:${memWarn?'#fff5f5':'var(--ground)'};border-color:${memWarn?'var(--rust)':'var(--line)'};color:${memWarn?'var(--rust)':'var(--ink-2)'};font-weight:600;padding:3px 10px;border-radius:6px;font-size:11px;letter-spacing:0.04em;text-transform:uppercase">${wiredUsed.toFixed(1)} / ${wiredTotal.toFixed(1)} GB wired</div>`
+    : "";
+  const tpsPill = (typeof a.avg_tok_s_recent === "number" && a.avg_tok_s_recent > 0)
+    ? `<div class="pill-status" style="background:var(--ground);border-color:var(--line);color:var(--ink-2);font-weight:600;padding:3px 10px;border-radius:6px;font-size:11px;letter-spacing:0.04em;text-transform:uppercase">${a.avg_tok_s_recent.toFixed(1)} tok/s</div>`
+    : "";
+  const f = state.telemak_load_form?.[cid] || { model: "", open: false };
+  const formOpen = !!f.open;
   const busy = !!state.busy_telemak_load?.[cid];
+
+  const rows = modelsLoaded.map((id) => {
+    const short = (id.split("/").pop() || id).toLowerCase();
+    const alias = modelsLoaded.length === 1 ? cid : `${cid}:${short}`;
+    return `
+      <div style="display:flex;align-items:center;gap:12px;padding:8px 12px;background:var(--surface);border:1px solid var(--line);border-radius:6px;font-family:var(--font-mono);font-size:12px">
+        <span style="font-weight:600;color:var(--ink);flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${escapeHtml(id)}</span>
+        <span style="color:var(--ink-3);font-size:11px;white-space:nowrap">alias: <span style="color:var(--ink-2)">${escapeHtml(alias)}</span></span>
+        <button class="btn btn-xs btn-destructive" data-act="telemak-unload" data-cluster="${cid}" data-model="${escapeHtml(id)}" title="Unload ${escapeHtml(id)}">${Icon.x}<span>Unload</span></button>
+      </div>
+    `;
+  }).join("");
+
+  const loadFormBody = `
+    <div class="field">
+      <input class="ce-input mono" data-act="telemak-load-edit-model" data-cluster="${cid}" value="${escapeHtml(f.model || "")}" placeholder="inferencerlabs/Qwen3.6-35B-A3B-MLX-9bit" style="width:100%"/>
+      <div style="font-size:11px;color:var(--ink-2);margin-top:4px">Hugging Face repo id or path the Telemak binary can resolve via its model loader.</div>
+    </div>
+    <div style="display:flex;gap:8px">
+      <button class="btn btn-sm" style="background:var(--blue);color:white;border-color:var(--blue)" ${busy?"disabled":""} data-act="telemak-load-submit" data-cluster="${cid}">${busy?"Loading…":"Load"}</button>
+      ${loaded ? `<button class="btn btn-sm" data-act="telemak-load-cancel" data-cluster="${cid}">Cancel</button>` : ""}
+      ${f.error ? `<div style="color:var(--rust);font-size:12px;align-self:center">${escapeHtml(f.error)}</div>` : ""}
+    </div>
+  `;
+
   return `
     <section class="cluster-card">
       <div class="section" style="border-bottom: 1px solid var(--line)">
@@ -2926,6 +2984,8 @@ function renderTelemakHomeCard(a, cid, label) {
             <div class="row">
               <h1>${escapeHtml(label)}</h1>
               ${statusPill}
+              ${memPill}
+              ${tpsPill}
             </div>
             <div class="topo">
               <span class="text">telemak · native swift · single-node</span>
@@ -2936,7 +2996,6 @@ function renderTelemakHomeCard(a, cid, label) {
           <div class="quick-actions">
             <button class="btn btn-sm" data-act="refresh">${Icon.refresh}<span>Refresh</span></button>
             <button class="btn btn-sm" data-act="cluster-settings" data-cluster="${cid}">${Icon.settings}<span>Cluster settings</span></button>
-            ${loaded ? `<button class="btn btn-dark btn-sm" data-act="telemak-unload" data-cluster="${cid}">${Icon.pause}<span>Unload</span></button>` : ""}
           </div>
         </div>
       </div>
@@ -2947,14 +3006,24 @@ function renderTelemakHomeCard(a, cid, label) {
 
       ${loaded ? `
         <div class="section">
-          <div style="display:flex;flex-direction:column;gap:6px">
-            <div class="field-label">Loaded model</div>
-            <div style="display:flex;align-items:center;gap:12px">
-              <div class="mono" style="font-size:14px;font-weight:600;color:var(--ink)">${escapeHtml(model || "")}</div>
-              <div style="font-size:11px;color:var(--ink-2);padding:2px 8px;background:var(--ink-soft,#f5f5f5);border-radius:4px">via ${escapeHtml(upstream)}</div>
+          <div class="section-head" style="margin-bottom:10px">
+            <div class="section-stack">
+              <div class="section-title">Loaded models (${modelsLoaded.length})</div>
+              <div class="section-sub">${modelsLoaded.length === 1
+                ? `Companion routes via <span class="mono">model: "${escapeHtml(cid)}"</span>`
+                : `Companion routes via <span class="mono">model: "${escapeHtml(cid)}:&lt;short&gt;"</span>`}</div>
             </div>
-            <div style="font-size:12px;color:var(--ink-2);margin-top:4px">Companion can route here with <span class="mono">model: "${escapeHtml(cid)}"</span>.</div>
+            ${reachable ? `<button class="btn btn-sm" data-act="telemak-load-toggle" data-cluster="${cid}">${Icon.plus}<span>${formOpen ? "Cancel" : "Load another model"}</span></button>` : ""}
           </div>
+          <div style="display:flex;flex-direction:column;gap:6px">
+            ${rows}
+          </div>
+          ${formOpen ? `
+            <div style="display:grid;gap:10px;max-width:680px;margin-top:14px;padding:14px;background:var(--surface);border:1px dashed var(--line);border-radius:8px">
+              <div style="font-family:var(--font-display);font-weight:600;font-size:13px">Add another model</div>
+              ${loadFormBody}
+            </div>
+          ` : ""}
         </div>
       ` : ""}
 
@@ -2962,14 +3031,7 @@ function renderTelemakHomeCard(a, cid, label) {
         <div class="section">
           <div class="field-label" style="margin-bottom:8px">Load a model</div>
           <div style="display:grid;gap:10px;max-width:680px">
-            <div class="field">
-              <input class="ce-input mono" data-act="telemak-load-edit-model" data-cluster="${cid}" value="${escapeHtml(f.model || "")}" placeholder="inferencerlabs/Qwen3.5-35B-A3B-MLX-9bit" style="width:100%"/>
-              <div style="font-size:11px;color:var(--ink-2);margin-top:4px">Hugging Face repo id or path the Telemak binary can resolve via its model loader.</div>
-            </div>
-            <div style="display:flex;gap:8px">
-              <button class="btn btn-sm" style="background:var(--blue);color:white;border-color:var(--blue)" ${busy?"disabled":""} data-act="telemak-load-submit" data-cluster="${cid}">${busy?"Loading…":"Load"}</button>
-              ${f.error ? `<div style="color:var(--rust);font-size:12px;align-self:center">${escapeHtml(f.error)}</div>` : ""}
-            </div>
+            ${loadFormBody}
           </div>
         </div>
       ` : ""}
@@ -5071,6 +5133,28 @@ async function handleAct(e) {
     if (e.type === "change") render();
     return;
   }
+  if (act === "telemak-load-toggle") {
+    // Toggle the "+ Load another model" inline form on the Home card
+    // when one or more models are already loaded.
+    const cid = el.dataset.cluster;
+    if (!cid) return;
+    if (!state.telemak_load_form) state.telemak_load_form = {};
+    if (!state.telemak_load_form[cid]) state.telemak_load_form[cid] = {};
+    state.telemak_load_form[cid].open = !state.telemak_load_form[cid].open;
+    state.telemak_load_form[cid].error = null;
+    render();
+    return;
+  }
+  if (act === "telemak-load-cancel") {
+    const cid = el.dataset.cluster;
+    if (!cid) return;
+    if (state.telemak_load_form?.[cid]) {
+      state.telemak_load_form[cid].open = false;
+      state.telemak_load_form[cid].error = null;
+      render();
+    }
+    return;
+  }
   if (act === "telemak-load-submit") {
     const cid = el.dataset.cluster;
     if (!cid) return;
@@ -5088,6 +5172,11 @@ async function handleAct(e) {
       });
       if (!r.ok) { const t = await r.text(); throw new Error(t.slice(0, 300)); }
       toast(`Loading ${model} on ${cid}…`, "ok");
+      // Close the inline form on success so subsequent loads stay tidy.
+      if (state.telemak_load_form?.[cid]) {
+        state.telemak_load_form[cid].open = false;
+        state.telemak_load_form[cid].model = "";
+      }
       await refreshAll();
     } catch (err) {
       if (state.telemak_load_form) state.telemak_load_form[cid].error = err.message;
@@ -5101,11 +5190,19 @@ async function handleAct(e) {
   if (act === "telemak-unload") {
     const cid = el.dataset.cluster;
     if (!cid) return;
-    if (!confirm(`Unload model on ${cid} ?`)) return;
+    // Per-row Unload sends data-model="<full-hf-id>"; legacy header
+    // Unload (no row context) sends nothing and the server unloads all.
+    const model = el.dataset.model || null;
+    const what = model ? `model '${model}' on ${cid}` : `all models on ${cid}`;
+    if (!confirm(`Unload ${what} ?`)) return;
     try {
-      const r = await fetch(`/admin/clusters/${encodeURIComponent(cid)}/unload`, { method: "POST" });
+      const r = await fetch(`/admin/clusters/${encodeURIComponent(cid)}/unload`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(model ? { model } : {}),
+      });
       if (!r.ok) { const t = await r.text(); throw new Error(t.slice(0, 300)); }
-      toast(`Unloaded ${cid}`, "ok");
+      toast(model ? `Unloaded ${model} on ${cid}` : `Unloaded all on ${cid}`, "ok");
       await refreshAll();
     } catch (err) {
       toast(`Unload failed: ${err.message}`, "err");
