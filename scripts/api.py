@@ -7613,7 +7613,23 @@ async def _telemak_proxy_chat_completion(
         )
     else:
         upstream_model = loaded[0]
-    auto_think = _model_auto_opens_think(upstream_model)
+    # Auto-think heuristic: Qwen3.5/3.6/MiniMax templates auto-open <think>
+    # at prompt time, so reasoning streams BEFORE any visible </think> tag.
+    # When that's the case we seed the filter with `in_think=True` and
+    # route everything to `reasoning_content` until the model finally
+    # closes with `</think>`.
+    #
+    # BUT — when the request body has `enable_thinking: false`, Telemak
+    # honors the kwarg via the chat template and the model does NOT
+    # auto-open <think>. If we still seed `in_think=True` here, the
+    # filter eats the entire visible output as reasoning_content
+    # (Companion gets a "ghost" — empty content, full reasoning_content).
+    # Disable the auto-seed in that case.
+    enable_thinking = body.get("enable_thinking")
+    if enable_thinking is False:
+        auto_think = False
+    else:
+        auto_think = _model_auto_opens_think(upstream_model)
     forward_body = dict(body)
     forward_body["model"] = upstream_model
     import httpx
