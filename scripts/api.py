@@ -7860,14 +7860,21 @@ def _telemak_filter_sse_line(line: bytes, state: dict, cluster_id: str) -> Optio
 async def _telemak_status(cluster_id: str, cd: dict) -> dict:
     """Return a status snapshot for a kind=telemak cluster.
 
-    Queries the upstream Telemak binary's /v1/models. If reachable AND has a
-    loaded model, returns loaded:true with the model id. Otherwise returns
-    loaded:false (and reachable:false on connection errors). Shape matches
-    Odysseus' mlx-distributed status so the dashboard renderers don't crash.
+    Queries /v1/models for the loaded-models list and /health for memory +
+    throughput metrics. Telemak holds N models concurrently (V1 Block 1+);
+    we surface the full list as `models_loaded` while keeping `model`
+    (singular) populated with the first entry so older dashboard code that
+    only checks "any model loaded?" still works.
+
+    Shape stays compatible with Odysseus' mlx-distributed cluster status so
+    the dashboard renderers don't crash on the kind=telemak branch.
     """
     upstream = (cd.get("upstream") or "").rstrip("/")
-    loaded_model = None
+    models_loaded: list[str] = []
     reachable = False
+    wired_used_gb = None
+    wired_free_gb = None
+    avg_tok_s_recent = None
     if upstream:
         import httpx
         try:
@@ -7876,20 +7883,38 @@ async def _telemak_status(cluster_id: str, cd: dict) -> dict:
                 if r.status_code == 200:
                     reachable = True
                     data = r.json().get("data", [])
-                    if data:
-                        loaded_model = data[0].get("id")
+                    models_loaded = [m.get("id") for m in data if m.get("id")]
+                # /health is independent — fetch even if /v1/models bombed,
+                # the user wants to know the upstream's memory state.
+                try:
+                    h = await client.get(f"{upstream}/health")
+                    if h.status_code == 200:
+                        reachable = True
+                        hj = h.json()
+                        if not models_loaded:
+                            models_loaded = hj.get("models_loaded", []) or []
+                        wired_used_gb = hj.get("wired_memory_used_gb")
+                        wired_free_gb = hj.get("wired_memory_free_gb")
+                        avg_tok_s_recent = hj.get("avg_tok_s_recent")
+                except Exception:
+                    pass
         except Exception:
             reachable = False
     nodes = cd.get("nodes") or []
     master_ssh = (nodes[0] or {}).get("ssh") if nodes else None
+    loaded_model = models_loaded[0] if models_loaded else None
     return {
-        "loaded": bool(loaded_model),
+        "loaded": bool(models_loaded),
         "cluster": cluster_id,
         "loading": None,
         "available_node_counts": [1],
         "max_nodes": 1,
-        "nodes": 1 if loaded_model else 0,
-        "model": loaded_model,
+        "nodes": 1 if models_loaded else 0,
+        "model": loaded_model,                     # back-compat (singular)
+        "models_loaded": models_loaded,            # canonical (list)
+        "wired_memory_used_gb": wired_used_gb,
+        "wired_memory_free_gb": wired_free_gb,
+        "avg_tok_s_recent": avg_tok_s_recent,
         "mode": "telemak",
         "topologies": {"1": [{"rank": 0, "ssh": master_ssh}]} if master_ssh else {"1": []},
         "models_dir": cd.get("models_dir"),
@@ -7932,22 +7957,37 @@ async def _telemak_proxy_load(cluster_id: str, cd: dict, req) -> dict:
     }
 
 
-async def _telemak_proxy_unload(cluster_id: str, cd: dict) -> dict:
-    """Proxy POST /admin/unload to the Telemak upstream."""
+async def _telemak_proxy_unload(
+    cluster_id: str, cd: dict, model: Optional[str] = None
+) -> dict:
+    """Proxy POST /admin/unload to the Telemak upstream.
+
+    `model=None` (or empty) → unload everything (`{"all": true}`).
+    `model="<hf-id>"`        → unload that one model only, leaving any
+    others in the registry untouched. The dashboard's per-row Unload
+    button sends the specific id; the legacy "Unload" header button (no
+    model attached) falls back to all.
+    """
     upstream = (cd.get("upstream") or "").rstrip("/")
     if not upstream:
         raise HTTPException(400, f"{cluster_id}: missing upstream URL")
+    payload: dict
+    if model:
+        payload = {"model": model}
+    else:
+        payload = {"all": True}
     import httpx
     try:
         async with httpx.AsyncClient(timeout=60.0) as client:
-            r = await client.post(f"{upstream}/admin/unload")
+            r = await client.post(f"{upstream}/admin/unload", json=payload)
     except Exception as e:
         raise HTTPException(502, f"telemak upstream unreachable: {e}")
-    save_cluster_def(cluster_id, {"_telemak_loaded_model": None})
     _telemak_cache_invalidate(cluster_id)
     if r.status_code >= 400 and r.status_code != 404:
         raise HTTPException(r.status_code, f"telemak upstream error: {r.text[:200]}")
-    return {"unloaded": True, "cluster": cluster_id}
+    if not model:
+        save_cluster_def(cluster_id, {"_telemak_loaded_model": None})
+    return {"unloaded": True, "cluster": cluster_id, "model": model}
 
 
 @app.post("/admin/clusters/{cluster_id}/unload")
@@ -7971,10 +8011,22 @@ async def admin_cluster_unload(
     """
     if not cluster_exists(cluster_id):
         raise HTTPException(404, f"unknown cluster {cluster_id}")
-    # kind=telemak: proxy to upstream /admin/unload.
+    # kind=telemak: proxy to upstream /admin/unload. Optional `model` in
+    # the body targets a specific loaded model; absent → unload all.
     cd_proxy = get_cluster_def(cluster_id)
     if cd_proxy.get("kind") == "telemak":
-        return await _telemak_proxy_unload(cluster_id, cd_proxy)
+        telemak_model: Optional[str] = None
+        try:
+            raw = await request.body()
+            if raw:
+                payload = json.loads(raw)
+                if isinstance(payload, dict):
+                    val = payload.get("model")
+                    if isinstance(val, str) and val:
+                        telemak_model = val
+        except Exception:
+            pass
+        return await _telemak_proxy_unload(cluster_id, cd_proxy, telemak_model)
     body_alias: Optional[str] = None
     if alias is None:
         try:
