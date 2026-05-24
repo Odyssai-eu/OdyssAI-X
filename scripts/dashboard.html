@@ -753,7 +753,7 @@ h1, h2, h3 { margin: 0; }
 .editor-head .editing-pill { font-size: 11px; font-weight: 600; color: var(--ink-2); letter-spacing: 0.04em; padding: 3px 8px; background: var(--ground); border-radius: 4px; }
 .editor-head .sub { font-size: 12px; color: var(--ink-2); margin-top: 2px; }
 
-.editor-body { padding: 26px; display: flex; flex-direction: column; gap: 24px; }
+.editor-body { padding: 26px; display: flex; flex-direction: column; gap: 24px; flex: 1; overflow-y: auto; min-height: 0; }
 
 .field-row3 { display: flex; flex-direction: row; gap: 16px; }
 .field-row3 > .field { flex: 1; }
@@ -1336,7 +1336,6 @@ function render() {
         ${renderClusterCard()}
         ${renderActiveRuns()}
         ${renderRunnerLogs()}
-        ${renderHFDownload(state.selected_cluster)}
         ${renderRecentActivity()}
         ${renderFooter()}
       </div>
@@ -2430,7 +2429,32 @@ function renderSettingsModels() {
     ${m ? renderMatrixCard(m, group) : (loading ? `<div class="empty-state">Probing 6 hosts via SSH… (~10 s)</div>` : `<div class="empty-state">Click <b>Refresh</b> to probe hosts.</div>`)}
     ${renderActiveSyncJobs()}
     ${state.sync_picker?.open ? renderSyncPicker() : ""}
+    ${renderSettingsHFDownload(group)}
   `;
+}
+
+// HF download UI — moved here from the Home dashboard (where it didn't belong).
+// Targets follow the selected Models matrix group: if a real cluster is
+// selected, download to that cluster's nodes. If "all" or a telemak cluster
+// is selected, hide the form (kind=telemak doesn't use rsync-distributed
+// model storage — it has its own local store, populated separately).
+function renderSettingsHFDownload(group) {
+  if (!group || group === "all") {
+    return `
+      <div style="margin-top:24px;padding:14px 16px;background:var(--ground);border-radius:10px;font-size:12px;color:var(--ink-2)">
+        Pick a cluster above to download a Hugging Face model to its nodes.
+      </div>
+    `;
+  }
+  const cdef = state.cluster_defs?.[group];
+  if (cdef?.kind === "telemak") {
+    return `
+      <div style="margin-top:24px;padding:14px 16px;background:var(--ground);border-radius:10px;font-size:12px;color:var(--ink-2)">
+        Telemak doesn't use the distributed model store — its model files are local to the Mac running the Swift binary. Pre-populate <span class="mono">TELEMAK_MODELS_DIR</span> via <span class="mono">huggingface-cli download</span> on that Mac, or download into the HF cache by loading the model from the Home tab (Telemak fetches on demand).
+      </div>
+    `;
+  }
+  return `<div style="margin-top:24px">${renderHFDownload(group)}</div>`;
 }
 
 function renderActiveSyncJobs() {
@@ -2613,6 +2637,17 @@ function renderSyncPicker() {
 }
 
 function renderMatrixCard(m, group) {
+  // kind=telemak clusters don't have SSH-accessible nodes in the rsync sense.
+  // The "node" is an HTTP endpoint with its own model store. Render a
+  // dedicated view that lists the models loaded on the upstream Telemak,
+  // sourced from /admin/clusters/<id>/status (already fetched into
+  // state.cluster_status).
+  if (group && group !== "all") {
+    const cdef = state.cluster_defs?.[group];
+    if (cdef?.kind === "telemak") {
+      return renderTelemakModelsCard(group, cdef);
+    }
+  }
   const allHosts = m.hosts || [];
   const groupHostIds = matrixGroupHostIds(group);
   const hosts = groupHostIds ? allHosts.filter(h => groupHostIds.includes(h.id)) : allHosts;
@@ -2635,6 +2670,45 @@ function renderMatrixCard(m, group) {
         <div class="mc-action"></div>
       </div>
       ${models.length === 0 ? `<div class="empty-state">No models present on these hosts.</div>` : models.map(mod => renderMatrixRow(mod, hosts)).join("")}
+    </div>
+  `;
+}
+
+// Dedicated view for kind=telemak clusters in the Models matrix tab.
+// Telemak doesn't use the rsync matrix — its model store is local to the
+// Mac running the Swift binary. So we show what's currently loaded plus
+// the upstream URL, with a pointer to the Home Load/Unload UI.
+function renderTelemakModelsCard(cid, cdef) {
+  const status = state.cluster_status?.[cid];
+  const loadedModel = status?.model;
+  const upstream = cdef?.upstream || status?.upstream || "";
+  const reachable = status?.upstream_reachable !== false;
+  const name = CLUSTERS.find(c => c.id === cid)?.name || cid;
+  return `
+    <div class="matrix-card" style="padding:24px">
+      <div style="display:flex;flex-direction:column;gap:12px">
+        <div style="display:flex;align-items:center;gap:10px">
+          <span style="font-size:18px;font-weight:600;color:var(--ink)">${escapeHtml(name)}</span>
+          <span style="font-size:11px;padding:3px 8px;border-radius:4px;background:var(--blue-soft);color:var(--blue-deep);font-weight:600;letter-spacing:0.04em;text-transform:uppercase">telemak</span>
+          ${reachable
+            ? `<span style="font-size:11px;color:var(--green-deep);font-weight:600">● reachable</span>`
+            : `<span style="font-size:11px;color:var(--rust);font-weight:600">● unreachable</span>`}
+        </div>
+        <div style="font-size:12px;color:var(--ink-2)">
+          Telemak runs as a native Swift binary on a single Mac. Its model store is local — no rsync between hosts.
+          Use the Home tab's Load form to bring models up explicitly.
+        </div>
+        <div style="margin-top:8px;padding:12px 14px;background:var(--ground);border-radius:8px;display:flex;flex-direction:column;gap:6px">
+          <div style="font-size:11px;font-weight:600;color:var(--ink-2);letter-spacing:0.04em;text-transform:uppercase">Upstream</div>
+          <div class="mono" style="font-size:13px;color:var(--ink)">${escapeHtml(upstream || "—")}</div>
+        </div>
+        <div style="padding:12px 14px;background:var(--ground);border-radius:8px;display:flex;flex-direction:column;gap:6px">
+          <div style="font-size:11px;font-weight:600;color:var(--ink-2);letter-spacing:0.04em;text-transform:uppercase">Currently loaded</div>
+          ${loadedModel
+            ? `<div class="mono" style="font-size:13px;color:var(--ink);font-weight:600">${escapeHtml(loadedModel)}</div>`
+            : `<div style="font-size:13px;color:var(--ink-2);font-style:italic">No model loaded — open the Home tab and click Load.</div>`}
+        </div>
+      </div>
     </div>
   `;
 }
@@ -3924,7 +3998,7 @@ function renderHFDownload(clusterId) {
         </div>
         <div>
           <div style="display:flex;align-items:center;justify-content:space-between;gap:14px;padding-bottom:8px">
-            <div class="field-label">${escapeHtml(cluster.charAt(0).toUpperCase()+cluster.slice(1))} nodes — pick which ones receive this model</div>
+            <div class="field-label">${escapeHtml(CLUSTERS.find(c => c.id === cluster)?.name || cluster)} nodes — pick which ones receive this model</div>
             <button class="btn btn-xs" data-act="hf-select-all" style="border:none;background:transparent">Select all</button>
           </div>
           <div class="target-chips">
@@ -3943,7 +4017,7 @@ function renderHFDownload(clusterId) {
           </div>
         </div>
         <div class="action-row">
-          <span class="hint">${Object.values(tgtState).filter(Boolean).length} of ${nodes.length} ${cluster} nodes selected · downloads run in parallel via <span class="mono">hf download</span></span>
+          <span class="hint">${Object.values(tgtState).filter(Boolean).length} of ${nodes.length} ${escapeHtml(CLUSTERS.find(c => c.id === cluster)?.name || cluster)} nodes selected · downloads run in parallel via <span class="mono">hf download</span></span>
           <button class="btn btn-dark" data-act="dl-start">${Icon.download}<span>Download to ${Object.values(tgtState).filter(Boolean).length} node${Object.values(tgtState).filter(Boolean).length!==1?"s":""}</span></button>
         </div>
       </div>
