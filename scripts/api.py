@@ -4691,9 +4691,12 @@ async def list_models(include_unloaded: bool = False):
     for cid, alias, pool in list_all_pools():
         await _push_loaded(pool, cid, alias)
 
-    # kind=telemak clusters: query the upstream's /v1/models. Emit one entry
-    # per cluster (the cluster_id is the public alias; the upstream's id is
-    # stashed in alias_for so callers know what concrete model is serving).
+    # kind=telemak clusters: query the upstream's /v1/models. Multi-model
+    # routing (V1):
+    #   - 1 model loaded → emit `cluster_id` (back-compat).
+    #   - N>1 models loaded → emit N entries `cluster_id:<short_id>`. The
+    #     bare cluster_id alias disappears so clients are forced to
+    #     disambiguate (Companion picks the right entry from the list).
     for cid in active_cluster_ids():
         cd = get_cluster_def(cid)
         if cd.get("kind") != "telemak":
@@ -4701,20 +4704,40 @@ async def list_models(include_unloaded: bool = False):
         loaded = await _telemak_loaded_models(cid, cd)
         if not loaded:
             continue
-        data.append({
-            "id": cid, "object": "model",
-            "created": _now(), "owned_by": f"odysseus-telemak",
-            "x_concrete": loaded[0],
-            "x_odyssai": {
-                "ready": True,
-                "alias_for": loaded[0],
-                "kind": "telemak",
-                "stream": True,
-                "tools": False,
-                "backend": "http-proxy",
-                "upstream": cd.get("upstream"),
-            },
-        })
+        if len(loaded) == 1:
+            data.append({
+                "id": cid, "object": "model",
+                "created": _now(), "owned_by": "odysseus-telemak",
+                "x_concrete": loaded[0],
+                "x_odyssai": {
+                    "ready": True,
+                    "alias_for": loaded[0],
+                    "kind": "telemak",
+                    "stream": True,
+                    "tools": False,
+                    "backend": "http-proxy",
+                    "upstream": cd.get("upstream"),
+                },
+            })
+        else:
+            for upstream_model in loaded:
+                short = _telemak_short_id(upstream_model)
+                data.append({
+                    "id": f"{cid}:{short}", "object": "model",
+                    "created": _now(), "owned_by": "odysseus-telemak",
+                    "x_concrete": upstream_model,
+                    "x_odyssai": {
+                        "ready": True,
+                        "alias_for": upstream_model,
+                        "kind": "telemak",
+                        "cluster": cid,
+                        "short_id": short,
+                        "stream": True,
+                        "tools": False,
+                        "backend": "http-proxy",
+                        "upstream": cd.get("upstream"),
+                    },
+                })
 
     # Published cloud aliases (Odysseus-as-gateway). Always advertised
     # because they're always servable — the upstream takes care of itself.
@@ -4895,12 +4918,19 @@ def _strip_tool_calls_from_text(text: str) -> str:
 @app.post("/v1/chat/completions")
 async def chat_completions(req: ChatCompletionRequest, request: Request):
     # 0. Telemak passthrough? If the model id matches a kind=telemak cluster,
-    # proxy the request to that cluster's upstream Swift binary.
-    if req.model and cluster_exists(req.model):
-        cd_t = get_cluster_def(req.model)
-        if cd_t.get("kind") == "telemak":
-            body = req.model_dump(exclude_none=True)
-            return await _telemak_proxy_chat_completion(req.model, cd_t, body, bool(req.stream))
+    # proxy the request to that cluster's upstream Swift binary. Supports
+    # both `cluster_id` (1-model back-compat) and `cluster_id:short_id`
+    # (multi-model V1) forms.
+    if req.model:
+        tele_cluster, tele_short = _telemak_split_alias(req.model)
+        if tele_cluster and cluster_exists(tele_cluster):
+            cd_t = get_cluster_def(tele_cluster)
+            if cd_t.get("kind") == "telemak":
+                body = req.model_dump(exclude_none=True)
+                return await _telemak_proxy_chat_completion(
+                    tele_cluster, cd_t, body, bool(req.stream),
+                    requested_short_id=tele_short,
+                )
 
     # 1. Cloud passthrough? If the model id matches a published cloud alias
     # (e.g. "or:claude-haiku"), proxy to the configured upstream. No local
@@ -7421,6 +7451,28 @@ _TELEMAK_MODELS_CACHE: dict[str, tuple[float, list[str]]] = {}
 _TELEMAK_CACHE_TTL_S = 8.0  # seconds — debounce dashboard polls without staleness
 
 
+def _telemak_short_id(hf_id: str) -> str:
+    """Short alias for a Telemak-loaded HF id — kebab-cased, no org prefix.
+
+    `mlx-community/Qwen3-0.6B-4bit` → `qwen3-0.6b-4bit`. URL-safe; used as
+    the colon-suffix in `<cluster_id>:<short_id>` for multi-model routing
+    (v1.7-v1.8 of Telemak V1)."""
+    tail = hf_id.rsplit("/", 1)[-1]
+    return tail.lower()
+
+
+def _telemak_split_alias(model: Optional[str]) -> tuple[Optional[str], Optional[str]]:
+    """Split `cluster_id:short_model_id` → (cluster_id, short_id). If no colon,
+    returns (model, None). Used by chat_completions routing to support both
+    bare-cluster (back-compat, 1 model) and colon-suffix (N models) forms."""
+    if not model:
+        return (None, None)
+    if ":" not in model:
+        return (model, None)
+    cluster, short = model.split(":", 1)
+    return (cluster, short or None)
+
+
 async def _telemak_loaded_models(cluster_id: str, cd: dict, force: bool = False) -> list[str]:
     """Query the Telemak upstream's /v1/models — return the list of model ids
     currently loaded. Empty list if upstream unreachable or has no models.
@@ -7456,12 +7508,24 @@ def _telemak_cache_invalidate(cluster_id: str) -> None:
     _TELEMAK_MODELS_CACHE.pop(cluster_id, None)
 
 
-async def _telemak_proxy_chat_completion(cluster_id: str, cd: dict, body: dict, stream: bool):
+async def _telemak_proxy_chat_completion(
+    cluster_id: str,
+    cd: dict,
+    body: dict,
+    stream: bool,
+    requested_short_id: Optional[str] = None,
+):
     """Proxy a /v1/chat/completions request to the Telemak upstream.
 
     Returns either a JSON dict (non-streaming) or a StreamingResponse (SSE
     streaming). The `model` field in the body is rewritten to the actually-
     loaded upstream model id — the client used `cluster_id` as the alias.
+
+    Multi-model routing (V1):
+      - `requested_short_id=None` (bare cluster alias) + 1 loaded → use it.
+      - `requested_short_id=None` + N loaded → 400 ambiguous.
+      - `requested_short_id="<short>"` → match against loaded[i].short_id.
+        404 if no match.
 
     If the upstream model auto-opens a `<think>` block (Qwen3.5, Qwen3.6,
     MiniMax), this proxy filters reasoning out of `content` and routes it
@@ -7470,11 +7534,27 @@ async def _telemak_proxy_chat_completion(cluster_id: str, cd: dict, body: dict, 
     upstream = (cd.get("upstream") or "").rstrip("/")
     if not upstream:
         raise HTTPException(400, f"{cluster_id}: missing upstream URL")
-    # Rewrite model id: pick the first loaded model from upstream.
     loaded = await _telemak_loaded_models(cluster_id, cd)
     if not loaded:
         raise HTTPException(503, f"{cluster_id}: no model loaded on upstream — POST /admin/clusters/{cluster_id}/load first")
-    upstream_model = loaded[0]
+
+    if requested_short_id:
+        match = next((m for m in loaded if _telemak_short_id(m) == requested_short_id), None)
+        if not match:
+            available = [f"{cluster_id}:{_telemak_short_id(m)}" for m in loaded]
+            raise HTTPException(
+                404,
+                f"{cluster_id}: no loaded model matches short id '{requested_short_id}'. available: {available}",
+            )
+        upstream_model = match
+    elif len(loaded) > 1:
+        available = [f"{cluster_id}:{_telemak_short_id(m)}" for m in loaded]
+        raise HTTPException(
+            400,
+            f"{cluster_id}: ambiguous model id — {len(loaded)} models loaded. use cluster:model form. available: {available}",
+        )
+    else:
+        upstream_model = loaded[0]
     auto_think = _model_auto_opens_think(upstream_model)
     forward_body = dict(body)
     forward_body["model"] = upstream_model
@@ -7504,7 +7584,7 @@ async def _telemak_proxy_chat_completion(cluster_id: str, cd: dict, body: dict, 
                 if reasoning:
                     msg["reasoning_content"] = reasoning
                 choice["message"] = msg
-        out["model"] = cluster_id
+        out["model"] = f"{cluster_id}:{requested_short_id}" if requested_short_id else cluster_id
         return out
 
     # Streaming path — parse SSE chunks, route delta.content through the
