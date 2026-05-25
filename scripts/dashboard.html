@@ -3040,15 +3040,152 @@ function renderTelemakHomeCard(a, cid, label) {
         </div>
       ` : ""}
 
+      ${reachable ? renderTelemakLoadConfig(cid, modelsLoaded) : ""}
+
       ${!loaded && reachable ? `
         <div class="section">
-          <div class="field-label" style="margin-bottom:8px">Load a model</div>
+          <div class="field-label" style="margin-bottom:8px">Or type an arbitrary model id</div>
           <div style="display:grid;gap:10px;max-width:680px">
             ${loadFormBody}
           </div>
         </div>
       ` : ""}
     </section>
+  `;
+}
+
+// ─── Telemak Load configuration ─ Argo-style rich swap form ───────────
+// Sits below the "Loaded models" list. Lets Sophie pick a target model
+// (and optionally an MTP draft) from the available-on-disk dropdown,
+// toggle KV cache Q8, and SWAP — i.e. unload current + load new in
+// one click. The existing "+ Load another model" button next to the
+// list keeps the STACK semantic (add in addition).
+//
+// Data source : `GET /admin/clusters/<cid>/models` (already exposed by
+// Odysseus, walks the upstream's models_dir via SSH). Cached in
+// state.telemak_available_models[cid] ; refreshed on the refresh
+// button click (telemak-config-refresh).
+// Fire-and-forget fetch helper for the Telemak Load configuration
+// dropdown. Cached in state.telemak_available_models[cid] ; called
+// lazily on first render of the rich form and on refresh button click.
+// Module-scope so both render() and handleAct() can reach it.
+async function fetchTelemakAvailable(cid) {
+  if (!state.telemak_available_models) state.telemak_available_models = {};
+  if (!state.fetching_telemak_models) state.fetching_telemak_models = {};
+  state.fetching_telemak_models[cid] = true;
+  try {
+    const r = await fetch(`/admin/clusters/${encodeURIComponent(cid)}/models`);
+    if (!r.ok) {
+      state.telemak_available_models[cid] = [];
+    } else {
+      const data = await r.json();
+      state.telemak_available_models[cid] = data.data || [];
+      if (data.models_dir) {
+        if (!state.cluster_models_dir) state.cluster_models_dir = {};
+        state.cluster_models_dir[cid] = data.models_dir;
+      }
+    }
+  } catch (err) {
+    state.telemak_available_models[cid] = [];
+  } finally {
+    state.fetching_telemak_models[cid] = false;
+    render();
+  }
+}
+
+function renderTelemakLoadConfig(cid, modelsLoaded) {
+  const cfg = state.telemak_load_config?.[cid] || {};
+  const available = state.telemak_available_models?.[cid];
+  const busy = !!state.busy_telemak_apply?.[cid];
+  const modelsDir = state.cluster_models_dir?.[cid] || "(default)";
+
+  if (available == null) {
+    // Lazy fetch on first render. Triggers a single network call ; the
+    // next render after fetchTelemakAvailable resolves will populate
+    // the dropdowns.
+    if (!state.fetching_telemak_models?.[cid]) {
+      state.fetching_telemak_models = state.fetching_telemak_models || {};
+      state.fetching_telemak_models[cid] = true;
+      fetchTelemakAvailable(cid);
+    }
+  }
+
+  const list = available || [];
+  // Heuristic split : MTP-suffixed model ids go in the MTP dropdown,
+  // the rest are chat-model candidates. Filter out anything already
+  // loaded (the swap dropdown picks something NEW).
+  const isMTP = (id) => /-MTP-MLX/i.test(id) || /mtp/i.test(id);
+  const loadedSet = new Set(modelsLoaded.map(m => m));
+  const chatCandidates = list.filter(m => !isMTP(m.id) && !loadedSet.has(m.id));
+  const mtpCandidates = list.filter(m => isMTP(m.id));
+
+  // Build the dropdown options. Show short name + size, value is the
+  // full path (which Telemak's loader accepts directly).
+  const buildOpts = (items, includeNone = false) => {
+    const opts = includeNone ? `<option value="">— none —</option>` : "";
+    return opts + items.map(m => {
+      const short = (m.id.split("/").pop() || m.id);
+      const sizeGB = m.size_bytes ? (m.size_bytes / 1024 / 1024 / 1024).toFixed(1) + " GB" : "";
+      const sel = (m.id === cfg.model || m.id === cfg.mtp) ? "selected" : "";
+      return `<option value="${escapeHtml(m.id)}" ${sel}>${escapeHtml(short)}${sizeGB ? ` — ${sizeGB}` : ""}</option>`;
+    }).join("");
+  };
+
+  const canApply = !busy && cfg.model && !loadedSet.has(cfg.model);
+  const helpText = available == null
+    ? `Discovering models on ${escapeHtml(modelsDir)}…`
+    : (chatCandidates.length === 0
+      ? `No swappable models found on ${escapeHtml(modelsDir)}.`
+      : (cfg.model ? `Will unload current + load <span class="mono">${escapeHtml((cfg.model.split("/").pop() || cfg.model))}</span>.` : `Pick a model from the dropdown to swap.`));
+
+  return `
+    <div class="section" style="border-top:1px solid var(--line)">
+      <div class="section-head" style="margin-bottom:10px">
+        <div class="section-stack">
+          <div class="section-title">Load configuration</div>
+          <div class="section-sub">Swap to a different model</div>
+        </div>
+        <button class="btn btn-sm" data-act="cluster-models-tab" data-cluster="${cid}" title="Open the Models tab for advanced management">${Icon.layers || ""}<span>Manage models →</span></button>
+      </div>
+      <div style="display:grid;grid-template-columns:1fr 2fr;gap:14px;max-width:920px">
+        <div>
+          <div class="field-label" style="margin-bottom:4px">Models directory</div>
+          <div style="display:flex;gap:6px;align-items:center">
+            <input class="ce-input mono" value="${escapeHtml(modelsDir)}" readonly style="flex:1;background:var(--ground);color:var(--ink-2)"/>
+            <button class="btn btn-xs" data-act="telemak-config-refresh" data-cluster="${cid}" title="Re-scan models directory">${Icon.refresh}</button>
+          </div>
+        </div>
+        <div>
+          <div class="field-label" style="margin-bottom:4px">Model</div>
+          <select class="ce-input mono" data-act="telemak-config-select-model" data-cluster="${cid}" style="width:100%">
+            <option value="">— pick a model —</option>
+            ${buildOpts(chatCandidates)}
+          </select>
+        </div>
+
+        <div>
+          <div class="field-label" style="margin-bottom:4px">Multi token prediction</div>
+          <div style="display:flex;gap:6px;align-items:center">
+            <select class="ce-input mono" data-act="telemak-config-select-mtp" data-cluster="${cid}" style="flex:1">
+              ${buildOpts(mtpCandidates, true)}
+            </select>
+            <button class="btn btn-xs" data-act="telemak-config-refresh" data-cluster="${cid}" title="Re-scan">${Icon.refresh}</button>
+          </div>
+          <div style="font-size:10px;color:var(--ink-3);margin-top:3px">Optional. Pairs an MTP draft for speculative decoding.</div>
+        </div>
+        <div style="display:flex;flex-direction:column;justify-content:space-between">
+          <div style="font-size:12px;color:var(--ink-2)">${helpText}</div>
+          <div style="display:flex;align-items:center;justify-content:flex-end;gap:14px">
+            <label style="display:flex;align-items:center;gap:6px;font-size:12px;color:var(--ink-2);cursor:pointer">
+              <input type="checkbox" data-act="telemak-config-toggle-kv-q8" data-cluster="${cid}" ${cfg.kv_q8 ? "checked" : ""}/>
+              KV cache Q8
+              <span style="color:var(--ink-3);font-size:11px">long contexts</span>
+            </label>
+            <button class="btn btn-sm" style="background:${canApply ? "var(--blue)" : "var(--ink-3)"};color:white;border-color:${canApply ? "var(--blue)" : "var(--ink-3)"}" ${canApply ? "" : "disabled"} data-act="telemak-config-apply" data-cluster="${cid}">${busy ? "Applying…" : "✓ Apply & reload"}</button>
+          </div>
+        </div>
+      </div>
+    </div>
   `;
 }
 
@@ -5220,6 +5357,101 @@ async function handleAct(e) {
     } catch (err) {
       toast(`Unload failed: ${err.message}`, "err");
     }
+    return;
+  }
+
+  // ── Telemak Load configuration (rich swap form) ─────────────────────
+  // Five tiny actions feed the swap dropdown on the Home card. The
+  // dropdown options come from the cached state.telemak_available_models
+  // which fetchTelemakAvailable populates on first render / on refresh.
+  if (act === "telemak-config-select-model") {
+    const cid = el.dataset.cluster;
+    if (!cid) return;
+    if (!state.telemak_load_config) state.telemak_load_config = {};
+    if (!state.telemak_load_config[cid]) state.telemak_load_config[cid] = {};
+    state.telemak_load_config[cid].model = el.value || "";
+    render();
+    return;
+  }
+  if (act === "telemak-config-select-mtp") {
+    const cid = el.dataset.cluster;
+    if (!cid) return;
+    if (!state.telemak_load_config) state.telemak_load_config = {};
+    if (!state.telemak_load_config[cid]) state.telemak_load_config[cid] = {};
+    state.telemak_load_config[cid].mtp = el.value || "";
+    render();
+    return;
+  }
+  if (act === "telemak-config-toggle-kv-q8") {
+    const cid = el.dataset.cluster;
+    if (!cid) return;
+    if (!state.telemak_load_config) state.telemak_load_config = {};
+    if (!state.telemak_load_config[cid]) state.telemak_load_config[cid] = {};
+    state.telemak_load_config[cid].kv_q8 = !!el.checked;
+    // Don't re-render here — the checkbox is uncontrolled visually.
+    return;
+  }
+  if (act === "telemak-config-refresh") {
+    const cid = el.dataset.cluster;
+    if (!cid) return;
+    if (state.telemak_available_models) state.telemak_available_models[cid] = null;
+    if (state.fetching_telemak_models) state.fetching_telemak_models[cid] = false;
+    await fetchTelemakAvailable(cid);
+    return;
+  }
+  if (act === "telemak-config-apply") {
+    const cid = el.dataset.cluster;
+    if (!cid) return;
+    const cfg = state.telemak_load_config?.[cid];
+    if (!cfg || !cfg.model) { toast("Pick a model first", "err"); return; }
+    if (!state.busy_telemak_apply) state.busy_telemak_apply = {};
+    state.busy_telemak_apply[cid] = true;
+    render();
+    try {
+      // Get the currently-loaded list to know what to unload first.
+      // We're doing a SWAP : unload everything currently loaded, then
+      // load the chosen target (+ optional MTP draft).
+      const status = state.cluster_status?.[cid];
+      const currentlyLoaded = Array.isArray(status?.models_loaded) ? status.models_loaded : (status?.model ? [status.model] : []);
+      for (const m of currentlyLoaded) {
+        const u = await fetch(`/admin/clusters/${encodeURIComponent(cid)}/unload`, {
+          method: "POST", headers: { "content-type": "application/json" },
+          body: JSON.stringify({ model: m }),
+        });
+        if (!u.ok) {
+          const t = await u.text();
+          throw new Error(`unload ${m} failed: ${t.slice(0, 200)}`);
+        }
+      }
+      // Then load the new target with optional draft. Telemak's
+      // /admin/load accepts `draft_model` (paired MTP) per V2 Unit 3.
+      const body = { model: cfg.model };
+      if (cfg.mtp) body.draft_model = cfg.mtp;
+      // KV cache Q8 toggle is captured in state but not yet wired to
+      // a Telemak per-load knob — leaving it as a visual affordance
+      // for V1.x parity with Argo. When Telemak exposes the setting
+      // in /admin/load, add `cache_quantization: 8` here.
+      const r = await fetch(`/admin/clusters/${encodeURIComponent(cid)}/load`, {
+        method: "POST", headers: { "content-type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      if (!r.ok) { const t = await r.text(); throw new Error(t.slice(0, 300)); }
+      const short = (cfg.model.split("/").pop() || cfg.model);
+      toast(`Swapped to ${short}${cfg.mtp ? " + MTP draft" : ""}…`, "ok");
+      await refreshAll();
+    } catch (err) {
+      toast(`Apply failed: ${err.message}`, "err");
+    } finally {
+      state.busy_telemak_apply[cid] = false;
+      render();
+    }
+    return;
+  }
+  if (act === "cluster-models-tab") {
+    // Jump to the Models tab — same affordance as Argo's
+    // "Manage models →" button at the top-right of its Load config.
+    state.view = "models";
+    render();
     return;
   }
 
