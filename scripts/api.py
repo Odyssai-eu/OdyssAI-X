@@ -323,8 +323,21 @@ def get_cluster_def(cluster_id: str) -> dict:
 
 
 def _is_cluster_tombstoned(cluster_id: str) -> bool:
-    """True if cluster-config.json marked this cluster as removed via UI."""
-    return bool(_load_cluster_config().get(cluster_id, {}).get("_removed"))
+    """True if cluster-config.json marked this cluster as removed via UI.
+
+    cluster-config.json mixes cluster definitions with non-cluster
+    sections at top-level (e.g. 'crew' is a list, 'discovery' is a
+    bookkeeping dict). Anything whose value isn't a dict can't be a
+    cluster, so it's never tombstoned. Without this guard, iterating
+    `active_cluster_ids()` over a config that contains a 'crew' list
+    crashes the cluster-list endpoint with
+    `AttributeError: 'list' object has no attribute 'get'` and the
+    dashboard renders 'No cluster configured'.
+    """
+    entry = _load_cluster_config().get(cluster_id)
+    if not isinstance(entry, dict):
+        return False
+    return bool(entry.get("_removed"))
 
 
 def cluster_exists(cluster_id: str) -> bool:
