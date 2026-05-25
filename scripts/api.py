@@ -7261,10 +7261,15 @@ async def admin_cluster_status(cluster_id: str):
         return await _telemak_status(cluster_id, cd_t)
     loading = _loading_snapshot(_loading_state_for(cluster_id))
     default_pool = get_pool(cluster_id)
+    all_loaded = list_pools(cluster_id)
     # During a load, expose per-rank phase. After load completes the snapshot
     # disappears and clients fall back to the main `loaded` status.
     if loading is not None:
-        ranks_view = _pool_per_rank_phases(default_pool)
+        # Prefer the default pool when present (single-pool back-compat),
+        # otherwise pick the first loaded pool so the dashboard renders
+        # per-rank phases for multi-pool loads too.
+        anchor_pool = default_pool or (all_loaded[0][1] if all_loaded else None)
+        ranks_view = _pool_per_rank_phases(anchor_pool)
         if ranks_view:
             loading["ranks"] = ranks_view
     cd = get_cluster_def(cluster_id)
@@ -7272,7 +7277,9 @@ async def admin_cluster_status(cluster_id: str):
     effective_max = get_cluster_max_nodes(cluster_id, default=cluster_max)
     effective_max = min(effective_max, cluster_max)
     avail_counts = list(range(1, effective_max + 1))
-    if default_pool is None:
+    # Empty-cluster path : no pool of any alias is loaded. Dashboard renders
+    # the load form, nothing else.
+    if default_pool is None and not all_loaded:
         return {
             "loaded": False, "cluster": cluster_id,
             "loading": loading,
@@ -7314,26 +7321,32 @@ async def admin_cluster_status(cluster_id: str):
                          for n in pool.nodes],
         }
 
-    pools = [_pool_view(a, p) for a, p in list_pools(cluster_id)]
-    # Default-alias fields, kept flat for back-compat.
-    uptime = time.time() - (default_pool.started_at or time.time())
+    pools = [_pool_view(a, p) for a, p in all_loaded]
+    # Pick a "primary" pool for the flat back-compat fields :
+    #   - default alias when loaded (single-pool clusters keep current shape),
+    #   - otherwise the first pool alphabetically — gives multi-pool clusters
+    #     a deterministic anchor for old clients that only read flat fields.
+    # Without this anchor, dashboards that don't yet parse `pools[]` show
+    # nothing at all when an operator uses custom aliases (no `default`).
+    primary_pool = default_pool or all_loaded[0][1]
+    uptime = time.time() - (primary_pool.started_at or time.time())
     recent_tps = [m["tps"] for m in list(_metrics)[:10]
-                  if m["tps"] > 0 and m.get("model") == default_pool.model]
-    topo = build_topology(cluster_id, default_pool.nodes_count)
+                  if m["tps"] > 0 and m.get("model") == primary_pool.model]
+    topo = build_topology(cluster_id, primary_pool.nodes_count)
     return {
         "loaded": True, "cluster": cluster_id,
         "loading": loading,
-        "model": default_pool.model, "mode": default_pool.mode,
-        "use_ap": default_pool.use_ap, "nodes": default_pool.nodes_count,
-        "kv_q8": default_pool.kv_q8,
-        "draft_model": default_pool.draft_model,
-        "num_draft_tokens": default_pool.num_draft_tokens if default_pool.draft_model else None,
-        "alive": default_pool.alive_count(),
-        "load_s": default_pool.load_s, "uptime_s": uptime,
+        "model": primary_pool.model, "mode": primary_pool.mode,
+        "use_ap": primary_pool.use_ap, "nodes": primary_pool.nodes_count,
+        "kv_q8": primary_pool.kv_q8,
+        "draft_model": primary_pool.draft_model,
+        "num_draft_tokens": primary_pool.num_draft_tokens if primary_pool.draft_model else None,
+        "alive": primary_pool.alive_count(),
+        "load_s": primary_pool.load_s, "uptime_s": uptime,
         "recent_avg_tps": round(sum(recent_tps) / len(recent_tps), 2) if recent_tps else None,
         "topology": [{"rank": n["rank"], "ssh": n["ssh"]} for n in topo],
         "pools": pools,
-        "aliases": [a for a, _ in list_pools(cluster_id)],
+        "aliases": [a for a, _ in all_loaded],
         "nodes_in_use": sorted(nodes_in_use(cluster_id)),
         "available_node_counts": avail_counts,
         "max_nodes": effective_max,
