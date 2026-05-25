@@ -236,26 +236,52 @@ def recent_jobs(limit: int = 50) -> list[dict]:
 
 
 def mark_orphans_interrupted() -> int:
-    """On startup, any sync_job still 'running' is actually orphaned (the
-    container restarted). Mark them as 'interrupted' so the dashboard
-    shows the true state."""
+    """On startup, any sync_job still 'running' AND any chat run still in
+    a non-terminal status ('running', 'streaming', 'cancelling') is
+    actually orphaned (the container or runner has restarted since).
+    Mark them as 'interrupted' so the dashboard reflects truth.
+
+    Returns the total number of rows touched across both tables.
+
+    Why both tables : sync_jobs used to be the only thing that could
+    be left dangling at container restart, but chat runs hit the same
+    issue when a runner is SIGKILL'd mid-flight or the runner.py
+    process locks in prefill and never ACKs the cancel. The result
+    was 'CANCELLING' rows that stayed forever on the dashboard,
+    confusing the operator into thinking the cluster was busy when
+    it actually wasn't. Sophie hit this 2026-05-25 with 4 runs stuck
+    cancelling at 2000+s elapsed.
+    """
     if _conn is None:
         return 0
+    total = 0
     try:
         with _lock:
+            now = time.time()
             cur = _conn.execute(
                 "UPDATE sync_jobs SET status='interrupted', "
                 "  finished_at=COALESCE(finished_at, ?) "
                 "WHERE status='running'",
-                (time.time(),),
+                (now,),
             )
-            n = cur.rowcount or 0
-            if n:
-                _log(f"marked {n} orphaned sync_jobs as interrupted")
-            return n
+            n_jobs = cur.rowcount or 0
+            if n_jobs:
+                _log(f"marked {n_jobs} orphaned sync_jobs as interrupted")
+            total += n_jobs
+            cur = _conn.execute(
+                "UPDATE runs SET status='interrupted', "
+                "  finished_at=COALESCE(finished_at, ?) "
+                "WHERE status IN ('running','streaming','cancelling')",
+                (now,),
+            )
+            n_runs = cur.rowcount or 0
+            if n_runs:
+                _log(f"marked {n_runs} orphaned chat runs as interrupted")
+            total += n_runs
+            return total
     except Exception as e:
         _log(f"mark_orphans failed: {e}")
-        return 0
+        return total
 
 
 def load_unfinished_jobs() -> list[dict]:

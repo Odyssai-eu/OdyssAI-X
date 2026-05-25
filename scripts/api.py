@@ -2106,6 +2106,44 @@ def _runs_finalize(rid: str, *, status: str = "done") -> None:
     _active_run_cancels.pop(rid, None)
 
 
+# Maximum time a run is allowed to sit in 'cancelling' before we
+# force-finalize it. After cancel-all + broadcast, a healthy runner
+# ACKs within a couple seconds and the normal _runs_finalize path fires.
+# When the runner is SIGKILL'd, deadlocked in prefill, or the node has
+# rebooted, the ACK never comes and the run rotted in _active_runs
+# forever. 30s is plenty for a real cancel ACK and short enough that
+# the dashboard "Active runs" pane reflects truth.
+CANCELLING_FINALIZE_GRACE_S = 30.0
+
+
+def _finalize_stuck_cancelling() -> int:
+    """Reap any run that's been 'cancelling' for more than the grace
+    period. Returns the count reaped. Called from a 10s background
+    sweeper so the dashboard never shows ghost CANCELLING entries.
+    Idempotent — runs that finalize legitimately via the ACK path
+    won't be in _active_runs anymore by the time we look."""
+    now = time.time()
+    reaped: list[str] = []
+    for rid, r in list(_active_runs.items()):
+        if r.get("status") != "cancelling":
+            continue
+        # Use cancel_started_at when present, else fall back to started_at.
+        # The Event was set in admin_run_cancel/admin_runs_cancel_all, so
+        # the run has been 'cancelling' from at least that moment.
+        cancelled_at = r.get("cancelled_at") or r.get("started_at") or now
+        if (now - cancelled_at) < CANCELLING_FINALIZE_GRACE_S:
+            continue
+        reaped.append(rid)
+    for rid in reaped:
+        _runs_finalize(rid, status="cancelled")
+    if reaped:
+        sys.stderr.write(
+            f"[cancel-sweeper] force-finalized {len(reaped)} stuck cancelling "
+            f"run(s): {', '.join(reaped)}\n"
+        )
+    return len(reaped)
+
+
 def _runs_is_cancelled(rid: str) -> bool:
     ev = _active_run_cancels.get(rid)
     return bool(ev and ev.is_set())
@@ -2412,10 +2450,16 @@ async def lifespan(app: FastAPI):
     # Background TTL sweeper — auto-unloads pools idle for > ttl_seconds.
     # Frees nodes for other pools without manual ops.
     ttl_task = asyncio.create_task(_pool_ttl_sweeper())
+    # Background cancelling-sweeper — force-finalises runs stuck
+    # in 'cancelling' past the grace period (runner never ACK'd
+    # because it was kill -9'd or the node rebooted). Without this,
+    # ghost runs sit in /admin/runs forever. See #?? follow-up.
+    cancel_task = asyncio.create_task(_cancelling_sweeper())
     try:
         yield
     finally:
         ttl_task.cancel()
+        cancel_task.cancel()
         if _pool is not None:
             await _pool.stop()
         for _cid, _alias, pool in list_all_pools():
@@ -2434,6 +2478,23 @@ def _apply_default_ttl_to_pools() -> None:
         _pool.ttl_seconds = ttl
     for _cid, _alias, pool in list_all_pools():
         pool.ttl_seconds = ttl
+
+
+async def _cancelling_sweeper() -> None:
+    """Every 10s, reap runs that have been 'cancelling' past the grace
+    period (the runner never ACK'd — usually because it was SIGKILL'd
+    or the node rebooted). Without this, ghost CANCELLING entries
+    stay forever in /admin/runs and confuse the dashboard into
+    thinking the cluster is busy. See _finalize_stuck_cancelling().
+    """
+    while True:
+        try:
+            await asyncio.sleep(10)
+            _finalize_stuck_cancelling()
+        except asyncio.CancelledError:
+            return
+        except Exception as e:
+            sys.stderr.write(f"[cancel-sweeper] error: {e}\n")
 
 
 async def _pool_ttl_sweeper() -> None:
@@ -6509,6 +6570,7 @@ async def admin_run_cancel(run_id: str):
     r = _active_runs.get(run_id)
     if r:
         r["status"] = "cancelling"
+        r["cancelled_at"] = time.time()
     # Hard cancel — best-effort broadcast to the right pool's runners.
     cluster = (r or {}).get("cluster")
     pool = _pool_for_cluster_name(cluster)
@@ -6529,6 +6591,7 @@ async def admin_runs_cancel_all(cluster: Optional[str] = None):
     runner-side broadcast (see admin_run_cancel)."""
     cancelled = 0
     hard_sent_total = 0
+    now = time.time()
     # Build list of (rid, pool) first to broadcast outside the iteration.
     targets: list[tuple[str, Optional[Any]]] = []
     for rid, ev in list(_active_run_cancels.items()):
@@ -6539,6 +6602,7 @@ async def admin_runs_cancel_all(cluster: Optional[str] = None):
         cancelled += 1
         if r:
             r["status"] = "cancelling"
+            r["cancelled_at"] = now
         targets.append((rid, _pool_for_cluster_name((r or {}).get("cluster"))))
     for rid, pool in targets:
         if pool is None:
