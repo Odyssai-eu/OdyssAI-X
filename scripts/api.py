@@ -1833,6 +1833,11 @@ _metrics: deque = deque(maxlen=50)
 
 # Runner stderr line buffers + SSE subscribers, per cluster. Each line is
 # {ts, cluster, rank, text}. Subscribers receive new lines via asyncio queues.
+# The seed entries are the historical clusters; any custom cluster id (e.g.
+# 'main' from topology.yaml, 'telemak-max64' from dashboard-added entries)
+# is initialised on demand via _ensure_log_cluster() below — without that,
+# /admin/logs?cluster=main 400s and the dashboard runner-logs panel stays
+# empty even though stderr is flowing.
 _log_buffers: dict[str, deque] = {
     "nautilus": deque(maxlen=500),
     "default": deque(maxlen=500),
@@ -1843,9 +1848,24 @@ _log_subscribers: dict[str, list[asyncio.Queue]] = {
 _log_lock = threading.Lock()
 
 
+def _ensure_log_cluster(cluster: str) -> None:
+    """Idempotent : init the per-cluster log buffer + subscriber list if
+    we haven't seen this cluster before. Cheap (one dict lookup) so we
+    call it both on the producer side (_push_log_line) and on the
+    consumer side (admin_logs) so either path bootstraps the entries
+    for new clusters."""
+    if cluster in _log_buffers:
+        return
+    with _log_lock:
+        if cluster not in _log_buffers:
+            _log_buffers[cluster] = deque(maxlen=500)
+            _log_subscribers[cluster] = []
+
+
 def _push_log_line(cluster: str, rank: int, text: str) -> None:
     """Called from the per-rank stderr drain thread. Appends to the buffer +
     notifies any active SSE subscribers. Thread-safe."""
+    _ensure_log_cluster(cluster)
     line = {"ts": time.time(), "cluster": cluster, "rank": rank, "text": text}
     with _log_lock:
         _log_buffers[cluster].append(line)
@@ -5874,8 +5894,13 @@ async def admin_logs(cluster: str = "default", tail: int = 100, follow: bool = F
     - `follow=true`: SSE stream, replays last `tail` lines then sends every
       new line as a JSON event. Closes on client disconnect.
     """
-    if cluster not in _log_buffers:
+    # Lazy-init: cluster may be a topology.yaml-defined id ('main',
+    # 'telemak-max64', …) that wasn't pre-seeded into _log_buffers.
+    # Only refuse the request if the cluster id is truly unknown to
+    # the orchestrator.
+    if cluster not in _log_buffers and not cluster_exists(cluster):
         raise HTTPException(400, f"unknown cluster {cluster}")
+    _ensure_log_cluster(cluster)
     if not follow:
         rows = list(_log_buffers[cluster])[-tail:]
         return {"cluster": cluster, "data": rows}
