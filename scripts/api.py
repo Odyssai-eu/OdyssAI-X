@@ -400,7 +400,18 @@ def build_topology(cluster_id: str, count: Optional[int] = None) -> list[dict]:
     host_ids = [n["host"] for n in nodes]
     matrix = build_rdma_matrix(host_ids)
     return [
-        {"rank": i, "ssh": n["ssh"], "rdma": matrix[i], "host": n["host"]}
+        {
+            "rank": i,
+            "ssh": n["ssh"],
+            "rdma": matrix[i],
+            "host": n["host"],
+            # Propagate models_dir to the runtime topology so consumers
+            # (preflight validator, runner spawn) can resolve relative
+            # model ids without a separate cluster_def lookup. Falls
+            # back to the cluster-level default models_dir when the
+            # node entry didn't override it.
+            "models_dir": n.get("models_dir") or cd.get("models_dir") or DEFAULT_MODELS_DIR,
+        }
         for i, n in enumerate(nodes)
     ]
 
@@ -446,7 +457,14 @@ def build_topology_from_indices(cluster_id: str,
     host_ids = [n["host"] for n in selected]
     matrix = build_rdma_matrix(host_ids)
     return [
-        {"rank": i, "ssh": n["ssh"], "rdma": matrix[i], "host": n["host"]}
+        {
+            "rank": i,
+            "ssh": n["ssh"],
+            "rdma": matrix[i],
+            "host": n["host"],
+            # Same models_dir propagation as build_topology (2026-05-25 fix).
+            "models_dir": n.get("models_dir") or cd.get("models_dir") or DEFAULT_MODELS_DIR,
+        }
         for i, n in enumerate(selected)
     ]
 
@@ -1406,7 +1424,14 @@ class RunnerPool:
             )
             if ssh_target:
                 try:
-                    ok, err = await _validate_model_layout(ssh_target, self.model)
+                    # Pass rank-0 models_dir so the validator can `cd` into
+                    # it before checking relative model paths. Without this
+                    # the SSH session defaults to $HOME and every relative
+                    # model id resolves to a missing path → false negative.
+                    rank0_models_dir = rank0_node.get("models_dir")
+                    ok, err = await _validate_model_layout(
+                        ssh_target, self.model, models_dir=rank0_models_dir
+                    )
                     if not ok:
                         raise RuntimeError(f"model layout invalid: {err}")
                 except RuntimeError:
@@ -2750,6 +2775,7 @@ def _enrich_caps_from_config(caps: dict, config: dict) -> None:
 
 
 async def _validate_model_layout(ssh_target: str, model_path: str,
+                                  models_dir: Optional[str] = None,
                                   timeout: float = 8.0) -> tuple[bool, Optional[str]]:
     """Pre-flight check that a model dir is fully usable before cluster spawn.
 
@@ -2759,13 +2785,28 @@ async def _validate_model_layout(ssh_target: str, model_path: str,
     KeyError (cf. Mistral Medium 3.5 saga 2026-05-15).
 
     Cheap : single SSH round-trip that runs the checks in shell.
+
+    Regression fix 2026-05-25 : when `model_path` is a relative id like
+    `inferencerlabs/Qwen3.5-397B-A17B-MLX-9bit`, SSH defaults to $HOME on
+    the rank-0 node and the existence check resolves nothing. Caller now
+    passes `models_dir` (the rank-0 node's models_dir from topology) so
+    we can `cd` into it before checking. Absolute paths (`/Volumes/...`)
+    are checked as-is regardless of models_dir.
     """
     p = model_path.rstrip("/")
+    is_absolute = p.startswith("/")
+    # `cd $models_dir` only when model_path is relative. For absolute paths
+    # we leave the working directory alone — the absolute path resolves
+    # correctly from $HOME or anywhere else.
+    cd_prefix = ""
+    if not is_absolute and models_dir:
+        cd_prefix = f"cd {shlex.quote(models_dir)} && "
     # Probe in one command:
     #   1. config.json exists + non-empty
     #   2. at least one *.safetensors file
     #   3. tokenizer present (config.json | tokenizer.json | tokenizer.model)
     script = (
+        f'{cd_prefix}'
         f'[ -s {shlex.quote(p)}/config.json ] || {{ echo MISSING_CONFIG; exit 0; }} && '
         f'ls {shlex.quote(p)}/*.safetensors >/dev/null 2>&1 || {{ echo MISSING_WEIGHTS; exit 0; }} && '
         f'{{ [ -s {shlex.quote(p)}/tokenizer.json ] || '
