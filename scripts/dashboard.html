@@ -1299,6 +1299,19 @@ function clusterState(id) {
 function pickCluster(id) {
   state.selected_cluster = id;
   localStorage.setItem('odyssai-cluster', id);
+  // Sync the back-compat aliases that the cluster-card renderers read from
+  // (renderArgoCard reads `state.default`, etc.). Without this, the render
+  // below would show the PREVIOUS cluster's status until the next 5s poll
+  // tick — Sophie reported seeing the Telemak load form on the Argo tab
+  // for ~5s and vice versa. The polling refresh at line ~1136 keeps the
+  // same shape ; we just mirror it here for immediacy. Data is already
+  // cached from the prior poll, so no network round-trip needed.
+  const cached = (state.cluster_status || {})[id] || null;
+  state.default = cached;
+  state.default_models_dir = cached?.models_dir
+    || state.cluster_models_dir?.[id]
+    || "";
+  state.default_models = state.cluster_models?.[id] || [];
   // If the user is following Runner logs, switch them to the new cluster too —
   // keeps the bottom panels in sync with the top picker. If logs were stopped,
   // leave them stopped (don't auto-start).
