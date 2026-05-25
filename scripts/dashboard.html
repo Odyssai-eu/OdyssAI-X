@@ -4171,6 +4171,10 @@ function computeArgoPresence(modelId) {
 function renderRunnerLogs() {
   const cluster = state.logs_cluster;
   const following = !!_logsES;
+  // Live cluster to follow when the user clicks Start. Prefer the cluster
+  // the dashboard is already focused on (state.default), so the button
+  // does the obvious thing on the active cluster without a select menu.
+  const targetCluster = state.default || cluster || "main";
   return `
     <div class="section">
       <div class="section-head logs-head">
@@ -4179,7 +4183,7 @@ function renderRunnerLogs() {
           <div class="pill-live"><div class="pip"></div><span class="label">${following ? "Live · SSE" : "Stopped"}</span></div>
         </div>
         <div style="display:flex;align-items:center;gap:8px">
-          
+          <button class="btn btn-xs" data-act="logs-follow" data-v="${targetCluster}" ${following?"disabled":""}>Start</button>
           <button class="btn btn-xs btn-destructive" data-act="logs-stop" ${following?"":"disabled"}>Stop</button>
         </div>
       </div>
