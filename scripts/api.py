@@ -1037,6 +1037,14 @@ def remote_cmd(node: dict, nodes: list[dict], model: str, mode: str, port: int,
         "RUNNER_KV_Q8": "1" if kv_q8 else "0",
         "RUNNER_EMIT_BATCH": str(emit_batch),
     }
+    # MiniMax's MLX implementation has a buggy BatchGenerator path —
+    # `bg.next() failed: 'array' object has no attribute 'extend'`
+    # fires on every request after the first, leaving completion_tokens=0.
+    # Force the legacy single-stream main loop for now. Observed
+    # 2026-05-25 on mlx-community/MiniMax-M2.7-8bit; the legacy path
+    # is slower but actually produces tokens.
+    if "minimax" in model.lower():
+        env["RUNNER_BATCH"] = "0"
     if draft_model:
         env["RUNNER_DRAFT_MODEL"] = draft_model
         env["RUNNER_NUM_DRAFT_TOKENS"] = str(num_draft_tokens)
