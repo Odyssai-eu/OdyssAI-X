@@ -5123,7 +5123,7 @@ async function handleAct(e) {
     if (!cid) return;
     if (!confirm(`Run the recovery ladder for ${cid}?\n\nThis will: cancel runs → stop pool → sweep orphan runners → verify wired memory → clear degraded flag.\n\nNo reboot needed — Macs stay up.`)) return;
     try {
-      const r = await postJson(`/admin/${encodeURIComponent(cid)}/reset`, {});
+      const r = await postJson(`/admin/clusters/${encodeURIComponent(cid)}/reset`, {});
       const ok = r.cleared === true;
       const ladder = (r.steps || []).map(s => `${s.ok ? "✓" : "✗"} ${s.name}`).join(" · ");
       if (ok) {
