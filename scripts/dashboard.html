@@ -1253,6 +1253,33 @@ function escapeHtml(s) {
   if (s == null) return "";
   return String(s).replace(/[&<>"']/g, c => ({ '&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;' }[c]));
 }
+
+/**
+ * Derive a short pool alias from a model path.
+ *
+ * Examples:
+ *   'mlx-community/MiniMax-M2.7-8bit'                  → 'minimax'
+ *   'inferencerlabs/Qwen3.5-397B-A17B-MLX-9bit'        → 'qwen3.5'
+ *   'inferencerlabs/Qwen3-Coder-Next-MLX-9bit'         → 'qwen3'
+ *   'GLM-5.1-8bit'                                     → 'glm'
+ *   ''                                                  → ''
+ *
+ * Strips path prefix, then keeps leading letters + optional version
+ * digits (matches the model "family" without the size/quant suffix).
+ * Stops at the first dash / underscore so 'MiniMax-M2.7-8bit' becomes
+ * 'minimax', not 'minimax-m2.7-8bit'. The API validator requires
+ * /^[a-z0-9][a-z0-9_-]{0,30}$/ and refuses literal 'default'.
+ */
+function _aliasFromModel(modelPath) {
+  if (!modelPath) return "";
+  const base = String(modelPath).split("/").pop();
+  const m = base.match(/^[A-Za-z]+[\d.]*/);
+  let alias = (m ? m[0] : base).toLowerCase();
+  alias = alias.replace(/\.+$/, "");           // trim trailing dot
+  alias = alias.replace(/[^a-z0-9_-]/g, "");   // strip illegal chars
+  if (!alias || alias === "default") alias = "pool";
+  return alias.slice(0, 30);
+}
 function truncatePath(p, n) {
   if (!p) return "";
   if (p.length <= n) return p;
@@ -1352,6 +1379,27 @@ function render() {
     savedScrollKeys[el.dataset.scrollKey] = el.scrollTop;
   });
 
+  // Preserve focus + cursor across the innerHTML wipe. Without this,
+  // typing in inputs whose handler calls render() (e.g. the load-form
+  // alias field) destroys the <input> on every keystroke, focus is
+  // lost, and the user can only type one character at a time before
+  // having to click back. Match the input by (data-act, name, type)
+  // tuple — id-less inputs are still uniquely identified by their
+  // action label inside a section. selectionStart/End preserve the
+  // cursor position so word-mid edits don't jump to the end.
+  const _focusActive = document.activeElement;
+  let savedFocus = null;
+  if (_focusActive && (_focusActive.tagName === "INPUT" || _focusActive.tagName === "TEXTAREA")
+      && _focusActive.dataset && _focusActive.dataset.act) {
+    savedFocus = {
+      act: _focusActive.dataset.act,
+      idx: _focusActive.dataset.idx || null,
+      field: _focusActive.dataset.field || null,
+      selStart: _focusActive.selectionStart,
+      selEnd: _focusActive.selectionEnd,
+    };
+  }
+
   $("root").innerHTML = `
     <div class="stage">
       ${renderHeader()}
@@ -1367,6 +1415,24 @@ function render() {
     </div>
   `;
   attachHandlers();
+
+  // Restore focus + cursor in inputs after the innerHTML wipe. Without
+  // this, typing in any input whose change handler calls render() loses
+  // focus on every keystroke (the alias field on the load form was the
+  // observed case — see comment above the savedFocus capture).
+  if (savedFocus) {
+    let selector = `[data-act="${CSS.escape(savedFocus.act)}"]`;
+    if (savedFocus.idx !== null) selector += `[data-idx="${CSS.escape(savedFocus.idx)}"]`;
+    if (savedFocus.field !== null) selector += `[data-field="${CSS.escape(savedFocus.field)}"]`;
+    const target = document.querySelector(selector);
+    if (target && (target.tagName === "INPUT" || target.tagName === "TEXTAREA")) {
+      target.focus();
+      if (savedFocus.selStart !== null && savedFocus.selEnd !== null) {
+        try { target.setSelectionRange(savedFocus.selStart, savedFocus.selEnd); }
+        catch (e) { /* unsupported input types (number, email) silently no-op */ }
+      }
+    }
+  }
 
   const newPane = $("logs-pane");
   if (newPane) {
@@ -4171,6 +4237,10 @@ function computeArgoPresence(modelId) {
 function renderRunnerLogs() {
   const cluster = state.logs_cluster;
   const following = !!_logsES;
+  // Live cluster to follow when the user clicks Start. Prefer the cluster
+  // the dashboard is already focused on (state.default), so the button
+  // does the obvious thing on the active cluster without a select menu.
+  const targetCluster = state.default || cluster || "main";
   return `
     <div class="section">
       <div class="section-head logs-head">
@@ -4179,7 +4249,7 @@ function renderRunnerLogs() {
           <div class="pill-live"><div class="pip"></div><span class="label">${following ? "Live · SSE" : "Stopped"}</span></div>
         </div>
         <div style="display:flex;align-items:center;gap:8px">
-          
+          <button class="btn btn-xs" data-act="logs-follow" data-v="${targetCluster}" ${following?"disabled":""}>Start</button>
           <button class="btn btn-xs btn-destructive" data-act="logs-stop" ${following?"":"disabled"}>Stop</button>
         </div>
       </div>
@@ -5053,7 +5123,7 @@ async function handleAct(e) {
     if (!cid) return;
     if (!confirm(`Run the recovery ladder for ${cid}?\n\nThis will: cancel runs → stop pool → sweep orphan runners → verify wired memory → clear degraded flag.\n\nNo reboot needed — Macs stay up.`)) return;
     try {
-      const r = await postJson(`/admin/${encodeURIComponent(cid)}/reset`, {});
+      const r = await postJson(`/admin/clusters/${encodeURIComponent(cid)}/reset`, {});
       const ok = r.cleared === true;
       const ladder = (r.steps || []).map(s => `${s.ok ? "✓" : "✗"} ${s.name}`).join(" · ");
       if (ok) {
@@ -5579,10 +5649,17 @@ async function handleAct(e) {
   if (act === "default-add-toggle") {
     f.default_add_open = !f.default_add_open;
     if (f.default_add_open) {
-      // Suggest a sensible default alias the first time.
+      // Suggest an alias derived from the selected model (e.g.
+      // 'mlx-community/MiniMax-M2.7-8bit' → 'minimax'). Falls back
+      // to 'pool-N' only when no model is picked yet.
       if (!f.default_add_alias) {
-        const pools = state.default?.pools || [];
-        f.default_add_alias = `default-${pools.length + 1}`;
+        const suggested = _aliasFromModel(f.default_add_model);
+        if (suggested) {
+          f.default_add_alias = suggested;
+        } else {
+          const pools = state.default?.pools || [];
+          f.default_add_alias = `pool-${pools.length + 1}`;
+        }
       }
     }
     state.form_interaction_at = Date.now();
@@ -5590,11 +5667,22 @@ async function handleAct(e) {
   }
   if (act === "form-default-add-alias") {
     f.default_add_alias = (el.value || "").trim().toLowerCase();
+    // Mark as user-edited so picking a different model after this
+    // won't clobber what the user typed.
+    f.default_add_alias_edited = true;
     state.form_interaction_at = Date.now();
     render(); return;
   }
   if (act === "form-default-add-model") {
     f.default_add_model = el.value;
+    // Auto-refresh the alias suggestion from the new model, unless the
+    // user has already manually edited the alias field. Without this
+    // the dashboard kept proposing the alphabetic 'pool-N' even after
+    // the user picked a concrete model.
+    if (!f.default_add_alias_edited) {
+      const suggested = _aliasFromModel(f.default_add_model);
+      if (suggested) f.default_add_alias = suggested;
+    }
     state.form_interaction_at = Date.now();
     render(); return;
   }
@@ -5633,6 +5721,7 @@ async function handleAct(e) {
       // Reset the form and hide
       f.default_add_open = false;
       f.default_add_alias = "";
+      f.default_add_alias_edited = false;
       f.default_add_model = null;
       f.default_add_indices = {};
     } catch (err) {

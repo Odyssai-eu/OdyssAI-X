@@ -323,8 +323,21 @@ def get_cluster_def(cluster_id: str) -> dict:
 
 
 def _is_cluster_tombstoned(cluster_id: str) -> bool:
-    """True if cluster-config.json marked this cluster as removed via UI."""
-    return bool(_load_cluster_config().get(cluster_id, {}).get("_removed"))
+    """True if cluster-config.json marked this cluster as removed via UI.
+
+    cluster-config.json mixes cluster definitions with non-cluster
+    sections at top-level (e.g. 'crew' is a list, 'discovery' is a
+    bookkeeping dict). Anything whose value isn't a dict can't be a
+    cluster, so it's never tombstoned. Without this guard, iterating
+    `active_cluster_ids()` over a config that contains a 'crew' list
+    crashes the cluster-list endpoint with
+    `AttributeError: 'list' object has no attribute 'get'` and the
+    dashboard renders 'No cluster configured'.
+    """
+    entry = _load_cluster_config().get(cluster_id)
+    if not isinstance(entry, dict):
+        return False
+    return bool(entry.get("_removed"))
 
 
 def cluster_exists(cluster_id: str) -> bool:
@@ -346,12 +359,29 @@ def cluster_exists(cluster_id: str) -> bool:
 
 def active_cluster_ids() -> list[str]:
     """Union of topology.yaml clusters + dashboard-added entries, minus
-    tombstones. Source of truth for "which clusters does Odysseus publish"."""
+    tombstones. Source of truth for "which clusters does Odysseus publish".
+
+    cluster-config.json carries cluster definitions alongside unrelated
+    top-level sections ('crew', 'discovery', 'settings', ...) that
+    were never meant to be cluster ids. Filter them out by requiring
+    the value to be a dict with at least one cluster-shape field.
+    """
     seen: dict[str, bool] = {}
     for cid in DEFAULT_CLUSTER_DEFS.keys():
         seen[cid] = True
-    for cid in _load_cluster_config().keys():
-        if cid not in seen:
+    for cid, entry in _load_cluster_config().items():
+        if cid in seen:
+            continue
+        if not isinstance(entry, dict):
+            continue
+        # Heuristic : a real cluster entry has at least one of these.
+        # Bare 'load_history'-only entries pre-date the explicit kind
+        # field — keep them too, since the legacy single-cluster file
+        # used 'load_history' as the only top-level marker.
+        if any(k in entry for k in (
+            "nodes", "kind", "label", "models_dir", "max_nodes",
+            "_removed", "load_history", "backend", "upstream",
+        )):
             seen[cid] = True
     return [cid for cid in seen if not _is_cluster_tombstoned(cid)]
 
@@ -992,7 +1022,8 @@ def remote_cmd(node: dict, nodes: list[dict], model: str, mode: str, port: int,
                devices_json: str, use_ap: bool, emit_batch: int,
                kv_q8: bool = False,
                draft_model: Optional[str] = None,
-               num_draft_tokens: int = 4) -> str:
+               num_draft_tokens: int = 4,
+               ram_weights_csv: Optional[str] = None) -> str:
     coord_ip = next(n for n in nodes if n["rank"] == COORDINATOR_RANK)["ssh"].split("@")[1]
     world_size = len(nodes)
     env = {
@@ -1007,6 +1038,15 @@ def remote_cmd(node: dict, nodes: list[dict], model: str, mode: str, port: int,
         "RUNNER_KV_Q8": "1" if kv_q8 else "0",
         "RUNNER_EMIT_BATCH": str(emit_batch),
     }
+    # Capacity-aware pipeline split (#9). When the orchestrator knows per-rank
+    # RAM (via telemetry), pass it as a CSV of weights so the runner can size
+    # each rank's layer count proportionally instead of doing the even split
+    # that OOMs heterogeneous clusters (.29 512GB + .30 256GB on Qwen397).
+    # Format: "wW0,wW1,...,wWN-1" where each Wi is the relative weight for
+    # rank i (the runner normalises). The runner falls back to even split
+    # when the env var is missing or invalid.
+    if ram_weights_csv:
+        env["RUNNER_RAM_WEIGHTS"] = ram_weights_csv
     if draft_model:
         env["RUNNER_DRAFT_MODEL"] = draft_model
         env["RUNNER_NUM_DRAFT_TOKENS"] = str(num_draft_tokens)
@@ -1456,6 +1496,38 @@ class RunnerPool:
         port = random_ephemeral_port()
         devices = [n["rdma"] for n in sorted(self.nodes, key=lambda x: x["rank"])]
         devices_json = json.dumps(devices)
+        # Capacity-aware split (#9). Gather per-rank RAM via telemetry so the
+        # runner can split layers proportionally rather than evenly. Falls
+        # back to even split when telemetry is missing (single-node, fresh
+        # cluster) — runner detects empty/invalid env and ignores it.
+        ram_weights_csv: Optional[str] = None
+        if self.nodes_count > 1 and self.mode == "pipeline":
+            try:
+                _total, per_node = _cluster_total_ram_bytes(
+                    self.cluster, self.nodes_count
+                )
+                # _cluster_total_ram_bytes returns entries in rank order
+                # (builds via build_topology). Use wired_limit when set,
+                # otherwise raw RAM — wired_limit is the actual Metal
+                # ceiling and is what JACCL/MLX can spend.
+                weights: list[int] = []
+                for entry in per_node:
+                    w = entry.get("wired_limit_bytes") or entry.get("ram_bytes") or 0
+                    weights.append(int(w))
+                # Only enable when EVERY rank has a non-zero weight AND
+                # there's actual heterogeneity (otherwise even-split is
+                # already correct and we save a code path).
+                if all(w > 0 for w in weights) and len(set(weights)) > 1:
+                    ram_weights_csv = ",".join(str(w) for w in weights)
+                    sys.stderr.write(
+                        f"[api] capacity-aware split: per-rank weights = {weights} "
+                        f"(bytes; runner will normalise)\n"
+                    )
+            except Exception as e:
+                sys.stderr.write(
+                    f"[api] capacity-aware split: telemetry probe failed ({e}); "
+                    f"falling back to even split\n"
+                )
         sys.stderr.write(
             f"[api] starting {self.nodes_count} runners "
             f"(model={self.model}, mode={self.mode}, ap={self.use_ap}, port={port})\n"
@@ -1465,7 +1537,8 @@ class RunnerPool:
             cmd = remote_cmd(node, self.nodes, self.model, self.mode, port, devices_json,
                              self.use_ap, self.emit_batch, kv_q8=self.kv_q8,
                              draft_model=self.draft_model,
-                             num_draft_tokens=self.num_draft_tokens)
+                             num_draft_tokens=self.num_draft_tokens,
+                             ram_weights_csv=ram_weights_csv)
             self.runners.append(RunnerProc(node, cmd, self._on_event, cluster=self.cluster))
         rank0 = next(r for r in self.runners if r.node["rank"] == 0)
 
@@ -1803,6 +1876,11 @@ _metrics: deque = deque(maxlen=50)
 
 # Runner stderr line buffers + SSE subscribers, per cluster. Each line is
 # {ts, cluster, rank, text}. Subscribers receive new lines via asyncio queues.
+# The seed entries are the historical clusters; any custom cluster id (e.g.
+# 'main' from topology.yaml, 'telemak-max64' from dashboard-added entries)
+# is initialised on demand via _ensure_log_cluster() below — without that,
+# /admin/logs?cluster=main 400s and the dashboard runner-logs panel stays
+# empty even though stderr is flowing.
 _log_buffers: dict[str, deque] = {
     "nautilus": deque(maxlen=500),
     "default": deque(maxlen=500),
@@ -1813,9 +1891,24 @@ _log_subscribers: dict[str, list[asyncio.Queue]] = {
 _log_lock = threading.Lock()
 
 
+def _ensure_log_cluster(cluster: str) -> None:
+    """Idempotent : init the per-cluster log buffer + subscriber list if
+    we haven't seen this cluster before. Cheap (one dict lookup) so we
+    call it both on the producer side (_push_log_line) and on the
+    consumer side (admin_logs) so either path bootstraps the entries
+    for new clusters."""
+    if cluster in _log_buffers:
+        return
+    with _log_lock:
+        if cluster not in _log_buffers:
+            _log_buffers[cluster] = deque(maxlen=500)
+            _log_subscribers[cluster] = []
+
+
 def _push_log_line(cluster: str, rank: int, text: str) -> None:
     """Called from the per-rank stderr drain thread. Appends to the buffer +
     notifies any active SSE subscribers. Thread-safe."""
+    _ensure_log_cluster(cluster)
     line = {"ts": time.time(), "cluster": cluster, "rank": rank, "text": text}
     with _log_lock:
         _log_buffers[cluster].append(line)
@@ -2054,6 +2147,44 @@ def _runs_finalize(rid: str, *, status: str = "done") -> None:
         _persist.finalize_run(rid, r)
     _active_runs.pop(rid, None)
     _active_run_cancels.pop(rid, None)
+
+
+# Maximum time a run is allowed to sit in 'cancelling' before we
+# force-finalize it. After cancel-all + broadcast, a healthy runner
+# ACKs within a couple seconds and the normal _runs_finalize path fires.
+# When the runner is SIGKILL'd, deadlocked in prefill, or the node has
+# rebooted, the ACK never comes and the run rotted in _active_runs
+# forever. 30s is plenty for a real cancel ACK and short enough that
+# the dashboard "Active runs" pane reflects truth.
+CANCELLING_FINALIZE_GRACE_S = 30.0
+
+
+def _finalize_stuck_cancelling() -> int:
+    """Reap any run that's been 'cancelling' for more than the grace
+    period. Returns the count reaped. Called from a 10s background
+    sweeper so the dashboard never shows ghost CANCELLING entries.
+    Idempotent — runs that finalize legitimately via the ACK path
+    won't be in _active_runs anymore by the time we look."""
+    now = time.time()
+    reaped: list[str] = []
+    for rid, r in list(_active_runs.items()):
+        if r.get("status") != "cancelling":
+            continue
+        # Use cancel_started_at when present, else fall back to started_at.
+        # The Event was set in admin_run_cancel/admin_runs_cancel_all, so
+        # the run has been 'cancelling' from at least that moment.
+        cancelled_at = r.get("cancelled_at") or r.get("started_at") or now
+        if (now - cancelled_at) < CANCELLING_FINALIZE_GRACE_S:
+            continue
+        reaped.append(rid)
+    for rid in reaped:
+        _runs_finalize(rid, status="cancelled")
+    if reaped:
+        sys.stderr.write(
+            f"[cancel-sweeper] force-finalized {len(reaped)} stuck cancelling "
+            f"run(s): {', '.join(reaped)}\n"
+        )
+    return len(reaped)
 
 
 def _runs_is_cancelled(rid: str) -> bool:
@@ -2366,11 +2497,17 @@ async def lifespan(app: FastAPI):
     # died (OOM, panic, node reboot) so the dashboard reflects reality
     # before the operator hits the load button. See #5.
     dead_task = asyncio.create_task(_dead_pool_sweeper())
+    # Background cancelling-sweeper — force-finalises runs stuck
+    # in 'cancelling' past the grace period (runner never ACK'd
+    # because it was kill -9'd or the node rebooted). Without this,
+    # ghost runs sit in /admin/runs forever.
+    cancel_task = asyncio.create_task(_cancelling_sweeper())
     try:
         yield
     finally:
         ttl_task.cancel()
         dead_task.cancel()
+        cancel_task.cancel()
         if _pool is not None:
             await _pool.stop()
         for _cid, _alias, pool in list_all_pools():
@@ -2425,6 +2562,23 @@ async def _dead_pool_sweeper() -> None:
             return
         except Exception as e:
             sys.stderr.write(f"[dead-pool-sweeper] error: {e}\n")
+
+
+async def _cancelling_sweeper() -> None:
+    """Every 10s, reap runs that have been 'cancelling' past the grace
+    period (the runner never ACK'd — usually because it was SIGKILL'd
+    or the node rebooted). Without this, ghost CANCELLING entries
+    stay forever in /admin/runs and confuse the dashboard into
+    thinking the cluster is busy. See _finalize_stuck_cancelling().
+    """
+    while True:
+        try:
+            await asyncio.sleep(10)
+            _finalize_stuck_cancelling()
+        except asyncio.CancelledError:
+            return
+        except Exception as e:
+            sys.stderr.write(f"[cancel-sweeper] error: {e}\n")
 
 
 async def _pool_ttl_sweeper() -> None:
@@ -5885,8 +6039,13 @@ async def admin_logs(cluster: str = "default", tail: int = 100, follow: bool = F
     - `follow=true`: SSE stream, replays last `tail` lines then sends every
       new line as a JSON event. Closes on client disconnect.
     """
-    if cluster not in _log_buffers:
+    # Lazy-init: cluster may be a topology.yaml-defined id ('main',
+    # 'telemak-max64', …) that wasn't pre-seeded into _log_buffers.
+    # Only refuse the request if the cluster id is truly unknown to
+    # the orchestrator.
+    if cluster not in _log_buffers and not cluster_exists(cluster):
         raise HTTPException(400, f"unknown cluster {cluster}")
+    _ensure_log_cluster(cluster)
     if not follow:
         rows = list(_log_buffers[cluster])[-tail:]
         return {"cluster": cluster, "data": rows}
@@ -6495,6 +6654,7 @@ async def admin_run_cancel(run_id: str):
     r = _active_runs.get(run_id)
     if r:
         r["status"] = "cancelling"
+        r["cancelled_at"] = time.time()
     # Hard cancel — best-effort broadcast to the right pool's runners.
     cluster = (r or {}).get("cluster")
     pool = _pool_for_cluster_name(cluster)
@@ -6515,6 +6675,7 @@ async def admin_runs_cancel_all(cluster: Optional[str] = None):
     runner-side broadcast (see admin_run_cancel)."""
     cancelled = 0
     hard_sent_total = 0
+    now = time.time()
     # Build list of (rid, pool) first to broadcast outside the iteration.
     targets: list[tuple[str, Optional[Any]]] = []
     for rid, ev in list(_active_run_cancels.items()):
@@ -6525,6 +6686,7 @@ async def admin_runs_cancel_all(cluster: Optional[str] = None):
         cancelled += 1
         if r:
             r["status"] = "cancelling"
+            r["cancelled_at"] = now
         targets.append((rid, _pool_for_cluster_name((r or {}).get("cluster"))))
     for rid, pool in targets:
         if pool is None:
@@ -7321,10 +7483,15 @@ async def admin_cluster_status(cluster_id: str):
         return await _telemak_status(cluster_id, cd_t)
     loading = _loading_snapshot(_loading_state_for(cluster_id))
     default_pool = get_pool(cluster_id)
+    all_loaded = list_pools(cluster_id)
     # During a load, expose per-rank phase. After load completes the snapshot
     # disappears and clients fall back to the main `loaded` status.
     if loading is not None:
-        ranks_view = _pool_per_rank_phases(default_pool)
+        # Prefer the default pool when present (single-pool back-compat),
+        # otherwise pick the first loaded pool so the dashboard renders
+        # per-rank phases for multi-pool loads too.
+        anchor_pool = default_pool or (all_loaded[0][1] if all_loaded else None)
+        ranks_view = _pool_per_rank_phases(anchor_pool)
         if ranks_view:
             loading["ranks"] = ranks_view
     cd = get_cluster_def(cluster_id)
@@ -7332,7 +7499,9 @@ async def admin_cluster_status(cluster_id: str):
     effective_max = get_cluster_max_nodes(cluster_id, default=cluster_max)
     effective_max = min(effective_max, cluster_max)
     avail_counts = list(range(1, effective_max + 1))
-    if default_pool is None:
+    # Empty-cluster path : no pool of any alias is loaded. Dashboard renders
+    # the load form, nothing else.
+    if default_pool is None and not all_loaded:
         return {
             "loaded": False, "cluster": cluster_id,
             "loading": loading,
@@ -7374,26 +7543,32 @@ async def admin_cluster_status(cluster_id: str):
                          for n in pool.nodes],
         }
 
-    pools = [_pool_view(a, p) for a, p in list_pools(cluster_id)]
-    # Default-alias fields, kept flat for back-compat.
-    uptime = time.time() - (default_pool.started_at or time.time())
+    pools = [_pool_view(a, p) for a, p in all_loaded]
+    # Pick a "primary" pool for the flat back-compat fields :
+    #   - default alias when loaded (single-pool clusters keep current shape),
+    #   - otherwise the first pool alphabetically — gives multi-pool clusters
+    #     a deterministic anchor for old clients that only read flat fields.
+    # Without this anchor, dashboards that don't yet parse `pools[]` show
+    # nothing at all when an operator uses custom aliases (no `default`).
+    primary_pool = default_pool or all_loaded[0][1]
+    uptime = time.time() - (primary_pool.started_at or time.time())
     recent_tps = [m["tps"] for m in list(_metrics)[:10]
-                  if m["tps"] > 0 and m.get("model") == default_pool.model]
-    topo = build_topology(cluster_id, default_pool.nodes_count)
+                  if m["tps"] > 0 and m.get("model") == primary_pool.model]
+    topo = build_topology(cluster_id, primary_pool.nodes_count)
     return {
         "loaded": True, "cluster": cluster_id,
         "loading": loading,
-        "model": default_pool.model, "mode": default_pool.mode,
-        "use_ap": default_pool.use_ap, "nodes": default_pool.nodes_count,
-        "kv_q8": default_pool.kv_q8,
-        "draft_model": default_pool.draft_model,
-        "num_draft_tokens": default_pool.num_draft_tokens if default_pool.draft_model else None,
-        "alive": default_pool.alive_count(),
-        "load_s": default_pool.load_s, "uptime_s": uptime,
+        "model": primary_pool.model, "mode": primary_pool.mode,
+        "use_ap": primary_pool.use_ap, "nodes": primary_pool.nodes_count,
+        "kv_q8": primary_pool.kv_q8,
+        "draft_model": primary_pool.draft_model,
+        "num_draft_tokens": primary_pool.num_draft_tokens if primary_pool.draft_model else None,
+        "alive": primary_pool.alive_count(),
+        "load_s": primary_pool.load_s, "uptime_s": uptime,
         "recent_avg_tps": round(sum(recent_tps) / len(recent_tps), 2) if recent_tps else None,
         "topology": [{"rank": n["rank"], "ssh": n["ssh"]} for n in topo],
         "pools": pools,
-        "aliases": [a for a, _ in list_pools(cluster_id)],
+        "aliases": [a for a, _ in all_loaded],
         "nodes_in_use": sorted(nodes_in_use(cluster_id)),
         "available_node_counts": avail_counts,
         "max_nodes": effective_max,

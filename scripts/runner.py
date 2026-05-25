@@ -43,6 +43,103 @@ from mlx_lm.sample_utils import make_sampler, make_logits_processors
 try:
     from mlx_lm.generate import BatchGenerator  # type: ignore
     _BATCH_AVAILABLE = True
+    # ── Monkey-patch _extend_cache (mlx-lm 0.31.3 bug) ────────────────
+    # Upstream `_extend_cache(cache_a, cache_b)` does
+    # `for ca, cb in zip(cache_a, cache_b): ca.extend(cb)` — but for
+    # certain cache types (Q8 quantized, MLA, some fp16 variants on
+    # newer model families), the cache object is backed by an mx.array
+    # that doesn't expose `.extend`. Result: every 2nd request through
+    # BatchGenerator dies with `'array' object has no attribute 'extend'`
+    # and the BG's internal _prompt_batch.prompt_cache stays poisoned
+    # until the BG is re-created.
+    #
+    # Workaround: replace cache_b's entries into cache_a in-place when
+    # extend is unavailable. We lose cache reuse for that pair (the new
+    # request starts cold for that layer), but the runner keeps serving.
+    # When mlx-lm fixes _extend_cache upstream, this patch becomes a
+    # no-op (ca.extend works again, the else branch never fires).
+    try:
+        import sys as _sys_for_bg
+        # `import mlx_lm.generate as X` resolves to the `generate` FUNCTION
+        # (because mlx_lm/__init__.py re-exports it from the submodule),
+        # not the module itself. Reach the module via sys.modules instead.
+        _bg_module = _sys_for_bg.modules["mlx_lm.generate"]
+
+        # ── Bug #1: _extend_cache lacks fallback for non-list caches ──
+        # `for ca, cb in zip(a, b): ca.extend(cb)` — some cache flavours
+        # are mx.array-backed and have no .extend. Replace those entries
+        # instead of crashing.
+        def _safe_extend_cache(cache_a, cache_b):
+            if not cache_a:
+                return cache_b
+            if not cache_b:
+                return cache_a
+            for i, (ca, cb) in enumerate(zip(cache_a, cache_b)):
+                try:
+                    ca.extend(cb)
+                except AttributeError:
+                    cache_a[i] = cb
+            return cache_a
+
+        _bg_module._extend_cache = _safe_extend_cache  # type: ignore[attr-defined]
+
+        # ── Bug #2: GenerationBatch.extend assumes _current/_next_logprobs
+        #            are always lists. They can become mx.array after the
+        #            first extend (line 1304 assignment), then line 1309
+        #            crashes with 'array' object has no attribute 'extend'.
+        # Repro: every 2nd request through the BG dies, runner emits
+        #        completion_tokens=0, Companion shows nothing.
+        # Wrap the method to coerce array → list before extending.
+        _GB = _bg_module.GenerationBatch  # type: ignore[attr-defined]
+        _orig_gb_extend = _GB.extend
+
+        def _safe_gb_extend(self, batch):
+            # Mirror upstream logic but coerce array → list at the
+            # extend points that crash. We do NOT touch the mx.concatenate
+            # branches (those work fine).
+            self.uids.extend(batch.uids)
+            self.prompt_cache = _bg_module._extend_cache(
+                self.prompt_cache, batch.prompt_cache
+            )
+            self.tokens.extend(batch.tokens)
+            self.samplers.extend(batch.samplers)
+            self.logits_processors.extend(batch.logits_processors)
+            self.max_tokens.extend(batch.max_tokens)
+            self.state_machines.extend(batch.state_machines)
+            import mlx.core as _mx_core
+            if self._current_tokens is None:
+                self._current_tokens = batch._current_tokens
+                self._current_logprobs = batch._current_logprobs
+            elif batch._current_tokens is not None:
+                self._current_tokens = _mx_core.concatenate(
+                    [self._current_tokens, batch._current_tokens]
+                )
+                if isinstance(self._current_logprobs, _mx_core.array):
+                    self._current_logprobs = list(self._current_logprobs)
+                if isinstance(batch._current_logprobs, _mx_core.array):
+                    self._current_logprobs.extend(list(batch._current_logprobs))
+                else:
+                    self._current_logprobs.extend(batch._current_logprobs)
+            if self._next_tokens is None:
+                self._next_tokens = batch._next_tokens
+                self._next_logprobs = batch._next_logprobs
+            elif batch._next_tokens is not None:
+                self._next_tokens = _mx_core.concatenate(
+                    [self._next_tokens, batch._next_tokens]
+                )
+                if isinstance(self._next_logprobs, _mx_core.array):
+                    self._next_logprobs = list(self._next_logprobs)
+                if isinstance(batch._next_logprobs, _mx_core.array):
+                    self._next_logprobs.extend(list(batch._next_logprobs))
+                else:
+                    self._next_logprobs.extend(batch._next_logprobs)
+            self._token_context.extend(batch._token_context)
+            self._num_tokens.extend(batch._num_tokens)
+            self._matcher_states.extend(batch._matcher_states)
+
+        _GB.extend = _safe_gb_extend  # type: ignore[method-assign]
+    except Exception:
+        pass
 except Exception:
     BatchGenerator = None  # type: ignore
     _BATCH_AVAILABLE = False
@@ -940,11 +1037,66 @@ def shard_tensor(model, group):
     return last  # unreachable
 
 
+def _compute_proportional_bounds(num_layers, weights):
+    """Split `num_layers` across ranks proportionally to `weights`.
+
+    Returns cumulative bounds (len = size+1, starts at 0, ends at num_layers).
+    Each rank gets `floor(num_layers * w_i / total_w)` layers; the rounding
+    leftover goes to the rank with the largest weight (the one that
+    can afford it). Every rank receives at least 1 layer.
+
+    Why proportional-to-weight : when nodes have heterogeneous RAM
+    (.29 512 GB + .30 256 GB), the even split assigns equal shards and
+    the small node OOMs on the first forward pass. Weighting by
+    available RAM (or wired_limit) approximates per-shard memory
+    pressure well enough that the small node breathes.
+
+    Layer-size variance (MoE sparsity) is NOT modelled — proportional-
+    by-RAM is rough but vastly better than even split on heterogeneous
+    hardware. Tune via RUNNER_LAYER_BOUNDS when the rough split misses.
+    """
+    size = len(weights)
+    if size <= 0 or num_layers <= 0:
+        return list(range(num_layers + 1))
+    total_w = sum(weights)
+    if total_w <= 0:
+        per = num_layers // size
+        return [0] + [per * i for i in range(1, size)] + [num_layers]
+    raw = [num_layers * w / total_w for w in weights]
+    counts = [max(1, int(r)) for r in raw]
+    diff = num_layers - sum(counts)
+    if diff != 0:
+        order = sorted(range(size), key=lambda i: weights[i], reverse=True)
+        i = 0
+        step = 1 if diff > 0 else -1
+        guard = 0
+        while diff != 0 and guard < size * (abs(diff) + size):
+            idx = order[i % size]
+            if counts[idx] + step >= 1:
+                counts[idx] += step
+                diff -= step
+            i += 1
+            guard += 1
+    bounds = [0]
+    acc = 0
+    for c in counts:
+        acc += c
+        bounds.append(acc)
+    if bounds[-1] != num_layers:
+        bounds[-1] = num_layers
+    return bounds
+
+
 def shard_pipeline(model, group, num_layers):
     """Apply exo-style auto_parallel pipeline sharding.
 
-    By default, split layers evenly. Override with RUNNER_LAYER_BOUNDS env var
-    (cumulative bounds, e.g. '0,38,77,92' for 3-node 38/39/15 split).
+    Layer split order of precedence :
+      1. RUNNER_LAYER_BOUNDS (operator override, cumulative bounds CSV).
+      2. RUNNER_RAM_WEIGHTS (orchestrator-supplied per-rank weights, CSV
+         of bytes — typically wired_limit_bytes or ram_bytes). The
+         runner normalises and computes proportional bounds. Required
+         for heterogeneous clusters where even-split OOMs small nodes.
+      3. Even split (default — same shard size on every rank).
     """
     from auto_parallel import pipeline_auto_parallel
     from exo_stubs import PipelineShardMetadata
@@ -952,19 +1104,43 @@ def shard_pipeline(model, group, num_layers):
     rank = group.rank()
     size = group.size()
     bounds_env = os.environ.get("RUNNER_LAYER_BOUNDS", "")
+    weights_env = os.environ.get("RUNNER_RAM_WEIGHTS", "")
+    bounds = None
+    split_source = "even"
     if bounds_env:
-        bounds = [int(x) for x in bounds_env.split(",")]
-        if len(bounds) != size + 1 or bounds[0] != 0 or bounds[-1] != num_layers:
+        try:
+            b = [int(x) for x in bounds_env.split(",")]
+        except ValueError as e:
+            raise ValueError(f"RUNNER_LAYER_BOUNDS={bounds_env!r} parse error: {e}")
+        if len(b) != size + 1 or b[0] != 0 or b[-1] != num_layers:
             raise ValueError(
                 f"RUNNER_LAYER_BOUNDS={bounds_env!r} invalid for size={size}, "
                 f"num_layers={num_layers}; expected {size+1} ints starting at 0 ending at {num_layers}"
             )
-        start, end = bounds[rank], bounds[rank + 1]
-    else:
+        bounds = b
+        split_source = "manual"
+    elif weights_env:
+        try:
+            weights = [int(x) for x in weights_env.split(",")]
+        except ValueError:
+            weights = []
+        if (
+            len(weights) == size
+            and all(w >= 0 for w in weights)
+            and sum(weights) > 0
+        ):
+            bounds = _compute_proportional_bounds(num_layers, weights)
+            split_source = f"proportional(weights={weights})"
+        else:
+            log(
+                f"RUNNER_RAM_WEIGHTS={weights_env!r} invalid for size={size}; "
+                f"falling back to even split"
+            )
+    if bounds is None:
         per = num_layers // size
-        start = rank * per
-        end = num_layers if rank == size - 1 else (rank + 1) * per
-    log(f"rank {rank} pipeline shard layers [{start}, {end})")
+        bounds = [0] + [per * i for i in range(1, size)] + [num_layers]
+    start, end = bounds[rank], bounds[rank + 1]
+    log(f"rank {rank} pipeline shard layers [{start}, {end}) split={split_source}")
     meta = PipelineShardMetadata(
         device_rank=rank,
         world_size=size,
@@ -1987,9 +2163,26 @@ def _run_batched_main(model, tokenizer, repo: str, kv_q8_default: bool,
         try:
             tick = bg.next()
         except Exception as e:
-            log(f"bg.next() failed: {e}; clearing all slots")
+            import traceback as _tb
+            log(f"bg.next() TRACEBACK: {_tb.format_exc()[:2000]}")
+            # bg.next() can poison its internal _prompt_batch.prompt_cache —
+            # observed with mlx-lm 0.31.3 where _extend_cache calls
+            # `ca.extend(cb)` and certain cache types (Q8, MLA, some fp16
+            # variants) don't have .extend → AttributeError. Clearing slots
+            # isn't enough because the poisoned cache stays in _prompt_batch
+            # and every subsequent request crashes the same way. Re-create
+            # the BG from scratch — costs one model.reset() but unblocks the
+            # serving path immediately. The first request after the reset
+            # always works; the bug only fires on subsequent extends.
+            log(f"bg.next() failed: {e}; resetting BatchGenerator + clearing slots")
             for uid in list(slot.keys()):
                 _emit_done_for(uid, finish_reason="error")
+            try:
+                bg = BatchGenerator(model, **bg_kwargs)
+                log("BatchGenerator re-initialised after extend-cache failure")
+            except Exception as e2:
+                log(f"BG reinit failed: {e2} — runner will die next iteration")
+                raise
             time.sleep(0.05)
             continue
 
