@@ -2362,10 +2362,15 @@ async def lifespan(app: FastAPI):
     # Background TTL sweeper — auto-unloads pools idle for > ttl_seconds.
     # Frees nodes for other pools without manual ops.
     ttl_task = asyncio.create_task(_pool_ttl_sweeper())
+    # Background dead-pool sweeper — drops pools whose runners have all
+    # died (OOM, panic, node reboot) so the dashboard reflects reality
+    # before the operator hits the load button. See #5.
+    dead_task = asyncio.create_task(_dead_pool_sweeper())
     try:
         yield
     finally:
         ttl_task.cancel()
+        dead_task.cancel()
         if _pool is not None:
             await _pool.stop()
         for _cid, _alias, pool in list_all_pools():
@@ -2384,6 +2389,42 @@ def _apply_default_ttl_to_pools() -> None:
         _pool.ttl_seconds = ttl
     for _cid, _alias, pool in list_all_pools():
         pool.ttl_seconds = ttl
+
+
+async def _dead_pool_sweeper() -> None:
+    """Every 30s, scan every cluster for pools whose runners have all
+    died and drop them. Same purge as the at-load path (#5 issue), just
+    pro-active so the dashboard reflects reality without the operator
+    having to attempt a load first.
+
+    Without this, an OOM crash or node reboot leaves the pool registry
+    "loaded:true" on the dashboard while every rank process is gone.
+    Operator sees a healthy pool tile, clicks chat, and gets
+    "model_not_loaded" because alive_count() == 0 at routing time. The
+    sweeper closes that gap.
+
+    Probe budget: just `proc.poll() is None`. No SSH, no TCP probe —
+    those would add latency and risk false positives on a flaky link.
+    A surviving runner is plenty robust under transient network
+    hiccups; only a dead local SSH child triggers purge.
+    """
+    while True:
+        try:
+            await asyncio.sleep(30)
+            seen_clusters = set()
+            for cid, _alias, _pool in list_all_pools():
+                seen_clusters.add(cid)
+            for cid in seen_clusters:
+                purged = await _purge_dead_pools(cid)
+                if purged:
+                    sys.stderr.write(
+                        f"[dead-pool-sweeper] {cid}: purged {len(purged)} "
+                        f"dead pool(s): {', '.join(purged)}\n"
+                    )
+        except asyncio.CancelledError:
+            return
+        except Exception as e:
+            sys.stderr.write(f"[dead-pool-sweeper] error: {e}\n")
 
 
 async def _pool_ttl_sweeper() -> None:
@@ -6825,6 +6866,55 @@ def _pool_for_cluster(cluster_id: str):
     return get_pool(cluster_id)
 
 
+async def _purge_dead_pools(cluster_id: str) -> list[str]:
+    """Drop pools whose ranks have all died.
+
+    A runner can die after the load endpoint returned `loaded:true`:
+      - OOM during the first forward pass (Metal OOM, common on under-RAMed nodes)
+      - segfault / panic
+      - node reboot (Sophie pulls the plug to fix RDMA cables)
+      - any silent JACCL crash that doesn't take the orchestrator down
+
+    The pool registry keeps claiming those node indices, so the next
+    `POST /load` on overlapping indices fails with HTTP 409
+    "already in use by another loaded pool", forcing the operator to
+    manually `unload {alias}` + `reset` before retrying. Friction with
+    no value — the runner is dead, we know it.
+
+    This helper sweeps `list_pools(cluster_id)` and drops every pool
+    with `alive_count() == 0`. Returns the list of purged aliases so
+    the caller can log them.
+
+    Best-effort: pool.stop() failures don't block the purge — if the
+    SSH connection is gone the runner is already dead.
+    """
+    purged: list[str] = []
+    for alias, pool in list(list_pools(cluster_id)):
+        if pool.alive_count() > 0:
+            continue
+        try:
+            await pool.stop()
+        except Exception as e:
+            print(
+                f"[purge] {cluster_id}[{alias}] stop failed during dead-pool "
+                f"purge: {e}", flush=True
+            )
+        del_pool(cluster_id, alias)
+        purged.append(alias)
+        print(
+            f"[purge] {cluster_id}[{alias}]: pool was 'loaded' in registry but "
+            f"every rank had exited — auto-unloaded to free node indices "
+            f"{sorted(pool.node_indices) if pool.node_indices else '[]'}",
+            flush=True,
+        )
+    if purged:
+        try:
+            save_cluster_state_v2(cluster_id)
+        except Exception as e:
+            print(f"[purge] {cluster_id} persist after purge failed: {e}", flush=True)
+    return purged
+
+
 async def _auto_unload_cluster(cluster_id: str, reason: str) -> None:
     """Unload every pool on a cluster in response to admin settings changes
     that invalidate the current load (topology change, max_nodes reduction,
@@ -7438,6 +7528,20 @@ async def admin_cluster_load(cluster_id: str, req: ArgoLoadRequest):
             )
         node_indices = list(range(req.nodes))
         nodes_count = req.nodes
+
+    # Purge any pool whose runners have all died (OOM, panic, node reboot).
+    # Without this, the next load on overlapping indices gets HTTP 409
+    # "already in use" even though nobody's actually using them. The user
+    # has to manually unload + reset to break the deadlock — friction with
+    # no value. See #5. Safe to run unconditionally : pools with alive
+    # ranks are skipped.
+    purged_aliases = await _purge_dead_pools(cluster_id)
+    if purged_aliases:
+        print(
+            f"[load] {cluster_id}: dead pools auto-purged before load "
+            f"({', '.join(purged_aliases)})",
+            flush=True,
+        )
 
     existing_aliases = {a for a, _ in list_pools(cluster_id)}
     if alias in existing_aliases and not req.force_hot_swap and alias != DEFAULT_ALIAS:
