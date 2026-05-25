@@ -359,12 +359,29 @@ def cluster_exists(cluster_id: str) -> bool:
 
 def active_cluster_ids() -> list[str]:
     """Union of topology.yaml clusters + dashboard-added entries, minus
-    tombstones. Source of truth for "which clusters does Odysseus publish"."""
+    tombstones. Source of truth for "which clusters does Odysseus publish".
+
+    cluster-config.json carries cluster definitions alongside unrelated
+    top-level sections ('crew', 'discovery', 'settings', ...) that
+    were never meant to be cluster ids. Filter them out by requiring
+    the value to be a dict with at least one cluster-shape field.
+    """
     seen: dict[str, bool] = {}
     for cid in DEFAULT_CLUSTER_DEFS.keys():
         seen[cid] = True
-    for cid in _load_cluster_config().keys():
-        if cid not in seen:
+    for cid, entry in _load_cluster_config().items():
+        if cid in seen:
+            continue
+        if not isinstance(entry, dict):
+            continue
+        # Heuristic : a real cluster entry has at least one of these.
+        # Bare 'load_history'-only entries pre-date the explicit kind
+        # field — keep them too, since the legacy single-cluster file
+        # used 'load_history' as the only top-level marker.
+        if any(k in entry for k in (
+            "nodes", "kind", "label", "models_dir", "max_nodes",
+            "_removed", "load_history", "backend", "upstream",
+        )):
             seen[cid] = True
     return [cid for cid in seen if not _is_cluster_tombstoned(cid)]
 
