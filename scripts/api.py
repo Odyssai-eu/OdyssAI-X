@@ -992,7 +992,8 @@ def remote_cmd(node: dict, nodes: list[dict], model: str, mode: str, port: int,
                devices_json: str, use_ap: bool, emit_batch: int,
                kv_q8: bool = False,
                draft_model: Optional[str] = None,
-               num_draft_tokens: int = 4) -> str:
+               num_draft_tokens: int = 4,
+               ram_weights_csv: Optional[str] = None) -> str:
     coord_ip = next(n for n in nodes if n["rank"] == COORDINATOR_RANK)["ssh"].split("@")[1]
     world_size = len(nodes)
     env = {
@@ -1007,6 +1008,15 @@ def remote_cmd(node: dict, nodes: list[dict], model: str, mode: str, port: int,
         "RUNNER_KV_Q8": "1" if kv_q8 else "0",
         "RUNNER_EMIT_BATCH": str(emit_batch),
     }
+    # Capacity-aware pipeline split (#9). When the orchestrator knows per-rank
+    # RAM (via telemetry), pass it as a CSV of weights so the runner can size
+    # each rank's layer count proportionally instead of doing the even split
+    # that OOMs heterogeneous clusters (.29 512GB + .30 256GB on Qwen397).
+    # Format: "wW0,wW1,...,wWN-1" where each Wi is the relative weight for
+    # rank i (the runner normalises). The runner falls back to even split
+    # when the env var is missing or invalid.
+    if ram_weights_csv:
+        env["RUNNER_RAM_WEIGHTS"] = ram_weights_csv
     if draft_model:
         env["RUNNER_DRAFT_MODEL"] = draft_model
         env["RUNNER_NUM_DRAFT_TOKENS"] = str(num_draft_tokens)
@@ -1456,6 +1466,38 @@ class RunnerPool:
         port = random_ephemeral_port()
         devices = [n["rdma"] for n in sorted(self.nodes, key=lambda x: x["rank"])]
         devices_json = json.dumps(devices)
+        # Capacity-aware split (#9). Gather per-rank RAM via telemetry so the
+        # runner can split layers proportionally rather than evenly. Falls
+        # back to even split when telemetry is missing (single-node, fresh
+        # cluster) — runner detects empty/invalid env and ignores it.
+        ram_weights_csv: Optional[str] = None
+        if self.nodes_count > 1 and self.mode == "pipeline":
+            try:
+                _total, per_node = _cluster_total_ram_bytes(
+                    self.cluster, self.nodes_count
+                )
+                # _cluster_total_ram_bytes returns entries in rank order
+                # (builds via build_topology). Use wired_limit when set,
+                # otherwise raw RAM — wired_limit is the actual Metal
+                # ceiling and is what JACCL/MLX can spend.
+                weights: list[int] = []
+                for entry in per_node:
+                    w = entry.get("wired_limit_bytes") or entry.get("ram_bytes") or 0
+                    weights.append(int(w))
+                # Only enable when EVERY rank has a non-zero weight AND
+                # there's actual heterogeneity (otherwise even-split is
+                # already correct and we save a code path).
+                if all(w > 0 for w in weights) and len(set(weights)) > 1:
+                    ram_weights_csv = ",".join(str(w) for w in weights)
+                    sys.stderr.write(
+                        f"[api] capacity-aware split: per-rank weights = {weights} "
+                        f"(bytes; runner will normalise)\n"
+                    )
+            except Exception as e:
+                sys.stderr.write(
+                    f"[api] capacity-aware split: telemetry probe failed ({e}); "
+                    f"falling back to even split\n"
+                )
         sys.stderr.write(
             f"[api] starting {self.nodes_count} runners "
             f"(model={self.model}, mode={self.mode}, ap={self.use_ap}, port={port})\n"
@@ -1465,7 +1507,8 @@ class RunnerPool:
             cmd = remote_cmd(node, self.nodes, self.model, self.mode, port, devices_json,
                              self.use_ap, self.emit_batch, kv_q8=self.kv_q8,
                              draft_model=self.draft_model,
-                             num_draft_tokens=self.num_draft_tokens)
+                             num_draft_tokens=self.num_draft_tokens,
+                             ram_weights_csv=ram_weights_csv)
             self.runners.append(RunnerProc(node, cmd, self._on_event, cluster=self.cluster))
         rank0 = next(r for r in self.runners if r.node["rank"] == 0)
 

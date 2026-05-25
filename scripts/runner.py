@@ -940,11 +940,66 @@ def shard_tensor(model, group):
     return last  # unreachable
 
 
+def _compute_proportional_bounds(num_layers, weights):
+    """Split `num_layers` across ranks proportionally to `weights`.
+
+    Returns cumulative bounds (len = size+1, starts at 0, ends at num_layers).
+    Each rank gets `floor(num_layers * w_i / total_w)` layers; the rounding
+    leftover goes to the rank with the largest weight (the one that
+    can afford it). Every rank receives at least 1 layer.
+
+    Why proportional-to-weight : when nodes have heterogeneous RAM
+    (.29 512 GB + .30 256 GB), the even split assigns equal shards and
+    the small node OOMs on the first forward pass. Weighting by
+    available RAM (or wired_limit) approximates per-shard memory
+    pressure well enough that the small node breathes.
+
+    Layer-size variance (MoE sparsity) is NOT modelled — proportional-
+    by-RAM is rough but vastly better than even split on heterogeneous
+    hardware. Tune via RUNNER_LAYER_BOUNDS when the rough split misses.
+    """
+    size = len(weights)
+    if size <= 0 or num_layers <= 0:
+        return list(range(num_layers + 1))
+    total_w = sum(weights)
+    if total_w <= 0:
+        per = num_layers // size
+        return [0] + [per * i for i in range(1, size)] + [num_layers]
+    raw = [num_layers * w / total_w for w in weights]
+    counts = [max(1, int(r)) for r in raw]
+    diff = num_layers - sum(counts)
+    if diff != 0:
+        order = sorted(range(size), key=lambda i: weights[i], reverse=True)
+        i = 0
+        step = 1 if diff > 0 else -1
+        guard = 0
+        while diff != 0 and guard < size * (abs(diff) + size):
+            idx = order[i % size]
+            if counts[idx] + step >= 1:
+                counts[idx] += step
+                diff -= step
+            i += 1
+            guard += 1
+    bounds = [0]
+    acc = 0
+    for c in counts:
+        acc += c
+        bounds.append(acc)
+    if bounds[-1] != num_layers:
+        bounds[-1] = num_layers
+    return bounds
+
+
 def shard_pipeline(model, group, num_layers):
     """Apply exo-style auto_parallel pipeline sharding.
 
-    By default, split layers evenly. Override with RUNNER_LAYER_BOUNDS env var
-    (cumulative bounds, e.g. '0,38,77,92' for 3-node 38/39/15 split).
+    Layer split order of precedence :
+      1. RUNNER_LAYER_BOUNDS (operator override, cumulative bounds CSV).
+      2. RUNNER_RAM_WEIGHTS (orchestrator-supplied per-rank weights, CSV
+         of bytes — typically wired_limit_bytes or ram_bytes). The
+         runner normalises and computes proportional bounds. Required
+         for heterogeneous clusters where even-split OOMs small nodes.
+      3. Even split (default — same shard size on every rank).
     """
     from auto_parallel import pipeline_auto_parallel
     from exo_stubs import PipelineShardMetadata
@@ -952,19 +1007,43 @@ def shard_pipeline(model, group, num_layers):
     rank = group.rank()
     size = group.size()
     bounds_env = os.environ.get("RUNNER_LAYER_BOUNDS", "")
+    weights_env = os.environ.get("RUNNER_RAM_WEIGHTS", "")
+    bounds = None
+    split_source = "even"
     if bounds_env:
-        bounds = [int(x) for x in bounds_env.split(",")]
-        if len(bounds) != size + 1 or bounds[0] != 0 or bounds[-1] != num_layers:
+        try:
+            b = [int(x) for x in bounds_env.split(",")]
+        except ValueError as e:
+            raise ValueError(f"RUNNER_LAYER_BOUNDS={bounds_env!r} parse error: {e}")
+        if len(b) != size + 1 or b[0] != 0 or b[-1] != num_layers:
             raise ValueError(
                 f"RUNNER_LAYER_BOUNDS={bounds_env!r} invalid for size={size}, "
                 f"num_layers={num_layers}; expected {size+1} ints starting at 0 ending at {num_layers}"
             )
-        start, end = bounds[rank], bounds[rank + 1]
-    else:
+        bounds = b
+        split_source = "manual"
+    elif weights_env:
+        try:
+            weights = [int(x) for x in weights_env.split(",")]
+        except ValueError:
+            weights = []
+        if (
+            len(weights) == size
+            and all(w >= 0 for w in weights)
+            and sum(weights) > 0
+        ):
+            bounds = _compute_proportional_bounds(num_layers, weights)
+            split_source = f"proportional(weights={weights})"
+        else:
+            log(
+                f"RUNNER_RAM_WEIGHTS={weights_env!r} invalid for size={size}; "
+                f"falling back to even split"
+            )
+    if bounds is None:
         per = num_layers // size
-        start = rank * per
-        end = num_layers if rank == size - 1 else (rank + 1) * per
-    log(f"rank {rank} pipeline shard layers [{start}, {end})")
+        bounds = [0] + [per * i for i in range(1, size)] + [num_layers]
+    start, end = bounds[rank], bounds[rank + 1]
+    log(f"rank {rank} pipeline shard layers [{start}, {end}) split={split_source}")
     meta = PipelineShardMetadata(
         device_rank=rank,
         world_size=size,
