@@ -1012,7 +1012,20 @@ def remote_cmd(node: dict, nodes: list[dict], model: str, mode: str, port: int,
         env["RUNNER_NUM_DRAFT_TOKENS"] = str(num_draft_tokens)
     env_str = " ".join(f"{k}={shlex.quote(v)}" for k, v in env.items())
     write_devices = f"echo {shlex.quote(devices_json)} > /tmp/mlx_jaccl_devices.json"
-    return f"{write_devices} && {env_str} {PYTHON_REMOTE} {RUNNER_REMOTE}"
+    # If the model path is relative, run the runner from the node's
+    # models_dir so `Path(repo).exists()` resolves correctly. Without
+    # this, runner.py falls through to `hf_repo_to_path()` which tries
+    # the HF cache with `local_files_only=True` and dies with
+    # LocalEntryNotFoundError — the regression Sophie hit on 2026-05-25
+    # when loading inferencerlabs/Qwen3.5-397B-A17B-MLX-9bit by
+    # relative path even though the model exists at
+    # $models_dir/inferencerlabs/Qwen3.5-397B-A17B-MLX-9bit on every
+    # node. Absolute model paths skip the cd.
+    cd_prefix = ""
+    if not model.startswith("/"):
+        node_models_dir = node.get("models_dir") or DEFAULT_MODELS_DIR
+        cd_prefix = f"cd {shlex.quote(node_models_dir)} && "
+    return f"{write_devices} && {cd_prefix}{env_str} {PYTHON_REMOTE} {RUNNER_REMOTE}"
 
 
 # ──────────────────────────────────────────────────────────────────────────────
