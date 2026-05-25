@@ -43,6 +43,103 @@ from mlx_lm.sample_utils import make_sampler, make_logits_processors
 try:
     from mlx_lm.generate import BatchGenerator  # type: ignore
     _BATCH_AVAILABLE = True
+    # ── Monkey-patch _extend_cache (mlx-lm 0.31.3 bug) ────────────────
+    # Upstream `_extend_cache(cache_a, cache_b)` does
+    # `for ca, cb in zip(cache_a, cache_b): ca.extend(cb)` — but for
+    # certain cache types (Q8 quantized, MLA, some fp16 variants on
+    # newer model families), the cache object is backed by an mx.array
+    # that doesn't expose `.extend`. Result: every 2nd request through
+    # BatchGenerator dies with `'array' object has no attribute 'extend'`
+    # and the BG's internal _prompt_batch.prompt_cache stays poisoned
+    # until the BG is re-created.
+    #
+    # Workaround: replace cache_b's entries into cache_a in-place when
+    # extend is unavailable. We lose cache reuse for that pair (the new
+    # request starts cold for that layer), but the runner keeps serving.
+    # When mlx-lm fixes _extend_cache upstream, this patch becomes a
+    # no-op (ca.extend works again, the else branch never fires).
+    try:
+        import sys as _sys_for_bg
+        # `import mlx_lm.generate as X` resolves to the `generate` FUNCTION
+        # (because mlx_lm/__init__.py re-exports it from the submodule),
+        # not the module itself. Reach the module via sys.modules instead.
+        _bg_module = _sys_for_bg.modules["mlx_lm.generate"]
+
+        # ── Bug #1: _extend_cache lacks fallback for non-list caches ──
+        # `for ca, cb in zip(a, b): ca.extend(cb)` — some cache flavours
+        # are mx.array-backed and have no .extend. Replace those entries
+        # instead of crashing.
+        def _safe_extend_cache(cache_a, cache_b):
+            if not cache_a:
+                return cache_b
+            if not cache_b:
+                return cache_a
+            for i, (ca, cb) in enumerate(zip(cache_a, cache_b)):
+                try:
+                    ca.extend(cb)
+                except AttributeError:
+                    cache_a[i] = cb
+            return cache_a
+
+        _bg_module._extend_cache = _safe_extend_cache  # type: ignore[attr-defined]
+
+        # ── Bug #2: GenerationBatch.extend assumes _current/_next_logprobs
+        #            are always lists. They can become mx.array after the
+        #            first extend (line 1304 assignment), then line 1309
+        #            crashes with 'array' object has no attribute 'extend'.
+        # Repro: every 2nd request through the BG dies, runner emits
+        #        completion_tokens=0, Companion shows nothing.
+        # Wrap the method to coerce array → list before extending.
+        _GB = _bg_module.GenerationBatch  # type: ignore[attr-defined]
+        _orig_gb_extend = _GB.extend
+
+        def _safe_gb_extend(self, batch):
+            # Mirror upstream logic but coerce array → list at the
+            # extend points that crash. We do NOT touch the mx.concatenate
+            # branches (those work fine).
+            self.uids.extend(batch.uids)
+            self.prompt_cache = _bg_module._extend_cache(
+                self.prompt_cache, batch.prompt_cache
+            )
+            self.tokens.extend(batch.tokens)
+            self.samplers.extend(batch.samplers)
+            self.logits_processors.extend(batch.logits_processors)
+            self.max_tokens.extend(batch.max_tokens)
+            self.state_machines.extend(batch.state_machines)
+            import mlx.core as _mx_core
+            if self._current_tokens is None:
+                self._current_tokens = batch._current_tokens
+                self._current_logprobs = batch._current_logprobs
+            elif batch._current_tokens is not None:
+                self._current_tokens = _mx_core.concatenate(
+                    [self._current_tokens, batch._current_tokens]
+                )
+                if isinstance(self._current_logprobs, _mx_core.array):
+                    self._current_logprobs = list(self._current_logprobs)
+                if isinstance(batch._current_logprobs, _mx_core.array):
+                    self._current_logprobs.extend(list(batch._current_logprobs))
+                else:
+                    self._current_logprobs.extend(batch._current_logprobs)
+            if self._next_tokens is None:
+                self._next_tokens = batch._next_tokens
+                self._next_logprobs = batch._next_logprobs
+            elif batch._next_tokens is not None:
+                self._next_tokens = _mx_core.concatenate(
+                    [self._next_tokens, batch._next_tokens]
+                )
+                if isinstance(self._next_logprobs, _mx_core.array):
+                    self._next_logprobs = list(self._next_logprobs)
+                if isinstance(batch._next_logprobs, _mx_core.array):
+                    self._next_logprobs.extend(list(batch._next_logprobs))
+                else:
+                    self._next_logprobs.extend(batch._next_logprobs)
+            self._token_context.extend(batch._token_context)
+            self._num_tokens.extend(batch._num_tokens)
+            self._matcher_states.extend(batch._matcher_states)
+
+        _GB.extend = _safe_gb_extend  # type: ignore[method-assign]
+    except Exception:
+        pass
 except Exception:
     BatchGenerator = None  # type: ignore
     _BATCH_AVAILABLE = False
@@ -1987,9 +2084,26 @@ def _run_batched_main(model, tokenizer, repo: str, kv_q8_default: bool,
         try:
             tick = bg.next()
         except Exception as e:
-            log(f"bg.next() failed: {e}; clearing all slots")
+            import traceback as _tb
+            log(f"bg.next() TRACEBACK: {_tb.format_exc()[:2000]}")
+            # bg.next() can poison its internal _prompt_batch.prompt_cache —
+            # observed with mlx-lm 0.31.3 where _extend_cache calls
+            # `ca.extend(cb)` and certain cache types (Q8, MLA, some fp16
+            # variants) don't have .extend → AttributeError. Clearing slots
+            # isn't enough because the poisoned cache stays in _prompt_batch
+            # and every subsequent request crashes the same way. Re-create
+            # the BG from scratch — costs one model.reset() but unblocks the
+            # serving path immediately. The first request after the reset
+            # always works; the bug only fires on subsequent extends.
+            log(f"bg.next() failed: {e}; resetting BatchGenerator + clearing slots")
             for uid in list(slot.keys()):
                 _emit_done_for(uid, finish_reason="error")
+            try:
+                bg = BatchGenerator(model, **bg_kwargs)
+                log("BatchGenerator re-initialised after extend-cache failure")
+            except Exception as e2:
+                log(f"BG reinit failed: {e2} — runner will die next iteration")
+                raise
             time.sleep(0.05)
             continue
 
