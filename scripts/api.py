@@ -2652,7 +2652,7 @@ def _initial_default_config() -> Optional[dict]:
 #   major (1.7.2 → 2.0.0) — breaking API or topology change
 #
 # Use `./scripts/bump-version.sh patch|minor|major` to bump + auto-commit.
-ODYSSEUS_VERSION = "1.7.7"
+ODYSSEUS_VERSION = "1.7.8"
 
 app = FastAPI(
     title="Odysseus (odyssai.eu)",
@@ -6264,6 +6264,42 @@ def _build_hosts_registry() -> list[dict]:
                 "label": inv.get("label") or host_id,
             }
 
+    # Also walk UI-added clusters from cluster-config.json so Telemak (and any
+    # other) clusters registered through the "+ Add Telemak" dashboard form
+    # contribute their nodes to the host registry. Without this, the matrix
+    # probe never sees those hosts → Models card stays empty.
+    try:
+        for cluster_id, entry in _load_cluster_config().items():
+            if cluster_id in DEFAULT_CLUSTER_DEFS:
+                continue  # already handled above
+            if not isinstance(entry, dict) or entry.get("_removed"):
+                continue
+            if not entry.get("nodes"):
+                continue
+            cluster_models_dir = entry.get("models_dir") or models_dir_for(cluster_id)
+            for node in entry.get("nodes") or []:
+                ssh = node.get("ssh") or ""
+                host_id = node.get("host") or _host_id_from_ssh(ssh)
+                if not host_id or not ssh:
+                    continue
+                inv = inventory.get(host_id, {})
+                rec = by_id.setdefault(host_id, {
+                    "id": host_id,
+                    "ssh": ssh,
+                    "models_dir": node.get("models_dir") or cluster_models_dir or DEFAULT_MODELS_DIR,
+                    "cluster": cluster_id,
+                    "label": inv.get("label") or host_id,
+                })
+                if not rec.get("ssh"):
+                    rec["ssh"] = ssh
+                if node.get("models_dir"):
+                    rec["models_dir"] = node["models_dir"]
+                cluster_sets.setdefault(host_id, set()).add(cluster_id)
+    except Exception:
+        # Probe must not crash on a malformed cluster-config.json — fall
+        # back to topology-only hosts in that case.
+        pass
+
     for host_id, entry in by_id.items():
         clusters = cluster_sets.get(host_id)
         if clusters:
@@ -6271,6 +6307,10 @@ def _build_hosts_registry() -> list[dict]:
     return [h for h in by_id.values() if h.get("ssh")]
 
 
+# Module-import snapshot. The matrix endpoint calls _build_hosts_registry()
+# fresh so UI-added clusters (cluster-config.json) are picked up without a
+# container restart — this constant is kept for legacy callers that may
+# import HOSTS_REGISTRY directly.
 HOSTS_REGISTRY = _build_hosts_registry()
 
 # In-memory cache: { "matrix": {...}, "ts": epoch }.
@@ -6586,8 +6626,12 @@ async def admin_sync_matrix(fresh: bool = False):
     if (not fresh) and _sync_matrix_cache["data"] and (now - _sync_matrix_cache["ts"] < _SYNC_MATRIX_TTL_S):
         return _sync_matrix_cache["data"]
 
+    # Rebuild the host registry each call so UI-added clusters (Telemak
+    # registered via "+ Add Telemak", future http-proxy kinds) show up in
+    # the matrix without requiring a container restart.
+    hosts_registry = _build_hosts_registry()
     # Probe all hosts in parallel.
-    results = await asyncio.gather(*[_probe_host(h) for h in HOSTS_REGISTRY])
+    results = await asyncio.gather(*[_probe_host(h) for h in hosts_registry])
     payload = _pivot_matrix(results)
     payload["cached_at"] = now
     _sync_matrix_cache["data"] = payload
