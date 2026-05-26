@@ -732,12 +732,22 @@ h1, h2, h3 { margin: 0; }
   cursor: pointer;
 }
 .cluster-item.selected { border-color: var(--ink); box-shadow: 0 1px 0 rgba(14, 27, 42, 0.04); }
-.cluster-item .dot { width: 10px; height: 10px; border-radius: 5px; flex-shrink: 0; }
+/* Colour the dot + pill by cluster KIND (mlx-distributed / telemak / http-proxy),
+   not by cluster id. Keying off id meant arbitrary user-chosen names like 'main'
+   or 'argo' had no matching CSS rule → invisible dot + un-styled pill →
+   the user saw a big empty gap on the left of the cluster card. */
+.cluster-item .dot { width: 10px; height: 10px; border-radius: 5px; flex-shrink: 0; background: var(--ink-4); }
+.cluster-item .dot.mlx-distributed { background: var(--blue); }
+.cluster-item .dot.telemak { background: var(--amber); }
+.cluster-item .dot.http-proxy { background: var(--amber); }
 .cluster-item .dot.default { background: var(--blue); }
 .cluster-item .stack { display: flex; flex-direction: column; gap: 2px; flex: 1; min-width: 0; }
 .cluster-item .name-row { display: flex; flex-direction: row; align-items: center; gap: 8px; }
 .cluster-item .name { font-family: var(--font-display); font-size: 15px; font-weight: 600; color: var(--ink); letter-spacing: -0.01em; }
-.cluster-item .kind-pill { font-size: 10px; font-weight: 600; padding: 2px 6px; border-radius: 4px; letter-spacing: 0.04em; text-transform: uppercase; }
+.cluster-item .kind-pill { font-size: 10px; font-weight: 600; padding: 2px 6px; border-radius: 4px; letter-spacing: 0.04em; text-transform: uppercase; color: var(--ink-2); background: var(--ink-7); }
+.cluster-item .kind-pill.mlx-distributed { color: var(--blue-deep); background: var(--blue-soft); }
+.cluster-item .kind-pill.telemak { color: var(--amber-deep); background: var(--amber-soft); }
+.cluster-item .kind-pill.http-proxy { color: var(--amber-deep); background: var(--amber-soft); }
 .cluster-item .kind-pill.default { color: var(--blue-deep); background: var(--blue-soft); }
 .cluster-item .meta { font-family: var(--font-mono); font-size: 11px; color: var(--ink-2); }
 .add-cluster-btn {
@@ -1794,11 +1804,11 @@ function renderSettingsClusters() {
         <div class="cap"><span>Configured clusters</span><span>${CLUSTERS.length}</span></div>
         ${CLUSTERS.map(c => `
           <div class="cluster-item ${sel===c.id?"selected":""}" data-act="settings-pick-cluster" data-v="${c.id}">
-            <div class="dot ${c.id}"></div>
+            <div class="dot ${escapeHtml(c.kind)}"></div>
             <div class="stack">
               <div class="name-row">
                 <div class="name">${c.name}</div>
-                <div class="kind-pill ${c.id}">${c.kind}</div>
+                <div class="kind-pill ${escapeHtml(c.kind)}">${c.kind}</div>
               </div>
               <div class="meta">${escapeHtml(summary(c.id))}</div>
             </div>
