@@ -35,3 +35,4 @@ nautilus.png
 # /app/data/odysseus.db — irrelevant to the repo.
 scripts/odysseus.db
 scripts/odysseus.db-*
+default.profraw
