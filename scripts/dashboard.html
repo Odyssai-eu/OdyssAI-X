@@ -2549,9 +2549,12 @@ function renderSettingsModels() {
 
 // HF download UI — moved here from the Home dashboard (where it didn't belong).
 // Targets follow the selected Models matrix group: if a real cluster is
-// selected, download to that cluster's nodes. If "all" or a telemak cluster
-// is selected, hide the form (kind=telemak doesn't use rsync-distributed
-// model storage — it has its own local store, populated separately).
+// selected, download to that cluster's nodes.
+//
+// For kind=telemak clusters, the HF download form is already rendered
+// inside renderTelemakModelsCard so the operator sees it next to the
+// inventory + the resolved models_dir. Returning empty here avoids
+// double-rendering.
 function renderSettingsHFDownload(group) {
   if (!group || group === "all") {
     return `
@@ -2562,11 +2565,8 @@ function renderSettingsHFDownload(group) {
   }
   const cdef = state.cluster_defs?.[group];
   if (cdef?.kind === "telemak") {
-    return `
-      <div style="margin-top:24px;padding:14px 16px;background:var(--ground);border-radius:10px;font-size:12px;color:var(--ink-2)">
-        Telemak doesn't use the distributed model store — its model files are local to the Mac running the Swift binary. Pre-populate <span class="mono">TELEMAK_MODELS_DIR</span> via <span class="mono">huggingface-cli download</span> on that Mac, or download into the HF cache by loading the model from the Home tab (Telemak fetches on demand).
-      </div>
-    `;
+    // Already rendered inside renderTelemakModelsCard.
+    return "";
   }
   return `<div style="margin-top:24px">${renderHFDownload(group)}</div>`;
 }
@@ -2789,9 +2789,13 @@ function renderMatrixCard(m, group) {
 }
 
 // Dedicated view for kind=telemak clusters in the Models matrix tab.
-// Telemak doesn't use the rsync matrix — its model store is local to the
-// Mac running the Swift binary. So we show what's currently loaded plus
-// the upstream URL, with a pointer to the Home Load/Unload UI.
+// Telemak runs on a single Mac with a local model store. The matrix
+// inventory is the standard `/admin/sync/matrix` filtered to the
+// telemak host. Per-model rows show size + loaded badge + load/unload
+// (no sync/delete-from-host since there's only one host). HF download
+// is enabled and lands in the host's configured `models_dir` (resolved
+// from topology.yaml — the dashboard surfaces the resolved path above
+// the form so the operator sees where the file is about to land).
 function renderTelemakModelsCard(cid, cdef) {
   const status = state.cluster_status?.[cid];
   const modelsLoaded = Array.isArray(status?.models_loaded)
@@ -2803,23 +2807,54 @@ function renderTelemakModelsCard(cid, cdef) {
   const wiredUsed = (typeof status?.wired_memory_used_gb === "number") ? status.wired_memory_used_gb : null;
   const wiredFree = (typeof status?.wired_memory_free_gb === "number") ? status.wired_memory_free_gb : null;
   const wiredTotal = (wiredUsed != null && wiredFree != null) ? (wiredUsed + wiredFree) : null;
-  const rows = modelsLoaded.map((id) => {
-    const short = (id.split("/").pop() || id).toLowerCase();
-    const alias = modelsLoaded.length === 1 ? cid : `${cid}:${short}`;
+  // Resolve the host(s) + models_dir for this telemak cluster from topology.
+  // Telemak is single-host by design, but we tolerate >1 (operator-defined
+  // multi-mac telemak fleet) and aggregate.
+  const cdefNodes = cdef?.nodes || [];
+  const hostIds = cdefNodes.map(n => n.host).filter(Boolean);
+  const modelsDirs = Array.from(new Set(cdefNodes.map(n => n.models_dir).filter(Boolean)));
+  const m = state.matrix;
+  const allHosts = m?.hosts || [];
+  const hosts = allHosts.filter(h => hostIds.includes(h.id));
+  // Models with presence on at least one telemak host, loaded-first then alpha.
+  const inventory = (m?.models || [])
+    .filter(mod => hosts.some(h => mod.presence?.[h.id]))
+    .map(mod => ({
+      ...mod,
+      _loaded: modelsLoaded.includes(mod.name)
+        || modelsLoaded.some(id => id.endsWith("/" + mod.name)),
+    }))
+    .sort((a, b) => {
+      if (a._loaded !== b._loaded) return a._loaded ? -1 : 1;
+      return a.name.localeCompare(b.name);
+    });
+  const rowFor = (mod) => {
+    const presentSize = hosts.reduce((acc, h) => acc + (mod.presence?.[h.id] || 0), 0);
+    const loaded = mod._loaded;
+    const short = (mod.name.split("/").pop() || mod.name).toLowerCase();
+    const alias = modelsLoaded.length <= 1 ? cid : `${cid}:${short}`;
     return `
-      <div style="display:flex;align-items:center;gap:12px;padding:8px 12px;background:var(--surface);border:1px solid var(--line);border-radius:6px;font-family:var(--font-mono);font-size:12px">
-        <span style="font-weight:600;color:var(--ink);flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${escapeHtml(id)}</span>
-        <span style="color:var(--ink-3);font-size:11px;white-space:nowrap">alias: <span style="color:var(--ink-2)">${escapeHtml(alias)}</span></span>
-        <button class="btn btn-xs btn-destructive" data-act="telemak-unload" data-cluster="${cid}" data-model="${escapeHtml(id)}" title="Unload ${escapeHtml(id)}">${Icon.x}<span>Unload</span></button>
+      <div class="matrix-row" style="grid-template-columns:1fr auto auto auto;gap:14px;padding:10px 14px">
+        <div class="mc-model" style="padding:0;min-width:0">
+          <div class="name" style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${escapeHtml(mod.name)}</div>
+          <div class="meta">${fmtBytes(presentSize)}${loaded ? ` · alias <span class="mono" style="color:var(--ink-2)">${escapeHtml(alias)}</span>` : ""}</div>
+        </div>
+        ${loaded
+          ? `<span class="state-pill" style="padding:3px 8px;background:var(--green-soft);color:var(--green-deep);border-radius:4px;font-size:10px;font-weight:700;letter-spacing:0.04em;text-transform:uppercase;align-self:center">loaded</span>`
+          : `<span style="padding:3px 8px;background:var(--ground);color:var(--ink-3);border-radius:4px;font-size:10px;font-weight:600;letter-spacing:0.04em;text-transform:uppercase;align-self:center">on disk</span>`}
+        ${loaded
+          ? `<button class="btn btn-xs btn-destructive" data-act="telemak-unload" data-cluster="${cid}" data-model="${escapeHtml(mod.name)}">${Icon.x}<span>Unload</span></button>`
+          : `<button class="btn btn-xs" data-act="telemak-load" data-cluster="${cid}" data-model="${escapeHtml(mod.name)}">${Icon.play || ""}<span>Load</span></button>`}
+        <span data-act="matrix-cell-trash" data-host="${escapeHtml(hosts[0]?.id || "")}" data-model="${escapeHtml(mod.name)}" style="cursor:pointer;color:var(--ink-2);display:inline-flex;align-items:center;padding:6px" title="Delete from disk">${Icon.trash}</span>
       </div>
     `;
-  }).join("");
+  };
   return `
     <div class="matrix-card" style="padding:24px">
-      <div style="display:flex;flex-direction:column;gap:12px">
+      <div style="display:flex;flex-direction:column;gap:14px">
         <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
           <span style="font-size:18px;font-weight:600;color:var(--ink)">${escapeHtml(name)}</span>
-          <span style="font-size:11px;padding:3px 8px;border-radius:4px;background:var(--blue-soft);color:var(--blue-deep);font-weight:600;letter-spacing:0.04em;text-transform:uppercase">telemak</span>
+          <span style="font-size:11px;padding:3px 8px;border-radius:4px;background:var(--amber-soft);color:var(--amber-deep);font-weight:600;letter-spacing:0.04em;text-transform:uppercase">telemak</span>
           ${reachable
             ? `<span style="font-size:11px;color:var(--green-deep);font-weight:600">● reachable</span>`
             : `<span style="font-size:11px;color:var(--rust);font-weight:600">● unreachable</span>`}
@@ -2827,22 +2862,30 @@ function renderTelemakModelsCard(cid, cdef) {
             ? `<span style="font-size:11px;color:var(--ink-2);padding:2px 8px;background:var(--ground);border-radius:4px;font-weight:600">${wiredUsed.toFixed(1)} / ${wiredTotal.toFixed(1)} GB wired</span>`
             : ""}
         </div>
-        <div style="font-size:12px;color:var(--ink-2)">
-          Telemak runs as a native Swift binary on a single Mac. Its model store is local — no rsync between hosts.
-          Use the Home tab to load or unload models.
+        <div style="display:flex;gap:14px;flex-wrap:wrap">
+          <div style="flex:1;min-width:260px;padding:12px 14px;background:var(--ground);border-radius:8px;display:flex;flex-direction:column;gap:6px">
+            <div style="font-size:11px;font-weight:600;color:var(--ink-2);letter-spacing:0.04em;text-transform:uppercase">Upstream</div>
+            <div class="mono" style="font-size:13px;color:var(--ink);overflow-wrap:anywhere">${escapeHtml(upstream || "—")}</div>
+          </div>
+          <div style="flex:1;min-width:260px;padding:12px 14px;background:var(--ground);border-radius:8px;display:flex;flex-direction:column;gap:6px">
+            <div style="font-size:11px;font-weight:600;color:var(--ink-2);letter-spacing:0.04em;text-transform:uppercase">Models directory</div>
+            <div class="mono" style="font-size:13px;color:var(--ink);overflow-wrap:anywhere">${escapeHtml(modelsDirs.join(", ") || "— (not configured in topology.yaml)")}</div>
+          </div>
         </div>
-        <div style="margin-top:8px;padding:12px 14px;background:var(--ground);border-radius:8px;display:flex;flex-direction:column;gap:6px">
-          <div style="font-size:11px;font-weight:600;color:var(--ink-2);letter-spacing:0.04em;text-transform:uppercase">Upstream</div>
-          <div class="mono" style="font-size:13px;color:var(--ink)">${escapeHtml(upstream || "—")}</div>
-        </div>
-        <div style="padding:12px 14px;background:var(--ground);border-radius:8px;display:flex;flex-direction:column;gap:6px">
-          <div style="font-size:11px;font-weight:600;color:var(--ink-2);letter-spacing:0.04em;text-transform:uppercase">Currently loaded (${modelsLoaded.length})</div>
-          ${modelsLoaded.length > 0
-            ? `<div style="display:flex;flex-direction:column;gap:6px">${rows}</div>`
-            : `<div style="font-size:13px;color:var(--ink-2);font-style:italic">No model loaded — open the Home tab and click Load.</div>`}
+        <div style="padding:0;background:transparent;display:flex;flex-direction:column;gap:6px">
+          <div style="display:flex;align-items:center;justify-content:space-between;padding:0 4px">
+            <div style="font-size:11px;font-weight:600;color:var(--ink-2);letter-spacing:0.04em;text-transform:uppercase">Models — ${inventory.length} on disk, ${modelsLoaded.length} loaded</div>
+            ${hosts.length === 0
+              ? `<span style="font-size:11px;color:var(--ink-3)">Click Refresh in the matrix tab to probe this host</span>`
+              : ""}
+          </div>
+          ${inventory.length > 0
+            ? `<div style="display:flex;flex-direction:column;gap:6px">${inventory.map(rowFor).join("")}</div>`
+            : `<div class="empty-state" style="margin:0">No models found on disk for this host. Download one below.</div>`}
         </div>
       </div>
     </div>
+    <div style="margin-top:24px">${renderHFDownload(cid)}</div>
   `;
 }
 
@@ -5414,6 +5457,26 @@ async function handleAct(e) {
     } finally {
       state.busy_telemak_load[cid] = false;
       render();
+    }
+    return;
+  }
+  if (act === "telemak-load") {
+    // One-click Load from the Models matrix row (Settings → Models).
+    // Same upstream POST as telemak-load-submit, but the model id is
+    // already known (it's the row the operator clicked on) — no form.
+    const cid = el.dataset.cluster;
+    const model = el.dataset.model;
+    if (!cid || !model) return;
+    try {
+      const r = await fetch(`/admin/clusters/${encodeURIComponent(cid)}/load`, {
+        method: "POST", headers: { "content-type": "application/json" },
+        body: JSON.stringify({ model }),
+      });
+      if (!r.ok) { const t = await r.text(); throw new Error(t.slice(0, 300)); }
+      toast(`Loading ${model} on ${cid}…`, "ok");
+      await refreshAll();
+    } catch (err) {
+      toast(`Load failed: ${err.message}`, "err");
     }
     return;
   }
