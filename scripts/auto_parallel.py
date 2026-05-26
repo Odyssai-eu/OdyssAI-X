@@ -24,8 +24,15 @@ from mlx_lm.models.base import (
 from mlx_lm.models.cache import ArraysCache, KVCache
 from mlx_lm.models.deepseek_v3 import DeepseekV3MLP
 from mlx_lm.models.deepseek_v3 import Model as DeepseekV3Model
-from mlx_lm.models.deepseek_v4 import DeepseekV4MoE, V4Attention
-from mlx_lm.models.deepseek_v4 import Model as DeepseekV4Model
+try:
+    from mlx_lm.models.deepseek_v4 import DeepseekV4MoE, V4Attention
+    from mlx_lm.models.deepseek_v4 import Model as DeepseekV4Model
+    _HAS_DEEPSEEK_V4 = True
+except ImportError:
+    DeepseekV4MoE = None  # type: ignore[assignment,misc]
+    V4Attention = None    # type: ignore[assignment,misc]
+    DeepseekV4Model = None  # type: ignore[assignment,misc]
+    _HAS_DEEPSEEK_V4 = False
 from mlx_lm.models.deepseek_v32 import DeepseekV32MLP
 from mlx_lm.models.deepseek_v32 import Model as DeepseekV32Model
 from mlx_lm.models.gemma4 import Model as Gemma4Model
@@ -409,7 +416,7 @@ def patch_pipeline_model(model: _ModelT, group: mx.distributed.Group) -> _ModelT
     call_signature = signature(original_call)  # type :ignore
 
     def patched_call(
-        self: T,
+        self: object,
         *args: object,
         **kwargs: object,
     ) -> mx.array:
@@ -438,7 +445,7 @@ def patch_tensor_model(model: _ModelT) -> _ModelT:
     call_signature = signature(original_call)
 
     def patched_call(
-        self: T,
+        self: object,
         *args: object,
         **kwargs: object,
     ) -> mx.array:
@@ -520,7 +527,7 @@ def tensor_auto_parallel(
             all_to_sharded_linear_in_place,
             sharded_to_all_linear_in_place,
         )
-    elif isinstance(model, DeepseekV4Model):
+    elif DeepseekV4Model is not None and isinstance(model, DeepseekV4Model):
         tensor_parallel_sharding_strategy = DeepseekV4ShardingStrategy(
             group,
             all_to_sharded_linear,
@@ -667,13 +674,13 @@ def _set_layers(model: nn.Module, layers: list[_LayerCallable]) -> None:
         # Update DeepSeek V3 specific parameters when layers are shrunk
         if isinstance(
             model,
-            (
+            tuple(m for m in (
                 DeepseekV3Model,
                 DeepseekV32Model,
                 DeepseekV4Model,
                 Glm4MoeModel,
                 KimiK25Model,
-            ),
+            ) if m is not None),
         ) and hasattr(inner_model_instance, "num_layers"):
             logger.info(
                 f"Setting num_layers to {len(layers)} for model {model.model.__class__.__name__}"
