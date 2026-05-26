@@ -7188,6 +7188,10 @@ async def admin_cluster_get(cluster_id: str):
         "nodes": cd.get("nodes", []),
         "max_nodes": effective_max,
         "models_dir": models_dir_for(cluster_id),
+        # upstream is meaningful for kind=telemak (http-proxy passthrough);
+        # exposing it here lets the dashboard editor pre-fill the form
+        # without an extra status fetch.
+        "upstream": cd.get("upstream"),
         "fallback": cd.get("fallback") or None,
         "enabled": _cluster_enabled(cluster_id),
         "capacity_by_nodes": capacity_by_nodes,

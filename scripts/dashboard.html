@@ -1900,8 +1900,8 @@ function hasDraftChanges(id) {
   if (!draft) return false;
   const def = clusterDef(id);
   if (!def) return false;
-  return JSON.stringify({ name: draft.name, kind: draft.kind, backend: draft.backend, nodes: draft.nodes, upstream: draft.upstream })
-       !== JSON.stringify({ name: def.name, kind: def.kind, backend: def.backend, nodes: def.nodes, upstream: def.upstream });
+  return JSON.stringify({ name: draft.name, kind: draft.kind, backend: draft.backend, nodes: draft.nodes, upstream: draft.upstream, models_dir: draft.models_dir })
+       !== JSON.stringify({ name: def.name, kind: def.kind, backend: def.backend, nodes: def.nodes, upstream: def.upstream, models_dir: def.models_dir });
 }
 
 function rdmaLabelForHost(hostId, peerIds) {
@@ -1975,6 +1975,10 @@ function renderTelemakEditorBody(id, draft, cfg, poolLoaded) {
       <div class="field">
         <div class="field-label">SSH target <span style="font-weight:400;color:var(--ink-3)">(for health probes — same Mac)</span></div>
         <input class="ce-input mono" ${poolLoaded?"disabled":""} data-act="cluster-edit-telemak-ssh" data-cluster="${id}" value="${escapeHtml(node.ssh || "")}" placeholder="admin@192.168.1.50"/>
+      </div>
+      <div class="field">
+        <div class="field-label">Models directory <span style="font-weight:400;color:var(--ink-3)">(where Telemak stores models on this Mac — used for inventory display and HF download destination)</span></div>
+        <input class="ce-input mono" data-act="cluster-edit-telemak-models-dir" data-cluster="${id}" value="${escapeHtml(draft.models_dir || "")}" placeholder="/Volumes/models/odysseus"/>
       </div>
       <div style="font-size:11px;color:var(--ink-2);background:var(--ink-soft,#f5f5f5);padding:10px 12px;border-radius:6px;margin-top:4px">
         Telemak runs as a native Swift binary on a single Mac. Odysseus only proxies HTTP — no runner spawning, no pipeline/tensor parallel, no RDMA wiring.
@@ -2812,7 +2816,14 @@ function renderTelemakModelsCard(cid, cdef) {
   // multi-mac telemak fleet) and aggregate.
   const cdefNodes = cdef?.nodes || [];
   const hostIds = cdefNodes.map(n => n.host).filter(Boolean);
-  const modelsDirs = Array.from(new Set(cdefNodes.map(n => n.models_dir).filter(Boolean)));
+  // models_dir can be set at the cluster level (preferred for Telemak — single
+  // editable field in Settings → Clusters → Telemak) or per-node (legacy /
+  // multi-node telemak fleets). Cluster-level wins; per-node fills in only if
+  // cluster-level isn't set.
+  const clusterModelsDir = (cdef?.models_dir || "").trim();
+  const modelsDirs = clusterModelsDir
+    ? [clusterModelsDir]
+    : Array.from(new Set(cdefNodes.map(n => n.models_dir).filter(Boolean)));
   const m = state.matrix;
   const allHosts = m?.hosts || [];
   const hosts = allHosts.filter(h => hostIds.includes(h.id));
@@ -2869,7 +2880,7 @@ function renderTelemakModelsCard(cid, cdef) {
           </div>
           <div style="flex:1;min-width:260px;padding:12px 14px;background:var(--ground);border-radius:8px;display:flex;flex-direction:column;gap:6px">
             <div style="font-size:11px;font-weight:600;color:var(--ink-2);letter-spacing:0.04em;text-transform:uppercase">Models directory</div>
-            <div class="mono" style="font-size:13px;color:var(--ink);overflow-wrap:anywhere">${escapeHtml(modelsDirs.join(", ") || "— (not configured in topology.yaml)")}</div>
+            <div class="mono" style="font-size:13px;color:var(--ink);overflow-wrap:anywhere">${escapeHtml(modelsDirs.join(", ") || "— (set it in Settings → Clusters → Telemak)")}</div>
           </div>
         </div>
         <div style="padding:0;background:transparent;display:flex;flex-direction:column;gap:6px">
@@ -4808,6 +4819,15 @@ async function handleAct(e) {
     if (e.type === "change") render();
     return;
   }
+  if (act === "cluster-edit-telemak-models-dir") {
+    const cid = el.dataset.cluster;
+    const d = ensureDraft(cid); if (!d) return;
+    // Cluster-level models_dir. Used by HF download destination and by
+    // the Telemak Models card to know where to look for inventory.
+    d.models_dir = (el.value || "").trim();
+    if (e.type === "change") render();
+    return;
+  }
   if (act === "cluster-set-master") {
     const cid = el.dataset.cluster;
     const idx = parseInt(el.dataset.idx);
@@ -4908,6 +4928,11 @@ async function handleAct(e) {
       // kind=telemak: include the http-proxy upstream URL.
       if (d.kind === "telemak" && d.upstream !== undefined) {
         body.upstream = d.upstream;
+      }
+      // models_dir is editable for all cluster kinds; backend persists via
+      // POST /admin/clusters/{id}/models-dir under the hood (same handler).
+      if (d.models_dir !== undefined) {
+        body.models_dir = d.models_dir;
       }
       const r = await fetch(`/admin/clusters/${encodeURIComponent(cid)}`, {
         method: "PUT", headers: { "content-type": "application/json" },
