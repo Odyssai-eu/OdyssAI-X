@@ -451,18 +451,21 @@ h1, h2, h3 { margin: 0; }
 
 .logs-pane {
   display: flex; flex-direction: column; gap: 4px;
-  padding: 16px 18px; background: var(--ink); border-radius: 10px;
+  padding: 16px 18px;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: 10px;
   height: 280px; overflow-y: auto;
 }
 .log-line { display: flex; flex-direction: row; align-items: baseline; gap: 14px; }
-.log-line .ts { font-family: var(--font-mono); font-size: 11px; color: var(--ink-2); min-width: 60px; flex-shrink: 0; line-height: 16px; }
+.log-line .ts { font-family: var(--font-mono); font-size: 11px; color: var(--ink-3); min-width: 60px; flex-shrink: 0; line-height: 16px; }
 .log-line .rank { font-family: var(--font-mono); font-size: 11px; font-weight: 600; min-width: 36px; flex-shrink: 0; line-height: 16px; }
-.log-line .rank.r0 { color: var(--blue); }
-.log-line .rank.r1 { color: #7C9EBF; }
-.log-line .rank.r2 { color: #A9C7A3; }
-.log-line .rank.r3 { color: #D4A53A; }
-.log-line .text { font-family: var(--font-mono); font-size: 12px; color: #E5E9EE; line-height: 16px; word-break: break-all; }
-.log-line .text.accent { color: var(--blue); }
+.log-line .rank.r0 { color: var(--blue-deep); }
+.log-line .rank.r1 { color: var(--green-deep); }
+.log-line .rank.r2 { color: var(--amber-deep); }
+.log-line .rank.r3 { color: var(--rust-deep); }
+.log-line .text { font-family: var(--font-mono); font-size: 12px; color: var(--ink); line-height: 16px; word-break: break-all; }
+.log-line .text.accent { color: var(--blue-deep); }
 
 /* HF download */
 .hf-form { display: flex; flex-direction: column; gap: 14px; }
@@ -729,12 +732,22 @@ h1, h2, h3 { margin: 0; }
   cursor: pointer;
 }
 .cluster-item.selected { border-color: var(--ink); box-shadow: 0 1px 0 rgba(14, 27, 42, 0.04); }
-.cluster-item .dot { width: 10px; height: 10px; border-radius: 5px; flex-shrink: 0; }
+/* Colour the dot + pill by cluster KIND (mlx-distributed / telemak / http-proxy),
+   not by cluster id. Keying off id meant arbitrary user-chosen names like 'main'
+   or 'argo' had no matching CSS rule → invisible dot + un-styled pill →
+   the user saw a big empty gap on the left of the cluster card. */
+.cluster-item .dot { width: 10px; height: 10px; border-radius: 5px; flex-shrink: 0; background: var(--ink-4); }
+.cluster-item .dot.mlx-distributed { background: var(--blue); }
+.cluster-item .dot.telemak { background: var(--amber); }
+.cluster-item .dot.http-proxy { background: var(--amber); }
 .cluster-item .dot.default { background: var(--blue); }
 .cluster-item .stack { display: flex; flex-direction: column; gap: 2px; flex: 1; min-width: 0; }
 .cluster-item .name-row { display: flex; flex-direction: row; align-items: center; gap: 8px; }
 .cluster-item .name { font-family: var(--font-display); font-size: 15px; font-weight: 600; color: var(--ink); letter-spacing: -0.01em; }
-.cluster-item .kind-pill { font-size: 10px; font-weight: 600; padding: 2px 6px; border-radius: 4px; letter-spacing: 0.04em; text-transform: uppercase; }
+.cluster-item .kind-pill { font-size: 10px; font-weight: 600; padding: 2px 6px; border-radius: 4px; letter-spacing: 0.04em; text-transform: uppercase; color: var(--ink-2); background: var(--ink-7); }
+.cluster-item .kind-pill.mlx-distributed { color: var(--blue-deep); background: var(--blue-soft); }
+.cluster-item .kind-pill.telemak { color: var(--amber-deep); background: var(--amber-soft); }
+.cluster-item .kind-pill.http-proxy { color: var(--amber-deep); background: var(--amber-soft); }
 .cluster-item .kind-pill.default { color: var(--blue-deep); background: var(--blue-soft); }
 .cluster-item .meta { font-family: var(--font-mono); font-size: 11px; color: var(--ink-2); }
 .add-cluster-btn {
@@ -753,7 +766,7 @@ h1, h2, h3 { margin: 0; }
 .editor-head .editing-pill { font-size: 11px; font-weight: 600; color: var(--ink-2); letter-spacing: 0.04em; padding: 3px 8px; background: var(--ground); border-radius: 4px; }
 .editor-head .sub { font-size: 12px; color: var(--ink-2); margin-top: 2px; }
 
-.editor-body { padding: 26px; display: flex; flex-direction: column; gap: 24px; }
+.editor-body { padding: 26px; display: flex; flex-direction: column; gap: 24px; flex: 1; overflow-y: auto; min-height: 0; }
 
 .field-row3 { display: flex; flex-direction: row; gap: 16px; }
 .field-row3 > .field { flex: 1; }
@@ -972,7 +985,12 @@ const state = {
     default_add_mode: "pipeline",
     default_add_use_ap: true,
     default_add_kv_q8: null,   // null = use server default
-    hf_repo: "", hf_token_saved: false,
+    hf_repo: "",
+    // HF token : persisted in localStorage under `odyssai.hf_token` so it
+    // survives reloads. Never sent to the server except inside an
+    // /admin/downloads POST body. The form shows a "saved" pip when a
+    // value is present locally; the input is masked.
+    hf_token_saved: !!(typeof localStorage !== "undefined" && localStorage.getItem("odyssai.hf_token")),
     ctest_cluster: "default", ctest_nodes: 2,
   },
 };
@@ -1250,6 +1268,33 @@ function escapeHtml(s) {
   if (s == null) return "";
   return String(s).replace(/[&<>"']/g, c => ({ '&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;' }[c]));
 }
+
+/**
+ * Derive a short pool alias from a model path.
+ *
+ * Examples:
+ *   'mlx-community/MiniMax-M2.7-8bit'                  → 'minimax'
+ *   'inferencerlabs/Qwen3.5-397B-A17B-MLX-9bit'        → 'qwen3.5'
+ *   'inferencerlabs/Qwen3-Coder-Next-MLX-9bit'         → 'qwen3'
+ *   'GLM-5.1-8bit'                                     → 'glm'
+ *   ''                                                  → ''
+ *
+ * Strips path prefix, then keeps leading letters + optional version
+ * digits (matches the model "family" without the size/quant suffix).
+ * Stops at the first dash / underscore so 'MiniMax-M2.7-8bit' becomes
+ * 'minimax', not 'minimax-m2.7-8bit'. The API validator requires
+ * /^[a-z0-9][a-z0-9_-]{0,30}$/ and refuses literal 'default'.
+ */
+function _aliasFromModel(modelPath) {
+  if (!modelPath) return "";
+  const base = String(modelPath).split("/").pop();
+  const m = base.match(/^[A-Za-z]+[\d.]*/);
+  let alias = (m ? m[0] : base).toLowerCase();
+  alias = alias.replace(/\.+$/, "");           // trim trailing dot
+  alias = alias.replace(/[^a-z0-9_-]/g, "");   // strip illegal chars
+  if (!alias || alias === "default") alias = "pool";
+  return alias.slice(0, 30);
+}
 function truncatePath(p, n) {
   if (!p) return "";
   if (p.length <= n) return p;
@@ -1296,6 +1341,19 @@ function clusterState(id) {
 function pickCluster(id) {
   state.selected_cluster = id;
   localStorage.setItem('odyssai-cluster', id);
+  // Sync the back-compat aliases that the cluster-card renderers read from
+  // (renderArgoCard reads `state.default`, etc.). Without this, the render
+  // below would show the PREVIOUS cluster's status until the next 5s poll
+  // tick — Sophie reported seeing the Telemak load form on the Argo tab
+  // for ~5s and vice versa. The polling refresh at line ~1136 keeps the
+  // same shape ; we just mirror it here for immediacy. Data is already
+  // cached from the prior poll, so no network round-trip needed.
+  const cached = (state.cluster_status || {})[id] || null;
+  state.default = cached;
+  state.default_models_dir = cached?.models_dir
+    || state.cluster_models_dir?.[id]
+    || "";
+  state.default_models = state.cluster_models?.[id] || [];
   // If the user is following Runner logs, switch them to the new cluster too —
   // keeps the bottom panels in sync with the top picker. If logs were stopped,
   // leave them stopped (don't auto-start).
@@ -1327,6 +1385,35 @@ function render() {
   // independent overflow.
   const settingsBody = document.querySelector('.settings-body');
   const savedSettingsScroll = settingsBody ? settingsBody.scrollTop : null;
+  // Generic scroll-preservation: any element marked with data-scroll-key
+  // has its scrollTop captured before render and restored after. Used for
+  // nested scrollable panels (cluster editor body, models matrix card)
+  // that the 5-second polling render would otherwise yank back to top.
+  const savedScrollKeys = {};
+  document.querySelectorAll('[data-scroll-key]').forEach(el => {
+    savedScrollKeys[el.dataset.scrollKey] = el.scrollTop;
+  });
+
+  // Preserve focus + cursor across the innerHTML wipe. Without this,
+  // typing in inputs whose handler calls render() (e.g. the load-form
+  // alias field) destroys the <input> on every keystroke, focus is
+  // lost, and the user can only type one character at a time before
+  // having to click back. Match the input by (data-act, name, type)
+  // tuple — id-less inputs are still uniquely identified by their
+  // action label inside a section. selectionStart/End preserve the
+  // cursor position so word-mid edits don't jump to the end.
+  const _focusActive = document.activeElement;
+  let savedFocus = null;
+  if (_focusActive && (_focusActive.tagName === "INPUT" || _focusActive.tagName === "TEXTAREA")
+      && _focusActive.dataset && _focusActive.dataset.act) {
+    savedFocus = {
+      act: _focusActive.dataset.act,
+      idx: _focusActive.dataset.idx || null,
+      field: _focusActive.dataset.field || null,
+      selStart: _focusActive.selectionStart,
+      selEnd: _focusActive.selectionEnd,
+    };
+  }
 
   $("root").innerHTML = `
     <div class="stage">
@@ -1336,7 +1423,6 @@ function render() {
         ${renderClusterCard()}
         ${renderActiveRuns()}
         ${renderRunnerLogs()}
-        ${renderHFDownload(state.selected_cluster)}
         ${renderRecentActivity()}
         ${renderFooter()}
       </div>
@@ -1344,6 +1430,24 @@ function render() {
     </div>
   `;
   attachHandlers();
+
+  // Restore focus + cursor in inputs after the innerHTML wipe. Without
+  // this, typing in any input whose change handler calls render() loses
+  // focus on every keystroke (the alias field on the load form was the
+  // observed case — see comment above the savedFocus capture).
+  if (savedFocus) {
+    let selector = `[data-act="${CSS.escape(savedFocus.act)}"]`;
+    if (savedFocus.idx !== null) selector += `[data-idx="${CSS.escape(savedFocus.idx)}"]`;
+    if (savedFocus.field !== null) selector += `[data-field="${CSS.escape(savedFocus.field)}"]`;
+    const target = document.querySelector(selector);
+    if (target && (target.tagName === "INPUT" || target.tagName === "TEXTAREA")) {
+      target.focus();
+      if (savedFocus.selStart !== null && savedFocus.selEnd !== null) {
+        try { target.setSelectionRange(savedFocus.selStart, savedFocus.selEnd); }
+        catch (e) { /* unsupported input types (number, email) silently no-op */ }
+      }
+    }
+  }
 
   const newPane = $("logs-pane");
   if (newPane) {
@@ -1360,10 +1464,22 @@ function render() {
   if (savedScrollY) {
     window.scrollTo(0, savedScrollY);
   }
-  if (savedSettingsScroll !== null) {
-    const sb = document.querySelector('.settings-body');
-    if (sb) sb.scrollTop = savedSettingsScroll;
-  }
+  // Restore in rAF so layout has computed scroll dimensions — without this,
+  // setting scrollTop on a freshly-created element with overflow:auto can be
+  // clamped to 0 if scrollHeight wasn't yet resolved.
+  const restoreAll = () => {
+    if (savedSettingsScroll !== null) {
+      const sb = document.querySelector('.settings-body');
+      if (sb) sb.scrollTop = savedSettingsScroll;
+    }
+    Object.entries(savedScrollKeys).forEach(([key, top]) => {
+      const el = document.querySelector(`[data-scroll-key="${key}"]`);
+      if (el) el.scrollTop = top;
+    });
+  };
+  // Sync (immediate) + async (post-layout) — covers both fast and slow cases.
+  restoreAll();
+  requestAnimationFrame(restoreAll);
 }
 
 // ─── Settings modal ────────────────────────────────────────────────
@@ -1693,19 +1809,73 @@ function renderSettingsClusters() {
         <div class="cap"><span>Configured clusters</span><span>${CLUSTERS.length}</span></div>
         ${CLUSTERS.map(c => `
           <div class="cluster-item ${sel===c.id?"selected":""}" data-act="settings-pick-cluster" data-v="${c.id}">
-            <div class="dot ${c.id}"></div>
+            <div class="dot ${escapeHtml(c.kind)}"></div>
             <div class="stack">
               <div class="name-row">
                 <div class="name">${c.name}</div>
-                <div class="kind-pill ${c.id}">${c.kind}</div>
+                <div class="kind-pill ${escapeHtml(c.kind)}">${c.kind}</div>
               </div>
               <div class="meta">${escapeHtml(summary(c.id))}</div>
             </div>
           </div>
         `).join("")}
         <button class="add-cluster-btn" data-act="settings-add-cluster">${Icon.plus}<span>Add cluster</span></button>
+        <button class="add-cluster-btn" data-act="settings-add-telemak" style="margin-top:4px">${Icon.plus}<span>Add Telemak</span></button>
       </div>
-      ${renderClusterEditor(sel)}
+      ${state.telemak_form?.open ? renderTelemakForm() : renderClusterEditor(sel)}
+    </div>
+  `;
+}
+
+// ── Add Telemak — simple form to register an http-proxy cluster ──────────
+// Telemak = native Swift single-Mac runtime, exposed via OpenAI-compat HTTP.
+// Odysseus only proxies — it doesn't spawn the runner. So the form just needs
+// (id, label, upstream URL, ssh_target for health probes).
+function renderTelemakForm() {
+  const f = state.telemak_form;
+  const slugOk = /^[a-z0-9][a-z0-9-]{0,40}$/.test(f.id || "");
+  const upstreamOk = /^https?:\/\/[^\s]+$/.test(f.upstream || "");
+  const sshOk = /^[^@\s]+@[^@\s:]+$/.test(f.ssh || "");
+  const allOk = slugOk && upstreamOk && sshOk && (f.label || "").trim().length > 0;
+  const err = f.error;
+  const busy = !!f.busy;
+  return `
+    <div class="cluster-editor">
+      <div class="editor-head">
+        <div class="head-left">
+          <div class="dot telemak"></div>
+          <h2>+ Add Telemak</h2>
+          <span class="kind-pill telemak" style="background:var(--blue-soft);color:var(--blue-deep)">telemak</span>
+        </div>
+        <div class="head-right">
+          <button class="btn btn-sm" data-act="telemak-cancel">Cancel</button>
+          <button class="btn btn-sm" style="background:var(--blue);color:white;border-color:var(--blue)" ${(!allOk||busy)?"disabled":""} data-act="telemak-create">${busy?"Adding…":"Add"}</button>
+        </div>
+      </div>
+      ${err ? `<div class="editor-error" style="margin:0 16px 12px;padding:10px 12px;background:#fff5f5;border:1px solid var(--rust);border-radius:6px;color:var(--rust);font-size:13px">${escapeHtml(err)}</div>` : ""}
+      <div class="editor-body">
+        <div style="display:grid;gap:14px;max-width:560px">
+          <div class="field">
+            <div class="field-label">Cluster ID <span style="font-weight:400;color:var(--ink-3)">(URL slug)</span></div>
+            <input class="ce-input mono" data-act="telemak-edit-id" value="${escapeHtml(f.id || "")}" placeholder="telemak-code"/>
+            <div style="font-size:11px;color:var(--ink-2);margin-top:4px">${slugOk ? '✓ valid' : 'lowercase letters, digits, hyphens — max 41 chars, must start alphanumeric'}</div>
+          </div>
+          <div class="field">
+            <div class="field-label">Display label</div>
+            <input class="ce-input" data-act="telemak-edit-label" value="${escapeHtml(f.label || "")}" placeholder="Telemak Code"/>
+          </div>
+          <div class="field">
+            <div class="field-label">Upstream URL <span style="font-weight:400;color:var(--ink-3)">(where the Telemak binary is listening)</span></div>
+            <input class="ce-input mono" data-act="telemak-edit-upstream" value="${escapeHtml(f.upstream || "")}" placeholder="http://192.168.1.50:8003"/>
+            <div style="font-size:11px;color:var(--ink-2);margin-top:4px">${upstreamOk ? '✓ valid' : 'must be http(s)://host:port'}</div>
+          </div>
+          <div class="field">
+            <div class="field-label">SSH target <span style="font-weight:400;color:var(--ink-3)">(for health probes — same Mac)</span></div>
+            <input class="ce-input mono" data-act="telemak-edit-ssh" value="${escapeHtml(f.ssh || "")}" placeholder="admin@192.168.1.50"/>
+            <div style="font-size:11px;color:var(--ink-2);margin-top:4px">${sshOk ? '✓ valid' : 'user@host'}</div>
+          </div>
+        </div>
+      </div>
     </div>
   `;
 }
@@ -1735,8 +1905,8 @@ function hasDraftChanges(id) {
   if (!draft) return false;
   const def = clusterDef(id);
   if (!def) return false;
-  return JSON.stringify({ name: draft.name, kind: draft.kind, backend: draft.backend, nodes: draft.nodes })
-       !== JSON.stringify({ name: def.name, kind: def.kind, backend: def.backend, nodes: def.nodes });
+  return JSON.stringify({ name: draft.name, kind: draft.kind, backend: draft.backend, nodes: draft.nodes, upstream: draft.upstream, models_dir: draft.models_dir })
+       !== JSON.stringify({ name: def.name, kind: def.kind, backend: def.backend, nodes: def.nodes, upstream: def.upstream, models_dir: def.models_dir });
 }
 
 function rdmaLabelForHost(hostId, peerIds) {
@@ -1777,6 +1947,7 @@ function renderClusterEditor(id) {
         </div>
         <div style="display:flex;align-items:center;gap:8px">
           <button class="btn btn-sm" data-act="cluster-toggle-enabled" data-cluster="${id}" title="${cfg.enabled === false ? 'Re-enable cluster' : 'Disable cluster (keeps config, refuses load, hidden from ribbon)'}" ${poolLoaded ? 'disabled style="opacity:0.5;cursor:not-allowed" title="Unload first"' : ''}>${cfg.enabled === false ? 'Enable' : 'Disable'}</button>
+          <button class="btn btn-sm" data-act="cluster-remove" data-cluster="${id}" style="color:var(--rust)" title="Remove this cluster">Remove</button>
           ${dirty ? `<button class="btn btn-sm" data-act="cluster-discard" data-cluster="${id}">Discard</button>` : ""}
           ${dirty ? `<button class="btn btn-sm" style="background:var(--blue);color:white;border-color:var(--blue)" ${saving?"disabled":""} data-act="cluster-save" data-cluster="${id}">${saving?"Saving…":"Save changes"}</button>` : ""}
         </div>
@@ -1784,40 +1955,78 @@ function renderClusterEditor(id) {
       ${cfg.enabled === false ? `<div style="margin:0 16px 12px;padding:8px 12px;background:var(--ink-soft, #f5f5f5);border-radius:6px;font-size:12px;color:var(--ink-2)">Cluster is <b>disabled</b> — it won't appear in the ribbon and load endpoints refuse. Click <b>Enable</b> to bring it back.</div>` : ""}
       ${err ? `<div class="editor-error" style="margin:0 16px 12px;padding:10px 12px;background:#fff5f5;border:1px solid var(--rust);border-radius:6px;color:var(--rust);font-size:13px">${escapeHtml(err)}</div>` : ""}
       ${poolLoaded ? `<div style="margin:0 16px 12px;padding:8px 12px;background:var(--blue-soft);border-radius:6px;font-size:12px;color:var(--ink-2)">Pool is loaded — topology fields are locked. Unload first to edit nodes/kind/backend.</div>` : ""}
-      <div class="editor-body">
-        <div class="field-row3">
-          <div class="field">
-            <div class="field-label">Cluster name</div>
-            <input class="ce-input" data-act="cluster-edit-name" data-cluster="${id}" value="${escapeHtml(draft.name || "")}" placeholder="My cluster"/>
-          </div>
-          <div class="field">
-            <div class="field-label">Kind</div>
-            <select class="ce-input" ${poolLoaded?"disabled":""} data-act="cluster-edit-kind" data-cluster="${id}">
-              ${kindOpts.map(k => `<option value="${k}" ${k===draft.kind?"selected":""}>${k}</option>`).join("")}
-            </select>
-          </div>
-          <div class="field">
-            <div class="field-label">Backend</div>
-            <select class="ce-input mono" ${poolLoaded?"disabled":""} data-act="cluster-edit-backend" data-cluster="${id}">
-              ${backendOpts.map(b => `<option value="${b.v}" ${b.v===draft.backend?"selected":""}>${b.label}</option>`).join("")}
-            </select>
-          </div>
-        </div>
-        <div>
-          <div style="display:flex;justify-content:space-between;align-items:center;padding-bottom:14px">
-            <div>
-              <div class="field-label">Member nodes</div>
-              <div style="font-size:12px;color:var(--ink-2);margin-top:2px">Order defines rank · master is rank 0 · exactly 1 master</div>
-            </div>
-            ${renderAddNodeControl(id, draft, poolLoaded)}
-          </div>
-          ${renderNodeTable(id, draft, poolLoaded)}
-        </div>
-        ${renderNodeManagement(id)}
-        ${renderSwapCard(id)}
-        ${renderEndpointPreview(id)}
+      <div class="editor-body" data-scroll-key="cluster-editor-${id}">
+        ${draft.kind === "telemak" ? renderTelemakEditorBody(id, draft, cfg, poolLoaded) : renderMlxClusterEditorBody(id, draft, cfg, poolLoaded, kindOpts, backendOpts)}
       </div>
     </div>
+  `;
+}
+
+// Editor body for kind=telemak: simple form (name + upstream URL + ssh).
+// No backend dropdown (locked to http-proxy), no node table (single-node),
+// no RDMA wiring (irrelevant for HTTP passthrough).
+function renderTelemakEditorBody(id, draft, cfg, poolLoaded) {
+  const node = (draft.nodes || [])[0] || {};
+  return `
+    <div style="display:grid;gap:14px;max-width:560px">
+      <div class="field">
+        <div class="field-label">Display label</div>
+        <input class="ce-input" data-act="cluster-edit-name" data-cluster="${id}" value="${escapeHtml(draft.name || "")}" placeholder="Telemak Code"/>
+      </div>
+      <div class="field">
+        <div class="field-label">Upstream URL <span style="font-weight:400;color:var(--ink-3)">(where the Telemak binary listens)</span></div>
+        <input class="ce-input mono" ${poolLoaded?"disabled":""} data-act="cluster-edit-upstream" data-cluster="${id}" value="${escapeHtml(draft.upstream || "")}" placeholder="http://192.168.1.50:8003"/>
+      </div>
+      <div class="field">
+        <div class="field-label">SSH target <span style="font-weight:400;color:var(--ink-3)">(for health probes — same Mac)</span></div>
+        <input class="ce-input mono" ${poolLoaded?"disabled":""} data-act="cluster-edit-telemak-ssh" data-cluster="${id}" value="${escapeHtml(node.ssh || "")}" placeholder="admin@192.168.1.50"/>
+      </div>
+      <div class="field">
+        <div class="field-label">Models directory <span style="font-weight:400;color:var(--ink-3)">(where Telemak stores models on this Mac — used for inventory display and HF download destination)</span></div>
+        <input class="ce-input mono" data-act="cluster-edit-telemak-models-dir" data-cluster="${id}" value="${escapeHtml(draft.models_dir || "")}" placeholder="/Volumes/models/odysseus"/>
+      </div>
+      <div style="font-size:11px;color:var(--ink-2);background:var(--ink-soft,#f5f5f5);padding:10px 12px;border-radius:6px;margin-top:4px">
+        Telemak runs as a native Swift binary on a single Mac. Odysseus only proxies HTTP — no runner spawning, no pipeline/tensor parallel, no RDMA wiring.
+        Use the Home tab to load a model on this cluster.
+      </div>
+    </div>
+  `;
+}
+
+// Original editor body — for kind=mlx-distributed (distributed via JACCL/ring).
+function renderMlxClusterEditorBody(id, draft, cfg, poolLoaded, kindOpts, backendOpts) {
+  return `
+    <div class="field-row3">
+      <div class="field">
+        <div class="field-label">Cluster name</div>
+        <input class="ce-input" data-act="cluster-edit-name" data-cluster="${id}" value="${escapeHtml(draft.name || "")}" placeholder="My cluster"/>
+      </div>
+      <div class="field">
+        <div class="field-label">Kind</div>
+        <select class="ce-input" ${poolLoaded?"disabled":""} data-act="cluster-edit-kind" data-cluster="${id}">
+          ${kindOpts.map(k => `<option value="${k}" ${k===draft.kind?"selected":""}>${k}</option>`).join("")}
+        </select>
+      </div>
+      <div class="field">
+        <div class="field-label">Backend</div>
+        <select class="ce-input mono" ${poolLoaded?"disabled":""} data-act="cluster-edit-backend" data-cluster="${id}">
+          ${backendOpts.map(b => `<option value="${b.v}" ${b.v===draft.backend?"selected":""}>${b.label}</option>`).join("")}
+        </select>
+      </div>
+    </div>
+    <div>
+      <div style="display:flex;justify-content:space-between;align-items:center;padding-bottom:14px">
+        <div>
+          <div class="field-label">Member nodes</div>
+          <div style="font-size:12px;color:var(--ink-2);margin-top:2px">Order defines rank · master is rank 0 · exactly 1 master</div>
+        </div>
+        ${renderAddNodeControl(id, draft, poolLoaded)}
+      </div>
+      ${renderNodeTable(id, draft, poolLoaded)}
+    </div>
+    ${renderNodeManagement(id)}
+    ${renderSwapCard(id)}
+    ${renderEndpointPreview(id)}
   `;
 }
 
@@ -2338,10 +2547,37 @@ function renderSettingsModels() {
       </div>
       <button class="btn btn-sm" data-act="matrix-refresh">${Icon.refresh}<span>${loading?"Probing…":"Refresh"}</span></button>
     </div>
-    ${m ? renderMatrixCard(m, group) : (loading ? `<div class="empty-state">Probing 6 hosts via SSH… (~10 s)</div>` : `<div class="empty-state">Click <b>Refresh</b> to probe hosts.</div>`)}
-    ${renderActiveSyncJobs()}
-    ${state.sync_picker?.open ? renderSyncPicker() : ""}
+    <div data-scroll-key="models-matrix-content">
+      ${m ? renderMatrixCard(m, group) : (loading ? `<div class="empty-state">Probing 6 hosts via SSH… (~10 s)</div>` : `<div class="empty-state">Click <b>Refresh</b> to probe hosts.</div>`)}
+      ${renderActiveSyncJobs()}
+      ${state.sync_picker?.open ? renderSyncPicker() : ""}
+      ${renderSettingsHFDownload(group)}
+    </div>
   `;
+}
+
+// HF download UI — moved here from the Home dashboard (where it didn't belong).
+// Targets follow the selected Models matrix group: if a real cluster is
+// selected, download to that cluster's nodes.
+//
+// For kind=telemak clusters, the HF download form is already rendered
+// inside renderTelemakModelsCard so the operator sees it next to the
+// inventory + the resolved models_dir. Returning empty here avoids
+// double-rendering.
+function renderSettingsHFDownload(group) {
+  if (!group || group === "all") {
+    return `
+      <div style="margin-top:24px;padding:14px 16px;background:var(--ground);border-radius:10px;font-size:12px;color:var(--ink-2)">
+        Pick a cluster above to download a Hugging Face model to its nodes.
+      </div>
+    `;
+  }
+  const cdef = state.cluster_defs?.[group];
+  if (cdef?.kind === "telemak") {
+    // Already rendered inside renderTelemakModelsCard.
+    return "";
+  }
+  return `<div style="margin-top:24px">${renderHFDownload(group)}</div>`;
 }
 
 function renderActiveSyncJobs() {
@@ -2524,6 +2760,17 @@ function renderSyncPicker() {
 }
 
 function renderMatrixCard(m, group) {
+  // kind=telemak clusters don't have SSH-accessible nodes in the rsync sense.
+  // The "node" is an HTTP endpoint with its own model store. Render a
+  // dedicated view that lists the models loaded on the upstream Telemak,
+  // sourced from /admin/clusters/<id>/status (already fetched into
+  // state.cluster_status).
+  if (group && group !== "all") {
+    const cdef = state.cluster_defs?.[group];
+    if (cdef?.kind === "telemak") {
+      return renderTelemakModelsCard(group, cdef);
+    }
+  }
   const allHosts = m.hosts || [];
   const groupHostIds = matrixGroupHostIds(group);
   const hosts = groupHostIds ? allHosts.filter(h => groupHostIds.includes(h.id)) : allHosts;
@@ -2547,6 +2794,121 @@ function renderMatrixCard(m, group) {
       </div>
       ${models.length === 0 ? `<div class="empty-state">No models present on these hosts.</div>` : models.map(mod => renderMatrixRow(mod, hosts)).join("")}
     </div>
+  `;
+}
+
+// Dedicated view for kind=telemak clusters in the Models matrix tab.
+// Telemak runs on a single Mac with a local model store. The matrix
+// inventory is the standard `/admin/sync/matrix` filtered to the
+// telemak host. Per-model rows show size + loaded badge + load/unload
+// (no sync/delete-from-host since there's only one host). HF download
+// is enabled and lands in the host's configured `models_dir` (resolved
+// from topology.yaml — the dashboard surfaces the resolved path above
+// the form so the operator sees where the file is about to land).
+function renderTelemakModelsCard(cid, cdef) {
+  const status = state.cluster_status?.[cid];
+  const modelsLoaded = Array.isArray(status?.models_loaded)
+    ? status.models_loaded.filter(Boolean)
+    : (status?.model ? [status.model] : []);
+  const upstream = cdef?.upstream || status?.upstream || "";
+  const reachable = status?.upstream_reachable !== false;
+  const name = CLUSTERS.find(c => c.id === cid)?.name || cid;
+  const wiredUsed = (typeof status?.wired_memory_used_gb === "number") ? status.wired_memory_used_gb : null;
+  const wiredFree = (typeof status?.wired_memory_free_gb === "number") ? status.wired_memory_free_gb : null;
+  const wiredTotal = (wiredUsed != null && wiredFree != null) ? (wiredUsed + wiredFree) : null;
+  // Resolve the host(s) + models_dir for this telemak cluster from topology.
+  // Telemak is single-host by design, but we tolerate >1 (operator-defined
+  // multi-mac telemak fleet) and aggregate.
+  const cdefNodes = cdef?.nodes || [];
+  const hostIds = cdefNodes.map(n => n.host).filter(Boolean);
+  const cdefSshs = cdefNodes.map(n => (n.ssh || "").trim()).filter(Boolean);
+  // models_dir can be set at the cluster level (preferred for Telemak — single
+  // editable field in Settings → Clusters → Telemak) or per-node (legacy /
+  // multi-node telemak fleets). Cluster-level wins; per-node fills in only if
+  // cluster-level isn't set.
+  const clusterModelsDir = (cdef?.models_dir || "").trim();
+  const modelsDirs = clusterModelsDir
+    ? [clusterModelsDir]
+    : Array.from(new Set(cdefNodes.map(n => n.models_dir).filter(Boolean)));
+  const m = state.matrix;
+  const allHosts = m?.hosts || [];
+  // Match by host id OR by SSH target. SSH is the authoritative identifier
+  // for Telemak: topology.yaml may still list the legacy cluster (e.g.
+  // `telemak-max64` with host id `telemak`) while cluster-config.json has
+  // a freshly UI-added entry (`telemak-64` with host id `telemak-64`).
+  // Both point at the same Mac via the same admin@<ip> SSH, so SSH match
+  // catches the legacy/new id drift without forcing a topology rewrite.
+  const hosts = allHosts.filter(h => hostIds.includes(h.id) || cdefSshs.includes((h.ssh || "").trim()));
+  // Models with presence on at least one telemak host, loaded-first then alpha.
+  const inventory = (m?.models || [])
+    .filter(mod => hosts.some(h => mod.presence?.[h.id]))
+    .map(mod => ({
+      ...mod,
+      _loaded: modelsLoaded.includes(mod.name)
+        || modelsLoaded.some(id => id.endsWith("/" + mod.name)),
+    }))
+    .sort((a, b) => {
+      if (a._loaded !== b._loaded) return a._loaded ? -1 : 1;
+      return a.name.localeCompare(b.name);
+    });
+  const rowFor = (mod) => {
+    const presentSize = hosts.reduce((acc, h) => acc + (mod.presence?.[h.id] || 0), 0);
+    const loaded = mod._loaded;
+    const short = (mod.name.split("/").pop() || mod.name).toLowerCase();
+    const alias = modelsLoaded.length <= 1 ? cid : `${cid}:${short}`;
+    return `
+      <div class="matrix-row" style="grid-template-columns:1fr auto auto auto;gap:14px;padding:10px 14px">
+        <div class="mc-model" style="padding:0;min-width:0">
+          <div class="name" style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${escapeHtml(mod.name)}</div>
+          <div class="meta">${fmtBytes(presentSize)}${loaded ? ` · alias <span class="mono" style="color:var(--ink-2)">${escapeHtml(alias)}</span>` : ""}</div>
+        </div>
+        ${loaded
+          ? `<span class="state-pill" style="padding:3px 8px;background:var(--green-soft);color:var(--green-deep);border-radius:4px;font-size:10px;font-weight:700;letter-spacing:0.04em;text-transform:uppercase;align-self:center">loaded</span>`
+          : `<span style="padding:3px 8px;background:var(--ground);color:var(--ink-3);border-radius:4px;font-size:10px;font-weight:600;letter-spacing:0.04em;text-transform:uppercase;align-self:center">on disk</span>`}
+        ${loaded
+          ? `<button class="btn btn-xs btn-destructive" data-act="telemak-unload" data-cluster="${cid}" data-model="${escapeHtml(mod.name)}">${Icon.x}<span>Unload</span></button>`
+          : `<button class="btn btn-xs" data-act="telemak-load" data-cluster="${cid}" data-model="${escapeHtml(mod.name)}">${Icon.play || ""}<span>Load</span></button>`}
+        <span data-act="matrix-cell-trash" data-host="${escapeHtml(hosts[0]?.id || "")}" data-model="${escapeHtml(mod.name)}" style="cursor:pointer;color:var(--ink-2);display:inline-flex;align-items:center;padding:6px" title="Delete from disk">${Icon.trash}</span>
+      </div>
+    `;
+  };
+  return `
+    <div class="matrix-card" style="padding:24px">
+      <div style="display:flex;flex-direction:column;gap:14px">
+        <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
+          <span style="font-size:18px;font-weight:600;color:var(--ink)">${escapeHtml(name)}</span>
+          <span style="font-size:11px;padding:3px 8px;border-radius:4px;background:var(--amber-soft);color:var(--amber-deep);font-weight:600;letter-spacing:0.04em;text-transform:uppercase">telemak</span>
+          ${reachable
+            ? `<span style="font-size:11px;color:var(--green-deep);font-weight:600">● reachable</span>`
+            : `<span style="font-size:11px;color:var(--rust);font-weight:600">● unreachable</span>`}
+          ${(wiredUsed != null && wiredTotal != null)
+            ? `<span style="font-size:11px;color:var(--ink-2);padding:2px 8px;background:var(--ground);border-radius:4px;font-weight:600">${wiredUsed.toFixed(1)} / ${wiredTotal.toFixed(1)} GB wired</span>`
+            : ""}
+        </div>
+        <div style="display:flex;gap:14px;flex-wrap:wrap">
+          <div style="flex:1;min-width:260px;padding:12px 14px;background:var(--ground);border-radius:8px;display:flex;flex-direction:column;gap:6px">
+            <div style="font-size:11px;font-weight:600;color:var(--ink-2);letter-spacing:0.04em;text-transform:uppercase">Upstream</div>
+            <div class="mono" style="font-size:13px;color:var(--ink);overflow-wrap:anywhere">${escapeHtml(upstream || "—")}</div>
+          </div>
+          <div style="flex:1;min-width:260px;padding:12px 14px;background:var(--ground);border-radius:8px;display:flex;flex-direction:column;gap:6px">
+            <div style="font-size:11px;font-weight:600;color:var(--ink-2);letter-spacing:0.04em;text-transform:uppercase">Models directory</div>
+            <div class="mono" style="font-size:13px;color:var(--ink);overflow-wrap:anywhere">${escapeHtml(modelsDirs.join(", ") || "— (set it in Settings → Clusters → Telemak)")}</div>
+          </div>
+        </div>
+        <div style="padding:0;background:transparent;display:flex;flex-direction:column;gap:6px">
+          <div style="display:flex;align-items:center;justify-content:space-between;padding:0 4px">
+            <div style="font-size:11px;font-weight:600;color:var(--ink-2);letter-spacing:0.04em;text-transform:uppercase">Models — ${inventory.length} on disk, ${modelsLoaded.length} loaded</div>
+            ${hosts.length === 0
+              ? `<span style="font-size:11px;color:var(--ink-3)">Click Refresh in the matrix tab to probe this host</span>`
+              : ""}
+          </div>
+          ${inventory.length > 0
+            ? `<div style="display:flex;flex-direction:column;gap:6px">${inventory.map(rowFor).join("")}</div>`
+            : `<div class="empty-state" style="margin:0">No models found on disk for this host. Download one below.</div>`}
+        </div>
+      </div>
+    </div>
+    <div style="margin-top:24px">${renderHFDownload(cid)}</div>
   `;
 }
 
@@ -2700,6 +3062,11 @@ function renderArgoCard() {
   const cid = state.selected_cluster;
   const label = CLUSTERS.find(c => c.id === cid)?.name || cid || "Cluster";
   if (!a) return `<section class="cluster-card"><div class="section"><div class="section-stack"><h1 style="font-family:var(--font-display);font-size:32px;font-weight:700;color:var(--ink);letter-spacing:-0.025em">${escapeHtml(label)}</h1><div class="section-sub">Loading status…</div></div></div></section>`;
+  // kind=telemak: render the simplified single-node card (no pools, no mode,
+  // no nodes count, no RDMA matrix — just upstream status + load/unload).
+  if (a.kind === "telemak") {
+    return renderTelemakHomeCard(a, cid, label);
+  }
   return `
     <section class="cluster-card">
       ${renderArgoHeader(a)}
@@ -2709,6 +3076,282 @@ function renderArgoCard() {
       ${renderStatusSplit(a, cid)}
       ${renderLoadConfig(a)}
     </section>
+  `;
+}
+
+// ─── Telemak Home card — single-node, multi-model (V1.x). Renders an
+// N-row "Loaded models" list with per-row Unload + "+ Load another
+// model" inline form. Empty state collapses to the same simple Load
+// form as before so single-model users see no extra chrome.
+function renderTelemakHomeCard(a, cid, label) {
+  const upstream = a.upstream || "";
+  const reachable = a.upstream_reachable !== false;
+  const modelsLoaded = Array.isArray(a.models_loaded) ? a.models_loaded.filter(Boolean) : (a.model ? [a.model] : []);
+  const loaded = modelsLoaded.length > 0;
+  const wiredUsed = (typeof a.wired_memory_used_gb === "number") ? a.wired_memory_used_gb : null;
+  const wiredFree = (typeof a.wired_memory_free_gb === "number") ? a.wired_memory_free_gb : null;
+  const wiredTotal = (wiredUsed != null && wiredFree != null) ? (wiredUsed + wiredFree) : null;
+  const memWarn = (wiredFree != null && wiredFree < 5);
+  const statusPill = !reachable
+    ? `<div class="pill-status" style="background:#fff5f5;border-color:var(--rust);color:var(--rust);font-weight:600;padding:3px 10px;border-radius:6px;font-size:11px;letter-spacing:0.04em;text-transform:uppercase">Upstream unreachable</div>`
+    : loaded
+      ? `<div class="pill-status"><div class="pip"></div><div class="label">${modelsLoaded.length} loaded</div></div>`
+      : `<div class="pill-status idle"><div class="pip"></div><div class="label">Idle</div></div>`;
+  const memPill = (wiredUsed != null && wiredTotal != null)
+    ? `<div class="pill-status" style="background:${memWarn?'#fff5f5':'var(--ground)'};border-color:${memWarn?'var(--rust)':'var(--line)'};color:${memWarn?'var(--rust)':'var(--ink-2)'};font-weight:600;padding:3px 10px;border-radius:6px;font-size:11px;letter-spacing:0.04em;text-transform:uppercase">${wiredUsed.toFixed(1)} / ${wiredTotal.toFixed(1)} GB wired</div>`
+    : "";
+  const tpsPill = (typeof a.avg_tok_s_recent === "number" && a.avg_tok_s_recent > 0)
+    ? `<div class="pill-status" style="background:var(--ground);border-color:var(--line);color:var(--ink-2);font-weight:600;padding:3px 10px;border-radius:6px;font-size:11px;letter-spacing:0.04em;text-transform:uppercase">${a.avg_tok_s_recent.toFixed(1)} tok/s</div>`
+    : "";
+  const f = state.telemak_load_form?.[cid] || { model: "", open: false };
+  const formOpen = !!f.open;
+  const busy = !!state.busy_telemak_load?.[cid];
+
+  // Per-model details (kind + MTP status) come from _telemak_status which
+  // parses Telemak's /v1/models x_telemak block + the engine capability
+  // contract. Empty/missing details default to {kind:"llm", mtp_enabled:false}
+  // so older Telemak builds still render cleanly.
+  const details = a.models_details || {};
+  const kindBadge = (kind) => {
+    const k = (kind || "llm").toLowerCase();
+    const palette = k === "embedder" ? ["green-soft", "green-deep", "embed"]
+                  : k === "vlm"      ? ["amber-soft", "amber-deep", "vlm"]
+                  : k === "embedding"? ["green-soft", "green-deep", "embed"]
+                  : k === "vision"   ? ["amber-soft", "amber-deep", "vlm"]
+                  :                    ["blue-soft", "blue-deep", "chat"];
+    return `<span style="padding:2px 7px;background:var(--${palette[0]});color:var(--${palette[1]});border-radius:4px;font-size:10px;font-weight:700;letter-spacing:0.04em;text-transform:uppercase;white-space:nowrap">${palette[2]}</span>`;
+  };
+  const rows = modelsLoaded.map((id) => {
+    const short = (id.split("/").pop() || id).toLowerCase();
+    const alias = modelsLoaded.length === 1 ? cid : `${cid}:${short}`;
+    const d = details[id] || {};
+    const mtpLine = d.mtp_enabled
+      ? `<div style="font-family:var(--font-mono);font-size:11px;color:var(--ink-2);margin-top:2px">MTP: <span style="color:var(--blue-deep);font-weight:600">${escapeHtml(d.draft_model || "mtp_adapter")}</span>${d.num_draft_tokens ? ` · window ${d.num_draft_tokens}` : ""}</div>`
+      : "";
+    return `
+      <div style="display:flex;align-items:center;gap:12px;padding:8px 12px;background:var(--surface);border:1px solid var(--line);border-radius:6px;font-family:var(--font-mono);font-size:12px">
+        <div style="flex:1;min-width:0;display:flex;flex-direction:column;gap:0">
+          <div style="display:flex;align-items:center;gap:8px;min-width:0">
+            ${kindBadge(d.kind)}
+            <span style="font-weight:600;color:var(--ink);flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${escapeHtml(id)}</span>
+          </div>
+          ${mtpLine}
+        </div>
+        <span style="color:var(--ink-3);font-size:11px;white-space:nowrap">alias: <span style="color:var(--ink-2)">${escapeHtml(alias)}</span></span>
+        <button class="btn btn-xs btn-destructive" data-act="telemak-unload" data-cluster="${cid}" data-model="${escapeHtml(id)}" title="Unload ${escapeHtml(id)}">${Icon.x}<span>Unload</span></button>
+      </div>
+    `;
+  }).join("");
+
+  const loadFormBody = `
+    <div class="field">
+      <input class="ce-input mono" data-act="telemak-load-edit-model" data-cluster="${cid}" value="${escapeHtml(f.model || "")}" placeholder="inferencerlabs/Qwen3.6-35B-A3B-MLX-9bit" style="width:100%"/>
+      <div style="font-size:11px;color:var(--ink-2);margin-top:4px">Hugging Face repo id or path the Telemak binary can resolve via its model loader.</div>
+    </div>
+    <div style="display:flex;gap:8px">
+      <button class="btn btn-sm" style="background:var(--blue);color:white;border-color:var(--blue)" ${busy?"disabled":""} data-act="telemak-load-submit" data-cluster="${cid}">${busy?"Loading…":"Load"}</button>
+      ${loaded ? `<button class="btn btn-sm" data-act="telemak-load-cancel" data-cluster="${cid}">Cancel</button>` : ""}
+      ${f.error ? `<div style="color:var(--rust);font-size:12px;align-self:center">${escapeHtml(f.error)}</div>` : ""}
+    </div>
+  `;
+
+  return `
+    <section class="cluster-card">
+      <div class="section" style="border-bottom: 1px solid var(--line)">
+        <div class="section-head">
+          <div class="h1-cluster">
+            <div class="row">
+              <h1>${escapeHtml(label)}</h1>
+              ${statusPill}
+              ${memPill}
+              ${tpsPill}
+            </div>
+            <div class="topo">
+              <span class="text">telemak · native swift · single-node</span>
+              <span class="dot">·</span>
+              <span class="mono">${escapeHtml(upstream || "—")}</span>
+            </div>
+          </div>
+          <div class="quick-actions">
+            <button class="btn btn-sm" data-act="refresh">${Icon.refresh}<span>Refresh</span></button>
+            <button class="btn btn-sm" data-act="cluster-settings" data-cluster="${cid}">${Icon.settings}<span>Cluster settings</span></button>
+          </div>
+        </div>
+      </div>
+
+      ${!reachable ? `<div style="margin:16px;padding:12px 14px;background:#fff5f5;border:1px solid var(--rust);border-radius:6px;color:var(--rust);font-size:13px">
+        <b>Upstream unreachable.</b> Cannot reach <span class="mono">${escapeHtml(upstream)}</span>. Check that Telemak is running on that Mac : <span class="mono">ssh ${escapeHtml((a.topologies?.["1"]?.[0]?.ssh) || "")} 'curl -s http://localhost:8003/health'</span>
+      </div>` : ""}
+
+      ${loaded ? `
+        <div class="section">
+          <div class="section-head" style="margin-bottom:10px">
+            <div class="section-stack">
+              <div class="section-title">Loaded models (${modelsLoaded.length})</div>
+              <div class="section-sub">${modelsLoaded.length === 1
+                ? `Companion routes via <span class="mono">model: "${escapeHtml(cid)}"</span>`
+                : `Companion routes via <span class="mono">model: "${escapeHtml(cid)}:&lt;short&gt;"</span>`}</div>
+            </div>
+            ${reachable ? `<button class="btn btn-sm" data-act="telemak-load-toggle" data-cluster="${cid}">${Icon.plus}<span>${formOpen ? "Cancel" : "Load another model"}</span></button>` : ""}
+          </div>
+          <div style="display:flex;flex-direction:column;gap:6px">
+            ${rows}
+          </div>
+          ${formOpen ? `
+            <div style="display:grid;gap:10px;max-width:680px;margin-top:14px;padding:14px;background:var(--surface);border:1px dashed var(--line);border-radius:8px">
+              <div style="font-family:var(--font-display);font-weight:600;font-size:13px">Add another model</div>
+              ${loadFormBody}
+            </div>
+          ` : ""}
+        </div>
+      ` : ""}
+
+      ${reachable ? renderTelemakLoadConfig(cid, modelsLoaded) : ""}
+
+      ${!loaded && reachable ? `
+        <div class="section">
+          <div class="field-label" style="margin-bottom:8px">Or type an arbitrary model id</div>
+          <div style="display:grid;gap:10px;max-width:680px">
+            ${loadFormBody}
+          </div>
+        </div>
+      ` : ""}
+    </section>
+  `;
+}
+
+// ─── Telemak Load configuration ─ Argo-style rich swap form ───────────
+// Sits below the "Loaded models" list. Lets Sophie pick a target model
+// (and optionally an MTP draft) from the available-on-disk dropdown,
+// toggle KV cache Q8, and SWAP — i.e. unload current + load new in
+// one click. The existing "+ Load another model" button next to the
+// list keeps the STACK semantic (add in addition).
+//
+// Data source : `GET /admin/clusters/<cid>/models` (already exposed by
+// Odysseus, walks the upstream's models_dir via SSH). Cached in
+// state.telemak_available_models[cid] ; refreshed on the refresh
+// button click (telemak-config-refresh).
+// Fire-and-forget fetch helper for the Telemak Load configuration
+// dropdown. Cached in state.telemak_available_models[cid] ; called
+// lazily on first render of the rich form and on refresh button click.
+// Module-scope so both render() and handleAct() can reach it.
+async function fetchTelemakAvailable(cid) {
+  if (!state.telemak_available_models) state.telemak_available_models = {};
+  if (!state.fetching_telemak_models) state.fetching_telemak_models = {};
+  state.fetching_telemak_models[cid] = true;
+  try {
+    const r = await fetch(`/admin/clusters/${encodeURIComponent(cid)}/models`);
+    if (!r.ok) {
+      state.telemak_available_models[cid] = [];
+    } else {
+      const data = await r.json();
+      state.telemak_available_models[cid] = data.data || [];
+      if (data.models_dir) {
+        if (!state.cluster_models_dir) state.cluster_models_dir = {};
+        state.cluster_models_dir[cid] = data.models_dir;
+      }
+    }
+  } catch (err) {
+    state.telemak_available_models[cid] = [];
+  } finally {
+    state.fetching_telemak_models[cid] = false;
+    render();
+  }
+}
+
+function renderTelemakLoadConfig(cid, modelsLoaded) {
+  const cfg = state.telemak_load_config?.[cid] || {};
+  const available = state.telemak_available_models?.[cid];
+  const busy = !!state.busy_telemak_apply?.[cid];
+  const modelsDir = state.cluster_models_dir?.[cid] || "(default)";
+
+  if (available == null) {
+    // Lazy fetch on first render. Triggers a single network call ; the
+    // next render after fetchTelemakAvailable resolves will populate
+    // the dropdowns.
+    if (!state.fetching_telemak_models?.[cid]) {
+      state.fetching_telemak_models = state.fetching_telemak_models || {};
+      state.fetching_telemak_models[cid] = true;
+      fetchTelemakAvailable(cid);
+    }
+  }
+
+  const list = available || [];
+  // Heuristic split : MTP-suffixed model ids go in the MTP dropdown,
+  // the rest are chat-model candidates. Filter out anything already
+  // loaded (the swap dropdown picks something NEW).
+  const isMTP = (id) => /-MTP-MLX/i.test(id) || /mtp/i.test(id);
+  const loadedSet = new Set(modelsLoaded.map(m => m));
+  const chatCandidates = list.filter(m => !isMTP(m.id) && !loadedSet.has(m.id));
+  const mtpCandidates = list.filter(m => isMTP(m.id));
+
+  // Build the dropdown options. Show short name + size, value is the
+  // full path (which Telemak's loader accepts directly).
+  const buildOpts = (items, includeNone = false) => {
+    const opts = includeNone ? `<option value="">— none —</option>` : "";
+    return opts + items.map(m => {
+      const short = (m.id.split("/").pop() || m.id);
+      const sizeGB = m.size_bytes ? (m.size_bytes / 1024 / 1024 / 1024).toFixed(1) + " GB" : "";
+      const sel = (m.id === cfg.model || m.id === cfg.mtp) ? "selected" : "";
+      return `<option value="${escapeHtml(m.id)}" ${sel}>${escapeHtml(short)}${sizeGB ? ` — ${sizeGB}` : ""}</option>`;
+    }).join("");
+  };
+
+  const canApply = !busy && cfg.model && !loadedSet.has(cfg.model);
+  const helpText = available == null
+    ? `Discovering models on ${escapeHtml(modelsDir)}…`
+    : (chatCandidates.length === 0
+      ? `No swappable models found on ${escapeHtml(modelsDir)}.`
+      : (cfg.model ? `Will unload current + load <span class="mono">${escapeHtml((cfg.model.split("/").pop() || cfg.model))}</span>.` : `Pick a model from the dropdown to swap.`));
+
+  return `
+    <div class="section" style="border-top:1px solid var(--line)">
+      <div class="section-head" style="margin-bottom:10px">
+        <div class="section-stack">
+          <div class="section-title">Load configuration</div>
+          <div class="section-sub">Swap to a different model</div>
+        </div>
+        <button class="btn btn-sm" data-act="cluster-models-tab" data-cluster="${cid}" title="Open the Models tab for advanced management">${Icon.layers || ""}<span>Manage models →</span></button>
+      </div>
+      <div style="display:grid;grid-template-columns:1fr 2fr;gap:14px;max-width:920px">
+        <div>
+          <div class="field-label" style="margin-bottom:4px">Models directory</div>
+          <div style="display:flex;gap:6px;align-items:center">
+            <input class="ce-input mono" value="${escapeHtml(modelsDir)}" readonly style="flex:1;background:var(--ground);color:var(--ink-2)"/>
+            <button class="btn btn-xs" data-act="telemak-config-refresh" data-cluster="${cid}" title="Re-scan models directory">${Icon.refresh}</button>
+          </div>
+        </div>
+        <div>
+          <div class="field-label" style="margin-bottom:4px">Model</div>
+          <select class="ce-input mono" data-act="telemak-config-select-model" data-cluster="${cid}" style="width:100%">
+            <option value="">— pick a model —</option>
+            ${buildOpts(chatCandidates)}
+          </select>
+        </div>
+
+        <div>
+          <div class="field-label" style="margin-bottom:4px">Multi token prediction</div>
+          <div style="display:flex;gap:6px;align-items:center">
+            <select class="ce-input mono" data-act="telemak-config-select-mtp" data-cluster="${cid}" style="flex:1">
+              ${buildOpts(mtpCandidates, true)}
+            </select>
+            <button class="btn btn-xs" data-act="telemak-config-refresh" data-cluster="${cid}" title="Re-scan">${Icon.refresh}</button>
+          </div>
+          <div style="font-size:10px;color:var(--ink-3);margin-top:3px">Optional. Pairs an MTP draft for speculative decoding.</div>
+        </div>
+        <div style="display:flex;flex-direction:column;justify-content:space-between">
+          <div style="font-size:12px;color:var(--ink-2)">${helpText}</div>
+          <div style="display:flex;align-items:center;justify-content:flex-end;gap:14px">
+            <label style="display:flex;align-items:center;gap:6px;font-size:12px;color:var(--ink-2);cursor:pointer">
+              <input type="checkbox" data-act="telemak-config-toggle-kv-q8" data-cluster="${cid}" ${cfg.kv_q8 ? "checked" : ""}/>
+              KV cache Q8
+              <span style="color:var(--ink-3);font-size:11px">long contexts</span>
+            </label>
+            <button class="btn btn-sm" style="background:${canApply ? "var(--blue)" : "var(--ink-3)"};color:white;border-color:${canApply ? "var(--blue)" : "var(--ink-3)"}" ${canApply ? "" : "disabled"} data-act="telemak-config-apply" data-cluster="${cid}">${busy ? "Applying…" : "✓ Apply & reload"}</button>
+          </div>
+        </div>
+      </div>
+    </div>
   `;
 }
 
@@ -3694,6 +4337,10 @@ function computeArgoPresence(modelId) {
 function renderRunnerLogs() {
   const cluster = state.logs_cluster;
   const following = !!_logsES;
+  // Live cluster to follow when the user clicks Start. Prefer the cluster
+  // the dashboard is already focused on (state.default), so the button
+  // does the obvious thing on the active cluster without a select menu.
+  const targetCluster = state.default || cluster || "main";
   return `
     <div class="section">
       <div class="section-head logs-head">
@@ -3702,7 +4349,7 @@ function renderRunnerLogs() {
           <div class="pill-live"><div class="pip"></div><span class="label">${following ? "Live · SSE" : "Stopped"}</span></div>
         </div>
         <div style="display:flex;align-items:center;gap:8px">
-          
+          <button class="btn btn-xs" data-act="logs-follow" data-v="${targetCluster}" ${following?"disabled":""}>Start</button>
           <button class="btn btn-xs btn-destructive" data-act="logs-stop" ${following?"":"disabled"}>Stop</button>
         </div>
       </div>
@@ -3758,7 +4405,7 @@ function renderHFDownload(clusterId) {
         </div>
         <div>
           <div style="display:flex;align-items:center;justify-content:space-between;gap:14px;padding-bottom:8px">
-            <div class="field-label">${escapeHtml(cluster.charAt(0).toUpperCase()+cluster.slice(1))} nodes — pick which ones receive this model</div>
+            <div class="field-label">${escapeHtml(CLUSTERS.find(c => c.id === cluster)?.name || cluster)} nodes — pick which ones receive this model</div>
             <button class="btn btn-xs" data-act="hf-select-all" style="border:none;background:transparent">Select all</button>
           </div>
           <div class="target-chips">
@@ -3777,7 +4424,7 @@ function renderHFDownload(clusterId) {
           </div>
         </div>
         <div class="action-row">
-          <span class="hint">${Object.values(tgtState).filter(Boolean).length} of ${nodes.length} ${cluster} nodes selected · downloads run in parallel via <span class="mono">hf download</span></span>
+          <span class="hint">${Object.values(tgtState).filter(Boolean).length} of ${nodes.length} ${escapeHtml(CLUSTERS.find(c => c.id === cluster)?.name || cluster)} nodes selected · downloads run in parallel via <span class="mono">hf download</span></span>
           <button class="btn btn-dark" data-act="dl-start">${Icon.download}<span>Download to ${Object.values(tgtState).filter(Boolean).length} node${Object.values(tgtState).filter(Boolean).length!==1?"s":""}</span></button>
         </div>
       </div>
@@ -3787,10 +4434,26 @@ function renderHFDownload(clusterId) {
 }
 
 function clusterTargetNodes(cluster) {
+  // The HF download endpoint validates `targets[]` against HOSTS_REGISTRY,
+  // which is built from `topology.yaml` host ids. cluster-config.json (the
+  // UI-added clusters) may use different node host ids — e.g. Telemak's
+  // legacy topology entry `telemak-max64` has host id `telemak`, while
+  // the UI-added cluster `telemak-64` has node host id `telemak-64`. Both
+  // point at the same machine via the same SSH target.
+  //
+  // Resolve the cdef node to its matrix-side host id by SSH match (or by
+  // id when it already lines up) so the download POST carries the id the
+  // backend recognises. Without this, every download for a UI-added
+  // cluster errors with `unknown target <cluster-id>`.
+  const matrixHosts = state.matrix?.hosts || [];
   return clusterDefNodes(cluster).map((n, idx) => {
-    const h = hostTelemetry(n.host);
+    const nodeSsh = (n.ssh || "").trim();
+    const resolved = matrixHosts.find(h => h.id === n.host)
+                  || matrixHosts.find(h => (h.ssh || "").trim() === nodeSsh && nodeSsh);
+    const hostId = resolved?.id || n.host;
+    const h = hostTelemetry(hostId) || (resolved ? { label: resolved.ssh, free_bytes: resolved.free_bytes } : null);
     const free = h?.free_bytes ? `${(h.free_bytes / 1024**4).toFixed(1)} TB free` : "free space unknown";
-    return { rank: idx, host: n.host, ip: h?.label || n.host, free };
+    return { rank: idx, host: hostId, ip: h?.label || n.host, free };
   });
 }
 
@@ -4166,6 +4829,33 @@ async function handleAct(e) {
     d.backend = el.value;
     render(); return;
   }
+  if (act === "cluster-edit-upstream") {
+    const cid = el.dataset.cluster;
+    const d = ensureDraft(cid); if (!d) return;
+    d.upstream = (el.value || "").trim();
+    if (e.type === "change") render();
+    return;
+  }
+  if (act === "cluster-edit-telemak-ssh") {
+    const cid = el.dataset.cluster;
+    const d = ensureDraft(cid); if (!d) return;
+    // Telemak: single node, hand-edited ssh on the master entry.
+    if (!Array.isArray(d.nodes) || d.nodes.length === 0) {
+      d.nodes = [{host: cid, ssh: "", master: true}];
+    }
+    d.nodes[0].ssh = (el.value || "").trim();
+    if (e.type === "change") render();
+    return;
+  }
+  if (act === "cluster-edit-telemak-models-dir") {
+    const cid = el.dataset.cluster;
+    const d = ensureDraft(cid); if (!d) return;
+    // Cluster-level models_dir. Used by HF download destination and by
+    // the Telemak Models card to know where to look for inventory.
+    d.models_dir = (el.value || "").trim();
+    if (e.type === "change") render();
+    return;
+  }
   if (act === "cluster-set-master") {
     const cid = el.dataset.cluster;
     const idx = parseInt(el.dataset.idx);
@@ -4263,6 +4953,15 @@ async function handleAct(e) {
         // backend doesn't touch the persisted value. The dedicated
         // Enable/Disable button is the only path to flip it.
       };
+      // kind=telemak: include the http-proxy upstream URL.
+      if (d.kind === "telemak" && d.upstream !== undefined) {
+        body.upstream = d.upstream;
+      }
+      // models_dir is editable for all cluster kinds; backend persists via
+      // POST /admin/clusters/{id}/models-dir under the hood (same handler).
+      if (d.models_dir !== undefined) {
+        body.models_dir = d.models_dir;
+      }
       const r = await fetch(`/admin/clusters/${encodeURIComponent(cid)}`, {
         method: "PUT", headers: { "content-type": "application/json" },
         body: JSON.stringify(body),
@@ -4554,7 +5253,7 @@ async function handleAct(e) {
     if (!cid) return;
     if (!confirm(`Run the recovery ladder for ${cid}?\n\nThis will: cancel runs → stop pool → sweep orphan runners → verify wired memory → clear degraded flag.\n\nNo reboot needed — Macs stay up.`)) return;
     try {
-      const r = await postJson(`/admin/${encodeURIComponent(cid)}/reset`, {});
+      const r = await postJson(`/admin/clusters/${encodeURIComponent(cid)}/reset`, {});
       const ok = r.cleared === true;
       const ladder = (r.steps || []).map(s => `${s.ok ? "✓" : "✗"} ${s.name}`).join(" · ");
       if (ok) {
@@ -4702,6 +5401,304 @@ async function handleAct(e) {
   }
   if (act === "settings-pick-cluster") { state.settings_selected_cluster = v; render(); return; }
   if (act === "settings-add-cluster") { toast("Add cluster — editor wiring next iteration", "err"); return; }
+
+  // ── Add Telemak — register an http-proxy cluster from the dashboard ──
+  if (act === "settings-add-telemak") {
+    state.telemak_form = { open: true, id: "", label: "", upstream: "", ssh: "", error: null, busy: false };
+    render(); return;
+  }
+  if (act === "telemak-cancel") {
+    state.telemak_form = null;
+    render(); return;
+  }
+  if (act === "telemak-edit-id") {
+    if (!state.telemak_form) return;
+    state.telemak_form.id = (el.value || "").toLowerCase().replace(/[^a-z0-9-]/g, "");
+    state.telemak_form.error = null;
+    if (e.type === "change") render();
+    return;
+  }
+  if (act === "telemak-edit-label") {
+    if (!state.telemak_form) return;
+    state.telemak_form.label = el.value || "";
+    if (e.type === "change") render();
+    return;
+  }
+  if (act === "telemak-edit-upstream") {
+    if (!state.telemak_form) return;
+    state.telemak_form.upstream = (el.value || "").trim();
+    state.telemak_form.error = null;
+    if (e.type === "change") render();
+    return;
+  }
+  if (act === "telemak-edit-ssh") {
+    if (!state.telemak_form) return;
+    state.telemak_form.ssh = (el.value || "").trim();
+    if (e.type === "change") render();
+    return;
+  }
+  if (act === "telemak-create") {
+    const f = state.telemak_form;
+    if (!f) return;
+    f.busy = true; f.error = null;
+    render();
+    try {
+      const body = {
+        name: f.label.trim(),
+        kind: "telemak",
+        backend: "http-proxy",
+        upstream: f.upstream,
+        nodes: [{ host: f.id, ssh: f.ssh, master: true }],
+      };
+      const r = await fetch(`/admin/clusters/${encodeURIComponent(f.id)}`, {
+        method: "PUT", headers: { "content-type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      if (!r.ok) {
+        const t = await r.text();
+        throw new Error(t.slice(0, 300));
+      }
+      const newId = f.id;
+      state.telemak_form = null;
+      state.settings_selected_cluster = newId;
+      toast(`Telemak '${newId}' added`, "ok");
+      await refreshAll();
+    } catch (err) {
+      state.telemak_form.busy = false;
+      state.telemak_form.error = err.message || String(err);
+      toast(`Add failed: ${err.message}`, "err");
+      render();
+    }
+    return;
+  }
+
+  // ── Telemak Home : Load / Unload model ──────────────────────────────────
+  if (act === "telemak-load-edit-model") {
+    const cid = el.dataset.cluster;
+    if (!cid) return;
+    if (!state.telemak_load_form) state.telemak_load_form = {};
+    if (!state.telemak_load_form[cid]) state.telemak_load_form[cid] = {};
+    state.telemak_load_form[cid].model = el.value || "";
+    state.telemak_load_form[cid].error = null;
+    if (e.type === "change") render();
+    return;
+  }
+  if (act === "telemak-load-toggle") {
+    // Toggle the "+ Load another model" inline form on the Home card
+    // when one or more models are already loaded.
+    const cid = el.dataset.cluster;
+    if (!cid) return;
+    if (!state.telemak_load_form) state.telemak_load_form = {};
+    if (!state.telemak_load_form[cid]) state.telemak_load_form[cid] = {};
+    state.telemak_load_form[cid].open = !state.telemak_load_form[cid].open;
+    state.telemak_load_form[cid].error = null;
+    render();
+    return;
+  }
+  if (act === "telemak-load-cancel") {
+    const cid = el.dataset.cluster;
+    if (!cid) return;
+    if (state.telemak_load_form?.[cid]) {
+      state.telemak_load_form[cid].open = false;
+      state.telemak_load_form[cid].error = null;
+      render();
+    }
+    return;
+  }
+  if (act === "telemak-load-submit") {
+    const cid = el.dataset.cluster;
+    if (!cid) return;
+    const f = state.telemak_load_form?.[cid] || {};
+    const model = (f.model || "").trim();
+    if (!model) { toast("Enter a model id first", "err"); return; }
+    if (!state.busy_telemak_load) state.busy_telemak_load = {};
+    state.busy_telemak_load[cid] = true;
+    if (state.telemak_load_form) state.telemak_load_form[cid].error = null;
+    render();
+    try {
+      const r = await fetch(`/admin/clusters/${encodeURIComponent(cid)}/load`, {
+        method: "POST", headers: { "content-type": "application/json" },
+        body: JSON.stringify({ model }),
+      });
+      if (!r.ok) { const t = await r.text(); throw new Error(t.slice(0, 300)); }
+      toast(`Loading ${model} on ${cid}…`, "ok");
+      // Close the inline form on success so subsequent loads stay tidy.
+      if (state.telemak_load_form?.[cid]) {
+        state.telemak_load_form[cid].open = false;
+        state.telemak_load_form[cid].model = "";
+      }
+      await refreshAll();
+    } catch (err) {
+      if (state.telemak_load_form) state.telemak_load_form[cid].error = err.message;
+      toast(`Load failed: ${err.message}`, "err");
+    } finally {
+      state.busy_telemak_load[cid] = false;
+      render();
+    }
+    return;
+  }
+  if (act === "telemak-load") {
+    // One-click Load from the Models matrix row (Settings → Models).
+    // Same upstream POST as telemak-load-submit, but the model id is
+    // already known (it's the row the operator clicked on) — no form.
+    const cid = el.dataset.cluster;
+    const model = el.dataset.model;
+    if (!cid || !model) return;
+    try {
+      const r = await fetch(`/admin/clusters/${encodeURIComponent(cid)}/load`, {
+        method: "POST", headers: { "content-type": "application/json" },
+        body: JSON.stringify({ model }),
+      });
+      if (!r.ok) { const t = await r.text(); throw new Error(t.slice(0, 300)); }
+      toast(`Loading ${model} on ${cid}…`, "ok");
+      await refreshAll();
+    } catch (err) {
+      toast(`Load failed: ${err.message}`, "err");
+    }
+    return;
+  }
+  if (act === "telemak-unload") {
+    const cid = el.dataset.cluster;
+    if (!cid) return;
+    // Per-row Unload sends data-model="<full-hf-id>"; legacy header
+    // Unload (no row context) sends nothing and the server unloads all.
+    const model = el.dataset.model || null;
+    const what = model ? `model '${model}' on ${cid}` : `all models on ${cid}`;
+    if (!confirm(`Unload ${what} ?`)) return;
+    try {
+      const r = await fetch(`/admin/clusters/${encodeURIComponent(cid)}/unload`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(model ? { model } : {}),
+      });
+      if (!r.ok) { const t = await r.text(); throw new Error(t.slice(0, 300)); }
+      toast(model ? `Unloaded ${model} on ${cid}` : `Unloaded all on ${cid}`, "ok");
+      await refreshAll();
+    } catch (err) {
+      toast(`Unload failed: ${err.message}`, "err");
+    }
+    return;
+  }
+
+  // ── Telemak Load configuration (rich swap form) ─────────────────────
+  // Five tiny actions feed the swap dropdown on the Home card. The
+  // dropdown options come from the cached state.telemak_available_models
+  // which fetchTelemakAvailable populates on first render / on refresh.
+  if (act === "telemak-config-select-model") {
+    const cid = el.dataset.cluster;
+    if (!cid) return;
+    if (!state.telemak_load_config) state.telemak_load_config = {};
+    if (!state.telemak_load_config[cid]) state.telemak_load_config[cid] = {};
+    state.telemak_load_config[cid].model = el.value || "";
+    render();
+    return;
+  }
+  if (act === "telemak-config-select-mtp") {
+    const cid = el.dataset.cluster;
+    if (!cid) return;
+    if (!state.telemak_load_config) state.telemak_load_config = {};
+    if (!state.telemak_load_config[cid]) state.telemak_load_config[cid] = {};
+    state.telemak_load_config[cid].mtp = el.value || "";
+    render();
+    return;
+  }
+  if (act === "telemak-config-toggle-kv-q8") {
+    const cid = el.dataset.cluster;
+    if (!cid) return;
+    if (!state.telemak_load_config) state.telemak_load_config = {};
+    if (!state.telemak_load_config[cid]) state.telemak_load_config[cid] = {};
+    state.telemak_load_config[cid].kv_q8 = !!el.checked;
+    // Don't re-render here — the checkbox is uncontrolled visually.
+    return;
+  }
+  if (act === "telemak-config-refresh") {
+    const cid = el.dataset.cluster;
+    if (!cid) return;
+    if (state.telemak_available_models) state.telemak_available_models[cid] = null;
+    if (state.fetching_telemak_models) state.fetching_telemak_models[cid] = false;
+    await fetchTelemakAvailable(cid);
+    return;
+  }
+  if (act === "telemak-config-apply") {
+    const cid = el.dataset.cluster;
+    if (!cid) return;
+    const cfg = state.telemak_load_config?.[cid];
+    if (!cfg || !cfg.model) { toast("Pick a model first", "err"); return; }
+    if (!state.busy_telemak_apply) state.busy_telemak_apply = {};
+    state.busy_telemak_apply[cid] = true;
+    render();
+    try {
+      // Get the currently-loaded list to know what to unload first.
+      // We're doing a SWAP : unload everything currently loaded, then
+      // load the chosen target (+ optional MTP draft).
+      const status = state.cluster_status?.[cid];
+      const currentlyLoaded = Array.isArray(status?.models_loaded) ? status.models_loaded : (status?.model ? [status.model] : []);
+      for (const m of currentlyLoaded) {
+        const u = await fetch(`/admin/clusters/${encodeURIComponent(cid)}/unload`, {
+          method: "POST", headers: { "content-type": "application/json" },
+          body: JSON.stringify({ model: m }),
+        });
+        if (!u.ok) {
+          const t = await u.text();
+          throw new Error(`unload ${m} failed: ${t.slice(0, 200)}`);
+        }
+      }
+      // Then load the new target with optional draft. Telemak's
+      // /admin/load accepts `draft_model` (paired MTP) per V2 Unit 3.
+      const body = { model: cfg.model };
+      if (cfg.mtp) body.draft_model = cfg.mtp;
+      // KV cache Q8 toggle is captured in state but not yet wired to
+      // a Telemak per-load knob — leaving it as a visual affordance
+      // for V1.x parity with Argo. When Telemak exposes the setting
+      // in /admin/load, add `cache_quantization: 8` here.
+      const r = await fetch(`/admin/clusters/${encodeURIComponent(cid)}/load`, {
+        method: "POST", headers: { "content-type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      if (!r.ok) { const t = await r.text(); throw new Error(t.slice(0, 300)); }
+      const short = (cfg.model.split("/").pop() || cfg.model);
+      toast(`Swapped to ${short}${cfg.mtp ? " + MTP draft" : ""}…`, "ok");
+      await refreshAll();
+    } catch (err) {
+      toast(`Apply failed: ${err.message}`, "err");
+    } finally {
+      state.busy_telemak_apply[cid] = false;
+      render();
+    }
+    return;
+  }
+  if (act === "cluster-models-tab") {
+    // Jump to the Models tab — same affordance as Argo's
+    // "Manage models →" button at the top-right of its Load config.
+    state.view = "models";
+    render();
+    return;
+  }
+
+  // ── Remove a cluster — works for any kind (DELETE /admin/clusters/{id}) ──
+  if (act === "cluster-remove") {
+    const cid = el.dataset.cluster;
+    if (!cid) return;
+    const def = clusterDef(cid);
+    const niceName = def?.name || cid;
+    if (!confirm(`Remove cluster '${niceName}'?\n\nThis unloads any running model and hides the cluster from the dashboard. Topology.yaml-declared clusters become tombstoned (re-add via UI to restore).`)) return;
+    try {
+      const r = await fetch(`/admin/clusters/${encodeURIComponent(cid)}`, { method: "DELETE" });
+      if (!r.ok) {
+        const t = await r.text();
+        throw new Error(t.slice(0, 300));
+      }
+      discardDraft(cid);
+      if (state.selected_cluster === cid) state.selected_cluster = null;
+      if (state.settings_selected_cluster === cid) state.settings_selected_cluster = null;
+      toast(`'${niceName}' removed`, "ok");
+      await refreshAll();
+    } catch (err) {
+      toast(`Remove failed: ${err.message}`, "err");
+    }
+    return;
+  }
+
   if (act === "matrix-refresh") { fetchMatrix(true); return; }
   if (act === "matrix-download-hf") { toast("HF download from settings — use Default card HF section for now", "err"); return; }
   if (act === "copy-curl") {
@@ -4747,7 +5744,30 @@ async function handleAct(e) {
     render();
   } return; }
   if (act === "form-hf-repo")   { f.hf_repo = el.value; return; }
-  if (act === "form-hf-token")  { /* token handling deferred */ return; }
+  if (act === "form-hf-token")  {
+    // Persist locally in localStorage so the operator doesn't have to
+    // paste their HF token on every download. Token is never persisted
+    // server-side; it's pulled out at submit time and sent fresh in the
+    // /admin/downloads body. Saving on `change` (blur) — not `input` —
+    // avoids re-renders that wipe the input cursor on every keystroke.
+    if (e.type === "change") {
+      const v = (el.value || "");
+      // The placeholder "••••••••••saved" is what we render when a token
+      // already exists. If the user blurs without typing a new value,
+      // don't overwrite the stored token with bullets.
+      if (v && !v.startsWith("•")) {
+        try { localStorage.setItem("odyssai.hf_token", v); } catch {}
+        f.hf_token_saved = true;
+        render();
+      } else if (!v) {
+        // Empty input on blur clears the stored token (explicit reset).
+        try { localStorage.removeItem("odyssai.hf_token"); } catch {}
+        f.hf_token_saved = false;
+        render();
+      }
+    }
+    return;
+  }
   if (act === "form-hf-target") {
     if (e.type === "click") {
       f.default_targets = f.default_targets || {};
@@ -4802,10 +5822,17 @@ async function handleAct(e) {
   if (act === "default-add-toggle") {
     f.default_add_open = !f.default_add_open;
     if (f.default_add_open) {
-      // Suggest a sensible default alias the first time.
+      // Suggest an alias derived from the selected model (e.g.
+      // 'mlx-community/MiniMax-M2.7-8bit' → 'minimax'). Falls back
+      // to 'pool-N' only when no model is picked yet.
       if (!f.default_add_alias) {
-        const pools = state.default?.pools || [];
-        f.default_add_alias = `default-${pools.length + 1}`;
+        const suggested = _aliasFromModel(f.default_add_model);
+        if (suggested) {
+          f.default_add_alias = suggested;
+        } else {
+          const pools = state.default?.pools || [];
+          f.default_add_alias = `pool-${pools.length + 1}`;
+        }
       }
     }
     state.form_interaction_at = Date.now();
@@ -4813,11 +5840,22 @@ async function handleAct(e) {
   }
   if (act === "form-default-add-alias") {
     f.default_add_alias = (el.value || "").trim().toLowerCase();
+    // Mark as user-edited so picking a different model after this
+    // won't clobber what the user typed.
+    f.default_add_alias_edited = true;
     state.form_interaction_at = Date.now();
     render(); return;
   }
   if (act === "form-default-add-model") {
     f.default_add_model = el.value;
+    // Auto-refresh the alias suggestion from the new model, unless the
+    // user has already manually edited the alias field. Without this
+    // the dashboard kept proposing the alphabetic 'pool-N' even after
+    // the user picked a concrete model.
+    if (!f.default_add_alias_edited) {
+      const suggested = _aliasFromModel(f.default_add_model);
+      if (suggested) f.default_add_alias = suggested;
+    }
     state.form_interaction_at = Date.now();
     render(); return;
   }
@@ -4856,6 +5894,7 @@ async function handleAct(e) {
       // Reset the form and hide
       f.default_add_open = false;
       f.default_add_alias = "";
+      f.default_add_alias_edited = false;
       f.default_add_model = null;
       f.default_add_indices = {};
     } catch (err) {
@@ -5049,12 +6088,22 @@ async function handleAct(e) {
       return;
     }
     const body = { repo: f.hf_repo, targets };
-    // Don't echo the saved token back into the request — UI uses the placeholder
-    // "••••••••••saved" string for that. Only send a real token if the user typed
-    // a new one (which the form doesn't yet persist between renders).
+    // Token resolution priority at submit time :
+    //   1. A freshly-typed value in the input (anything not starting with •).
+    //   2. The localStorage-persisted token (what the "saved" pip represents).
+    // Sending nothing is valid — many HF repos are public. The token only
+    // matters for gated / private repos.
     const tokenEl = document.querySelector('[data-act="form-hf-token"]');
-    const tokenVal = tokenEl?.value || "";
-    if (tokenVal && !tokenVal.startsWith("•")) body.hf_token = tokenVal;
+    const typed = tokenEl?.value || "";
+    if (typed && !typed.startsWith("•")) {
+      body.hf_token = typed;
+      try { localStorage.setItem("odyssai.hf_token", typed); } catch {}
+    } else {
+      try {
+        const stored = localStorage.getItem("odyssai.hf_token");
+        if (stored) body.hf_token = stored;
+      } catch {}
+    }
     try {
       const r = await postJson("/admin/downloads", body);
       toast(`download started on ${targets.length} node${targets.length>1?"s":""}: ${r.id}`, "ok");

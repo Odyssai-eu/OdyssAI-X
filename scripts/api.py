@@ -314,7 +314,7 @@ def get_cluster_def(cluster_id: str) -> dict:
     default = DEFAULT_CLUSTER_DEFS.get(cluster_id, {})
     overlay = cfg.get(cluster_id, {})
     merged = json.loads(json.dumps(default))  # deep copy
-    for k in ("name", "kind", "backend", "max_nodes", "models_dir", "enabled"):
+    for k in ("name", "kind", "backend", "max_nodes", "models_dir", "enabled", "upstream"):
         if k in overlay:
             merged[k] = overlay[k]
     if "nodes" in overlay and overlay["nodes"]:
@@ -501,14 +501,27 @@ def build_topology_from_indices(cluster_id: str,
 
 def validate_cluster_def(cluster_id: str, new_def: dict) -> Optional[str]:
     """Return error string if invalid, else None."""
+    kind = new_def.get("kind", "mlx-distributed")
+    backend = new_def.get("backend", "jaccl")
     nodes = new_def.get("nodes") or []
     if not isinstance(nodes, list) or len(nodes) == 0:
         return "nodes must be a non-empty list"
     masters = [n for n in nodes if n.get("master")]
     if len(masters) != 1:
         return f"exactly 1 master required (got {len(masters)})"
-    kind = new_def.get("kind", "mlx-distributed")
-    backend = new_def.get("backend", "jaccl")
+
+    # Telemak (single-Mac native runtime) — http-proxy passthrough to a Swift
+    # binary running on a Mac on the LAN. The Odysseus orchestrator does not
+    # spawn the runner — it just proxies HTTP requests. Single node by design.
+    if kind == "telemak":
+        if backend != "http-proxy":
+            return f"telemak kind requires backend=http-proxy (got {backend})"
+        if len(nodes) != 1:
+            return f"telemak kind requires exactly 1 node (got {len(nodes)})"
+        if not (new_def.get("upstream") or "").strip():
+            return "telemak kind requires non-empty 'upstream' (e.g. http://host.lan:8003)"
+        return None
+
     if kind != "mlx-distributed":
         return f"unknown kind: {kind}"
     if backend not in ("jaccl", "ring"):
@@ -1009,7 +1022,8 @@ def remote_cmd(node: dict, nodes: list[dict], model: str, mode: str, port: int,
                devices_json: str, use_ap: bool, emit_batch: int,
                kv_q8: bool = False,
                draft_model: Optional[str] = None,
-               num_draft_tokens: int = 4) -> str:
+               num_draft_tokens: int = 4,
+               ram_weights_csv: Optional[str] = None) -> str:
     coord_ip = next(n for n in nodes if n["rank"] == COORDINATOR_RANK)["ssh"].split("@")[1]
     world_size = len(nodes)
     env = {
@@ -1024,6 +1038,15 @@ def remote_cmd(node: dict, nodes: list[dict], model: str, mode: str, port: int,
         "RUNNER_KV_Q8": "1" if kv_q8 else "0",
         "RUNNER_EMIT_BATCH": str(emit_batch),
     }
+    # Capacity-aware pipeline split (#9). When the orchestrator knows per-rank
+    # RAM (via telemetry), pass it as a CSV of weights so the runner can size
+    # each rank's layer count proportionally instead of doing the even split
+    # that OOMs heterogeneous clusters (.29 512GB + .30 256GB on Qwen397).
+    # Format: "wW0,wW1,...,wWN-1" where each Wi is the relative weight for
+    # rank i (the runner normalises). The runner falls back to even split
+    # when the env var is missing or invalid.
+    if ram_weights_csv:
+        env["RUNNER_RAM_WEIGHTS"] = ram_weights_csv
     if draft_model:
         env["RUNNER_DRAFT_MODEL"] = draft_model
         env["RUNNER_NUM_DRAFT_TOKENS"] = str(num_draft_tokens)
@@ -1473,6 +1496,38 @@ class RunnerPool:
         port = random_ephemeral_port()
         devices = [n["rdma"] for n in sorted(self.nodes, key=lambda x: x["rank"])]
         devices_json = json.dumps(devices)
+        # Capacity-aware split (#9). Gather per-rank RAM via telemetry so the
+        # runner can split layers proportionally rather than evenly. Falls
+        # back to even split when telemetry is missing (single-node, fresh
+        # cluster) — runner detects empty/invalid env and ignores it.
+        ram_weights_csv: Optional[str] = None
+        if self.nodes_count > 1 and self.mode == "pipeline":
+            try:
+                _total, per_node = _cluster_total_ram_bytes(
+                    self.cluster, self.nodes_count
+                )
+                # _cluster_total_ram_bytes returns entries in rank order
+                # (builds via build_topology). Use wired_limit when set,
+                # otherwise raw RAM — wired_limit is the actual Metal
+                # ceiling and is what JACCL/MLX can spend.
+                weights: list[int] = []
+                for entry in per_node:
+                    w = entry.get("wired_limit_bytes") or entry.get("ram_bytes") or 0
+                    weights.append(int(w))
+                # Only enable when EVERY rank has a non-zero weight AND
+                # there's actual heterogeneity (otherwise even-split is
+                # already correct and we save a code path).
+                if all(w > 0 for w in weights) and len(set(weights)) > 1:
+                    ram_weights_csv = ",".join(str(w) for w in weights)
+                    sys.stderr.write(
+                        f"[api] capacity-aware split: per-rank weights = {weights} "
+                        f"(bytes; runner will normalise)\n"
+                    )
+            except Exception as e:
+                sys.stderr.write(
+                    f"[api] capacity-aware split: telemetry probe failed ({e}); "
+                    f"falling back to even split\n"
+                )
         sys.stderr.write(
             f"[api] starting {self.nodes_count} runners "
             f"(model={self.model}, mode={self.mode}, ap={self.use_ap}, port={port})\n"
@@ -1482,7 +1537,8 @@ class RunnerPool:
             cmd = remote_cmd(node, self.nodes, self.model, self.mode, port, devices_json,
                              self.use_ap, self.emit_batch, kv_q8=self.kv_q8,
                              draft_model=self.draft_model,
-                             num_draft_tokens=self.num_draft_tokens)
+                             num_draft_tokens=self.num_draft_tokens,
+                             ram_weights_csv=ram_weights_csv)
             self.runners.append(RunnerProc(node, cmd, self._on_event, cluster=self.cluster))
         rank0 = next(r for r in self.runners if r.node["rank"] == 0)
 
@@ -1967,7 +2023,7 @@ _THINK_MAX_PARTIAL = max(len(_THINK_OPEN), len(_THINK_CLOSE)) - 1  # 7
 #    content field. Do not modify the content field."
 # i.e. their stance is "don't disable thinking" — we route around them
 # by treating the auto-opened block as reasoning and stripping the close.
-_MODELS_AUTO_OPEN_THINK = ("minimax",)
+_MODELS_AUTO_OPEN_THINK = ("minimax", "qwen3.5", "qwen3.6")
 
 
 def _model_auto_opens_think(model_id: Optional[str]) -> bool:
@@ -2589,7 +2645,14 @@ def _initial_default_config() -> Optional[dict]:
 # Version is the single source of truth for the server identity. Bump at
 # each meaningful release (engine behaviour change, API contract change,
 # user-visible feature). Surfaced via /admin/version + dashboard About tab.
-ODYSSEUS_VERSION = "1.7.5"
+#
+# Bump conventions:
+#   patch (1.7.2 → 1.7.3) — bugfix only
+#   minor (1.7.2 → 1.8.0) — new feature, new endpoint, behaviour change
+#   major (1.7.2 → 2.0.0) — breaking API or topology change
+#
+# Use `./scripts/bump-version.sh patch|minor|major` to bump + auto-commit.
+ODYSSEUS_VERSION = "1.7.6"
 
 app = FastAPI(
     title="Odysseus (odyssai.eu)",
@@ -4884,6 +4947,60 @@ async def list_models(include_unloaded: bool = False):
     for cid, alias, pool in list_all_pools():
         await _push_loaded(pool, cid, alias)
 
+    # kind=telemak clusters: query the upstream's /v1/models. Multi-model
+    # routing (V1):
+    #   - 1 model loaded → emit `cluster_id` (back-compat).
+    #   - N>1 models loaded → emit N entries `cluster_id:<short_id>`. The
+    #     bare cluster_id alias disappears so clients are forced to
+    #     disambiguate (Companion picks the right entry from the list).
+    for cid in active_cluster_ids():
+        cd = get_cluster_def(cid)
+        if cd.get("kind") != "telemak":
+            continue
+        loaded = await _telemak_loaded_models(cid, cd)
+        if not loaded:
+            continue
+        # Auto-discover capabilities from upstream /.well-known/. Falls back
+        # to legacy hardcoded (stream=True, tools=False) when the endpoint
+        # is missing or unreachable (older Telemak builds).
+        caps = (await _telemak_capabilities(cid, cd)).get("capabilities") or {}
+        stream_cap = caps.get("stream", True)
+        tools_cap = caps.get("tools", False)
+        if len(loaded) == 1:
+            data.append({
+                "id": cid, "object": "model",
+                "created": _now(), "owned_by": "odysseus-telemak",
+                "x_concrete": loaded[0],
+                "x_odyssai": {
+                    "ready": True,
+                    "alias_for": loaded[0],
+                    "kind": "telemak",
+                    "stream": stream_cap,
+                    "tools": tools_cap,
+                    "backend": "http-proxy",
+                    "upstream": cd.get("upstream"),
+                },
+            })
+        else:
+            for upstream_model in loaded:
+                short = _telemak_short_id(upstream_model)
+                data.append({
+                    "id": f"{cid}:{short}", "object": "model",
+                    "created": _now(), "owned_by": "odysseus-telemak",
+                    "x_concrete": upstream_model,
+                    "x_odyssai": {
+                        "ready": True,
+                        "alias_for": upstream_model,
+                        "kind": "telemak",
+                        "cluster": cid,
+                        "short_id": short,
+                        "stream": stream_cap,
+                        "tools": tools_cap,
+                        "backend": "http-proxy",
+                        "upstream": cd.get("upstream"),
+                    },
+                })
+
     # Published cloud aliases (Odysseus-as-gateway). Always advertised
     # because they're always servable — the upstream takes care of itself.
     cloud = _cloud_entries_for_v1_models()
@@ -5062,6 +5179,21 @@ def _strip_tool_calls_from_text(text: str) -> str:
 
 @app.post("/v1/chat/completions")
 async def chat_completions(req: ChatCompletionRequest, request: Request):
+    # 0. Telemak passthrough? If the model id matches a kind=telemak cluster,
+    # proxy the request to that cluster's upstream Swift binary. Supports
+    # both `cluster_id` (1-model back-compat) and `cluster_id:short_id`
+    # (multi-model V1) forms.
+    if req.model:
+        tele_cluster, tele_short = _telemak_split_alias(req.model)
+        if tele_cluster and cluster_exists(tele_cluster):
+            cd_t = get_cluster_def(tele_cluster)
+            if cd_t.get("kind") == "telemak":
+                body = req.model_dump(exclude_none=True)
+                return await _telemak_proxy_chat_completion(
+                    tele_cluster, cd_t, body, bool(req.stream),
+                    requested_short_id=tele_short,
+                )
+
     # 1. Cloud passthrough? If the model id matches a published cloud alias
     # (e.g. "or:claude-haiku"), proxy to the configured upstream. No local
     # compute. OpenAI-compat in / out — no protocol translation.
@@ -5524,6 +5656,20 @@ def _antc_tools_to_openai(tools: Optional[list[AnthropicTool]]) -> Optional[list
 
 @app.post("/v1/messages")
 async def anthropic_messages(req: AnthropicMessagesRequest, request: Request):
+    # 0. Telemak passthrough? kind=telemak clusters expose /v1/messages
+    # natively (V1, Block 4). Same cluster_id / cluster:short alias
+    # convention as /v1/chat/completions.
+    if req.model:
+        tele_cluster, tele_short = _telemak_split_alias(req.model)
+        if tele_cluster and cluster_exists(tele_cluster):
+            cd_t = get_cluster_def(tele_cluster)
+            if cd_t.get("kind") == "telemak":
+                body = req.model_dump(exclude_none=True)
+                return await _telemak_proxy_messages(
+                    tele_cluster, cd_t, body, bool(req.stream),
+                    requested_short_id=tele_short,
+                )
+
     # If the model alias maps to a cloud provider, proxy to upstream.
     # Anthropic-protocol upstreams (api.anthropic.com) get a direct
     # passthrough — same wire format on both ends. OpenAI-protocol
@@ -6862,9 +7008,12 @@ class ClusterConfigUpdate(BaseModel):
     models_dir: Optional[str] = None
     # Full editable definition
     name: Optional[str] = None
-    kind: Optional[str] = None        # "mlx-distributed"
-    backend: Optional[str] = None     # "jaccl" (RDMA TB5) | "ring" (TCP)
+    kind: Optional[str] = None        # "mlx-distributed" | "telemak"
+    backend: Optional[str] = None     # "jaccl" | "ring" | "http-proxy"
     nodes: Optional[list[ClusterNodeIn]] = None
+    # Upstream URL — required for kind=telemak (http-proxy passthrough to a
+    # Swift single-node runtime). Empty / None for mlx-distributed.
+    upstream: Optional[str] = None
     # Optional cloud fallback (cloud alias to redirect to when the pool is
     # unreachable). Empty string clears it.
     fallback: Optional[str] = None
@@ -6963,9 +7112,13 @@ async def admin_clusters_list():
     """Compact list of every cluster Odysseus publishes — id, display name,
     backend, master SSH/host, total node count, enabled flag. Used by
     external bench/cockpit UIs (odyssai-services) so they don't have to
-    hardcode the cluster IDs."""
+    hardcode the cluster IDs.
+
+    Includes BOTH topology.yaml-seeded clusters AND dashboard-added entries
+    (kind=telemak, etc.). Tombstoned clusters (DELETE'd via UI) are hidden.
+    """
     out = []
-    for cid in DEFAULT_CLUSTER_DEFS.keys():
+    for cid in active_cluster_ids():
         cd = get_cluster_def(cid)
         nodes = cd.get("nodes") or []
         master = next((n for n in nodes if n.get("master")), nodes[0] if nodes else {})
@@ -6976,6 +7129,7 @@ async def admin_clusters_list():
             "name": cd.get("name", cid),
             "kind": cd.get("kind"),
             "backend": cd.get("backend"),
+            "upstream": cd.get("upstream") or None,
             "enabled": _cluster_enabled(cid),
             "master_host": master.get("host"),
             "master_ssh": master.get("ssh"),
@@ -6987,7 +7141,7 @@ async def admin_clusters_list():
 
 @app.get("/admin/clusters/{cluster_id}")
 async def admin_cluster_get(cluster_id: str):
-    if cluster_id not in DEFAULT_CLUSTER_DEFS:
+    if not cluster_exists(cluster_id):
         raise HTTPException(404, f"unknown cluster {cluster_id}")
     cd = get_cluster_def(cluster_id)
     cluster_max = len(cd.get("nodes", [])) or 1
@@ -7034,6 +7188,10 @@ async def admin_cluster_get(cluster_id: str):
         "nodes": cd.get("nodes", []),
         "max_nodes": effective_max,
         "models_dir": models_dir_for(cluster_id),
+        # upstream is meaningful for kind=telemak (http-proxy passthrough);
+        # exposing it here lets the dashboard editor pre-fill the form
+        # without an extra status fetch.
+        "upstream": cd.get("upstream"),
         "fallback": cd.get("fallback") or None,
         "enabled": _cluster_enabled(cluster_id),
         "capacity_by_nodes": capacity_by_nodes,
@@ -7051,12 +7209,21 @@ async def admin_cluster_update(cluster_id: str, req: ClusterConfigUpdate):
     with >1 node, etc).
 
     Refuses topology changes while a pool is loaded — user must unload first.
+
+    Upsert: if cluster_id doesn't exist (neither in topology.yaml nor in
+    cluster-config.json), CREATE it. Used by the "+ Add Telemak" flow in
+    the dashboard.
     """
-    if cluster_id not in DEFAULT_CLUSTER_DEFS:
-        raise HTTPException(404, f"unknown cluster {cluster_id}")
+    creating = not cluster_exists(cluster_id)
+    if creating:
+        # On create, validate the cluster_id slug shape (URL-safe, no weird chars).
+        if not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,40}", cluster_id):
+            raise HTTPException(400, f"cluster_id {cluster_id!r} must match [a-z0-9][a-z0-9-]{{0,40}} (URL-safe slug)")
+        # Lift any tombstone if one existed for this id.
+        _save_cluster_config({**_load_cluster_config(), cluster_id: {}})
 
     pool = _pool_for_cluster(cluster_id)
-    current = get_cluster_def(cluster_id)
+    current = get_cluster_def(cluster_id) if not creating else {}
 
     # Build the candidate (full) def by merging requested fields onto current.
     candidate = json.loads(json.dumps(current))
@@ -7074,6 +7241,20 @@ async def admin_cluster_update(cluster_id: str, req: ClusterConfigUpdate):
         topo_changed = True
     if req.nodes is not None:
         candidate["nodes"] = [n.model_dump() for n in req.nodes]
+        topo_changed = True
+    if req.upstream is not None:
+        # http-proxy passthrough target — only meaningful for kind=telemak.
+        candidate["upstream"] = req.upstream.strip()
+        topo_changed = True
+
+    # On create, kind/backend/nodes are required. Stamp them on the candidate.
+    if creating:
+        if not candidate.get("kind"):
+            raise HTTPException(400, "create requires `kind` (mlx-distributed or telemak)")
+        if not candidate.get("backend"):
+            raise HTTPException(400, "create requires `backend`")
+        if not candidate.get("nodes"):
+            raise HTTPException(400, "create requires `nodes`")
         topo_changed = True
 
     # Validate when topology fields changed
@@ -7111,6 +7292,7 @@ async def admin_cluster_update(cluster_id: str, req: ClusterConfigUpdate):
         if req.enabled is False and pool is not None and getattr(pool, "loaded", False):
             raise HTTPException(409, f"{cluster_id} is loaded — unload first to disable")
         persist["enabled"] = bool(req.enabled)
+    if req.upstream is not None: persist["upstream"] = candidate["upstream"]
     if req.fallback is not None:
         # Empty string clears the fallback; non-empty validates against published cloud aliases.
         if req.fallback == "":
@@ -7126,6 +7308,28 @@ async def admin_cluster_update(cluster_id: str, req: ClusterConfigUpdate):
         set_models_dir(cluster_id, req.models_dir)
 
     return await admin_cluster_get(cluster_id)
+
+
+@app.delete("/admin/clusters/{cluster_id}")
+async def admin_cluster_delete(cluster_id: str):
+    """Remove a cluster via UI. Auto-unloads first if loaded.
+
+    Tombstone semantics: the cluster's overlay entry in cluster-config.json is
+    overwritten with `{_removed: true}`. At next list/lookup, active_cluster_ids()
+    filters it out. This works for both dashboard-added clusters AND for
+    topology.yaml-declared clusters (the tombstone shadows the seed). To
+    un-remove a topology.yaml cluster, the operator edits cluster-config.json
+    by hand or re-adds it via the UI.
+    """
+    if not cluster_exists(cluster_id):
+        raise HTTPException(404, f"unknown cluster {cluster_id}")
+    pool = _pool_for_cluster(cluster_id)
+    if pool is not None and getattr(pool, "loaded", False):
+        await _auto_unload_cluster(cluster_id, reason="cluster removed via UI")
+    cfg = _load_cluster_config()
+    cfg[cluster_id] = {"_removed": True}
+    _save_cluster_config(cfg)
+    return {"ok": True, "removed": cluster_id}
 
 
 @app.post("/admin/clusters/{cluster_id}/reboot-all")
@@ -7272,8 +7476,15 @@ def _pool_per_rank_phases(pool) -> Optional[list[dict]]:
 
 @app.get("/admin/clusters/{cluster_id}/status")
 async def admin_cluster_status(cluster_id: str):
-    if cluster_id not in DEFAULT_CLUSTER_DEFS:
+    if not cluster_exists(cluster_id):
         raise HTTPException(404, f"unknown cluster {cluster_id}")
+    # kind=telemak: short-circuit to a single-node "what's loaded" view.
+    # The upstream is the source of truth — we query it once and shape the
+    # response into Odysseus' status format so the dashboard reuses the
+    # mlx-distributed renderers without crashing.
+    cd_t = get_cluster_def(cluster_id)
+    if cd_t.get("kind") == "telemak":
+        return await _telemak_status(cluster_id, cd_t)
     loading = _loading_snapshot(_loading_state_for(cluster_id))
     default_pool = get_pool(cluster_id)
     all_loaded = list_pools(cluster_id)
@@ -7378,7 +7589,7 @@ async def admin_cluster_models(cluster_id: str, dir: Optional[str] = None):
     can show the user how big each model is BEFORE they attempt to load it.
     Sizes are gathered in one batched SSH call to avoid the per-model fanout.
     """
-    if cluster_id not in DEFAULT_CLUSTER_DEFS:
+    if not cluster_exists(cluster_id):
         raise HTTPException(404, f"unknown cluster {cluster_id}")
     rank0 = rank0_ssh_for_cluster(cluster_id, 1)
     target_dir = dir or models_dir_for(cluster_id)
@@ -7398,7 +7609,7 @@ async def admin_cluster_models(cluster_id: str, dir: Optional[str] = None):
 
 @app.post("/admin/clusters/{cluster_id}/models-dir")
 async def admin_cluster_models_dir(cluster_id: str, req: ModelsDirRequest):
-    if cluster_id not in DEFAULT_CLUSTER_DEFS:
+    if not cluster_exists(cluster_id):
         raise HTTPException(404, f"unknown cluster {cluster_id}")
     set_models_dir(cluster_id, req.dir)
     return {"cluster": cluster_id, "models_dir": req.dir}
@@ -7437,10 +7648,16 @@ class ArgoLoadRequest(BaseModel):
 
 @app.post("/admin/clusters/{cluster_id}/load")
 async def admin_cluster_load(cluster_id: str, req: ArgoLoadRequest):
-    if cluster_id not in DEFAULT_CLUSTER_DEFS:
+    if not cluster_exists(cluster_id):
         raise HTTPException(404, f"unknown cluster {cluster_id}")
     if not _cluster_enabled(cluster_id):
         raise HTTPException(409, f"{cluster_id} is disabled — toggle enable in cluster settings to load")
+    # kind=telemak: proxy load to the Swift binary's /admin/load endpoint.
+    # Telemak is single-node http-proxy — no pipeline/tensor parallel, no node
+    # selection. We just POST {model} upstream and return its response.
+    cd = get_cluster_def(cluster_id)
+    if cd.get("kind") == "telemak":
+        return await _telemak_proxy_load(cluster_id, cd, req)
     # Block reload if the cluster is currently flagged degraded — a JACCL
     # queue-pair stuck in TIME_WAIT or a wired-memory leak makes the next
     # load almost certain to crash the same way. Operator runs
@@ -7594,6 +7811,565 @@ class _ArgoUnloadBody(BaseModel):
     alias: Optional[str] = None
 
 
+_TELEMAK_MODELS_CACHE: dict[str, tuple[float, list[str]]] = {}
+_TELEMAK_CACHE_TTL_S = 8.0  # seconds — debounce dashboard polls without staleness
+
+
+def _telemak_short_id(hf_id: str) -> str:
+    """Short alias for a Telemak-loaded HF id — kebab-cased, no org prefix.
+
+    `mlx-community/Qwen3-0.6B-4bit` → `qwen3-0.6b-4bit`. URL-safe; used as
+    the colon-suffix in `<cluster_id>:<short_id>` for multi-model routing
+    (v1.7-v1.8 of Telemak V1)."""
+    tail = hf_id.rsplit("/", 1)[-1]
+    return tail.lower()
+
+
+def _telemak_split_alias(model: Optional[str]) -> tuple[Optional[str], Optional[str]]:
+    """Split `cluster_id:short_model_id` → (cluster_id, short_id). If no colon,
+    returns (model, None). Used by chat_completions routing to support both
+    bare-cluster (back-compat, 1 model) and colon-suffix (N models) forms."""
+    if not model:
+        return (None, None)
+    if ":" not in model:
+        return (model, None)
+    cluster, short = model.split(":", 1)
+    return (cluster, short or None)
+
+
+async def _telemak_loaded_models(cluster_id: str, cd: dict, force: bool = False) -> list[str]:
+    """Query the Telemak upstream's /v1/models — return the list of model ids
+    currently loaded. Empty list if upstream unreachable or has no models.
+
+    Cached for ~8s per cluster to avoid hammering the upstream during dashboard
+    refreshes (every status poll, /v1/models call, etc.). Set force=True to
+    bypass the cache — used right after /admin/load and /admin/unload."""
+    now = time.time()
+    cached = _TELEMAK_MODELS_CACHE.get(cluster_id)
+    if not force and cached and (now - cached[0]) < _TELEMAK_CACHE_TTL_S:
+        return cached[1]
+    upstream = (cd.get("upstream") or "").rstrip("/")
+    if not upstream:
+        return []
+    import httpx
+    try:
+        async with httpx.AsyncClient(timeout=4.0) as client:
+            r = await client.get(f"{upstream}/v1/models")
+            if r.status_code != 200:
+                models = []
+            else:
+                data = r.json().get("data", [])
+                models = [m.get("id") for m in data if m.get("id")]
+    except Exception:
+        models = []
+    _TELEMAK_MODELS_CACHE[cluster_id] = (now, models)
+    return models
+
+
+def _telemak_cache_invalidate(cluster_id: str) -> None:
+    """Invalidate the cached /v1/models list for a cluster — call after
+    load/unload so the next status poll sees the new state."""
+    _TELEMAK_MODELS_CACHE.pop(cluster_id, None)
+    _TELEMAK_CAPS_CACHE.pop(cluster_id, None)
+
+
+_TELEMAK_CAPS_CACHE: dict[str, tuple[float, dict]] = {}
+_TELEMAK_CAPS_TTL_S = 60.0
+
+
+async def _telemak_capabilities(cluster_id: str, cd: dict) -> dict:
+    """Fetch `/.well-known/inference-engine.json` from the Telemak upstream.
+
+    Cached 60s per cluster. Returns `{}` on any failure — the caller falls
+    back to the legacy hardcoded `stream: True, tools: False` shape, so
+    older Telemak builds without the well-known endpoint keep working.
+
+    Schema produced by Telemak >= 0.2.0:
+      {engine: "telemak", version, capabilities: {stream, tools, vision,
+       max_context, session_cache, openai_compat, anthropic_compat}, models}
+    """
+    now = time.time()
+    cached = _TELEMAK_CAPS_CACHE.get(cluster_id)
+    if cached and (now - cached[0]) < _TELEMAK_CAPS_TTL_S:
+        return cached[1]
+    upstream = (cd.get("upstream") or "").rstrip("/")
+    if not upstream:
+        return {}
+    import httpx
+    try:
+        async with httpx.AsyncClient(timeout=3.0) as client:
+            r = await client.get(f"{upstream}/.well-known/inference-engine.json")
+            if r.status_code != 200:
+                _TELEMAK_CAPS_CACHE[cluster_id] = (now, {})
+                return {}
+            data = r.json()
+    except Exception:
+        _TELEMAK_CAPS_CACHE[cluster_id] = (now, {})
+        return {}
+    _TELEMAK_CAPS_CACHE[cluster_id] = (now, data)
+    return data
+
+
+async def _telemak_proxy_chat_completion(
+    cluster_id: str,
+    cd: dict,
+    body: dict,
+    stream: bool,
+    requested_short_id: Optional[str] = None,
+):
+    """Proxy a /v1/chat/completions request to the Telemak upstream.
+
+    Returns either a JSON dict (non-streaming) or a StreamingResponse (SSE
+    streaming). The `model` field in the body is rewritten to the actually-
+    loaded upstream model id — the client used `cluster_id` as the alias.
+
+    Multi-model routing (V1):
+      - `requested_short_id=None` (bare cluster alias) + 1 loaded → use it.
+      - `requested_short_id=None` + N loaded → 400 ambiguous.
+      - `requested_short_id="<short>"` → match against loaded[i].short_id.
+        404 if no match.
+
+    If the upstream model auto-opens a `<think>` block (Qwen3.5, Qwen3.6,
+    MiniMax), this proxy filters reasoning out of `content` and routes it
+    into `reasoning_content`, both for the non-stream and stream paths.
+    """
+    upstream = (cd.get("upstream") or "").rstrip("/")
+    if not upstream:
+        raise HTTPException(400, f"{cluster_id}: missing upstream URL")
+    loaded = await _telemak_loaded_models(cluster_id, cd)
+    if not loaded:
+        raise HTTPException(503, f"{cluster_id}: no model loaded on upstream — POST /admin/clusters/{cluster_id}/load first")
+
+    if requested_short_id:
+        match = next((m for m in loaded if _telemak_short_id(m) == requested_short_id), None)
+        if not match:
+            available = [f"{cluster_id}:{_telemak_short_id(m)}" for m in loaded]
+            raise HTTPException(
+                404,
+                f"{cluster_id}: no loaded model matches short id '{requested_short_id}'. available: {available}",
+            )
+        upstream_model = match
+    elif len(loaded) > 1:
+        available = [f"{cluster_id}:{_telemak_short_id(m)}" for m in loaded]
+        raise HTTPException(
+            400,
+            f"{cluster_id}: ambiguous model id — {len(loaded)} models loaded. use cluster:model form. available: {available}",
+        )
+    else:
+        upstream_model = loaded[0]
+    # Auto-think heuristic: Qwen3.5/3.6/MiniMax templates auto-open <think>
+    # at prompt time, so reasoning streams BEFORE any visible </think> tag.
+    # When that's the case we seed the filter with `in_think=True` and
+    # route everything to `reasoning_content` until the model finally
+    # closes with `</think>`.
+    #
+    # BUT — when the request body has `enable_thinking: false`, Telemak
+    # honors the kwarg via the chat template and the model does NOT
+    # auto-open <think>. If we still seed `in_think=True` here, the
+    # filter eats the entire visible output as reasoning_content
+    # (Companion gets a "ghost" — empty content, full reasoning_content).
+    # Disable the auto-seed in that case.
+    enable_thinking = body.get("enable_thinking")
+    if enable_thinking is False:
+        auto_think = False
+    else:
+        auto_think = _model_auto_opens_think(upstream_model)
+    forward_body = dict(body)
+    forward_body["model"] = upstream_model
+    import httpx
+    if not stream:
+        try:
+            async with httpx.AsyncClient(timeout=300.0) as client:
+                r = await client.post(f"{upstream}/v1/chat/completions", json=forward_body)
+        except Exception as e:
+            raise HTTPException(502, f"telemak upstream unreachable: {e}")
+        if r.status_code >= 400:
+            raise HTTPException(r.status_code, f"telemak upstream error: {r.text[:300]}")
+        out = r.json()
+        # Filter <think>...</think> out of content. Seed in_think=True for
+        # auto-opening models so reasoning before the first </think> close
+        # gets routed to reasoning_content instead of leaking into content.
+        if auto_think:
+            for choice in out.get("choices", []) or []:
+                msg = choice.get("message") or {}
+                raw = msg.get("content") or ""
+                state = {"in_think": True, "carry": ""}
+                vis, reas = _split_think_stream(raw, state)
+                vis2, reas2 = _flush_think_stream(state)
+                visible = (vis + vis2).lstrip()
+                reasoning = (reas + reas2).strip()
+                msg["content"] = visible
+                if reasoning:
+                    msg["reasoning_content"] = reasoning
+                choice["message"] = msg
+        out["model"] = f"{cluster_id}:{requested_short_id}" if requested_short_id else cluster_id
+        return out
+
+    # Streaming path — parse SSE chunks, route delta.content through the
+    # think filter, re-emit content + reasoning_content as separate deltas.
+    async def _gen():
+        state = {"in_think": True, "carry": ""} if auto_think else None
+        async with httpx.AsyncClient(timeout=None) as client:
+            async with client.stream("POST", f"{upstream}/v1/chat/completions", json=forward_body) as r:
+                if r.status_code >= 400:
+                    err_body = (await r.aread()).decode(errors="replace")[:500]
+                    yield f"data: {json.dumps({'error': {'message': f'telemak upstream {r.status_code}: {err_body}'}})}\n\n".encode()
+                    return
+                if not auto_think:
+                    # No filter needed — just pipe bytes through.
+                    async for chunk in r.aiter_raw():
+                        if chunk:
+                            yield chunk
+                    return
+                # Auto-think filter mode: line-buffer the SSE stream so we
+                # can parse each `data: {...}` event, extract delta.content,
+                # filter, and re-emit as content + reasoning_content deltas.
+                #
+                # Important: flush any residual think-stream carry BEFORE
+                # passing `data: [DONE]` through, so the final reasoning
+                # bytes never land after the [DONE] sentinel (which some
+                # clients treat as end-of-stream and discard later events).
+                buf = b""
+                done_seen = False
+                async for chunk in r.aiter_raw():
+                    if not chunk:
+                        continue
+                    buf += chunk
+                    while b"\n" in buf:
+                        line, buf = buf.split(b"\n", 1)
+                        if line.strip() == b"data: [DONE]":
+                            # Flush + emit DONE last.
+                            async for f in _telemak_emit_flush(state, cluster_id):
+                                yield f
+                            yield b"data: [DONE]\n"
+                            done_seen = True
+                            break
+                        out_line = _telemak_filter_sse_line(line, state, cluster_id)
+                        if out_line is not None:
+                            yield out_line
+                    if done_seen:
+                        break
+                if not done_seen:
+                    # Upstream closed without [DONE] — flush what we have.
+                    if buf:
+                        out_line = _telemak_filter_sse_line(buf, state, cluster_id)
+                        if out_line is not None:
+                            yield out_line
+                    async for f in _telemak_emit_flush(state, cluster_id):
+                        yield f
+    from fastapi.responses import StreamingResponse
+    return StreamingResponse(_gen(), media_type="text/event-stream")
+
+
+async def _telemak_proxy_messages(
+    cluster_id: str,
+    cd: dict,
+    body: dict,
+    stream: bool,
+    requested_short_id: Optional[str] = None,
+):
+    """Proxy a /v1/messages (Anthropic shape) request to the Telemak upstream.
+
+    Mirror of `_telemak_proxy_chat_completion` for the Anthropic surface
+    (Telemak V1 Block 4 ships /v1/messages natively). We don't translate
+    the body — Telemak speaks Anthropic on the same model.
+
+    For streaming, Anthropic SSE events (`message_start`, `content_block_*`,
+    `message_*`) are piped through verbatim. No `<think>` filtering for now —
+    that's a `/v1/chat/completions` concern.
+    """
+    upstream = (cd.get("upstream") or "").rstrip("/")
+    if not upstream:
+        raise HTTPException(400, f"{cluster_id}: missing upstream URL")
+    loaded = await _telemak_loaded_models(cluster_id, cd)
+    if not loaded:
+        raise HTTPException(503, f"{cluster_id}: no model loaded on upstream")
+
+    if requested_short_id:
+        match = next((m for m in loaded if _telemak_short_id(m) == requested_short_id), None)
+        if not match:
+            available = [f"{cluster_id}:{_telemak_short_id(m)}" for m in loaded]
+            raise HTTPException(
+                404,
+                f"{cluster_id}: no loaded model matches '{requested_short_id}'. available: {available}",
+            )
+        upstream_model = match
+    elif len(loaded) > 1:
+        available = [f"{cluster_id}:{_telemak_short_id(m)}" for m in loaded]
+        raise HTTPException(
+            400,
+            f"{cluster_id}: ambiguous model — {len(loaded)} loaded. use cluster:short form. available: {available}",
+        )
+    else:
+        upstream_model = loaded[0]
+
+    forward_body = dict(body)
+    forward_body["model"] = upstream_model
+
+    import httpx
+    if not stream:
+        try:
+            async with httpx.AsyncClient(timeout=300.0) as client:
+                r = await client.post(f"{upstream}/v1/messages", json=forward_body)
+        except Exception as e:
+            raise HTTPException(502, f"telemak upstream unreachable: {e}")
+        if r.status_code >= 400:
+            raise HTTPException(r.status_code, f"telemak upstream error: {r.text[:300]}")
+        out = r.json()
+        out["model"] = f"{cluster_id}:{requested_short_id}" if requested_short_id else cluster_id
+        return out
+
+    async def _gen():
+        async with httpx.AsyncClient(timeout=None) as client:
+            async with client.stream("POST", f"{upstream}/v1/messages", json=forward_body) as r:
+                if r.status_code >= 400:
+                    err_body = (await r.aread()).decode(errors="replace")[:500]
+                    yield f"event: error\ndata: {json.dumps({'type':'error','error':{'type':'api_error','message': f'telemak upstream {r.status_code}: {err_body}'}})}\n\n".encode()
+                    return
+                async for chunk in r.aiter_raw():
+                    if chunk:
+                        yield chunk
+
+    from fastapi.responses import StreamingResponse
+    return StreamingResponse(_gen(), media_type="text/event-stream")
+
+
+async def _telemak_emit_flush(state: dict, cluster_id: str):
+    """Yield the residual carry from the think-stream filter as a final delta
+    chunk, before [DONE]. No-op if there's nothing to flush."""
+    vis, reas = _flush_think_stream(state)
+    if not vis and not reas:
+        return
+    delta: dict = {}
+    if vis: delta["content"] = vis
+    if reas: delta["reasoning_content"] = reas
+    final = {
+        "id": "chatcmpl-telemak-flush",
+        "object": "chat.completion.chunk",
+        "created": _now(),
+        "model": cluster_id,
+        "choices": [{"index": 0, "delta": delta, "finish_reason": None}],
+    }
+    yield f"data: {json.dumps(final, ensure_ascii=False)}\n\n".encode()
+
+
+def _telemak_filter_sse_line(line: bytes, state: dict, cluster_id: str) -> Optional[bytes]:
+    """Parse one SSE line. If it's a `data: {...}` chat-completion chunk with a
+    delta.content, run the content through the think-stream filter and re-emit
+    with content + reasoning_content separated. Other lines (blank, [DONE],
+    role-only deltas, finish-reason chunks) pass through unchanged.
+
+    Returns the line to emit (bytes including the trailing `\n`), or None if
+    fully consumed (e.g. content all routed to carry, no visible output yet)."""
+    raw = line.rstrip(b"\r")
+    if not raw.startswith(b"data: "):
+        # Pass through unchanged (blank lines between events, comments, etc.)
+        return raw + b"\n"
+    payload = raw[len(b"data: "):]
+    if payload.strip() == b"[DONE]":
+        return raw + b"\n"
+    try:
+        obj = json.loads(payload)
+    except Exception:
+        return raw + b"\n"
+    # Find the delta.content if present.
+    try:
+        choices = obj.get("choices") or []
+        if not choices:
+            obj["model"] = cluster_id
+            return (b"data: " + json.dumps(obj, ensure_ascii=False).encode() + b"\n")
+        choice0 = choices[0]
+        delta = choice0.get("delta") or {}
+        content = delta.get("content")
+        if not isinstance(content, str) or content == "":
+            # Pass through (role-only chunk, finish_reason chunk, etc.)
+            obj["model"] = cluster_id
+            return (b"data: " + json.dumps(obj, ensure_ascii=False).encode() + b"\n")
+        vis, reas = _split_think_stream(content, state)
+        if not vis and not reas:
+            return None  # all carried over, nothing to emit yet
+        new_delta = {k: v for k, v in delta.items() if k != "content"}
+        if vis:
+            new_delta["content"] = vis
+        if reas:
+            new_delta["reasoning_content"] = reas
+        new_obj = dict(obj)
+        new_obj["model"] = cluster_id
+        new_obj["choices"] = [dict(choice0, delta=new_delta)]
+        return (b"data: " + json.dumps(new_obj, ensure_ascii=False).encode() + b"\n")
+    except Exception:
+        return raw + b"\n"
+
+
+async def _telemak_status(cluster_id: str, cd: dict) -> dict:
+    """Return a status snapshot for a kind=telemak cluster.
+
+    Queries /v1/models for the loaded-models list and /health for memory +
+    throughput metrics. Telemak holds N models concurrently (V1 Block 1+);
+    we surface the full list as `models_loaded` while keeping `model`
+    (singular) populated with the first entry so older dashboard code that
+    only checks "any model loaded?" still works.
+
+    Shape stays compatible with Odysseus' mlx-distributed cluster status so
+    the dashboard renderers don't crash on the kind=telemak branch.
+    """
+    upstream = (cd.get("upstream") or "").rstrip("/")
+    models_loaded: list[str] = []
+    # Per-model metadata derived from Telemak's /v1/models + capability
+    # contract. Shape : {model_id: {kind: "llm"|"embedder"|"vlm",
+    # mtp_enabled: bool, draft_model: str|null, num_draft_tokens: int|null}}.
+    # Default values mean "Telemak didn't tell us, treat as LLM with no
+    # speculative decoding" — keeps old Telemak builds compatible.
+    models_details: dict[str, dict] = {}
+    reachable = False
+    wired_used_gb = None
+    wired_free_gb = None
+    avg_tok_s_recent = None
+    spec_modes: list[str] = []
+    if upstream:
+        import httpx
+        try:
+            async with httpx.AsyncClient(timeout=4.0) as client:
+                r = await client.get(f"{upstream}/v1/models")
+                if r.status_code == 200:
+                    reachable = True
+                    data = r.json().get("data", [])
+                    for m in data:
+                        mid = m.get("id")
+                        if not mid:
+                            continue
+                        models_loaded.append(mid)
+                        x = m.get("x_telemak") or {}
+                        models_details[mid] = {
+                            "kind": x.get("kind") or "llm",
+                            "draft_model": x.get("draft_model"),
+                            "num_draft_tokens": x.get("num_draft_tokens"),
+                        }
+                # /health is independent — fetch even if /v1/models bombed,
+                # the user wants to know the upstream's memory state.
+                try:
+                    h = await client.get(f"{upstream}/health")
+                    if h.status_code == 200:
+                        reachable = True
+                        hj = h.json()
+                        if not models_loaded:
+                            models_loaded = hj.get("models_loaded", []) or []
+                        wired_used_gb = hj.get("wired_memory_used_gb")
+                        wired_free_gb = hj.get("wired_memory_free_gb")
+                        avg_tok_s_recent = hj.get("avg_tok_s_recent")
+                except Exception:
+                    pass
+                # Capability contract — tells us which speculative-decoding
+                # modes the engine supports (e.g. ["mtp_adapter"]). Combined
+                # with the per-model kind it gives "MTP active for this LLM".
+                try:
+                    cap = await client.get(f"{upstream}/.well-known/inference-engine.json")
+                    if cap.status_code == 200:
+                        cj = cap.json()
+                        spec_modes = (cj.get("capabilities", {}).get("speculative_decoding") or {}).get("modes") or []
+                except Exception:
+                    pass
+        except Exception:
+            reachable = False
+    # Derive mtp_enabled per model : engine reports an MTP mode AND model
+    # is an LLM (embedders / VLMs don't benefit from MTP today).
+    has_mtp_mode = any("mtp" in (m or "").lower() for m in spec_modes)
+    for mid, det in models_details.items():
+        det["mtp_enabled"] = bool(
+            has_mtp_mode and (det.get("kind") or "llm") == "llm"
+        )
+    nodes = cd.get("nodes") or []
+    master_ssh = (nodes[0] or {}).get("ssh") if nodes else None
+    loaded_model = models_loaded[0] if models_loaded else None
+    return {
+        "loaded": bool(models_loaded),
+        "cluster": cluster_id,
+        "loading": None,
+        "available_node_counts": [1],
+        "max_nodes": 1,
+        "nodes": 1 if models_loaded else 0,
+        "model": loaded_model,                     # back-compat (singular)
+        "models_loaded": models_loaded,            # canonical (list)
+        "models_details": models_details,          # per-model kind / MTP / draft
+        "spec_modes": spec_modes,                  # engine-level speculative_decoding modes
+        "wired_memory_used_gb": wired_used_gb,
+        "wired_memory_free_gb": wired_free_gb,
+        "avg_tok_s_recent": avg_tok_s_recent,
+        "mode": "telemak",
+        "topologies": {"1": [{"rank": 0, "ssh": master_ssh}]} if master_ssh else {"1": []},
+        "models_dir": cd.get("models_dir"),
+        "degraded": None,
+        "kind": "telemak",
+        "upstream": upstream,
+        "upstream_reachable": reachable,
+    }
+
+
+async def _telemak_proxy_load(cluster_id: str, cd: dict, req) -> dict:
+    """Proxy POST /admin/load to the Telemak upstream and reshape the response
+    into Odysseus' standard load-response shape so the dashboard renders it
+    without a special-case."""
+    upstream = (cd.get("upstream") or "").rstrip("/")
+    if not upstream:
+        raise HTTPException(400, f"{cluster_id}: missing upstream URL")
+    if not req.model:
+        raise HTTPException(400, "model is required")
+    import httpx
+    try:
+        async with httpx.AsyncClient(timeout=300.0) as client:
+            r = await client.post(f"{upstream}/admin/load", json={"model": req.model})
+    except Exception as e:
+        raise HTTPException(502, f"telemak upstream unreachable: {e}")
+    if r.status_code >= 400:
+        raise HTTPException(r.status_code, f"telemak upstream error: {r.text[:200]}")
+    body = r.json() if r.text else {}
+    # Stash the loaded model in cluster-config so /status & dashboard can show it
+    save_cluster_def(cluster_id, {"_telemak_loaded_model": req.model})
+    _telemak_cache_invalidate(cluster_id)
+    return {
+        "loaded": True,
+        "cluster": cluster_id,
+        "model": req.model,
+        "nodes": 1,
+        "mode": "telemak",
+        "load_s": float(body.get("load_s") or 0.0),
+        "upstream_response": body,
+    }
+
+
+async def _telemak_proxy_unload(
+    cluster_id: str, cd: dict, model: Optional[str] = None
+) -> dict:
+    """Proxy POST /admin/unload to the Telemak upstream.
+
+    `model=None` (or empty) → unload everything (`{"all": true}`).
+    `model="<hf-id>"`        → unload that one model only, leaving any
+    others in the registry untouched. The dashboard's per-row Unload
+    button sends the specific id; the legacy "Unload" header button (no
+    model attached) falls back to all.
+    """
+    upstream = (cd.get("upstream") or "").rstrip("/")
+    if not upstream:
+        raise HTTPException(400, f"{cluster_id}: missing upstream URL")
+    payload: dict
+    if model:
+        payload = {"model": model}
+    else:
+        payload = {"all": True}
+    import httpx
+    try:
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            r = await client.post(f"{upstream}/admin/unload", json=payload)
+    except Exception as e:
+        raise HTTPException(502, f"telemak upstream unreachable: {e}")
+    _telemak_cache_invalidate(cluster_id)
+    if r.status_code >= 400 and r.status_code != 404:
+        raise HTTPException(r.status_code, f"telemak upstream error: {r.text[:200]}")
+    if not model:
+        save_cluster_def(cluster_id, {"_telemak_loaded_model": None})
+    return {"unloaded": True, "cluster": cluster_id, "model": model}
+
+
 @app.post("/admin/clusters/{cluster_id}/unload")
 async def admin_cluster_unload(
     cluster_id: str,
@@ -7613,8 +8389,24 @@ async def admin_cluster_unload(
     were live, so a stale runner from a previous container life gets killed
     even if our state says nothing was loaded.
     """
-    if cluster_id not in DEFAULT_CLUSTER_DEFS:
+    if not cluster_exists(cluster_id):
         raise HTTPException(404, f"unknown cluster {cluster_id}")
+    # kind=telemak: proxy to upstream /admin/unload. Optional `model` in
+    # the body targets a specific loaded model; absent → unload all.
+    cd_proxy = get_cluster_def(cluster_id)
+    if cd_proxy.get("kind") == "telemak":
+        telemak_model: Optional[str] = None
+        try:
+            raw = await request.body()
+            if raw:
+                payload = json.loads(raw)
+                if isinstance(payload, dict):
+                    val = payload.get("model")
+                    if isinstance(val, str) and val:
+                        telemak_model = val
+        except Exception:
+            pass
+        return await _telemak_proxy_unload(cluster_id, cd_proxy, telemak_model)
     body_alias: Optional[str] = None
     if alias is None:
         try:
@@ -7763,7 +8555,7 @@ async def _cluster_reset(cluster_id: str) -> dict:
 
 @app.post("/admin/clusters/{cluster_id}/reset")
 async def admin_cluster_reset(cluster_id: str):
-    if cluster_id not in DEFAULT_CLUSTER_DEFS:
+    if not cluster_exists(cluster_id):
         raise HTTPException(404, f"unknown cluster {cluster_id}")
     return await _cluster_reset(cluster_id)
 
