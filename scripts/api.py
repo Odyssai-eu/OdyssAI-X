@@ -2365,7 +2365,7 @@ def _initial_default_config() -> Optional[dict]:
 # Version is the single source of truth for the server identity. Bump at
 # each meaningful release (engine behaviour change, API contract change,
 # user-visible feature). Surfaced via /admin/version + dashboard About tab.
-ODYSSEUS_VERSION = "1.7.2"
+ODYSSEUS_VERSION = "1.7.3"
 
 app = FastAPI(
     title="Odysseus (odyssai.eu)",
