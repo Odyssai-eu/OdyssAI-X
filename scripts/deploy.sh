@@ -127,19 +127,24 @@ done
 
 # ── Post-deploy smoke ────────────────────────────────────────────────────
 #
-# Give FastAPI 6s to come back up, then verify the version field matches
-# what we just shipped. If the field doesn't match, the deploy silently
-# failed (e.g. docker cp landed on a stopped container, or a syntax error
-# in api.py crashed startup). Loud failure here is the whole point.
+# Verify the live version field matches what we just shipped. If the
+# field doesn't match, the deploy silently failed (e.g. docker cp landed
+# on a stopped container, or a syntax error in api.py crashed startup).
+# Loud failure here is the whole point.
+#
+# Be patient on the wait : when a cluster has loaded pools, the container
+# replays orphan sweeps + runner startup before FastAPI accepts requests
+# (observed up to ~45s on .39 when 3 ranks are coming back). Total budget
+# ~90s, polled every 4s.
 echo
 echo "→ verifying $VERIFY_URL"
-sleep 6
-for attempt in 1 2 3 4 5; do
-  LIVE_VERSION=$(curl -s "$VERIFY_URL/health" 2>/dev/null | python3 -c "import sys,json;d=json.load(sys.stdin);print(d.get('version',''))" 2>/dev/null || echo "")
+LIVE_VERSION=""
+for attempt in $(seq 1 22); do
+  sleep 4
+  LIVE_VERSION=$(curl -s --max-time 3 "$VERIFY_URL/health" 2>/dev/null | python3 -c "import sys,json;d=json.load(sys.stdin);print(d.get('version',''))" 2>/dev/null || echo "")
   if [ -n "$LIVE_VERSION" ]; then
     break
   fi
-  sleep 3
 done
 
 if [ -z "$LIVE_VERSION" ]; then
