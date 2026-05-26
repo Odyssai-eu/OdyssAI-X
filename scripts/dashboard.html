@@ -985,7 +985,12 @@ const state = {
     default_add_mode: "pipeline",
     default_add_use_ap: true,
     default_add_kv_q8: null,   // null = use server default
-    hf_repo: "", hf_token_saved: false,
+    hf_repo: "",
+    // HF token : persisted in localStorage under `odyssai.hf_token` so it
+    // survives reloads. Never sent to the server except inside an
+    // /admin/downloads POST body. The form shows a "saved" pip when a
+    // value is present locally; the input is masked.
+    hf_token_saved: !!(typeof localStorage !== "undefined" && localStorage.getItem("odyssai.hf_token")),
     ctest_cluster: "default", ctest_nodes: 2,
   },
 };
@@ -4429,10 +4434,26 @@ function renderHFDownload(clusterId) {
 }
 
 function clusterTargetNodes(cluster) {
+  // The HF download endpoint validates `targets[]` against HOSTS_REGISTRY,
+  // which is built from `topology.yaml` host ids. cluster-config.json (the
+  // UI-added clusters) may use different node host ids — e.g. Telemak's
+  // legacy topology entry `telemak-max64` has host id `telemak`, while
+  // the UI-added cluster `telemak-64` has node host id `telemak-64`. Both
+  // point at the same machine via the same SSH target.
+  //
+  // Resolve the cdef node to its matrix-side host id by SSH match (or by
+  // id when it already lines up) so the download POST carries the id the
+  // backend recognises. Without this, every download for a UI-added
+  // cluster errors with `unknown target <cluster-id>`.
+  const matrixHosts = state.matrix?.hosts || [];
   return clusterDefNodes(cluster).map((n, idx) => {
-    const h = hostTelemetry(n.host);
+    const nodeSsh = (n.ssh || "").trim();
+    const resolved = matrixHosts.find(h => h.id === n.host)
+                  || matrixHosts.find(h => (h.ssh || "").trim() === nodeSsh && nodeSsh);
+    const hostId = resolved?.id || n.host;
+    const h = hostTelemetry(hostId) || (resolved ? { label: resolved.ssh, free_bytes: resolved.free_bytes } : null);
     const free = h?.free_bytes ? `${(h.free_bytes / 1024**4).toFixed(1)} TB free` : "free space unknown";
-    return { rank: idx, host: n.host, ip: h?.label || n.host, free };
+    return { rank: idx, host: hostId, ip: h?.label || n.host, free };
   });
 }
 
@@ -5723,7 +5744,30 @@ async function handleAct(e) {
     render();
   } return; }
   if (act === "form-hf-repo")   { f.hf_repo = el.value; return; }
-  if (act === "form-hf-token")  { /* token handling deferred */ return; }
+  if (act === "form-hf-token")  {
+    // Persist locally in localStorage so the operator doesn't have to
+    // paste their HF token on every download. Token is never persisted
+    // server-side; it's pulled out at submit time and sent fresh in the
+    // /admin/downloads body. Saving on `change` (blur) — not `input` —
+    // avoids re-renders that wipe the input cursor on every keystroke.
+    if (e.type === "change") {
+      const v = (el.value || "");
+      // The placeholder "••••••••••saved" is what we render when a token
+      // already exists. If the user blurs without typing a new value,
+      // don't overwrite the stored token with bullets.
+      if (v && !v.startsWith("•")) {
+        try { localStorage.setItem("odyssai.hf_token", v); } catch {}
+        f.hf_token_saved = true;
+        render();
+      } else if (!v) {
+        // Empty input on blur clears the stored token (explicit reset).
+        try { localStorage.removeItem("odyssai.hf_token"); } catch {}
+        f.hf_token_saved = false;
+        render();
+      }
+    }
+    return;
+  }
   if (act === "form-hf-target") {
     if (e.type === "click") {
       f.default_targets = f.default_targets || {};
@@ -6044,12 +6088,22 @@ async function handleAct(e) {
       return;
     }
     const body = { repo: f.hf_repo, targets };
-    // Don't echo the saved token back into the request — UI uses the placeholder
-    // "••••••••••saved" string for that. Only send a real token if the user typed
-    // a new one (which the form doesn't yet persist between renders).
+    // Token resolution priority at submit time :
+    //   1. A freshly-typed value in the input (anything not starting with •).
+    //   2. The localStorage-persisted token (what the "saved" pip represents).
+    // Sending nothing is valid — many HF repos are public. The token only
+    // matters for gated / private repos.
     const tokenEl = document.querySelector('[data-act="form-hf-token"]');
-    const tokenVal = tokenEl?.value || "";
-    if (tokenVal && !tokenVal.startsWith("•")) body.hf_token = tokenVal;
+    const typed = tokenEl?.value || "";
+    if (typed && !typed.startsWith("•")) {
+      body.hf_token = typed;
+      try { localStorage.setItem("odyssai.hf_token", typed); } catch {}
+    } else {
+      try {
+        const stored = localStorage.getItem("odyssai.hf_token");
+        if (stored) body.hf_token = stored;
+      } catch {}
+    }
     try {
       const r = await postJson("/admin/downloads", body);
       toast(`download started on ${targets.length} node${targets.length>1?"s":""}: ${r.id}`, "ok");
