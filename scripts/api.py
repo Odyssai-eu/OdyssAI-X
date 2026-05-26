@@ -322,6 +322,70 @@ def get_cluster_def(cluster_id: str) -> dict:
     return merged
 
 
+def _is_cluster_tombstoned(cluster_id: str) -> bool:
+    """True if cluster-config.json marked this cluster as removed via UI.
+
+    cluster-config.json mixes cluster definitions with non-cluster
+    sections at top-level (e.g. 'crew' is a list, 'discovery' is a
+    bookkeeping dict). Anything whose value isn't a dict can't be a
+    cluster, so it's never tombstoned. Without this guard, iterating
+    `active_cluster_ids()` over a config that contains a 'crew' list
+    crashes the cluster-list endpoint with
+    `AttributeError: 'list' object has no attribute 'get'` and the
+    dashboard renders 'No cluster configured'.
+    """
+    entry = _load_cluster_config().get(cluster_id)
+    if not isinstance(entry, dict):
+        return False
+    return bool(entry.get("_removed"))
+
+
+def cluster_exists(cluster_id: str) -> bool:
+    """Cluster is active (visible in dashboard) when it has a definition AND
+    isn't tombstoned. Definitions come from either topology.yaml seed OR a
+    dashboard-added entry in cluster-config.json."""
+    if _is_cluster_tombstoned(cluster_id):
+        return False
+    if cluster_id in DEFAULT_CLUSTER_DEFS:
+        return True
+    overlay = _load_cluster_config().get(cluster_id, {})
+    # A meaningful overlay entry (has nodes, or has kind=telemak with upstream)
+    if overlay.get("nodes"):
+        return True
+    if overlay.get("kind") == "telemak" and overlay.get("upstream"):
+        return True
+    return False
+
+
+def active_cluster_ids() -> list[str]:
+    """Union of topology.yaml clusters + dashboard-added entries, minus
+    tombstones. Source of truth for "which clusters does Odysseus publish".
+
+    cluster-config.json carries cluster definitions alongside unrelated
+    top-level sections ('crew', 'discovery', 'settings', ...) that
+    were never meant to be cluster ids. Filter them out by requiring
+    the value to be a dict with at least one cluster-shape field.
+    """
+    seen: dict[str, bool] = {}
+    for cid in DEFAULT_CLUSTER_DEFS.keys():
+        seen[cid] = True
+    for cid, entry in _load_cluster_config().items():
+        if cid in seen:
+            continue
+        if not isinstance(entry, dict):
+            continue
+        # Heuristic : a real cluster entry has at least one of these.
+        # Bare 'load_history'-only entries pre-date the explicit kind
+        # field — keep them too, since the legacy single-cluster file
+        # used 'load_history' as the only top-level marker.
+        if any(k in entry for k in (
+            "nodes", "kind", "label", "models_dir", "max_nodes",
+            "_removed", "load_history", "backend", "upstream",
+        )):
+            seen[cid] = True
+    return [cid for cid in seen if not _is_cluster_tombstoned(cid)]
+
+
 def _cluster_enabled(cluster_id: str) -> bool:
     """True unless cluster-config.json explicitly stored enabled=false for this
     cluster. Default True so existing config (no `enabled` field) keeps working."""
@@ -366,7 +430,18 @@ def build_topology(cluster_id: str, count: Optional[int] = None) -> list[dict]:
     host_ids = [n["host"] for n in nodes]
     matrix = build_rdma_matrix(host_ids)
     return [
-        {"rank": i, "ssh": n["ssh"], "rdma": matrix[i], "host": n["host"]}
+        {
+            "rank": i,
+            "ssh": n["ssh"],
+            "rdma": matrix[i],
+            "host": n["host"],
+            # Propagate models_dir to the runtime topology so consumers
+            # (preflight validator, runner spawn) can resolve relative
+            # model ids without a separate cluster_def lookup. Falls
+            # back to the cluster-level default models_dir when the
+            # node entry didn't override it.
+            "models_dir": n.get("models_dir") or cd.get("models_dir") or DEFAULT_MODELS_DIR,
+        }
         for i, n in enumerate(nodes)
     ]
 
@@ -412,7 +487,14 @@ def build_topology_from_indices(cluster_id: str,
     host_ids = [n["host"] for n in selected]
     matrix = build_rdma_matrix(host_ids)
     return [
-        {"rank": i, "ssh": n["ssh"], "rdma": matrix[i], "host": n["host"]}
+        {
+            "rank": i,
+            "ssh": n["ssh"],
+            "rdma": matrix[i],
+            "host": n["host"],
+            # Same models_dir propagation as build_topology (2026-05-25 fix).
+            "models_dir": n.get("models_dir") or cd.get("models_dir") or DEFAULT_MODELS_DIR,
+        }
         for i, n in enumerate(selected)
     ]
 
@@ -947,7 +1029,20 @@ def remote_cmd(node: dict, nodes: list[dict], model: str, mode: str, port: int,
         env["RUNNER_NUM_DRAFT_TOKENS"] = str(num_draft_tokens)
     env_str = " ".join(f"{k}={shlex.quote(v)}" for k, v in env.items())
     write_devices = f"echo {shlex.quote(devices_json)} > /tmp/mlx_jaccl_devices.json"
-    return f"{write_devices} && {env_str} {PYTHON_REMOTE} {RUNNER_REMOTE}"
+    # If the model path is relative, run the runner from the node's
+    # models_dir so `Path(repo).exists()` resolves correctly. Without
+    # this, runner.py falls through to `hf_repo_to_path()` which tries
+    # the HF cache with `local_files_only=True` and dies with
+    # LocalEntryNotFoundError — the regression Sophie hit on 2026-05-25
+    # when loading inferencerlabs/Qwen3.5-397B-A17B-MLX-9bit by
+    # relative path even though the model exists at
+    # $models_dir/inferencerlabs/Qwen3.5-397B-A17B-MLX-9bit on every
+    # node. Absolute model paths skip the cd.
+    cd_prefix = ""
+    if not model.startswith("/"):
+        node_models_dir = node.get("models_dir") or DEFAULT_MODELS_DIR
+        cd_prefix = f"cd {shlex.quote(node_models_dir)} && "
+    return f"{write_devices} && {cd_prefix}{env_str} {PYTHON_REMOTE} {RUNNER_REMOTE}"
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -1359,7 +1454,14 @@ class RunnerPool:
             )
             if ssh_target:
                 try:
-                    ok, err = await _validate_model_layout(ssh_target, self.model)
+                    # Pass rank-0 models_dir so the validator can `cd` into
+                    # it before checking relative model paths. Without this
+                    # the SSH session defaults to $HOME and every relative
+                    # model id resolves to a missing path → false negative.
+                    rank0_models_dir = rank0_node.get("models_dir")
+                    ok, err = await _validate_model_layout(
+                        ssh_target, self.model, models_dir=rank0_models_dir
+                    )
                     if not ok:
                         raise RuntimeError(f"model layout invalid: {err}")
                 except RuntimeError:
@@ -1718,6 +1820,11 @@ _metrics: deque = deque(maxlen=50)
 
 # Runner stderr line buffers + SSE subscribers, per cluster. Each line is
 # {ts, cluster, rank, text}. Subscribers receive new lines via asyncio queues.
+# The seed entries are the historical clusters; any custom cluster id (e.g.
+# 'main' from topology.yaml, 'telemak-max64' from dashboard-added entries)
+# is initialised on demand via _ensure_log_cluster() below — without that,
+# /admin/logs?cluster=main 400s and the dashboard runner-logs panel stays
+# empty even though stderr is flowing.
 _log_buffers: dict[str, deque] = {
     "nautilus": deque(maxlen=500),
     "default": deque(maxlen=500),
@@ -1728,9 +1835,24 @@ _log_subscribers: dict[str, list[asyncio.Queue]] = {
 _log_lock = threading.Lock()
 
 
+def _ensure_log_cluster(cluster: str) -> None:
+    """Idempotent : init the per-cluster log buffer + subscriber list if
+    we haven't seen this cluster before. Cheap (one dict lookup) so we
+    call it both on the producer side (_push_log_line) and on the
+    consumer side (admin_logs) so either path bootstraps the entries
+    for new clusters."""
+    if cluster in _log_buffers:
+        return
+    with _log_lock:
+        if cluster not in _log_buffers:
+            _log_buffers[cluster] = deque(maxlen=500)
+            _log_subscribers[cluster] = []
+
+
 def _push_log_line(cluster: str, rank: int, text: str) -> None:
     """Called from the per-rank stderr drain thread. Appends to the buffer +
     notifies any active SSE subscribers. Thread-safe."""
+    _ensure_log_cluster(cluster)
     line = {"ts": time.time(), "cluster": cluster, "rank": rank, "text": text}
     with _log_lock:
         _log_buffers[cluster].append(line)
@@ -1969,6 +2091,44 @@ def _runs_finalize(rid: str, *, status: str = "done") -> None:
         _persist.finalize_run(rid, r)
     _active_runs.pop(rid, None)
     _active_run_cancels.pop(rid, None)
+
+
+# Maximum time a run is allowed to sit in 'cancelling' before we
+# force-finalize it. After cancel-all + broadcast, a healthy runner
+# ACKs within a couple seconds and the normal _runs_finalize path fires.
+# When the runner is SIGKILL'd, deadlocked in prefill, or the node has
+# rebooted, the ACK never comes and the run rotted in _active_runs
+# forever. 30s is plenty for a real cancel ACK and short enough that
+# the dashboard "Active runs" pane reflects truth.
+CANCELLING_FINALIZE_GRACE_S = 30.0
+
+
+def _finalize_stuck_cancelling() -> int:
+    """Reap any run that's been 'cancelling' for more than the grace
+    period. Returns the count reaped. Called from a 10s background
+    sweeper so the dashboard never shows ghost CANCELLING entries.
+    Idempotent — runs that finalize legitimately via the ACK path
+    won't be in _active_runs anymore by the time we look."""
+    now = time.time()
+    reaped: list[str] = []
+    for rid, r in list(_active_runs.items()):
+        if r.get("status") != "cancelling":
+            continue
+        # Use cancel_started_at when present, else fall back to started_at.
+        # The Event was set in admin_run_cancel/admin_runs_cancel_all, so
+        # the run has been 'cancelling' from at least that moment.
+        cancelled_at = r.get("cancelled_at") or r.get("started_at") or now
+        if (now - cancelled_at) < CANCELLING_FINALIZE_GRACE_S:
+            continue
+        reaped.append(rid)
+    for rid in reaped:
+        _runs_finalize(rid, status="cancelled")
+    if reaped:
+        sys.stderr.write(
+            f"[cancel-sweeper] force-finalized {len(reaped)} stuck cancelling "
+            f"run(s): {', '.join(reaped)}\n"
+        )
+    return len(reaped)
 
 
 def _runs_is_cancelled(rid: str) -> bool:
@@ -2277,10 +2437,21 @@ async def lifespan(app: FastAPI):
     # Background TTL sweeper — auto-unloads pools idle for > ttl_seconds.
     # Frees nodes for other pools without manual ops.
     ttl_task = asyncio.create_task(_pool_ttl_sweeper())
+    # Background dead-pool sweeper — drops pools whose runners have all
+    # died (OOM, panic, node reboot) so the dashboard reflects reality
+    # before the operator hits the load button. See #5.
+    dead_task = asyncio.create_task(_dead_pool_sweeper())
+    # Background cancelling-sweeper — force-finalises runs stuck
+    # in 'cancelling' past the grace period (runner never ACK'd
+    # because it was kill -9'd or the node rebooted). Without this,
+    # ghost runs sit in /admin/runs forever.
+    cancel_task = asyncio.create_task(_cancelling_sweeper())
     try:
         yield
     finally:
         ttl_task.cancel()
+        dead_task.cancel()
+        cancel_task.cancel()
         if _pool is not None:
             await _pool.stop()
         for _cid, _alias, pool in list_all_pools():
@@ -2299,6 +2470,59 @@ def _apply_default_ttl_to_pools() -> None:
         _pool.ttl_seconds = ttl
     for _cid, _alias, pool in list_all_pools():
         pool.ttl_seconds = ttl
+
+
+async def _dead_pool_sweeper() -> None:
+    """Every 30s, scan every cluster for pools whose runners have all
+    died and drop them. Same purge as the at-load path (#5 issue), just
+    pro-active so the dashboard reflects reality without the operator
+    having to attempt a load first.
+
+    Without this, an OOM crash or node reboot leaves the pool registry
+    "loaded:true" on the dashboard while every rank process is gone.
+    Operator sees a healthy pool tile, clicks chat, and gets
+    "model_not_loaded" because alive_count() == 0 at routing time. The
+    sweeper closes that gap.
+
+    Probe budget: just `proc.poll() is None`. No SSH, no TCP probe —
+    those would add latency and risk false positives on a flaky link.
+    A surviving runner is plenty robust under transient network
+    hiccups; only a dead local SSH child triggers purge.
+    """
+    while True:
+        try:
+            await asyncio.sleep(30)
+            seen_clusters = set()
+            for cid, _alias, _pool in list_all_pools():
+                seen_clusters.add(cid)
+            for cid in seen_clusters:
+                purged = await _purge_dead_pools(cid)
+                if purged:
+                    sys.stderr.write(
+                        f"[dead-pool-sweeper] {cid}: purged {len(purged)} "
+                        f"dead pool(s): {', '.join(purged)}\n"
+                    )
+        except asyncio.CancelledError:
+            return
+        except Exception as e:
+            sys.stderr.write(f"[dead-pool-sweeper] error: {e}\n")
+
+
+async def _cancelling_sweeper() -> None:
+    """Every 10s, reap runs that have been 'cancelling' past the grace
+    period (the runner never ACK'd — usually because it was SIGKILL'd
+    or the node rebooted). Without this, ghost CANCELLING entries
+    stay forever in /admin/runs and confuse the dashboard into
+    thinking the cluster is busy. See _finalize_stuck_cancelling().
+    """
+    while True:
+        try:
+            await asyncio.sleep(10)
+            _finalize_stuck_cancelling()
+        except asyncio.CancelledError:
+            return
+        except Exception as e:
+            sys.stderr.write(f"[cancel-sweeper] error: {e}\n")
 
 
 async def _pool_ttl_sweeper() -> None:
@@ -2365,7 +2589,7 @@ def _initial_default_config() -> Optional[dict]:
 # Version is the single source of truth for the server identity. Bump at
 # each meaningful release (engine behaviour change, API contract change,
 # user-visible feature). Surfaced via /admin/version + dashboard About tab.
-ODYSSEUS_VERSION = "1.7.4"
+ODYSSEUS_VERSION = "1.7.5"
 
 app = FastAPI(
     title="Odysseus (odyssai.eu)",
@@ -2696,6 +2920,7 @@ def _enrich_caps_from_config(caps: dict, config: dict) -> None:
 
 
 async def _validate_model_layout(ssh_target: str, model_path: str,
+                                  models_dir: Optional[str] = None,
                                   timeout: float = 8.0) -> tuple[bool, Optional[str]]:
     """Pre-flight check that a model dir is fully usable before cluster spawn.
 
@@ -2705,13 +2930,28 @@ async def _validate_model_layout(ssh_target: str, model_path: str,
     KeyError (cf. Mistral Medium 3.5 saga 2026-05-15).
 
     Cheap : single SSH round-trip that runs the checks in shell.
+
+    Regression fix 2026-05-25 : when `model_path` is a relative id like
+    `inferencerlabs/Qwen3.5-397B-A17B-MLX-9bit`, SSH defaults to $HOME on
+    the rank-0 node and the existence check resolves nothing. Caller now
+    passes `models_dir` (the rank-0 node's models_dir from topology) so
+    we can `cd` into it before checking. Absolute paths (`/Volumes/...`)
+    are checked as-is regardless of models_dir.
     """
     p = model_path.rstrip("/")
+    is_absolute = p.startswith("/")
+    # `cd $models_dir` only when model_path is relative. For absolute paths
+    # we leave the working directory alone — the absolute path resolves
+    # correctly from $HOME or anywhere else.
+    cd_prefix = ""
+    if not is_absolute and models_dir:
+        cd_prefix = f"cd {shlex.quote(models_dir)} && "
     # Probe in one command:
     #   1. config.json exists + non-empty
     #   2. at least one *.safetensors file
     #   3. tokenizer present (config.json | tokenizer.json | tokenizer.model)
     script = (
+        f'{cd_prefix}'
         f'[ -s {shlex.quote(p)}/config.json ] || {{ echo MISSING_CONFIG; exit 0; }} && '
         f'ls {shlex.quote(p)}/*.safetensors >/dev/null 2>&1 || {{ echo MISSING_WEIGHTS; exit 0; }} && '
         f'{{ [ -s {shlex.quote(p)}/tokenizer.json ] || '
@@ -5653,8 +5893,13 @@ async def admin_logs(cluster: str = "default", tail: int = 100, follow: bool = F
     - `follow=true`: SSE stream, replays last `tail` lines then sends every
       new line as a JSON event. Closes on client disconnect.
     """
-    if cluster not in _log_buffers:
+    # Lazy-init: cluster may be a topology.yaml-defined id ('main',
+    # 'telemak-max64', …) that wasn't pre-seeded into _log_buffers.
+    # Only refuse the request if the cluster id is truly unknown to
+    # the orchestrator.
+    if cluster not in _log_buffers and not cluster_exists(cluster):
         raise HTTPException(400, f"unknown cluster {cluster}")
+    _ensure_log_cluster(cluster)
     if not follow:
         rows = list(_log_buffers[cluster])[-tail:]
         return {"cluster": cluster, "data": rows}
@@ -6263,6 +6508,7 @@ async def admin_run_cancel(run_id: str):
     r = _active_runs.get(run_id)
     if r:
         r["status"] = "cancelling"
+        r["cancelled_at"] = time.time()
     # Hard cancel — best-effort broadcast to the right pool's runners.
     cluster = (r or {}).get("cluster")
     pool = _pool_for_cluster_name(cluster)
@@ -6283,6 +6529,7 @@ async def admin_runs_cancel_all(cluster: Optional[str] = None):
     runner-side broadcast (see admin_run_cancel)."""
     cancelled = 0
     hard_sent_total = 0
+    now = time.time()
     # Build list of (rid, pool) first to broadcast outside the iteration.
     targets: list[tuple[str, Optional[Any]]] = []
     for rid, ev in list(_active_run_cancels.items()):
@@ -6293,6 +6540,7 @@ async def admin_runs_cancel_all(cluster: Optional[str] = None):
         cancelled += 1
         if r:
             r["status"] = "cancelling"
+            r["cancelled_at"] = now
         targets.append((rid, _pool_for_cluster_name((r or {}).get("cluster"))))
     for rid, pool in targets:
         if pool is None:
@@ -6629,6 +6877,55 @@ def _pool_for_cluster(cluster_id: str):
     """Return the default-alias pool for this cluster, if loaded. Generic
     over any cluster_id in topology.yaml."""
     return get_pool(cluster_id)
+
+
+async def _purge_dead_pools(cluster_id: str) -> list[str]:
+    """Drop pools whose ranks have all died.
+
+    A runner can die after the load endpoint returned `loaded:true`:
+      - OOM during the first forward pass (Metal OOM, common on under-RAMed nodes)
+      - segfault / panic
+      - node reboot (Sophie pulls the plug to fix RDMA cables)
+      - any silent JACCL crash that doesn't take the orchestrator down
+
+    The pool registry keeps claiming those node indices, so the next
+    `POST /load` on overlapping indices fails with HTTP 409
+    "already in use by another loaded pool", forcing the operator to
+    manually `unload {alias}` + `reset` before retrying. Friction with
+    no value — the runner is dead, we know it.
+
+    This helper sweeps `list_pools(cluster_id)` and drops every pool
+    with `alive_count() == 0`. Returns the list of purged aliases so
+    the caller can log them.
+
+    Best-effort: pool.stop() failures don't block the purge — if the
+    SSH connection is gone the runner is already dead.
+    """
+    purged: list[str] = []
+    for alias, pool in list(list_pools(cluster_id)):
+        if pool.alive_count() > 0:
+            continue
+        try:
+            await pool.stop()
+        except Exception as e:
+            print(
+                f"[purge] {cluster_id}[{alias}] stop failed during dead-pool "
+                f"purge: {e}", flush=True
+            )
+        del_pool(cluster_id, alias)
+        purged.append(alias)
+        print(
+            f"[purge] {cluster_id}[{alias}]: pool was 'loaded' in registry but "
+            f"every rank had exited — auto-unloaded to free node indices "
+            f"{sorted(pool.node_indices) if pool.node_indices else '[]'}",
+            flush=True,
+        )
+    if purged:
+        try:
+            save_cluster_state_v2(cluster_id)
+        except Exception as e:
+            print(f"[purge] {cluster_id} persist after purge failed: {e}", flush=True)
+    return purged
 
 
 async def _auto_unload_cluster(cluster_id: str, reason: str) -> None:
@@ -6979,10 +7276,15 @@ async def admin_cluster_status(cluster_id: str):
         raise HTTPException(404, f"unknown cluster {cluster_id}")
     loading = _loading_snapshot(_loading_state_for(cluster_id))
     default_pool = get_pool(cluster_id)
+    all_loaded = list_pools(cluster_id)
     # During a load, expose per-rank phase. After load completes the snapshot
     # disappears and clients fall back to the main `loaded` status.
     if loading is not None:
-        ranks_view = _pool_per_rank_phases(default_pool)
+        # Prefer the default pool when present (single-pool back-compat),
+        # otherwise pick the first loaded pool so the dashboard renders
+        # per-rank phases for multi-pool loads too.
+        anchor_pool = default_pool or (all_loaded[0][1] if all_loaded else None)
+        ranks_view = _pool_per_rank_phases(anchor_pool)
         if ranks_view:
             loading["ranks"] = ranks_view
     cd = get_cluster_def(cluster_id)
@@ -6990,7 +7292,9 @@ async def admin_cluster_status(cluster_id: str):
     effective_max = get_cluster_max_nodes(cluster_id, default=cluster_max)
     effective_max = min(effective_max, cluster_max)
     avail_counts = list(range(1, effective_max + 1))
-    if default_pool is None:
+    # Empty-cluster path : no pool of any alias is loaded. Dashboard renders
+    # the load form, nothing else.
+    if default_pool is None and not all_loaded:
         return {
             "loaded": False, "cluster": cluster_id,
             "loading": loading,
@@ -7032,26 +7336,32 @@ async def admin_cluster_status(cluster_id: str):
                          for n in pool.nodes],
         }
 
-    pools = [_pool_view(a, p) for a, p in list_pools(cluster_id)]
-    # Default-alias fields, kept flat for back-compat.
-    uptime = time.time() - (default_pool.started_at or time.time())
+    pools = [_pool_view(a, p) for a, p in all_loaded]
+    # Pick a "primary" pool for the flat back-compat fields :
+    #   - default alias when loaded (single-pool clusters keep current shape),
+    #   - otherwise the first pool alphabetically — gives multi-pool clusters
+    #     a deterministic anchor for old clients that only read flat fields.
+    # Without this anchor, dashboards that don't yet parse `pools[]` show
+    # nothing at all when an operator uses custom aliases (no `default`).
+    primary_pool = default_pool or all_loaded[0][1]
+    uptime = time.time() - (primary_pool.started_at or time.time())
     recent_tps = [m["tps"] for m in list(_metrics)[:10]
-                  if m["tps"] > 0 and m.get("model") == default_pool.model]
-    topo = build_topology(cluster_id, default_pool.nodes_count)
+                  if m["tps"] > 0 and m.get("model") == primary_pool.model]
+    topo = build_topology(cluster_id, primary_pool.nodes_count)
     return {
         "loaded": True, "cluster": cluster_id,
         "loading": loading,
-        "model": default_pool.model, "mode": default_pool.mode,
-        "use_ap": default_pool.use_ap, "nodes": default_pool.nodes_count,
-        "kv_q8": default_pool.kv_q8,
-        "draft_model": default_pool.draft_model,
-        "num_draft_tokens": default_pool.num_draft_tokens if default_pool.draft_model else None,
-        "alive": default_pool.alive_count(),
-        "load_s": default_pool.load_s, "uptime_s": uptime,
+        "model": primary_pool.model, "mode": primary_pool.mode,
+        "use_ap": primary_pool.use_ap, "nodes": primary_pool.nodes_count,
+        "kv_q8": primary_pool.kv_q8,
+        "draft_model": primary_pool.draft_model,
+        "num_draft_tokens": primary_pool.num_draft_tokens if primary_pool.draft_model else None,
+        "alive": primary_pool.alive_count(),
+        "load_s": primary_pool.load_s, "uptime_s": uptime,
         "recent_avg_tps": round(sum(recent_tps) / len(recent_tps), 2) if recent_tps else None,
         "topology": [{"rank": n["rank"], "ssh": n["ssh"]} for n in topo],
         "pools": pools,
-        "aliases": [a for a, _ in list_pools(cluster_id)],
+        "aliases": [a for a, _ in all_loaded],
         "nodes_in_use": sorted(nodes_in_use(cluster_id)),
         "available_node_counts": avail_counts,
         "max_nodes": effective_max,
@@ -7180,6 +7490,20 @@ async def admin_cluster_load(cluster_id: str, req: ArgoLoadRequest):
             )
         node_indices = list(range(req.nodes))
         nodes_count = req.nodes
+
+    # Purge any pool whose runners have all died (OOM, panic, node reboot).
+    # Without this, the next load on overlapping indices gets HTTP 409
+    # "already in use" even though nobody's actually using them. The user
+    # has to manually unload + reset to break the deadlock — friction with
+    # no value. See #5. Safe to run unconditionally : pools with alive
+    # ranks are skipped.
+    purged_aliases = await _purge_dead_pools(cluster_id)
+    if purged_aliases:
+        print(
+            f"[load] {cluster_id}: dead pools auto-purged before load "
+            f"({', '.join(purged_aliases)})",
+            flush=True,
+        )
 
     existing_aliases = {a for a, _ in list_pools(cluster_id)}
     if alias in existing_aliases and not req.force_hot_swap and alias != DEFAULT_ALIAS:
