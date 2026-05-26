@@ -1,0 +1,20 @@
+{
+  "telemak-test": {
+    "_removed": true
+  },
+  "telemak-max64": {
+    "name": "Telemak (max-64)",
+    "kind": "telemak",
+    "backend": "http-proxy",
+    "nodes": [
+      {
+        "host": "telemak",
+        "ssh": "admin@192.168.86.50",
+        "master": true,
+        "port": null
+      }
+    ],
+    "upstream": "http://192.168.86.50:8003",
+    "_telemak_loaded_model": "/Volumes/models/odysseus/inferencerlabs/Qwen3.6-35B-A3B-MLX-9bit"
+  }
+}

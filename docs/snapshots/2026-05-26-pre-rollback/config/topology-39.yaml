@@ -1,0 +1,107 @@
+clusters:
+  main:
+    label: "Studio JACCL (4× Ultra)"
+    backend: jaccl
+
+    pools:
+      - size: 1
+        nodes:
+          - rank: 0
+            id: ultra-512
+            ssh: admin@192.168.86.29
+            models_dir: /volumes/models/odysseus
+            rdma_to: {}
+
+      - size: 2
+        nodes:
+          - rank: 0
+            id: ultra-512
+            ssh: admin@192.168.86.29
+            models_dir: /volumes/models/odysseus
+            rdma_to:
+              1: rdma_en5
+          - rank: 1
+            id: ultra-256a
+            ssh: admin@192.168.86.30
+            models_dir: /volumes/models/odysseus
+            rdma_to:
+              0: rdma_en5
+
+      # 3-node — re-mapped 2026-05-25 after .31 re-cabling
+      # Links : 512↔256a (en5↔en5), 512↔256b (en6↔en3), 256a↔256b (en7↔en7)
+      - size: 3
+        nodes:
+          - rank: 0
+            id: ultra-512
+            ssh: admin@192.168.86.29
+            models_dir: /volumes/models/odysseus
+            rdma_to:
+              1: rdma_en5    # 512 → 256a
+              2: rdma_en6    # 512 → 256b
+          - rank: 1
+            id: ultra-256a
+            ssh: admin@192.168.86.30
+            models_dir: /volumes/models/odysseus
+            rdma_to:
+              0: rdma_en5    # 256a → 512
+              2: rdma_en7    # 256a → 256b
+          - rank: 2
+            id: ultra-256b
+            ssh: admin@192.168.86.31
+            models_dir: /volumes/models/odysseus
+            rdma_to:
+              0: rdma_en3    # 256b → 512
+              1: rdma_en7    # 256b → 256a
+
+      # 4-node full mesh — re-mapped 2026-05-25 after .31 re-cabling
+      # (Sophie cabled 2 front + 1 rear on each Mac).
+      # 6 unique links (discovered via ndp MAC neighbors):
+      #   512↔256a (en5↔en5), 512↔256b (en6↔en3), 512↔256c (en3↔en3),
+      #   256a↔256b (en7↔en7), 256a↔256c (en3↔en5), 256b↔256c (en6↔en7).
+      - size: 4
+        nodes:
+          - rank: 0
+            id: ultra-512
+            ssh: admin@192.168.86.29
+            models_dir: /volumes/models/odysseus
+            rdma_to:
+              1: rdma_en5    # 512 → 256a
+              2: rdma_en6    # 512 → 256b
+              3: rdma_en3    # 512 → 256c
+          - rank: 1
+            id: ultra-256a
+            ssh: admin@192.168.86.30
+            models_dir: /volumes/models/odysseus
+            rdma_to:
+              0: rdma_en5    # 256a → 512
+              2: rdma_en7    # 256a → 256b
+              3: rdma_en3    # 256a → 256c
+          - rank: 2
+            id: ultra-256b
+            ssh: admin@192.168.86.31
+            models_dir: /volumes/models/odysseus
+            rdma_to:
+              0: rdma_en3    # 256b → 512
+              1: rdma_en7    # 256b → 256a
+              3: rdma_en6    # 256b → 256c
+          - rank: 3
+            id: ultra-256c
+            ssh: admin@192.168.86.32
+            models_dir: /volumes/models/odysseus
+            rdma_to:
+              0: rdma_en3    # 256c → 512
+              1: rdma_en5    # 256c → 256a
+              2: rdma_en7    # 256c → 256b
+
+  telemak-max64:
+    label: "Telemak (max-64)"
+    backend: http-proxy
+    upstream: http://192.168.86.50:8003
+    pools:
+      - size: 1
+        nodes:
+          - rank: 0
+            id: telemak
+            ssh: admin@192.168.86.50
+            models_dir: /Volumes/models/odysseus
+            rdma_to: {}

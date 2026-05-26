@@ -1,0 +1,137 @@
+{
+  "main": {
+    "load_history": {
+      "/Volumes/models/odysseus/Qwen/Qwen2.5-3B-bf16": {
+        "last_load_s": 4.08,
+        "size_bytes": 6183542784,
+        "nodes": 1
+      },
+      "/Volumes/models/odysseus/inferencerlabs/Qwen3.5-397B-A17B-MLX-9bit": {
+        "last_load_s": 154.35,
+        "size_bytes": 445913030656,
+        "nodes": 3
+      },
+      "/Volumes/models/odysseus/mlx-community/Qwen3-Coder-480B-A35B-Instruct-8bit": {
+        "last_load_s": 131.46,
+        "size_bytes": 540187709440,
+        "nodes": 4
+      },
+      "inferencerlabs/Qwen3.5-397B-A17B-MLX-9bit": {
+        "last_load_s": 37.0,
+        "size_bytes": 0,
+        "nodes": 3
+      },
+      "inferencerlabs/Qwen3-Coder-Next-MLX-9bit": {
+        "last_load_s": 11.19,
+        "size_bytes": 0,
+        "nodes": 2
+      },
+      "mlx-community/MiniMax-M2.7-8bit": {
+        "last_load_s": 10.65,
+        "size_bytes": 0,
+        "nodes": 1
+      },
+      "/Volumes/models/odysseus/mlx-community/MiniMax-M2.7-8bit": {
+        "last_load_s": 11.16,
+        "size_bytes": 243002847232,
+        "nodes": 1
+      },
+      "Qwen/Qwen2.5-3B-bf16": {
+        "last_load_s": 1.52,
+        "size_bytes": 0,
+        "nodes": 1
+      },
+      "/Volumes/models/odysseus/Qwen/Qwen3.6-35B-A3B-MLX-8bit": {
+        "last_load_s": 3.06,
+        "size_bytes": 37741953024,
+        "nodes": 1
+      },
+      "/Volumes/models/odysseus/inferencerlabs/Qwen3-Coder-Next-MLX-9bit": {
+        "last_load_s": 68.44,
+        "size_bytes": 89643708416,
+        "nodes": 1
+      }
+    },
+    "name": "Argo",
+    "kind": "mlx-distributed",
+    "backend": "jaccl",
+    "nodes": [
+      {
+        "host": "ultra-512",
+        "ssh": "admin@192.168.86.29",
+        "master": true,
+        "port": null
+      },
+      {
+        "host": "ultra-256a",
+        "ssh": "admin@192.168.86.30",
+        "master": false,
+        "port": null
+      },
+      {
+        "host": "ultra-256b",
+        "ssh": "admin@192.168.86.31",
+        "master": false,
+        "port": null
+      },
+      {
+        "host": "ultra-256c",
+        "ssh": "admin@192.168.86.32",
+        "master": false,
+        "port": null
+      }
+    ],
+    "models_dir": "/Volumes/models/odysseus"
+  },
+  "telemak-max64": {
+    "_removed": true
+  },
+  "discovery": {
+    "active": false,
+    "started_at": null,
+    "expires_at": null
+  },
+  "crew": [
+    {
+      "id": "crew-05d458929e046e59",
+      "client_id": "companion-1de390e9-acec-439d-9d2e-a1859e6434f6",
+      "client_name": "Companion @ 60f98c164a7e",
+      "user_label": null,
+      "token_hash": "09e1944da3475e1b2ef7b90d8ba663a20dcea4e2e1d6a3432e8316204a2861a1",
+      "token_preview": "1twjNS",
+      "paired_at": 1779724352.772295,
+      "last_seen": 1779801627.5336335,
+      "scopes": [
+        "chat"
+      ]
+    },
+    {
+      "id": "crew-ddd65d45a587c1d5",
+      "client_id": "companion-d24fe4e4-4096-4833-8cd0-2a3a1f9f765a",
+      "client_name": "Companion @ c4a2fc99a7f0",
+      "user_label": null,
+      "token_hash": "5be7887fef8122c8b10a7f027cda12dfba870839517b445925a62c30ee1952c7",
+      "token_preview": "sM0vD_",
+      "paired_at": 1779726723.9645815,
+      "last_seen": 1779728062.244498,
+      "scopes": [
+        "chat"
+      ]
+    }
+  ],
+  "telemak-64": {
+    "name": "Telemak",
+    "kind": "telemak",
+    "backend": "http-proxy",
+    "nodes": [
+      {
+        "host": "telemak-64",
+        "ssh": "admin@192.168.86.50",
+        "master": true,
+        "port": null
+      }
+    ],
+    "upstream": "http://192.168.86.50:8003",
+    "models_dir": "/Volumes/models/odysseus"
+  }
+}

@@ -1,0 +1,57 @@
+# Odysseus topology — .141 orchestrator
+# Generated 2026-05-23
+#
+# - Argo: 4× Ultra (M3 Ultra 512 + 3× M3 Ultra 256), JACCL TB5 mesh
+#   - currently OFF; cluster will show as unreachable until powered on
+# - Telemak: single-Mac native runtime (Swift, mlx-swift-lm)
+#   - registered as http-proxy cluster when ready
+
+clusters:
+  argo:
+    label: "Argo (4× Ultra distributed)"
+    backend: jaccl
+    pools:
+      - size: 4
+        models_dir: /Volumes/models/odysseus
+        nodes:
+          - rank: 0
+            id: ultra-512
+            ssh: admin@192.168.86.29
+            rdma_to:
+              1: rdma_en5
+              2: rdma_en4
+              3: rdma_en3
+          - rank: 1
+            id: ultra-256a
+            ssh: admin@192.168.86.30
+            rdma_to:
+              0: rdma_en5
+              2: rdma_en4
+              3: rdma_en3
+          - rank: 2
+            id: ultra-256b
+            ssh: admin@192.168.86.31
+            rdma_to:
+              0: rdma_en5
+              1: rdma_en4
+              3: rdma_en3
+          - rank: 3
+            id: ultra-256c
+            ssh: admin@192.168.86.32
+            rdma_to:
+              0: rdma_en3
+              1: rdma_en5
+              2: rdma_en4
+
+  # Telemak placeholder — uncomment when the Swift binary is running.
+  # telemak:
+  #   label: "Telemak (single-Mac native)"
+  #   backend: http-proxy
+  #   upstream: http://<mac>.lan:8002
+  #   pools:
+  #     - size: 1
+  #       models_dir: ~/mlx-models
+  #       nodes:
+  #         - rank: 0
+  #           id: telemak
+  #           ssh: admin@<mac>.lan
