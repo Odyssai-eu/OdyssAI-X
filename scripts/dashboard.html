@@ -2816,6 +2816,7 @@ function renderTelemakModelsCard(cid, cdef) {
   // multi-mac telemak fleet) and aggregate.
   const cdefNodes = cdef?.nodes || [];
   const hostIds = cdefNodes.map(n => n.host).filter(Boolean);
+  const cdefSshs = cdefNodes.map(n => (n.ssh || "").trim()).filter(Boolean);
   // models_dir can be set at the cluster level (preferred for Telemak — single
   // editable field in Settings → Clusters → Telemak) or per-node (legacy /
   // multi-node telemak fleets). Cluster-level wins; per-node fills in only if
@@ -2826,7 +2827,13 @@ function renderTelemakModelsCard(cid, cdef) {
     : Array.from(new Set(cdefNodes.map(n => n.models_dir).filter(Boolean)));
   const m = state.matrix;
   const allHosts = m?.hosts || [];
-  const hosts = allHosts.filter(h => hostIds.includes(h.id));
+  // Match by host id OR by SSH target. SSH is the authoritative identifier
+  // for Telemak: topology.yaml may still list the legacy cluster (e.g.
+  // `telemak-max64` with host id `telemak`) while cluster-config.json has
+  // a freshly UI-added entry (`telemak-64` with host id `telemak-64`).
+  // Both point at the same Mac via the same admin@<ip> SSH, so SSH match
+  // catches the legacy/new id drift without forcing a topology rewrite.
+  const hosts = allHosts.filter(h => hostIds.includes(h.id) || cdefSshs.includes((h.ssh || "").trim()));
   // Models with presence on at least one telemak host, loaded-first then alpha.
   const inventory = (m?.models || [])
     .filter(mod => hosts.some(h => mod.presence?.[h.id]))
