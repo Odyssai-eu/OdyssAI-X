@@ -3084,12 +3084,36 @@ function renderTelemakHomeCard(a, cid, label) {
   const formOpen = !!f.open;
   const busy = !!state.busy_telemak_load?.[cid];
 
+  // Per-model details (kind + MTP status) come from _telemak_status which
+  // parses Telemak's /v1/models x_telemak block + the engine capability
+  // contract. Empty/missing details default to {kind:"llm", mtp_enabled:false}
+  // so older Telemak builds still render cleanly.
+  const details = a.models_details || {};
+  const kindBadge = (kind) => {
+    const k = (kind || "llm").toLowerCase();
+    const palette = k === "embedder" ? ["green-soft", "green-deep", "embed"]
+                  : k === "vlm"      ? ["amber-soft", "amber-deep", "vlm"]
+                  : k === "embedding"? ["green-soft", "green-deep", "embed"]
+                  : k === "vision"   ? ["amber-soft", "amber-deep", "vlm"]
+                  :                    ["blue-soft", "blue-deep", "chat"];
+    return `<span style="padding:2px 7px;background:var(--${palette[0]});color:var(--${palette[1]});border-radius:4px;font-size:10px;font-weight:700;letter-spacing:0.04em;text-transform:uppercase;white-space:nowrap">${palette[2]}</span>`;
+  };
   const rows = modelsLoaded.map((id) => {
     const short = (id.split("/").pop() || id).toLowerCase();
     const alias = modelsLoaded.length === 1 ? cid : `${cid}:${short}`;
+    const d = details[id] || {};
+    const mtpLine = d.mtp_enabled
+      ? `<div style="font-family:var(--font-mono);font-size:11px;color:var(--ink-2);margin-top:2px">MTP: <span style="color:var(--blue-deep);font-weight:600">${escapeHtml(d.draft_model || "mtp_adapter")}</span>${d.num_draft_tokens ? ` · window ${d.num_draft_tokens}` : ""}</div>`
+      : "";
     return `
       <div style="display:flex;align-items:center;gap:12px;padding:8px 12px;background:var(--surface);border:1px solid var(--line);border-radius:6px;font-family:var(--font-mono);font-size:12px">
-        <span style="font-weight:600;color:var(--ink);flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${escapeHtml(id)}</span>
+        <div style="flex:1;min-width:0;display:flex;flex-direction:column;gap:0">
+          <div style="display:flex;align-items:center;gap:8px;min-width:0">
+            ${kindBadge(d.kind)}
+            <span style="font-weight:600;color:var(--ink);flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${escapeHtml(id)}</span>
+          </div>
+          ${mtpLine}
+        </div>
         <span style="color:var(--ink-3);font-size:11px;white-space:nowrap">alias: <span style="color:var(--ink-2)">${escapeHtml(alias)}</span></span>
         <button class="btn btn-xs btn-destructive" data-act="telemak-unload" data-cluster="${cid}" data-model="${escapeHtml(id)}" title="Unload ${escapeHtml(id)}">${Icon.x}<span>Unload</span></button>
       </div>

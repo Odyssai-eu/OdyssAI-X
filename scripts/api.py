@@ -8211,10 +8211,17 @@ async def _telemak_status(cluster_id: str, cd: dict) -> dict:
     """
     upstream = (cd.get("upstream") or "").rstrip("/")
     models_loaded: list[str] = []
+    # Per-model metadata derived from Telemak's /v1/models + capability
+    # contract. Shape : {model_id: {kind: "llm"|"embedder"|"vlm",
+    # mtp_enabled: bool, draft_model: str|null, num_draft_tokens: int|null}}.
+    # Default values mean "Telemak didn't tell us, treat as LLM with no
+    # speculative decoding" — keeps old Telemak builds compatible.
+    models_details: dict[str, dict] = {}
     reachable = False
     wired_used_gb = None
     wired_free_gb = None
     avg_tok_s_recent = None
+    spec_modes: list[str] = []
     if upstream:
         import httpx
         try:
@@ -8223,7 +8230,17 @@ async def _telemak_status(cluster_id: str, cd: dict) -> dict:
                 if r.status_code == 200:
                     reachable = True
                     data = r.json().get("data", [])
-                    models_loaded = [m.get("id") for m in data if m.get("id")]
+                    for m in data:
+                        mid = m.get("id")
+                        if not mid:
+                            continue
+                        models_loaded.append(mid)
+                        x = m.get("x_telemak") or {}
+                        models_details[mid] = {
+                            "kind": x.get("kind") or "llm",
+                            "draft_model": x.get("draft_model"),
+                            "num_draft_tokens": x.get("num_draft_tokens"),
+                        }
                 # /health is independent — fetch even if /v1/models bombed,
                 # the user wants to know the upstream's memory state.
                 try:
@@ -8238,8 +8255,25 @@ async def _telemak_status(cluster_id: str, cd: dict) -> dict:
                         avg_tok_s_recent = hj.get("avg_tok_s_recent")
                 except Exception:
                     pass
+                # Capability contract — tells us which speculative-decoding
+                # modes the engine supports (e.g. ["mtp_adapter"]). Combined
+                # with the per-model kind it gives "MTP active for this LLM".
+                try:
+                    cap = await client.get(f"{upstream}/.well-known/inference-engine.json")
+                    if cap.status_code == 200:
+                        cj = cap.json()
+                        spec_modes = (cj.get("capabilities", {}).get("speculative_decoding") or {}).get("modes") or []
+                except Exception:
+                    pass
         except Exception:
             reachable = False
+    # Derive mtp_enabled per model : engine reports an MTP mode AND model
+    # is an LLM (embedders / VLMs don't benefit from MTP today).
+    has_mtp_mode = any("mtp" in (m or "").lower() for m in spec_modes)
+    for mid, det in models_details.items():
+        det["mtp_enabled"] = bool(
+            has_mtp_mode and (det.get("kind") or "llm") == "llm"
+        )
     nodes = cd.get("nodes") or []
     master_ssh = (nodes[0] or {}).get("ssh") if nodes else None
     loaded_model = models_loaded[0] if models_loaded else None
@@ -8252,6 +8286,8 @@ async def _telemak_status(cluster_id: str, cd: dict) -> dict:
         "nodes": 1 if models_loaded else 0,
         "model": loaded_model,                     # back-compat (singular)
         "models_loaded": models_loaded,            # canonical (list)
+        "models_details": models_details,          # per-model kind / MTP / draft
+        "spec_modes": spec_modes,                  # engine-level speculative_decoding modes
         "wired_memory_used_gb": wired_used_gb,
         "wired_memory_free_gb": wired_free_gb,
         "avg_tok_s_recent": avg_tok_s_recent,
