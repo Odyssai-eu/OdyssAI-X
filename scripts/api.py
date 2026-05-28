@@ -2024,6 +2024,16 @@ _THINK_MAX_PARTIAL = max(len(_THINK_OPEN), len(_THINK_CLOSE)) - 1  # 7
 # i.e. their stance is "don't disable thinking" — we route around them
 # by treating the auto-opened block as reasoning and stripping the close.
 _MODELS_AUTO_OPEN_THINK = ("minimax", "qwen3.5", "qwen3.6")
+# Subset of _MODELS_AUTO_OPEN_THINK that IGNORES the `enable_thinking`
+# kwarg and always wraps reasoning in <think>...</think>. Per MiniMax M2
+# docs (2026-05-20 update): "The model's reasoning is wrapped in <think>
+# tags within the content field. Do not modify the content field."
+# Qwen3.5 and Qwen3.6 honor the flag — when Companion sends
+# enable_thinking=false they actually stop thinking, no filter needed.
+# MiniMax doesn't honor it, so we MUST keep the filter on for it even
+# when callers ask for no-thinking, otherwise the reasoning text leaks
+# into `content` verbatim (`</think>` literal visible to the user).
+_MODELS_IGNORE_ENABLE_THINKING_FLAG = ("minimax",)
 
 
 def _model_auto_opens_think(model_id: Optional[str]) -> bool:
@@ -2031,6 +2041,13 @@ def _model_auto_opens_think(model_id: Optional[str]) -> bool:
         return False
     needle = model_id.lower()
     return any(key in needle for key in _MODELS_AUTO_OPEN_THINK)
+
+
+def _model_ignores_enable_thinking_flag(model_id: Optional[str]) -> bool:
+    if not model_id:
+        return False
+    needle = model_id.lower()
+    return any(key in needle for key in _MODELS_IGNORE_ENABLE_THINKING_FLAG)
 
 
 def _split_think_stream(text: str, state: dict) -> tuple[str, str]:
@@ -8016,14 +8033,21 @@ async def _telemak_proxy_chat_completion(
     # route everything to `reasoning_content` until the model finally
     # closes with `</think>`.
     #
-    # BUT — when the request body has `enable_thinking: false`, Telemak
-    # honors the kwarg via the chat template and the model does NOT
-    # auto-open <think>. If we still seed `in_think=True` here, the
-    # filter eats the entire visible output as reasoning_content
-    # (Companion gets a "ghost" — empty content, full reasoning_content).
-    # Disable the auto-seed in that case.
+    # `enable_thinking: false` from the client means "I don't want
+    # thinking in the output". Qwen3.5/3.6 honor the flag at the chat
+    # template level — the model genuinely stops emitting <think> blocks,
+    # so we MUST disable the filter (otherwise it eats the visible
+    # output as reasoning_content — empty-content ghost bug).
+    #
+    # MiniMax M2 docs explicitly say it IGNORES the flag and always
+    # wraps reasoning in <think>. If we trust the flag for MiniMax, the
+    # reasoning + `</think>` literal leaks into `content` (Companion
+    # shows "The user is asking…</think>\n\n# Real story" in chat).
+    # So for MiniMax (and any other model in the ignore list), keep the
+    # filter on regardless of the flag.
     enable_thinking = body.get("enable_thinking")
-    if enable_thinking is False:
+    ignores_flag = _model_ignores_enable_thinking_flag(upstream_model)
+    if enable_thinking is False and not ignores_flag:
         auto_think = False
     else:
         auto_think = _model_auto_opens_think(upstream_model)
