@@ -364,6 +364,30 @@ Speed: 33.4 tok/s · Decode: 43.3 tok/s · Chunks: 47
 single-node MLX-Swift gagne sur distribué Python + JACCL pour les
 modèles qui tiennent en RAM.
 
+### Cross-check inferencerlabs sur le même hardware
+
+Sophie va vérifier les chiffres publiés par inferencerlabs pour le
+même modèle sur le même hardware (M3 Ultra 512 GB, l'app Inferencer
+native) :
+
+| | Inferencer (debug build) | Telemak Kolos (release 0.6.10) |
+|---|---|---|
+| Speed | ~30 tok/s @ 1000 tokens | **43.3 tok/s decode** |
+| RAM | ~240 GiB | 227.7 GiB wired used |
+
+L'écart vient en partie du build (eux annoncent debug, nous release —
+le release Swift est typiquement 30-50% plus rapide). Mais on est
+clairement **dans la même league qu'inferencer**, leur app native
+qu'ils benchent pour leurs propres modèles. Ce n'est plus seulement
+"plus rapide qu'Argo distribué", c'est "à la hauteur de la
+référence Swift-native du domaine". Et on consomme légèrement moins
+de wired (227 vs 240 GB).
+
+La barre où on se mesure passe de "le rig fait tourner du local" à
+"le rig est compétitif avec ce que l'industrie locale produit". Le
+pivot Telemak du 26-27 mai (sortir de mlx-distributed pour aller
+chercher MLX-Swift natif) est validé empiriquement.
+
 ---
 
 ## 5. Bonus — métrique Decode tok/s dans Companion
