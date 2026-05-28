@@ -93,7 +93,12 @@ def collect_iface_data(target: str, ifaces: list[str]) -> tuple[dict[str, str], 
     # then dump ifconfig + ndp -an in a single SSH round-trip.
     parts = []
     for i in ifaces:
-        parts.append(f"ping6 -c 1 -W 500 ff02::1%{i} >/dev/null 2>&1")
+        # `-c 1` exits as soon as the first reply arrives. `-W` is dropped
+        # because macOS `ping6` does not treat `-W <ms>` as a wait timeout
+        # (Linux iputils semantics) — the numeric argument got consumed in
+        # a way that broke the multicast probe silently. The default packet
+        # timeout (~1s on the loopback / link-local scope) is fine here.
+        parts.append(f"ping6 -c 1 ff02::1%{i} >/dev/null 2>&1")
         parts.append(f"echo '--IFCONFIG {i}--'; ifconfig {i} 2>/dev/null")
     parts.append("echo '--NDP--'; ndp -an 2>/dev/null")
     out = ssh(target, " ; ".join(parts))
