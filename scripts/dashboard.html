@@ -3104,14 +3104,61 @@ function renderTelemakHomeCard(a, cid, label) {
   const tpsPill = (typeof a.avg_tok_s_recent === "number" && a.avg_tok_s_recent > 0)
     ? `<div class="pill-status" style="background:var(--ground);border-color:var(--line);color:var(--ink-2);font-weight:600;padding:3px 10px;border-radius:6px;font-size:11px;letter-spacing:0.04em;text-transform:uppercase">${a.avg_tok_s_recent.toFixed(1)} tok/s</div>`
     : "";
-  // Live-activity readout — see api.py:_telemak_status. busy=true means
-  // a session was touched within ~5s. active_sessions_count is the
-  // number of KV-cached sessions Telemak is holding for fast resume.
-  const busyPill = a.busy
+  // Live-activity readout — see api.py:_telemak_status. The richer
+  // fields (current_phase / current_tok_s / current_generated_tokens /
+  // active_requests / last_error) come from Telemak's /admin/activity
+  // (0.6.15+) when available; busy + sessions are the fallback when
+  // the upstream is older.
+  const phase = a.current_phase;
+  const liveTps = (typeof a.current_tok_s === "number" && a.current_tok_s > 0)
+    ? `${a.current_tok_s.toFixed(1)} tok/s` : "";
+  const liveTokens = (typeof a.current_generated_tokens === "number" && a.current_generated_tokens > 0)
+    ? `${a.current_generated_tokens} tok` : "";
+  // current_request_started_at — Telemak ships an ISO-8601 string
+  // ("2026-05-28T15:35:38.797Z"), older builds may have sent a float
+  // (Unix seconds). Handle both.
+  let elapsedS = null;
+  if (typeof a.current_request_started_at === "string" && a.current_request_started_at) {
+    const t = Date.parse(a.current_request_started_at);
+    if (!Number.isNaN(t)) elapsedS = Math.max(0, Math.floor((Date.now() - t) / 1000));
+  } else if (typeof a.current_request_started_at === "number" && a.current_request_started_at > 0) {
+    elapsedS = Math.max(0, Math.floor(Date.now()/1000 - a.current_request_started_at));
+  }
+  // Phase pill — colored by what Telemak is doing right now.
+  // idle      → no pill (idle is silence; the model-loaded pill carries the day)
+  // prefill   → blue, pulsing dot (compute-heavy, no tokens yet)
+  // decode / streaming → amber, pulsing dot + live tok/s + token count
+  const phaseColors = {
+    prefill:   { bg: "#e8f0fa", border: "var(--blue)",  ink: "var(--blue-deep)",  dot: "var(--blue)"  },
+    decode:    { bg: "#fff8e6", border: "var(--amber)", ink: "var(--amber-deep)", dot: "var(--amber)" },
+    streaming: { bg: "#fff8e6", border: "var(--amber)", ink: "var(--amber-deep)", dot: "var(--amber)" },
+  };
+  const phasePill = (phase && phase !== "idle" && phaseColors[phase])
+    ? (() => {
+        const c = phaseColors[phase];
+        const detail = [liveTps, liveTokens, elapsedS !== null ? `${elapsedS}s` : ""]
+          .filter(Boolean).join(" · ");
+        return `<div class="pill-status" style="background:${c.bg};border-color:${c.border};color:${c.ink};font-weight:600;padding:3px 10px;border-radius:6px;font-size:11px;letter-spacing:0.04em;text-transform:uppercase" title="${escapeHtml(a.current_model || "")}"><span style="display:inline-block;width:6px;height:6px;border-radius:50%;background:${c.dot};margin-right:5px;animation:pulse 1s infinite;vertical-align:middle"></span>${phase}${detail ? " · " + detail : ""}</div>`;
+      })()
+    : "";
+  // Legacy "generating" pill, only when /admin/activity isn't available
+  // (Telemak < 0.6.15) but busy heuristic kicked in via /admin/sessions.
+  const busyPill = (!phasePill && a.busy)
     ? `<div class="pill-status" style="background:#fff8e6;border-color:var(--amber);color:var(--amber-deep);font-weight:600;padding:3px 10px;border-radius:6px;font-size:11px;letter-spacing:0.04em;text-transform:uppercase"><span style="display:inline-block;width:6px;height:6px;border-radius:50%;background:var(--amber);margin-right:5px;animation:pulse 1s infinite;vertical-align:middle"></span>generating</div>`
+    : "";
+  // Active concurrent requests (only meaningful when > 1 — Telemak runs
+  // one turn at a time per model, but queues can stack).
+  const reqsPill = (typeof a.active_requests === "number" && a.active_requests > 1)
+    ? `<div class="pill-status" style="background:var(--ground);border-color:var(--line);color:var(--ink-2);font-weight:600;padding:3px 10px;border-radius:6px;font-size:11px;letter-spacing:0.04em;text-transform:uppercase">${a.active_requests} req</div>`
     : "";
   const sessionsPill = (typeof a.active_sessions_count === "number" && a.active_sessions_count > 0)
     ? `<div class="pill-status" style="background:var(--ground);border-color:var(--line);color:var(--ink-2);font-weight:600;padding:3px 10px;border-radius:6px;font-size:11px;letter-spacing:0.04em;text-transform:uppercase" title="KV-cached sessions on this Telemak${typeof a.last_request_seconds_ago === 'number' ? '\nlast touched ' + a.last_request_seconds_ago.toFixed(1) + 's ago' : ''}">${a.active_sessions_count} session${a.active_sessions_count > 1 ? 's' : ''}</div>`
+    : "";
+  // last_error from /admin/activity — surface as a red pill so the
+  // operator notices without having to dig into logs. Cleared when
+  // Telemak's next successful turn lands (Telemak clears it).
+  const errPill = (typeof a.last_error === "string" && a.last_error.trim())
+    ? `<div class="pill-status" style="background:#fff5f5;border-color:var(--rust);color:var(--rust);font-weight:600;padding:3px 10px;border-radius:6px;font-size:11px;letter-spacing:0.04em;text-transform:uppercase;cursor:help" title="${escapeHtml(a.last_error)}">last error</div>`
     : "";
   const f = state.telemak_load_form?.[cid] || { model: "", open: false };
   const formOpen = !!f.open;
@@ -3173,8 +3220,11 @@ function renderTelemakHomeCard(a, cid, label) {
             <div class="row">
               <h1>${escapeHtml(label)}</h1>
               ${statusPill}
+              ${phasePill}
               ${busyPill}
+              ${reqsPill}
               ${sessionsPill}
+              ${errPill}
               ${memPill}
               ${tpsPill}
             </div>

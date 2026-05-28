@@ -8306,16 +8306,27 @@ async def _telemak_status(cluster_id: str, cd: dict) -> dict:
     uptime_s = None
     upstream_version = None
     spec_modes: list[str] = []
-    # Activity readout — derived from Telemak's /admin/sessions. We don't
-    # have a literal "is_generating" flag on the upstream, but a session
-    # with a very recent `last_used_s` (< BUSY_WINDOW_S) is almost
-    # certainly in the middle of (or has just finished) a turn. Good
-    # enough to drive a "busy" pill in the dashboard.
+    # Activity readout. Two sources, in priority order:
+    #   1. /admin/activity (Telemak 0.6.15+) — gives the canonical
+    #      current_phase / current_model / current_tok_s straight from
+    #      the engine. When available, `busy` derives from
+    #      current_phase != "idle" (no heuristic window).
+    #   2. /admin/sessions (older Telemak) — fallback, infers busy from
+    #      last_used_s < 5s on any KV-cached session.
     BUSY_WINDOW_S = 5.0
     active_sessions_count: int = 0
     last_request_seconds_ago: Optional[float] = None
     busy = False
     sessions_summary: list[dict] = []
+    # /admin/activity fields (Telemak 0.6.15+). All optional — None
+    # means the upstream is too old to report.
+    current_phase: Optional[str] = None
+    current_model: Optional[str] = None
+    current_request_started_at: Optional[float] = None
+    current_generated_tokens: Optional[int] = None
+    current_tok_s: Optional[float] = None
+    active_requests: Optional[int] = None
+    last_error: Optional[str] = None
     if upstream:
         import httpx
         try:
@@ -8362,9 +8373,30 @@ async def _telemak_status(cluster_id: str, cd: dict) -> dict:
                         spec_modes = (cj.get("capabilities", {}).get("speculative_decoding") or {}).get("modes") or []
                 except Exception:
                     pass
-                # Activity / KV-cache sessions. Best-effort — older Telemak
-                # builds don't expose this, in which case we leave the
-                # fields at their defaults (count=0, busy=False).
+                # /admin/activity — canonical runtime activity readout
+                # (Telemak 0.6.15+). Gives us current_phase, current_tok_s,
+                # current_model, active_requests, last_error directly from
+                # the engine. When present, busy = (current_phase != idle),
+                # no heuristic needed.
+                try:
+                    act = await client.get(f"{upstream}/admin/activity")
+                    if act.status_code == 200:
+                        aj = act.json() or {}
+                        current_phase = aj.get("current_phase")
+                        current_model = aj.get("current_model")
+                        current_request_started_at = aj.get("current_request_started_at")
+                        current_generated_tokens = aj.get("current_generated_tokens")
+                        current_tok_s = aj.get("current_tok_s")
+                        active_requests = aj.get("active_requests")
+                        last_error = aj.get("last_error")
+                        if current_phase and current_phase != "idle":
+                            busy = True
+                except Exception:
+                    pass
+                # /admin/sessions — KV-cached sessions (Telemak 0.6.10+).
+                # Used for active_sessions_count + sessions_summary even
+                # when /admin/activity is available; falls back to driving
+                # the `busy` flag when /admin/activity isn't.
                 try:
                     s = await client.get(f"{upstream}/admin/sessions")
                     if s.status_code == 200:
@@ -8378,7 +8410,11 @@ async def _telemak_status(cluster_id: str, cd: dict) -> dict:
                             ]
                             if recents:
                                 last_request_seconds_ago = min(recents)
-                                busy = last_request_seconds_ago < BUSY_WINDOW_S
+                                # Only set busy from heuristic if /admin/activity
+                                # didn't already report a phase. The engine
+                                # truth-source wins.
+                                if current_phase is None:
+                                    busy = last_request_seconds_ago < BUSY_WINDOW_S
                             # Trim per-session fields to what the dashboard
                             # actually renders — id, kv size, last_used.
                             sessions_summary = [
@@ -8421,15 +8457,32 @@ async def _telemak_status(cluster_id: str, cd: dict) -> dict:
         "requests_served": requests_served,
         "uptime_s": uptime_s,
         "upstream_version": upstream_version,
-        # Activity readout — see the BUSY_WINDOW_S constant above.
-        # busy=True means at least one cached session was touched within
-        # the last few seconds; treat it as "Telemak is currently
-        # generating or just finished". For UIs that want a richer view,
-        # `sessions` gives the per-session breakdown.
+        # Activity readout. `busy` is the truthy summary derived from
+        # /admin/activity when available (Telemak 0.6.15+), falling back
+        # to a recent-session heuristic for older builds. The richer
+        # fields below come from /admin/activity directly:
+        #
+        #   current_phase             "idle" | "prefill" | "decode" | "streaming"
+        #   current_model             absolute path to the model serving the live turn
+        #   current_request_started_at unix seconds since the turn began
+        #   current_generated_tokens   token count emitted so far in the live turn
+        #   current_tok_s              live decode rate
+        #   active_requests            concurrent in-flight HTTP requests
+        #   last_error                 last exception message, if any, else null
+        #
+        # All can be null when the upstream is too old (< 0.6.15) or
+        # currently idle.
         "busy": busy,
         "active_sessions_count": active_sessions_count,
         "last_request_seconds_ago": last_request_seconds_ago,
         "sessions": sessions_summary,
+        "current_phase": current_phase,
+        "current_model": current_model,
+        "current_request_started_at": current_request_started_at,
+        "current_generated_tokens": current_generated_tokens,
+        "current_tok_s": current_tok_s,
+        "active_requests": active_requests,
+        "last_error": last_error,
         "mode": "telemak",
         "topologies": {"1": [{"rank": 0, "ssh": master_ssh}]} if master_ssh else {"1": []},
         "models_dir": cd.get("models_dir"),
