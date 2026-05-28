@@ -591,6 +591,7 @@ h1, h2, h3 { margin: 0; }
 @keyframes load-stripe { 0% { background-position: 0 0; } 100% { background-position: 40px 0; } }
 @keyframes load-pulse  { 0%,100% { opacity: 0.8; } 50% { opacity: 1; } }
 @keyframes syncIndeterminate { 0% { margin-left: -30%; } 100% { margin-left: 100%; } }
+@keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.35; } }
 
 /* Admin auth modal */
 #auth-overlay { position: fixed; inset: 0; z-index: 9999; display: flex; align-items: center; justify-content: center; }
@@ -3103,6 +3104,15 @@ function renderTelemakHomeCard(a, cid, label) {
   const tpsPill = (typeof a.avg_tok_s_recent === "number" && a.avg_tok_s_recent > 0)
     ? `<div class="pill-status" style="background:var(--ground);border-color:var(--line);color:var(--ink-2);font-weight:600;padding:3px 10px;border-radius:6px;font-size:11px;letter-spacing:0.04em;text-transform:uppercase">${a.avg_tok_s_recent.toFixed(1)} tok/s</div>`
     : "";
+  // Live-activity readout — see api.py:_telemak_status. busy=true means
+  // a session was touched within ~5s. active_sessions_count is the
+  // number of KV-cached sessions Telemak is holding for fast resume.
+  const busyPill = a.busy
+    ? `<div class="pill-status" style="background:#fff8e6;border-color:var(--amber);color:var(--amber-deep);font-weight:600;padding:3px 10px;border-radius:6px;font-size:11px;letter-spacing:0.04em;text-transform:uppercase"><span style="display:inline-block;width:6px;height:6px;border-radius:50%;background:var(--amber);margin-right:5px;animation:pulse 1s infinite;vertical-align:middle"></span>generating</div>`
+    : "";
+  const sessionsPill = (typeof a.active_sessions_count === "number" && a.active_sessions_count > 0)
+    ? `<div class="pill-status" style="background:var(--ground);border-color:var(--line);color:var(--ink-2);font-weight:600;padding:3px 10px;border-radius:6px;font-size:11px;letter-spacing:0.04em;text-transform:uppercase" title="KV-cached sessions on this Telemak${typeof a.last_request_seconds_ago === 'number' ? '\nlast touched ' + a.last_request_seconds_ago.toFixed(1) + 's ago' : ''}">${a.active_sessions_count} session${a.active_sessions_count > 1 ? 's' : ''}</div>`
+    : "";
   const f = state.telemak_load_form?.[cid] || { model: "", open: false };
   const formOpen = !!f.open;
   const busy = !!state.busy_telemak_load?.[cid];
@@ -3163,6 +3173,8 @@ function renderTelemakHomeCard(a, cid, label) {
             <div class="row">
               <h1>${escapeHtml(label)}</h1>
               ${statusPill}
+              ${busyPill}
+              ${sessionsPill}
               ${memPill}
               ${tpsPill}
             </div>

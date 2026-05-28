@@ -8278,7 +8278,20 @@ async def _telemak_status(cluster_id: str, cd: dict) -> dict:
     wired_used_gb = None
     wired_free_gb = None
     avg_tok_s_recent = None
+    requests_served = None
+    uptime_s = None
+    upstream_version = None
     spec_modes: list[str] = []
+    # Activity readout — derived from Telemak's /admin/sessions. We don't
+    # have a literal "is_generating" flag on the upstream, but a session
+    # with a very recent `last_used_s` (< BUSY_WINDOW_S) is almost
+    # certainly in the middle of (or has just finished) a turn. Good
+    # enough to drive a "busy" pill in the dashboard.
+    BUSY_WINDOW_S = 5.0
+    active_sessions_count: int = 0
+    last_request_seconds_ago: Optional[float] = None
+    busy = False
+    sessions_summary: list[dict] = []
     if upstream:
         import httpx
         try:
@@ -8310,6 +8323,9 @@ async def _telemak_status(cluster_id: str, cd: dict) -> dict:
                         wired_used_gb = hj.get("wired_memory_used_gb")
                         wired_free_gb = hj.get("wired_memory_free_gb")
                         avg_tok_s_recent = hj.get("avg_tok_s_recent")
+                        requests_served = hj.get("requests_served")
+                        uptime_s = hj.get("uptime_s")
+                        upstream_version = hj.get("version")
                 except Exception:
                     pass
                 # Capability contract — tells us which speculative-decoding
@@ -8320,6 +8336,36 @@ async def _telemak_status(cluster_id: str, cd: dict) -> dict:
                     if cap.status_code == 200:
                         cj = cap.json()
                         spec_modes = (cj.get("capabilities", {}).get("speculative_decoding") or {}).get("modes") or []
+                except Exception:
+                    pass
+                # Activity / KV-cache sessions. Best-effort — older Telemak
+                # builds don't expose this, in which case we leave the
+                # fields at their defaults (count=0, busy=False).
+                try:
+                    s = await client.get(f"{upstream}/admin/sessions")
+                    if s.status_code == 200:
+                        sess_list = (s.json() or {}).get("sessions") or []
+                        active_sessions_count = len(sess_list)
+                        if sess_list:
+                            recents = [
+                                float(x.get("last_used_s"))
+                                for x in sess_list
+                                if x.get("last_used_s") is not None
+                            ]
+                            if recents:
+                                last_request_seconds_ago = min(recents)
+                                busy = last_request_seconds_ago < BUSY_WINDOW_S
+                            # Trim per-session fields to what the dashboard
+                            # actually renders — id, kv size, last_used.
+                            sessions_summary = [
+                                {
+                                    "id": str(x.get("id"))[:12],
+                                    "model": x.get("model"),
+                                    "kv_size_mb": x.get("kv_size_mb"),
+                                    "last_used_s": x.get("last_used_s"),
+                                }
+                                for x in sess_list
+                            ]
                 except Exception:
                     pass
         except Exception:
@@ -8348,6 +8394,18 @@ async def _telemak_status(cluster_id: str, cd: dict) -> dict:
         "wired_memory_used_gb": wired_used_gb,
         "wired_memory_free_gb": wired_free_gb,
         "avg_tok_s_recent": avg_tok_s_recent,
+        "requests_served": requests_served,
+        "uptime_s": uptime_s,
+        "upstream_version": upstream_version,
+        # Activity readout — see the BUSY_WINDOW_S constant above.
+        # busy=True means at least one cached session was touched within
+        # the last few seconds; treat it as "Telemak is currently
+        # generating or just finished". For UIs that want a richer view,
+        # `sessions` gives the per-session breakdown.
+        "busy": busy,
+        "active_sessions_count": active_sessions_count,
+        "last_request_seconds_ago": last_request_seconds_ago,
+        "sessions": sessions_summary,
         "mode": "telemak",
         "topologies": {"1": [{"rank": 0, "ssh": master_ssh}]} if master_ssh else {"1": []},
         "models_dir": cd.get("models_dir"),
