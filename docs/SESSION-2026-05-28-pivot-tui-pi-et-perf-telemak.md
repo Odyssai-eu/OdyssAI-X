@@ -15,6 +15,15 @@
 > *"on doit faire mieux vu que c'est en natif"* est validée
 > empiriquement.
 >
+> La fin de journée change le centre de gravité : MTP est suspendu
+> officiellement, non parce que l'idée est mauvaise mais parce que le
+> ROI immédiat est trop faible face aux autres chantiers. Telemak
+> revient sur une base saine, puis se durcit : chunks batchés, builds
+> Release propres, paths modèles absolus normalisés, et enfin une vraie
+> surface d'activité runtime (`/admin/activity`) affichée jusque dans le
+> menubar. Le produit local devient moins spectaculaire, mais beaucoup
+> plus opérable.
+>
 > Versions de sortie : Odysseus `internal/main` v1.7.8 → suite avec
 > `d73da66` + `9a2d73f`, Companion v0.2.2 (deux commits sur main).
 
@@ -28,6 +37,7 @@
 | **Hermes default model** | Switch de `or:hy3-preview` (via LiteLLM) vers `telemak-code-next` (via Odysseus). Schema YAML Hermes corrigé (`base_url` pas `api_base`). Gateway restart. Smoke 200 OK. |
 | **Telemak activity sur Odysseus** | `/admin/clusters/{id}/status` enrichi : `busy`, `active_sessions_count`, `last_request_seconds_ago`, `sessions[]`, `requests_served`, `uptime_s`, `upstream_version`. Pills "● generating" pulsant + "N sessions" sur les cards. Commit `d73da66`. |
 | **MiniMax 1.5 → 43 tok/s** | Deux bugs en série : Telemak Swift émettait 1 chunk SSE par token (Sophie installe 0.6.10 avec batching upstream), et Odysseus skippait le `<think>` filter dès que `enable_thinking=false` alors que MiniMax ignore ce flag. Fix `9a2d73f` + `_MODELS_IGNORE_ENABLE_THINKING_FLAG`. Bonus : Companion affiche maintenant `Decode: X tok/s` (commit `e2c875a`) excluant TTFT du calcul. |
+| **Telemak hardening natif** | MTP suspendu, retour à la base stable, puis série `0.6.12 → 0.6.15` : clean Release build, batching SSE, MiniMax alias, Mistral InferencerLabs config normalize, canonicalisation des paths absolus, `/admin/activity`, et affichage live dans le toolbar menu. Déployé sur `.29`, `.50`, `.49`, `.32`. |
 
 ---
 
@@ -418,6 +428,189 @@ remplace pour le coding text-only.
 
 ---
 
+## 7. Fin de journée — MTP suspendu, Telemak stabilisé
+
+Après les essais Gemma MTP, Sophie fait le calcul froid. Gemma 26B
+sans MTP donne déjà :
+
+```text
+TTFT: 441ms · Duration: 31.82s · Completion: 2308 tok ·
+Speed: 72.5 tok/s · Model: telemak-64 — gemma-4-26B-A4B-MLX-9bit
+```
+
+Le MTP promet un gain réel dans l'absolu, mais pas assez urgent ici.
+Sophie tranche :
+
+> *"je suis vraiment circonspecte. est ce que ca vaut les ressources
+> qu'on y met ?"*
+>
+> *"on a d'autres chantiers plus importants"*
+>
+> *"le MTP est suspendu, officiellement"*
+
+Décision saine : on garde la recherche MTP comme chantier futur, mais
+on ne casse pas Telemak pour courir après 80 → 110 tok/s sur un workflow
+VS Code où l'écart ne change pas l'usage. Le vrai gain MTP serait soit
+un petit modèle agentique hyper rapide, soit le cluster Qwen 397B en
+MLX-distributed Python — pas la priorité du soir.
+
+### Rollback base saine
+
+On repart d'un point stable identifié :
+
+```text
+Version prod : 0.6.1
+Commit main : fd80608
+Base reprise : 179026a
+```
+
+Objectif : ne pas laisser le fork Gemma/MTP contaminer la prod. Telemak
+revient en mode "super compute single node" pendant qu'Odysseus reste le
+rail multi-node Python. Sophie reformule l'architecture :
+
+> *"telemak, super compute single node*
+> *Odysseus, multi node python"*
+
+À partir de là, les commits Telemak de fin de journée ne cherchent plus
+le speculative decoding. Ils cherchent l'opérabilité.
+
+### `0.6.12` — chunks SSE batchés
+
+Le smoking gun MiniMax était clair : Telemak envoyait 1 chunk par token.
+Le fix côté Swift coalesce les deltas SSE en petits batches, comme Argo.
+Résultat terrain sur ultra-512 :
+
+```text
+TTFT: 3503ms · Duration: 15.20s · Completion: 507 tok ·
+Speed: 33.4 tok/s · Decode: 43.3 tok/s · Chunks: 47 ·
+Model: telemak512 — MiniMax-M2.7-8bit
+```
+
+Commit Telemak : `455d98d perf(stream): coalesce chat completion chunks`.
+
+### `0.6.13` — Mistral InferencerLabs config normalize
+
+Tentative de charger le modèle 9-bit InferencerLabs :
+
+```text
+could not load model '/Volumes/models/odysseus/inferencerlabs/Mistral-Medium-3.5-MLX-9bit':
+configurationDecodingError("config.json", "staged-models/--Volumes--models--od...")
+```
+
+Le problème immédiat n'est pas la vitesse du modèle, mais le staging :
+les chemins absolus et certains configs InferencerLabs ne passent pas
+dans le loader tel quel. Telemak normalise le config staging pour ces
+modèles. Commit : `e9e24ff fix(loader): normalize inferencerlabs mistral config`.
+
+Le résultat perf reste mauvais pour Mistral Medium (environ 4-5 tok/s),
+mais au moins on sépare les sujets : le load path est corrigé, la vitesse
+est une caractéristique modèle/backend à évaluer ailleurs.
+
+### `0.6.14` — paths absolus de modèles
+
+MiniMax a aussi révélé un bug de forme API. Sophie envoie :
+
+```text
+Apply failed: model_load_failed:
+could not load model '/Volumes/models/odysseus/mlx-community/MiniMax-M2.7-8bit':
+unsupportedModelType("minimax_m2")
+```
+
+Le loader prenait parfois un chemin absolu comme identifiant brut au lieu
+de le canonicaliser par rapport à `TELEMAK_MODELS_DIR`. Fix :
+
+```text
+/Volumes/models/odysseus/mlx-community/MiniMax-M2.7-8bit
+→ mlx-community/MiniMax-M2.7-8bit
+```
+
+Commit : `8b761d0 fix(loader): canonicalize model paths`.
+
+Smoke sur ultra-512 : load via path absolu OK, chat 128 tokens en 5.16s,
+17 chunks, `avg_tok_s_recent ≈ 24.8`.
+
+### `0.6.15` — activité runtime publiée par Telemak
+
+La question opérateur de fin de soirée :
+
+> *"quels sont les info que telemak publie sur son activité, qu'est ce
+> que je pourrait afficher dans Odysseus pour vérifier ce qu'il fait ?"*
+
+Puis la spec directe :
+
+```text
+active_requests
+current_model
+current_request_started_at
+current_generated_tokens
+current_tok_s
+current_phase: prefill | decode | streaming | idle
+last_error
+```
+
+Telemak apprend donc un vrai `ActivityTracker` côté Swift, partagé entre
+les handlers :
+
+- `GET /admin/activity`
+- phases `prefill | decode | streaming | idle`
+- `active_requests`
+- `current_model`
+- `current_request_started_at`
+- `current_generated_tokens`
+- `current_tok_s`
+- `last_error`
+- clés stables même quand la valeur est `null`
+
+Puis Sophie ajoute :
+
+> *"et du coup, on les affiche aussi dans le toolbar menu"*
+
+Le menubar poll `/admin/activity` après `/health` et affiche :
+requêtes actives, phase, modèle courant, tokens générés, tok/s courant,
+started_at et last error. Commit : `a11bcb5 feat(activity): expose live runtime state`.
+
+Smoke sur ultra-512 pendant stream MiniMax :
+
+```json
+{
+  "active_requests": 1,
+  "current_phase": "streaming",
+  "current_model": "mlx-community/MiniMax-M2.7-8bit",
+  "current_generated_tokens": 120,
+  "current_tok_s": 23.935484449304408,
+  "last_error": null
+}
+```
+
+Après le stream :
+
+```json
+{
+  "active_requests": 0,
+  "current_phase": "idle",
+  "current_model": null,
+  "current_generated_tokens": 0,
+  "current_tok_s": null,
+  "last_error": null
+}
+```
+
+Déploiements finaux `0.6.15` :
+
+| Host | IP | État |
+|---|---:|---|
+| ultra-512 | `.29:8013` | OK, MiniMax chargé, `/admin/activity` validé |
+| max-64 | `.50:8003` | OK, Gemma 26B replay chargé |
+| ultra-96 | `.49:8003` | OK, menubar OK, state replay Gemma 31B neutralisé car load bloquait le port |
+| ultra-256d / ultra-256c | `.32:8003` | OK, menubar OK, `--no-replay`, aucun modèle chargé |
+
+Le cas ultra-96 est important : l'ancien state essayait de recharger
+`mlx/gemma-4-31b-it-8bit` au boot et bloquait l'ouverture du port.
+State sauvegardé dans `~/.telemak/state.json.before-0.6.15-deploy`,
+puis `loaded_models: []` pour garder le service disponible.
+
+---
+
 ## Fichiers modifiés / créés
 
 **Companion** (`~/Claude/code/thecompai/app/`)
@@ -432,6 +625,17 @@ remplace pour le coding text-only.
   `_MODELS_IGNORE_ENABLE_THINKING_FLAG` ajouté, `_telemak_proxy_chat_completion` honore le split
 - `dashboard.html` — pills `busyPill` + `sessionsPill` sur les cards Telemak, `@keyframes pulse`
 
+**Telemak** (`~/Claude/code/telemak/`)
+- `Sources/Telemak/Server/ChatCompletions.swift` — batching SSE + instrumentation activité
+- `Sources/Telemak/Server/AnthropicMessages.swift` — instrumentation activité
+- `Sources/Telemak/Server/Embeddings.swift` — instrumentation activité
+- `Sources/Telemak/Server/ChatCompletionsMTP.swift` — instrumentation activité minimale
+- `Sources/Telemak/Engine/ActivityTracker.swift` — nouveau tracker runtime
+- `Sources/Telemak/Server/Activity.swift` — nouveau `GET /admin/activity`
+- `Sources/TelemakMenuBar/TelemakMenuBarApp.swift` — section Activity dans le menu
+- `Sources/Telemak/Engine/ModelLoader.swift` — fixes staging / path canonicalization
+- `Sources/TelemakVersion/Version.swift` — bump jusqu'à **`0.6.15`**
+
 **Pi host** (`.50`)
 - `/Users/admin/.local/bin/pi-ttyd-launcher.sh` — wrapper tmux+ttyd
 - `/Users/admin/Library/LaunchAgents/com.thecompai.pi-ttyd.plist` — déposé, désactivé
@@ -444,11 +648,13 @@ remplace pour le coding text-only.
 
 ## Numbers de la journée
 
-- **Commits** : 2 sur Odysseus (`d73da66` + `9a2d73f`), 2 sur Companion (`27c74df` + `e2c875a`). 1 commit dormant d'hier (`51194ba`) côté Companion — bridge-pattern Pi routes kept-around.
-- **Lignes diff** : Odysseus +111 / -8 (2 fichiers), Companion +136 / -22 (5 fichiers).
+- **Commits** : 2 sur Odysseus (`d73da66` + `9a2d73f`), 2 sur Companion (`27c74df` + `e2c875a`), 11 sur Telemak dans la journée dont `455d98d`, `e9e24ff`, `8b761d0`, `a11bcb5`. 1 commit dormant d'hier (`51194ba`) côté Companion — bridge-pattern Pi routes kept-around.
+- **Versions** : Telemak **`0.6.5 → 0.6.15`** sur la journée ; Companion v0.2.2 ; Odysseus `internal/main` avec commits status + think-filter.
+- **Lignes diff** : Odysseus +111 / -8 (2 fichiers), Companion +136 / -22 (5 fichiers), Telemak `0.6.15` activity +320 / -17 (10 fichiers) sur le dernier commit.
 - **Push** : `internal/main` (Odysseus) + Companion deploy v0.2.2 sur `.39` via `deploy-prod.sh skip`.
-- **Smoke** : `/pi` end-to-end (test03/story.md écrit), `/hermes` 200 OK sur Codermac, MiniMax sur Kolos 43.3 tok/s decode confirmé, Hermes gateway répond après config switch.
-- **Bug fixés** : 2 (chunks 1-token côté Telemak Swift → upstream 0.6.10, think leak côté Odysseus → `9a2d73f`).
+- **Telemak deploys** : `.29:8013`, `.50:8003`, `.49:8003`, `.32:8003`.
+- **Smoke** : `/pi` end-to-end (test03/story.md écrit), `/hermes` 200 OK sur Codermac, MiniMax sur Kolos 43.3 tok/s decode confirmé, Hermes gateway répond après config switch, `/admin/activity` idle + stream validé, menubar `0.6.15` actif sur `.49` et `.32`.
+- **Bug fixés** : 5 (chunks 1-token côté Telemak Swift, think leak côté Odysseus, staging InferencerLabs Mistral, canonicalisation path absolu, replay ultra-96 qui bloquait le port).
 - **Bug contournés** : 1 (long-lived parent Connection error sur Pi — TUI pivot bypasse au lieu de fixer).
 
 ---
@@ -456,10 +662,10 @@ remplace pour le coding text-only.
 ## TODO direct (par ordre)
 
 1. **Pi launchd plist** — actuellement déposé mais inactif (reproduit le bug). Soit on crack le mystère long-lived parent, soit on utilise un autre mécanisme (launchctl as user-scope sur foreground ?). Sophie doit relancer manuellement après reboot.
-2. **Decode metric pour `/hermes` et `/pi`** — ces paths ne passent pas par `chat.ts`, donc le champ `decodeSpeed` n'est pas calculé pour eux. À étendre.
-3. **Mistral3ForConditionalGeneration upstream** — feature request mlx-swift-lm pour le multimodal mistral3 (Mistral-Medium-3.5).
-4. **Renderer Pi-native dans Companion** — pour l'instant on iframe le terminal ttyd ; à terme, parser les events Pi natifs (`pi.text_delta`, `pi.tool_call`) pour un rendu intégré au chat. Pas urgent — le iframe fait le job.
-5. **Companion bridge-pattern Pi routes** — `addon-pi.ts` + `agent-pi.ts` restent en tree, dormants. À retirer quand le bug upstream est fixé ou à conserver si on veut un fallback structuré. À décider.
+2. **Odysseus consomme `/admin/activity` natif** — remplacer le heuristic `busy = last_session_used < 5s` par les champs Telemak `active_requests/current_phase/current_tok_s`.
+3. **Decode metric pour `/hermes` et `/pi`** — ces paths ne passent pas par `chat.ts`, donc le champ `decodeSpeed` n'est pas calculé pour eux. À étendre.
+4. **Mistral3ForConditionalGeneration upstream** — feature request mlx-swift-lm pour le multimodal mistral3 (Mistral-Medium-3.5).
+5. **Replay ultra-96 Gemma 31B** — comprendre pourquoi `mlx/gemma-4-31b-it-8bit` bloque le startup Telemak avant de le remettre dans `state.json`.
 
 ---
 
@@ -486,3 +692,11 @@ proxy Odysseus ne peut pas trust le flag uniformément — il faut une
 table des comportements par famille. Le commit `9a2d73f` matérialise
 ce pattern (`_MODELS_IGNORE_ENABLE_THINKING_FLAG`), réutilisable
 quand d'autres familles apparaîtront.
+
+**Suspension propre > entêtement technique.** MTP reste intéressant,
+mais aujourd'hui la décision correcte était de l'arrêter. Telemak a plus
+gagné en fiabilité opérateur avec `/admin/activity`, les rollbacks, les
+deploys propres et les paths modèles qu'il n'aurait gagné en poursuivant
+un spike qui faisait déjà douter du ROI. Le signal utile : quand Sophie
+dit *"on a d'autres chantiers plus importants"*, le bon move est de
+stabiliser le socle.
