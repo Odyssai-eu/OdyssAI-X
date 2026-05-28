@@ -258,11 +258,20 @@ def mark_orphans_interrupted() -> int:
     try:
         with _lock:
             now = time.time()
+            # We rewrite BOTH the SQL columns and the JSON payload so the
+            # downstream readers stay consistent. recent_runs() / recent_jobs()
+            # deserialise the payload column and return it as-is — without
+            # the json_set, a row marked 'interrupted' at the SQL level still
+            # reports its pre-restart status ('cancelling', 'streaming',
+            # 'running') in the dashboard, exactly the symptom #17 describes.
             cur = _conn.execute(
                 "UPDATE sync_jobs SET status='interrupted', "
-                "  finished_at=COALESCE(finished_at, ?) "
+                "  finished_at=COALESCE(finished_at, ?), "
+                "  payload=json_set(payload, "
+                "    '$.status', 'interrupted', "
+                "    '$.finished_at', COALESCE(json_extract(payload, '$.finished_at'), ?)) "
                 "WHERE status='running'",
-                (now,),
+                (now, now),
             )
             n_jobs = cur.rowcount or 0
             if n_jobs:
@@ -270,9 +279,12 @@ def mark_orphans_interrupted() -> int:
             total += n_jobs
             cur = _conn.execute(
                 "UPDATE runs SET status='interrupted', "
-                "  finished_at=COALESCE(finished_at, ?) "
+                "  finished_at=COALESCE(finished_at, ?), "
+                "  payload=json_set(payload, "
+                "    '$.status', 'interrupted', "
+                "    '$.finished_at', COALESCE(json_extract(payload, '$.finished_at'), ?)) "
                 "WHERE status IN ('running','streaming','cancelling')",
-                (now,),
+                (now, now),
             )
             n_runs = cur.rowcount or 0
             if n_runs:
