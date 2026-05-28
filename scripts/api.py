@@ -2245,8 +2245,16 @@ def discover_models_on_node(ssh: str, models_dir: str) -> list[str]:
     in the same run. Returns absolute paths usable as RUNNER_MODEL —
     callers can derive a display name via the relative path under
     `models_dir`.
+
+    !! We force `bash -c` because the default shell on the remote node
+    may be zsh (macOS default since Catalina). zsh's nomatch option
+    aborts the entire script when an inner glob expands to nothing
+    (e.g. an empty org dir like `mistralai/`), which silently drops
+    every subsequent org folder. Bash treats empty globs as the
+    literal pattern, the `-d` test fails, and we continue. Discovered
+    2026-05-28 — picker was showing partial lists.
     """
-    cmd = (
+    inner = (
         f"for d in {shlex.quote(models_dir)}/*; do "
         "  [ -d \"$d\" ] || continue ; "
         # Flat layout: config.json sits directly under <d>.
@@ -2261,6 +2269,7 @@ def discover_models_on_node(ssh: str, models_dir: str) -> list[str]:
         "  done ; "
         "done 2>/dev/null"
     )
+    cmd = f"bash -c {shlex.quote(inner)}"
     try:
         out = subprocess.run(
             ["ssh", "-o", "ConnectTimeout=5", ssh, cmd],
