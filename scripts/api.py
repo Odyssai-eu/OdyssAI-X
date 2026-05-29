@@ -3195,6 +3195,14 @@ async def _model_capabilities(
         caps["nodes"] = pool.nodes_count
         caps["kv_cache_q8"] = bool(pool.kv_q8)
         caps["estimated_tps"] = _avg_tps_for(pool.model)
+        # cluster_label + kind let clients (Companion picker) render the
+        # group heading using the operator-chosen display name ("Argo"
+        # instead of "main", "TeleCoder" instead of "telemak-code-next").
+        # kind tells the picker which group bucket to drop the entry in
+        # (telemak vs mlx-distributed vs cloud).
+        if cd:
+            caps["cluster_label"] = cd.get("name") or pool_name
+            caps["kind"] = cd.get("kind")
 
     # Try config.json — for loaded: from rank0 of its pool; for unloaded: from cluster master
     ssh_target = None
@@ -4992,6 +5000,10 @@ async def list_models(include_unloaded: bool = False):
         caps = (await _telemak_capabilities(cid, cd)).get("capabilities") or {}
         stream_cap = caps.get("stream", True)
         tools_cap = caps.get("tools", False)
+        # cluster_label + family + quantization let the Companion picker
+        # render telemak rows with the same depth as local pool rows:
+        # title = cluster_label (e.g. "TeleCoder"), subtitle = family · quant.
+        cluster_label = cd.get("name") or cid
         if len(loaded) == 1:
             data.append({
                 "id": cid, "object": "model",
@@ -4999,8 +5011,12 @@ async def list_models(include_unloaded: bool = False):
                 "x_concrete": loaded[0],
                 "x_odyssai": {
                     "ready": True,
+                    "loaded": True,
                     "alias_for": loaded[0],
                     "kind": "telemak",
+                    "cluster_label": cluster_label,
+                    "family": loaded[0],
+                    "quantization": _quant_from_name(loaded[0]),
                     "stream": stream_cap,
                     "tools": tools_cap,
                     "backend": "http-proxy",
@@ -5016,8 +5032,12 @@ async def list_models(include_unloaded: bool = False):
                     "x_concrete": upstream_model,
                     "x_odyssai": {
                         "ready": True,
+                        "loaded": True,
                         "alias_for": upstream_model,
                         "kind": "telemak",
+                        "cluster_label": cluster_label,
+                        "family": upstream_model,
+                        "quantization": _quant_from_name(upstream_model),
                         "cluster": cid,
                         "short_id": short,
                         "stream": stream_cap,
