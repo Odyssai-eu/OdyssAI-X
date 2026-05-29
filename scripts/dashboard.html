@@ -943,6 +943,14 @@ const state = {
   userguide_slug: null,
   userguide_body: null,
   userguide_error: null,
+  // Endpoints (Settings → Endpoints tab). Recipes built from the live
+  // /v1/models list so the model ids + cluster labels are real.
+  endpoint_models_loaded: false,
+  endpoint_models: [],            // GET /v1/models data[]
+  endpoint_error: null,
+  endpoint_base_url: null,        // editable; defaults to origin + /v1
+  endpoint_model: null,           // currently picked model id for snippets
+  endpoint_client: "opencode",    // selected client recipe
   telemetry: null,      // /admin/nodes/telemetry
   runs: [],             // /admin/runs
   sync_jobs: [],        // /admin/sync/jobs
@@ -1490,8 +1498,21 @@ const SETTINGS_TABS = [
   { id: "models",     label: "Models" },
   { id: "providers",  label: "Cloud providers" },
   { id: "crew",       label: "Crew" },
+  { id: "endpoints",  label: "Endpoints" },
   { id: "userguide",  label: "User Guide" },
   { id: "about",      label: "About" },
+];
+
+// Client recipes for Settings → Endpoints. Each builder receives the
+// resolved context { baseUrl, baseUrlNoV1, model, models, hasAnthropicApi }
+// and returns { lang, body }. `model` is the currently-picked model id;
+// `models` is the full servable list so a recipe can enumerate if needed.
+const ENDPOINT_CLIENTS = [
+  { id: "curl",       label: "curl / OpenAI" },
+  { id: "opencode",   label: "OpenCode" },
+  { id: "continue",   label: "Continue.dev" },
+  { id: "anthropic",  label: "Anthropic SDK" },
+  { id: "hermes",     label: "Hermes" },
 ];
 
 function renderSettings() {
@@ -1523,6 +1544,7 @@ function renderSettingsBody(tab) {
   if (tab === "models")    return renderSettingsModels();
   if (tab === "providers") return renderSettingsProviders();
   if (tab === "crew")      return renderSettingsCrew();
+  if (tab === "endpoints") return renderSettingsEndpoints();
   if (tab === "userguide") return renderSettingsUserGuide();
   if (tab === "about")     return renderSettingsAbout();
   return `<div class="empty-state">Unknown tab.</div>`;
@@ -1680,6 +1702,234 @@ function mdToHtml(md) {
   });
 
   return src;
+}
+
+// ─── Settings: Endpoints ──────────────────────────────────────────
+// Generates copy-paste client configs from the live /v1/models list,
+// so the model ids + cluster labels are real (no placeholders to guess).
+async function loadEndpointModels() {
+  if (state.endpoint_models_loaded) return;
+  try {
+    const j = await getJson("/v1/models");
+    state.endpoint_models = (j && j.data) ? j.data : [];
+    state.endpoint_models_loaded = true;
+    // Default the snippet model to the first servable entry.
+    if (!state.endpoint_model && state.endpoint_models.length > 0) {
+      state.endpoint_model = state.endpoint_models[0].id;
+    }
+    render();
+  } catch (e) {
+    state.endpoint_error = String(e && e.message ? e.message : e);
+    state.endpoint_models_loaded = true;
+    render();
+  }
+}
+
+// Default base URL = however the operator reached this dashboard, + /v1.
+// Editable so they can publish a different public-facing URL in the snippet.
+function endpointBaseUrl() {
+  if (state.endpoint_base_url != null) return state.endpoint_base_url;
+  let origin = "http://localhost:8000";
+  try { if (window.location && window.location.origin) origin = window.location.origin; } catch (e) {}
+  return origin.replace(/\/+$/, "") + "/v1";
+}
+
+// Friendly label for a model entry (cluster_label when present).
+function endpointModelLabel(m) {
+  const cap = (m && m.x_odyssai) || {};
+  if (cap.cluster_label && cap.family) return cap.cluster_label + " — " + cap.family;
+  if (cap.cluster_label) return cap.cluster_label;
+  return m.id;
+}
+
+// Build the recipe body for the selected client.
+function endpointRecipe(clientId, ctx) {
+  const { baseUrl, baseUrlNoV1, model, label } = ctx;
+  if (clientId === "curl") {
+    return {
+      lang: "bash",
+      body:
+`# OpenAI-compatible. Works with any OpenAI SDK / tool.
+export OPENAI_BASE_URL="${baseUrl}"
+export OPENAI_API_KEY="dummy"   # /admin auth is separate; chat needs no key on a LAN install
+
+curl "${baseUrl}/chat/completions" \\
+  -H "Content-Type: application/json" \\
+  -d '{
+    "model": "${model}",
+    "messages": [{"role": "user", "content": "Hello from Odysseus"}]
+  }'`,
+    };
+  }
+  if (clientId === "opencode") {
+    return {
+      lang: "json",
+      body:
+`// opencode.json — Custom provider (OpenAI-compatible).
+// Or fill the UI form with: ID=odysseus  Name=Odysseus
+//   Base URL=${baseUrl}  API key=(leave empty)
+//   Model ID=${model}  Model name=${label}
+{
+  "provider": {
+    "odysseus": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "Odysseus",
+      "options": { "baseURL": "${baseUrl}" },
+      "models": {
+        "${model}": { "name": "${label}" }
+      }
+    }
+  }
+}`,
+    };
+  }
+  if (clientId === "continue") {
+    return {
+      lang: "json",
+      body:
+`// ~/.continue/config.json — add to the "models" array.
+{
+  "models": [
+    {
+      "title": "${label}",
+      "provider": "openai",
+      "model": "${model}",
+      "apiBase": "${baseUrl}",
+      "apiKey": "dummy"
+    }
+  ]
+}`,
+    };
+  }
+  if (clientId === "anthropic") {
+    return {
+      lang: "bash",
+      body:
+`# Odysseus speaks the Anthropic Messages API too (/v1/messages).
+# Point the Anthropic SDK / Claude-compatible tools at the base (no /v1 suffix).
+export ANTHROPIC_BASE_URL="${baseUrlNoV1}"
+export ANTHROPIC_API_KEY="dummy"
+
+curl "${baseUrlNoV1}/v1/messages" \\
+  -H "content-type: application/json" \\
+  -H "anthropic-version: 2023-06-01" \\
+  -d '{
+    "model": "${model}",
+    "max_tokens": 256,
+    "messages": [{"role": "user", "content": "Hello from Odysseus"}]
+  }'`,
+    };
+  }
+  if (clientId === "hermes") {
+    return {
+      lang: "yaml",
+      body:
+`# ~/.hermes/config.yaml — point the default model at Odysseus.
+model:
+  provider: odyssai
+  base_url: ${baseUrl}
+  default: ${model}`,
+    };
+  }
+  return { lang: "text", body: "Unknown client." };
+}
+
+function renderSettingsEndpoints() {
+  if (!state.endpoint_models_loaded) {
+    return `<div class="empty-state">Loading servable models…</div>`;
+  }
+  const models = state.endpoint_models || [];
+  const baseUrl = endpointBaseUrl();
+  const baseUrlNoV1 = baseUrl.replace(/\/v1\/?$/, "");
+
+  if (models.length === 0) {
+    return `
+      <div style="display:flex;flex-direction:column;gap:16px">
+        <div class="empty-state">
+          No servable models yet. Load a model on a cluster (Settings → Models)
+          or check that a Telemak / cloud upstream is reachable, then reopen this tab.
+        </div>
+        ${state.endpoint_error ? `<div style="color:var(--red);font-size:12px;font-family:var(--font-mono)">${escapeHtml(state.endpoint_error)}</div>` : ""}
+      </div>`;
+  }
+
+  // Pick model: keep selection valid against the live list.
+  let model = state.endpoint_model;
+  if (!model || !models.some(m => m.id === model)) model = models[0].id;
+  const picked = models.find(m => m.id === model) || models[0];
+  const label = endpointModelLabel(picked);
+
+  const ctx = { baseUrl, baseUrlNoV1, model, label };
+  const client = state.endpoint_client || "opencode";
+  const recipe = endpointRecipe(client, ctx);
+
+  // Group the model id list by cluster_label for a quick reference table.
+  const rows = models.map(m => {
+    const cap = m.x_odyssai || {};
+    const kind = cap.kind || (cap.backend === "http-proxy" ? "cloud" : "cluster");
+    const q = cap.quantization ? ` · ${escapeHtml(cap.quantization)}` : "";
+    return `
+      <div style="display:grid;grid-template-columns:1fr auto auto;gap:8px;align-items:center;padding:6px 0;border-bottom:1px solid var(--line)">
+        <code style="font-size:12px;color:var(--ink)">${escapeHtml(m.id)}</code>
+        <span style="font-size:11px;color:var(--ink-3)">${escapeHtml(cap.cluster_label || kind)}${q}</span>
+        <button class="btn btn-xs" data-act="endpoint-copy" data-v="${escapeHtml(m.id)}">Copy id</button>
+      </div>`;
+  }).join("");
+
+  return `
+    <div style="display:flex;flex-direction:column;gap:20px">
+
+      <div style="font-size:13px;color:var(--ink-2);line-height:1.6;max-width:620px">
+        Connect any OpenAI- or Anthropic-compatible client to this engine.
+        Snippets below are generated from your live model list — IDs and base
+        URL are ready to copy. The base URL defaults to how you reached this
+        dashboard; edit it if you publish Odysseus on a different address.
+      </div>
+
+      <!-- Base URL -->
+      <div style="display:flex;flex-direction:column;gap:6px;max-width:520px">
+        <div class="field-label">Base URL</div>
+        <input class="ce-input mono" value="${escapeHtml(baseUrl)}"
+               data-act="endpoint-base-url"
+               style="width:100%" />
+        <div style="font-size:11px;color:var(--ink-3)">
+          OpenAI clients use this as-is. Anthropic clients use the base without
+          the <code>/v1</code> suffix: <code>${escapeHtml(baseUrlNoV1)}</code>
+        </div>
+      </div>
+
+      <!-- Servable models reference -->
+      <div style="display:flex;flex-direction:column;gap:8px">
+        <div class="field-label">Servable models (${models.length})</div>
+        <div style="background:var(--surface);border:1px solid var(--line);border-radius:10px;padding:4px 14px">
+          ${rows}
+        </div>
+      </div>
+
+      <!-- Recipe builder -->
+      <div style="display:flex;flex-direction:column;gap:10px">
+        <div style="display:flex;gap:14px;flex-wrap:wrap;align-items:flex-end">
+          <div style="display:flex;flex-direction:column;gap:6px;flex:1;min-width:220px">
+            <div class="field-label">Model for snippet</div>
+            <select class="ce-input mono" data-act="endpoint-pick-model" style="width:100%">
+              ${models.map(m => `<option value="${escapeHtml(m.id)}" ${m.id === model ? "selected" : ""}>${escapeHtml(endpointModelLabel(m))}</option>`).join("")}
+            </select>
+          </div>
+        </div>
+
+        <div class="settings-tabs" style="padding:0;border-bottom:1px solid var(--line)">
+          ${ENDPOINT_CLIENTS.map(c => `<button class="${c.id === client ? "active" : ""}" data-act="endpoint-pick-client" data-v="${c.id}">${c.label}</button>`).join("")}
+        </div>
+
+        <div style="position:relative">
+          <button class="btn btn-sm" data-act="endpoint-copy" data-v="${escapeHtml(recipe.body)}"
+                  style="position:absolute;top:10px;right:10px;z-index:2">Copy</button>
+          <pre style="margin:0;background:#0f1419;color:#E5E9EE;border-radius:10px;padding:16px;overflow:auto;font-size:12px;line-height:1.55;max-height:420px"><code>${escapeHtml(recipe.body)}</code></pre>
+        </div>
+      </div>
+
+    </div>
+  `;
 }
 
 // ─── Settings: About ──────────────────────────────────────────────
@@ -5342,6 +5592,7 @@ async function handleAct(e) {
     state.settings_tab = v;
     if (v === "models" && !state.matrix && !state.matrix_loading) fetchMatrix(false);
     if (v === "userguide" && !state.userguide_topics_loaded) loadUserGuideTopics();
+    if (v === "endpoints" && !state.endpoint_models_loaded) loadEndpointModels();
     render(); return;
   }
   if (act === "userguide-pick") {
@@ -5772,6 +6023,30 @@ async function handleAct(e) {
   if (act === "copy-curl") {
     try { navigator.clipboard.writeText(v); toast("curl copied", "ok"); }
     catch (e) { toast("copy failed: " + e.message, "err"); }
+    return;
+  }
+
+  // ─── Endpoints tab ───────────────────────────────────────────────
+  if (act === "endpoint-copy") {
+    try { navigator.clipboard.writeText(v); toast("copied", "ok"); }
+    catch (e) { toast("copy failed: " + e.message, "err"); }
+    return;
+  }
+  if (act === "endpoint-base-url") {
+    state.endpoint_base_url = el.value;
+    // Only re-render on commit (blur/change), not on every keystroke,
+    // so the input cursor doesn't jump while typing.
+    if (e.type === "change") render();
+    return;
+  }
+  if (act === "endpoint-pick-model") {
+    state.endpoint_model = el.value;
+    render();
+    return;
+  }
+  if (act === "endpoint-pick-client") {
+    state.endpoint_client = v;
+    render();
     return;
   }
 
