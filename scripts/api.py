@@ -5701,6 +5701,53 @@ def _antc_tools_to_openai(tools: Optional[list[AnthropicTool]]) -> Optional[list
     } for t in tools]
 
 
+@app.post("/v1/messages/count_tokens")
+async def anthropic_count_tokens(req: AnthropicMessagesRequest):
+    """Anthropic Messages token-count endpoint.
+
+    Claude Code probes this at startup (and before each turn) to manage
+    its context window — without it, Claude Code refuses to talk to a
+    custom ANTHROPIC_BASE_URL. The official API returns `{input_tokens: N}`.
+
+    We don't run the target model's tokenizer here (it lives remote on the
+    runner, and count_tokens must be cheap + synchronous), so we return a
+    char-based estimate. ~4 chars/token is the standard heuristic for
+    English/code; it's close enough for context-budget decisions, which is
+    all the caller uses it for. We round UP (ceil) so we never *under*-count
+    and let the client overflow the window.
+    """
+    # Flatten system + messages to text via the same path /v1/messages uses.
+    text_parts: list[str] = []
+    try:
+        for m in _antc_to_openai_messages(req):
+            c = m.get("content")
+            if isinstance(c, str):
+                text_parts.append(c)
+            # tool_calls carry JSON arguments that also cost tokens
+            for tc in (m.get("tool_calls") or []):
+                fn = tc.get("function") or {}
+                text_parts.append(str(fn.get("name", "")))
+                text_parts.append(str(fn.get("arguments", "")))
+    except Exception:
+        # Defensive: fall back to a raw text extraction if the flatten path
+        # trips on an unexpected block shape.
+        if isinstance(req.system, str):
+            text_parts.append(req.system)
+        for m in req.messages:
+            text_parts.append(_antc_text_from_blocks(m.content))
+
+    # Tool schemas are part of the prompt the model sees — count them too.
+    if req.tools:
+        try:
+            text_parts.append(json.dumps(_antc_tools_to_openai(req.tools)))
+        except Exception:
+            pass
+
+    total_chars = sum(len(p) for p in text_parts if p)
+    input_tokens = max(1, -(-total_chars // 4))  # ceil(total_chars / 4)
+    return {"input_tokens": input_tokens}
+
+
 @app.post("/v1/messages")
 async def anthropic_messages(req: AnthropicMessagesRequest, request: Request):
     # 0. Telemak passthrough? kind=telemak clusters expose /v1/messages
