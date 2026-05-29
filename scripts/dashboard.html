@@ -3373,7 +3373,13 @@ function renderTelemakLoadConfig(cid, modelsLoaded) {
           <div class="section-title">Load configuration</div>
           <div class="section-sub">Swap to a different model</div>
         </div>
-        <button class="btn btn-sm" data-act="cluster-models-tab" data-cluster="${cid}" title="Open the Models tab for advanced management">${Icon.layers || ""}<span>Manage models →</span></button>
+        <!-- "Manage models →" intentionally absent on Telemak screens.
+             The Models tab targets Odysseus-managed pools (load/unload
+             planning, capacity-aware multi-pool routing) — none of that
+             applies here. Telemak owns its model lifecycle itself; the
+             "Load configuration" block above is the operator surface
+             for it. Removed 2026-05-29 after Sophie called out the
+             button as broken on Telemak screens. -->
       </div>
       <div style="display:grid;grid-template-columns:1fr 2fr;gap:14px;max-width:920px">
         <div>
