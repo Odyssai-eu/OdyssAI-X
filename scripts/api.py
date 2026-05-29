@@ -5005,6 +5005,7 @@ async def list_models(include_unloaded: bool = False):
         # title = cluster_label (e.g. "TeleCoder"), subtitle = family · quant.
         cluster_label = cd.get("name") or cid
         if len(loaded) == 1:
+            short = _telemak_short_id(loaded[0])
             data.append({
                 "id": cid, "object": "model",
                 "created": _now(), "owned_by": "odysseus-telemak",
@@ -5015,7 +5016,7 @@ async def list_models(include_unloaded: bool = False):
                     "alias_for": loaded[0],
                     "kind": "telemak",
                     "cluster_label": cluster_label,
-                    "family": loaded[0],
+                    "family": short,
                     "quantization": _quant_from_name(loaded[0]),
                     "stream": stream_cap,
                     "tools": tools_cap,
@@ -5036,7 +5037,7 @@ async def list_models(include_unloaded: bool = False):
                         "alias_for": upstream_model,
                         "kind": "telemak",
                         "cluster_label": cluster_label,
-                        "family": upstream_model,
+                        "family": short,
                         "quantization": _quant_from_name(upstream_model),
                         "cluster": cid,
                         "short_id": short,
