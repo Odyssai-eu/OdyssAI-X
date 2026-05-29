@@ -328,6 +328,14 @@ Common edits in `topology.yaml`:
   It SSHes into each node, lists PORT_ACTIVE HCAs, cross-references
   peer MACs via NDP, and prints the `rdma_to:` blocks ready to paste.
 
+  > **Note for AI install agents** : you are the one writing
+  > `topology.yaml` — you know the cluster the operator is
+  > deploying because you just bootstrapped it (step 3) and got
+  > the `user@host` mappings from the operator. The rank → ssh
+  > arguments you pass to `discover-rdma-wiring.py` MUST match the
+  > rank → ssh entries you put in `topology.yaml`. Same source of
+  > truth, no duplication risk : you held both ends.
+
 The example file has commented blocks for 2-node ring and 3-node JACCL —
 adapt them, don't write topology.yaml from scratch.
 

@@ -13,13 +13,23 @@ matrix for topology.yaml.
 
   Usage:
     scripts/discover-rdma-wiring.py \\
-      0=admin@192.168.86.29:ultra-512 \\
-      1=admin@192.168.86.30:ultra-256a \\
-      2=admin@192.168.86.31:ultra-256b \\
-      3=admin@192.168.86.32:ultra-256c
+      0=user@host-a \\
+      1=user@host-b \\
+      2=user@host-c \\
+      3=user@host-d
+
+  Real example (4-node cluster with hostnames + IPs):
+    scripts/discover-rdma-wiring.py \\
+      0=alice@10.0.0.10:node-a \\
+      1=alice@10.0.0.11:node-b \\
+      2=alice@10.0.0.12:node-c \\
+      3=alice@10.0.0.13:node-d
 
 Each positional argument is `<rank>=<ssh-target>[:<node-id>]`. The
-node-id is optional — defaults to the SSH target's hostname.
+ssh-target is whatever `ssh` accepts (user@host, ~/.ssh/config alias,
+IP, etc.). The node-id is optional — defaults to the SSH target's
+hostname. The rank-to-ssh-target mapping MUST match the one in your
+`topology.yaml` (same operator owns both).
 
 Output: per-node `rdma_to:` blocks ready to paste into topology.yaml.
 Exits non-zero if the cluster isn't a full mesh (some peer not
