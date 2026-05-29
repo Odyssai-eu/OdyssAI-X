@@ -3357,6 +3357,68 @@ def find_cloud_alias(model_id: Optional[str]) -> Optional[tuple[str, dict, dict]
     return None
 
 
+# Canonical Claude tier names that Claude Code / the Anthropic SDK send
+# (claude-opus-4-x, claude-sonnet-4-x, claude-3-5-haiku-x, etc.). We map
+# each tier to an operator-chosen local model so `claude` works
+# plug-and-play against a custom ANTHROPIC_BASE_URL without the user
+# setting ANTHROPIC_MODEL. Inspired by free-claude-code's tier routing.
+_ANTHROPIC_TIER_ENV = {
+    "opus":   "ODYSSEUS_ANTHROPIC_OPUS",
+    "sonnet": "ODYSSEUS_ANTHROPIC_SONNET",
+    "haiku":  "ODYSSEUS_ANTHROPIC_HAIKU",
+}
+
+
+def _first_servable_model() -> Optional[str]:
+    """The model id a tier should fall back to when nothing is configured:
+    the first loaded local pool, else the first loaded Telemak cluster."""
+    for cid, alias, _pool in list_all_pools():
+        return alias if alias != DEFAULT_ALIAS else cid
+    for cid in active_cluster_ids():
+        cd = get_cluster_def(cid)
+        if cd.get("kind") == "telemak":
+            return cid
+    return None
+
+
+def _resolve_anthropic_tier(model_id: Optional[str]) -> Optional[str]:
+    """Map a canonical Claude tier name → an operator-chosen local model.
+
+    Resolution order, per tier (opus/sonnet/haiku):
+      1. tier-specific env var (ODYSSEUS_ANTHROPIC_{OPUS,SONNET,HAIKU})
+      2. catch-all env var ODYSSEUS_ANTHROPIC_MODEL
+      3. plug-and-play fallback = first servable local model
+
+    Returns `model_id` unchanged when it isn't a Claude tier name, or when
+    it already resolves to a published cloud alias (operator intent wins).
+    This is purely additive: a `claude-*` name that previously 404'd now
+    routes to a local model; nothing else changes path.
+    """
+    if not model_id:
+        return model_id
+    low = model_id.lower()
+    if not low.startswith("claude"):
+        return model_id
+    # If the operator explicitly published a cloud alias by this exact
+    # name, respect it — don't hijack to a local model.
+    if find_cloud_alias(model_id):
+        return model_id
+    tier = (
+        "opus" if "opus" in low
+        else "sonnet" if "sonnet" in low
+        else "haiku" if "haiku" in low
+        else None
+    )
+    if tier:
+        env_target = os.environ.get(_ANTHROPIC_TIER_ENV[tier])
+        if env_target:
+            return env_target
+    catch_all = os.environ.get("ODYSSEUS_ANTHROPIC_MODEL")
+    if catch_all:
+        return catch_all
+    return _first_servable_model() or model_id
+
+
 def _cloud_provider_key(prov: dict) -> Optional[str]:
     """Resolve the provider's API key.
 
@@ -5750,6 +5812,12 @@ async def anthropic_count_tokens(req: AnthropicMessagesRequest):
 
 @app.post("/v1/messages")
 async def anthropic_messages(req: AnthropicMessagesRequest, request: Request):
+    # 0a. Tier routing: Claude Code / Anthropic SDK send canonical tier
+    # names (claude-opus/sonnet/haiku-*). Map them to an operator-chosen
+    # local model so `claude` works against ANTHROPIC_BASE_URL without the
+    # user pinning ANTHROPIC_MODEL. No-op for non-claude model ids.
+    req.model = _resolve_anthropic_tier(req.model)
+
     # 0. Telemak passthrough? kind=telemak clusters expose /v1/messages
     # natively (V1, Block 4). Same cluster_id / cluster:short alias
     # convention as /v1/chat/completions.
