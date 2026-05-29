@@ -2622,7 +2622,7 @@ async def _pool_ttl_sweeper() -> None:
 #   major (1.7.2 → 2.0.0) — breaking API or topology change
 #
 # Use `./scripts/bump-version.sh patch|minor|major` to bump + auto-commit.
-ODYSSEUS_VERSION = "1.7.13"
+ODYSSEUS_VERSION = "1.7.12"
 
 app = FastAPI(
     title="Odysseus (odyssai.eu)",
