@@ -1336,6 +1336,39 @@ function toast(msg, kind) {
   setTimeout(() => { t.className = "toast"; }, 2400);
 }
 
+// Clipboard with a fallback. `navigator.clipboard` only exists in a
+// secure context (HTTPS or localhost). The dashboard is usually served
+// over plain HTTP on a LAN IP (http://192.168.x.x:8000), where
+// navigator.clipboard is undefined — so every copy button failed with
+// "undefined is not an object". Fall back to a hidden-textarea +
+// execCommand("copy"), which works in non-secure contexts.
+function copyToClipboard(text) {
+  const okToast = () => toast("copied", "ok");
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    navigator.clipboard.writeText(text).then(okToast).catch(() => fallbackCopy(text));
+    return;
+  }
+  fallbackCopy(text);
+}
+function fallbackCopy(text) {
+  try {
+    const ta = document.createElement("textarea");
+    ta.value = text;
+    ta.setAttribute("readonly", "");
+    ta.style.position = "fixed";
+    ta.style.top = "-1000px";
+    ta.style.opacity = "0";
+    document.body.appendChild(ta);
+    ta.select();
+    ta.setSelectionRange(0, ta.value.length);
+    const ok = document.execCommand("copy");
+    document.body.removeChild(ta);
+    toast(ok ? "copied" : "copy failed", ok ? "ok" : "err");
+  } catch (e) {
+    toast("copy failed: " + (e && e.message ? e.message : e), "err");
+  }
+}
+
 // ─── Cluster identity helpers ───────────────────────────────────────
 // Populated from GET /admin/clusters at startup. Operators declare their
 // clusters in topology.yaml — the dashboard renders one tab per declared
@@ -1742,16 +1775,27 @@ function endpointModelLabel(m) {
   return m.id;
 }
 
-// Build the recipe body for the selected client.
+// Config file path shown above the snippet (null for env-var-only clients).
+function endpointConfigPath(clientId) {
+  if (clientId === "opencode")  return "~/.config/opencode/opencode.json";
+  if (clientId === "continue")  return "~/.continue/config.yaml";
+  if (clientId === "hermes")    return "~/.hermes/config.yaml";
+  return null; // curl + anthropic are env-var based, no file
+}
+
+// Build the recipe body for the selected client. Formats verified against
+// each client's official docs (2026-05). The model id + base URL are
+// interpolated from the live config.
 function endpointRecipe(clientId, ctx) {
   const { baseUrl, baseUrlNoV1, model, label } = ctx;
+
   if (clientId === "curl") {
     return {
-      lang: "bash",
       body:
-`# OpenAI-compatible. Works with any OpenAI SDK / tool.
+`# OpenAI-compatible — works with any OpenAI SDK or tool.
+# No key needed on a LAN install; pass any non-empty value.
 export OPENAI_BASE_URL="${baseUrl}"
-export OPENAI_API_KEY="dummy"   # /admin auth is separate; chat needs no key on a LAN install
+export OPENAI_API_KEY="dummy"
 
 curl "${baseUrl}/chat/completions" \\
   -H "Content-Type: application/json" \\
@@ -1761,20 +1805,20 @@ curl "${baseUrl}/chat/completions" \\
   }'`,
     };
   }
+
   if (clientId === "opencode") {
     return {
-      lang: "json",
       body:
-`// opencode.json — Custom provider (OpenAI-compatible).
-// Or fill the UI form with: ID=odysseus  Name=Odysseus
-//   Base URL=${baseUrl}  API key=(leave empty)
-//   Model ID=${model}  Model name=${label}
-{
+`{
+  "$schema": "https://opencode.ai/config.json",
   "provider": {
     "odysseus": {
       "npm": "@ai-sdk/openai-compatible",
       "name": "Odysseus",
-      "options": { "baseURL": "${baseUrl}" },
+      "options": {
+        "baseURL": "${baseUrl}",
+        "apiKey": "dummy"
+      },
       "models": {
         "${model}": { "name": "${label}" }
       }
@@ -1783,32 +1827,34 @@ curl "${baseUrl}/chat/completions" \\
 }`,
     };
   }
+
   if (clientId === "continue") {
     return {
-      lang: "json",
       body:
-`// ~/.continue/config.json — add to the "models" array.
-{
-  "models": [
-    {
-      "title": "${label}",
-      "provider": "openai",
-      "model": "${model}",
-      "apiBase": "${baseUrl}",
-      "apiKey": "dummy"
-    }
-  ]
-}`,
+`name: Odysseus
+version: 1.0.0
+schema: v1
+models:
+  - name: ${label}
+    provider: openai
+    model: ${model}
+    apiBase: ${baseUrl}
+    apiKey: dummy
+    roles:
+      - chat
+      - edit
+      - apply`,
     };
   }
+
   if (clientId === "anthropic") {
     return {
-      lang: "bash",
       body:
-`# Odysseus speaks the Anthropic Messages API too (/v1/messages).
-# Point the Anthropic SDK / Claude-compatible tools at the base (no /v1 suffix).
+`# Odysseus also speaks the Anthropic Messages API (/v1/messages).
+# Point the Anthropic SDK at the base WITHOUT the /v1 suffix.
 export ANTHROPIC_BASE_URL="${baseUrlNoV1}"
-export ANTHROPIC_API_KEY="dummy"
+export ANTHROPIC_AUTH_TOKEN="dummy"   # sent as Authorization: Bearer
+export ANTHROPIC_MODEL="${model}"
 
 curl "${baseUrlNoV1}/v1/messages" \\
   -H "content-type: application/json" \\
@@ -1817,21 +1863,25 @@ curl "${baseUrlNoV1}/v1/messages" \\
     "model": "${model}",
     "max_tokens": 256,
     "messages": [{"role": "user", "content": "Hello from Odysseus"}]
-  }'`,
+  }'
+
+# Note: Claude Code itself also probes /v1/messages/count_tokens at
+# startup, which this engine does not implement yet — the raw SDK /
+# curl path above works today; full Claude Code support is a follow-up.`,
     };
   }
+
   if (clientId === "hermes") {
     return {
-      lang: "yaml",
       body:
-`# ~/.hermes/config.yaml — point the default model at Odysseus.
-model:
+`model:
   provider: odyssai
   base_url: ${baseUrl}
   default: ${model}`,
     };
   }
-  return { lang: "text", body: "Unknown client." };
+
+  return { body: "Unknown client." };
 }
 
 function renderSettingsEndpoints() {
@@ -1863,68 +1913,50 @@ function renderSettingsEndpoints() {
   const client = state.endpoint_client || "opencode";
   const recipe = endpointRecipe(client, ctx);
 
-  // Group the model id list by cluster_label for a quick reference table.
-  const rows = models.map(m => {
-    const cap = m.x_odyssai || {};
-    const kind = cap.kind || (cap.backend === "http-proxy" ? "cloud" : "cluster");
-    const q = cap.quantization ? ` · ${escapeHtml(cap.quantization)}` : "";
-    return `
-      <div style="display:grid;grid-template-columns:1fr auto auto;gap:8px;align-items:center;padding:6px 0;border-bottom:1px solid var(--line)">
-        <code style="font-size:12px;color:var(--ink)">${escapeHtml(m.id)}</code>
-        <span style="font-size:11px;color:var(--ink-3)">${escapeHtml(cap.cluster_label || kind)}${q}</span>
-        <button class="btn btn-xs" data-act="endpoint-copy" data-v="${escapeHtml(m.id)}">Copy id</button>
-      </div>`;
-  }).join("");
+  const pathLine = endpointConfigPath(client);
 
   return `
-    <div style="display:flex;flex-direction:column;gap:20px">
+    <div style="display:flex;flex-direction:column;gap:18px">
 
-      <div style="font-size:13px;color:var(--ink-2);line-height:1.6;max-width:620px">
-        Connect any OpenAI- or Anthropic-compatible client to this engine.
-        Snippets below are generated from your live model list — IDs and base
-        URL are ready to copy. The base URL defaults to how you reached this
-        dashboard; edit it if you publish Odysseus on a different address.
+      <div style="font-size:13px;color:var(--ink-2);line-height:1.6;max-width:640px">
+        Connect any OpenAI- or Anthropic-compatible client. Pick a model and a
+        client below — the snippet is generated from your live config (real
+        model id, real base URL) and ready to paste.
       </div>
 
-      <!-- Base URL -->
-      <div style="display:flex;flex-direction:column;gap:6px;max-width:520px">
-        <div class="field-label">Base URL</div>
-        <input class="ce-input mono" value="${escapeHtml(baseUrl)}"
-               data-act="endpoint-base-url"
-               style="width:100%" />
-        <div style="font-size:11px;color:var(--ink-3)">
-          OpenAI clients use this as-is. Anthropic clients use the base without
-          the <code>/v1</code> suffix: <code>${escapeHtml(baseUrlNoV1)}</code>
+      <!-- Base URL + model picker, side by side -->
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px">
+        <div style="display:flex;flex-direction:column;gap:6px">
+          <div class="field-label">Base URL</div>
+          <input class="ce-input mono" value="${escapeHtml(baseUrl)}"
+                 data-act="endpoint-base-url" style="width:100%" />
+        </div>
+        <div style="display:flex;flex-direction:column;gap:6px">
+          <div class="field-label">Model</div>
+          <select class="ce-input mono" data-act="endpoint-pick-model" style="width:100%">
+            ${models.map(m => `<option value="${escapeHtml(m.id)}" ${m.id === model ? "selected" : ""}>${escapeHtml(endpointModelLabel(m))}</option>`).join("")}
+          </select>
         </div>
       </div>
 
-      <!-- Servable models reference -->
+      <!-- Client tabs -->
+      <div class="settings-tabs" style="padding:0;border-bottom:1px solid var(--line)">
+        ${ENDPOINT_CLIENTS.map(c => `<button class="${c.id === client ? "active" : ""}" data-act="endpoint-pick-client" data-v="${c.id}">${c.label}</button>`).join("")}
+      </div>
+
+      <!-- Config file path + snippet -->
       <div style="display:flex;flex-direction:column;gap:8px">
-        <div class="field-label">Servable models (${models.length})</div>
-        <div style="background:var(--surface);border:1px solid var(--line);border-radius:10px;padding:4px 14px">
-          ${rows}
-        </div>
-      </div>
-
-      <!-- Recipe builder -->
-      <div style="display:flex;flex-direction:column;gap:10px">
-        <div style="display:flex;gap:14px;flex-wrap:wrap;align-items:flex-end">
-          <div style="display:flex;flex-direction:column;gap:6px;flex:1;min-width:220px">
-            <div class="field-label">Model for snippet</div>
-            <select class="ce-input mono" data-act="endpoint-pick-model" style="width:100%">
-              ${models.map(m => `<option value="${escapeHtml(m.id)}" ${m.id === model ? "selected" : ""}>${escapeHtml(endpointModelLabel(m))}</option>`).join("")}
-            </select>
-          </div>
-        </div>
-
-        <div class="settings-tabs" style="padding:0;border-bottom:1px solid var(--line)">
-          ${ENDPOINT_CLIENTS.map(c => `<button class="${c.id === client ? "active" : ""}" data-act="endpoint-pick-client" data-v="${c.id}">${c.label}</button>`).join("")}
-        </div>
+        ${pathLine ? `
+          <div style="display:flex;align-items:center;gap:8px;font-size:12px">
+            <span style="color:var(--ink-3)">Config file:</span>
+            <code style="color:var(--ink)">${escapeHtml(pathLine)}</code>
+            <button class="btn btn-xs" data-act="endpoint-copy" data-v="${escapeHtml(pathLine)}">Copy path</button>
+          </div>` : ""}
 
         <div style="position:relative">
           <button class="btn btn-sm" data-act="endpoint-copy" data-v="${escapeHtml(recipe.body)}"
                   style="position:absolute;top:10px;right:10px;z-index:2">Copy</button>
-          <pre style="margin:0;background:#0f1419;color:#E5E9EE;border-radius:10px;padding:16px;overflow:auto;font-size:12px;line-height:1.55;max-height:420px"><code>${escapeHtml(recipe.body)}</code></pre>
+          <pre style="margin:0;background:#0f1419;color:#E5E9EE;border-radius:10px;padding:16px 16px 16px 16px;overflow:auto;font-size:12px;line-height:1.55;max-height:460px"><code>${escapeHtml(recipe.body)}</code></pre>
         </div>
       </div>
 
@@ -6021,15 +6053,13 @@ async function handleAct(e) {
   if (act === "matrix-refresh") { fetchMatrix(true); return; }
   if (act === "matrix-download-hf") { toast("HF download from settings — use Default card HF section for now", "err"); return; }
   if (act === "copy-curl") {
-    try { navigator.clipboard.writeText(v); toast("curl copied", "ok"); }
-    catch (e) { toast("copy failed: " + e.message, "err"); }
+    copyToClipboard(v);
     return;
   }
 
   // ─── Endpoints tab ───────────────────────────────────────────────
   if (act === "endpoint-copy") {
-    try { navigator.clipboard.writeText(v); toast("copied", "ok"); }
-    catch (e) { toast("copy failed: " + e.message, "err"); }
+    copyToClipboard(v);
     return;
   }
   if (act === "endpoint-base-url") {
