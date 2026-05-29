@@ -63,11 +63,14 @@ cp config/topology.example.yaml ~/.odysseus/topology.yaml
 $EDITOR ~/.odysseus/topology.yaml
 ```
 
-Minimal `topology.yaml` for single-node:
+Minimal `topology.yaml` for single-node. Cluster IDs are
+operator-chosen (free-form). `default` is a sensible name for "my
+primary local cluster" — anything works (`chat`, `coder`, `reasoner`,
+`mon-mac`, …).
 
 ```yaml
 clusters:
-  argo:
+  default:
     pools:
       - size: 1
         nodes:
@@ -96,19 +99,21 @@ huggingface-cli download \
   mlx-community/Qwen3-7B-MLX-8bit \
   --local-dir ~/mlx-models/mlx-community/Qwen3-7B-MLX-8bit
 
-# 9. Load it onto the argo cluster
+# 9. Load it onto your cluster (matches the cluster id in topology.yaml).
 #    /admin/* is open on a default LAN install. To require Bearer auth
 #    on a publicly-reachable deployment, set ODYSSEUS_ADMIN_TOKEN in
 #    your env and pass `-H "Authorization: Bearer $ODYSSEUS_ADMIN_TOKEN"`.
-curl -X POST http://localhost:8000/admin/argo/load \
+curl -X POST http://localhost:8000/admin/clusters/default/load \
   -H 'Content-Type: application/json' \
   -d '{"model": "mlx-community/Qwen3-7B-MLX-8bit"}'
 
-# 10. Chat
+# 10. Chat — `default` is the pool alias (set in topology.yaml). Your
+#     cluster's id is what appears in admin routes; the alias is what
+#     the model picker / OpenAI client sees.
 curl -X POST http://localhost:8000/v1/chat/completions \
   -H 'Content-Type: application/json' \
   -d '{
-    "model": "argo",
+    "model": "default",
     "messages": [{"role":"user","content":"Hello"}]
   }'
 ```
@@ -134,7 +139,7 @@ scripts/bootstrap-node.sh user@host-b.lan
 
 ```yaml
 clusters:
-  argo:
+  default:
     backend: ring                 # TCP, not JACCL
     pools:
       - size: 2
@@ -185,11 +190,22 @@ This is the production path but the setup is more involved:
 
    These names depend on macOS port enumeration at boot. They differ from one node to the next — that's expected.
 
-3. **Generate the topology** with the discovery tool (TODO — currently you edit `topology.yaml` by hand from the `ifconfig` output):
+3. **Generate the wiring matrix** with the discovery tool — pass it
+   the same rank → ssh mapping you'll write in `topology.yaml`:
+
+   ```bash
+   scripts/discover-rdma-wiring.py \
+     0=user@host-a.lan \
+     1=user@host-b.lan \
+     2=user@host-c.lan
+   ```
+
+   It SSHes into each node, lists PORT_ACTIVE HCAs, cross-references peer
+   MACs via NDP, and prints `rdma_to:` blocks ready to paste:
 
    ```yaml
    clusters:
-     argo:
+     default:
        backend: jaccl
        pools:
          - size: 3
@@ -234,7 +250,12 @@ This is the production path but the setup is more involved:
 ## Next steps
 
 - **Pair Companion** — install [Companion](https://github.com/Odyssai-eu/Companion) and point it at this engine for a chat UI with memory, projects, skills, and the rest.
-- **Multi-cluster setups** — the API recognises three cluster keys today: `argo`, `hades`, `vlm`. You can run more than one (e.g. `argo` for a big reasoner pool, `hades` for code, `vlm` for vision) by defining several entries in `topology.yaml`. The user-facing aliases in `/v1/models` are editable separately from the dashboard.
+- **Multi-cluster setups** — cluster keys in `topology.yaml` are
+  arbitrary (`default`, `chat`, `coder`, `reasoner`, `vision`, `mon-mac`
+  — anything works). Define several entries to run multiple pools side
+  by side (e.g. a big reasoner pool and a code-tuned smaller pool).
+  The API exposes them under `/admin/clusters/<id>/…`. The user-facing
+  aliases in `/v1/models` are editable separately from the dashboard.
 - **Capability contract** — your engine publishes `/.well-known/inference-engine.json` and `/v1/models` with `x_odyssai` blocks. Clients (Companion, IDE plugins) use this to know what each model supports.
 
 If you get stuck, open an issue with your `topology.yaml` (redact SSH targets if sharing) and the output of `curl /admin/version` + the error you're seeing.

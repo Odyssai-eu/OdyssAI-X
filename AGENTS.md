@@ -302,10 +302,11 @@ The example ships with a single-node cluster keyed `default`.
 **Cluster IDs are arbitrary.** The keys under `clusters:` in
 `topology.yaml` are free-form identifiers chosen by the operator — they
 appear in admin routes (`/admin/clusters/<id>/…`) and in the dashboard.
-Pick short, role-descriptive names: `default`, `chat`, `coder`,
-`reasoner`, `vision`, or `argo` / `hades` / `vlm` — anything works. The
-engine discovers them at boot. **Ask the user** what to call their
-cluster(s) before editing the file. The model *alias* published in
+Pick short, role-descriptive names — `default`, `chat`, `coder`,
+`reasoner`, `vision`, `mon-mac`, or any free-form identifier (the
+engine treats them as opaque strings, doesn't bake any specific name
+in). **Ask the user** what to call their cluster(s) before editing
+the file. The model *alias* published in
 `/v1/models` is separate and editable from the dashboard.
 
 Common edits in `topology.yaml`:
