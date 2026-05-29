@@ -35,3 +35,10 @@ nautilus.png
 # /app/data/odysseus.db — irrelevant to the repo.
 scripts/odysseus.db
 scripts/odysseus.db-*
+
+# Local deploy script — defaults to the maintainer's prod hosts +
+# carries operator-specific bumps + push targets. An operator running
+# their own Odysseus instance writes their own version (cp from local
+# OR uses the documented hot-patch flow in INSTALL-CLUSTER.md / DEPLOY.md).
+# Kept on disk for the maintainer; not tracked.
+scripts/deploy.sh
