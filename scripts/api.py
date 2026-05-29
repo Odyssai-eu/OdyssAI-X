@@ -173,7 +173,9 @@ def state_file_for(cluster_id: str) -> Path:
     return state_dir / f"state-{cluster_id}.json"
 
 
+# Legacy single-grid state file (kept only for the unused Nautilus path).
 # Per-cluster state files come from state_file_for(cluster_id).
+STATE_FILE = Path(os.environ.get("STATE_FILE", _HERE / "state.json"))
 # SQLite history for runs + sync jobs. Defaults to /app/data/ (the Docker
 # volume that holds state.json + cluster-config.json), so history survives
 # container restarts. Env override: ODYSSEUS_DB_PATH.
@@ -776,6 +778,7 @@ def _validate_load_fits(model_size_bytes: int, cluster: str,
 # Module-level loading state (read by /admin/.../status without holding the
 # admin lock; the load handlers update these dicts inside their critical
 # sections so the UI sees consistent values).
+_nautilus_loading: dict = {"in_progress": False}
 _loading_state: dict[str, dict] = {}
 
 
@@ -1069,7 +1072,7 @@ def remote_cmd(node: dict, nodes: list[dict], model: str, mode: str, port: int,
 # Runner pool
 # ──────────────────────────────────────────────────────────────────────────────
 class RunnerProc:
-    def __init__(self, node: dict, cmd: str, on_event, cluster: str = "default"):
+    def __init__(self, node: dict, cmd: str, on_event, cluster: str = "nautilus"):
         self.node = node
         self.cluster = cluster
         self.proc = subprocess.Popen(
@@ -1261,7 +1264,7 @@ def _sweep_orphan_runners(cluster_id: str,
     Why this exists:
       The orchestrator container is the only thing that should launch runner.py
       on the macs. But if the container crashes/restarts while runners are still
-      alive on the macs, the new container starts with empty pool state and has
+      alive on the macs, the new container starts with `_*_pool = None` and has
       no idea those zombies exist. They keep ~200 GB wired in MLX/Metal each
       until reboot, and JACCL re-init fails because the queue pairs are still
       occupied (errno 16). Symptom on 2026-05-18: container restart → auto-load
@@ -1390,7 +1393,7 @@ def _sweep_orphan_runners(cluster_id: str,
 
 class RunnerPool:
     def __init__(self, model: str, mode: str, use_ap: bool, nodes_count: int = 2,
-                 emit_batch: int = 10, cluster: str = "default",
+                 emit_batch: int = 10, cluster: str = "nautilus",
                  kv_q8: bool = False,
                  draft_model: Optional[str] = None,
                  num_draft_tokens: int = 4,
@@ -1405,8 +1408,8 @@ class RunnerPool:
         self.draft_model = draft_model
         self.num_draft_tokens = num_draft_tokens
         # Default alias = cluster name (back-compat: single pool per cluster
-        # stays at alias=="default"). Additional pool aliases pass an
-        # explicit alias like "default-big".
+        # stays at alias=="default" / "nautilus"). Additional pool aliases
+        # pools pass an explicit alias like "default-big".
         self.alias = alias or cluster
         # `node_indices` (Default only) selects which subset of the cluster's
         # nodes this pool occupies. When absent we fall back to the legacy
@@ -1755,13 +1758,16 @@ class RunnerPool:
 # State + metrics
 # ──────────────────────────────────────────────────────────────────────────────
 def _state_path_for_cluster(cluster: str) -> Path:
-    """Where save_state writes the legacy v1 state file. Uses the standard
-    state-<id>.json convention."""
+    """Where save_state writes the legacy v1 state file. Nautilus keeps its
+    historical filename for back-compat; every other cluster uses the
+    standard state-<id>.json convention."""
+    if cluster == "nautilus":
+        return STATE_FILE
     return state_file_for(cluster)
 
 
 def save_state(model: str, mode: str, use_ap: bool, nodes_count: int,
-               cluster: str = "default", kv_q8: bool = False) -> None:
+               cluster: str = "nautilus", kv_q8: bool = False) -> None:
     path = _state_path_for_cluster(cluster)
     try:
         path.write_text(json.dumps({
@@ -1772,7 +1778,7 @@ def save_state(model: str, mode: str, use_ap: bool, nodes_count: int,
         sys.stderr.write(f"[api] failed to save {cluster} state: {e}\n")
 
 
-def load_state(cluster: str = "default") -> Optional[dict]:
+def load_state(cluster: str = "nautilus") -> Optional[dict]:
     path = _state_path_for_cluster(cluster)
     try:
         return json.loads(path.read_text())
@@ -1876,10 +1882,11 @@ _metrics: deque = deque(maxlen=50)
 # /admin/logs?cluster=main 400s and the dashboard runner-logs panel stays
 # empty even though stderr is flowing.
 _log_buffers: dict[str, deque] = {
+    "nautilus": deque(maxlen=500),
     "default": deque(maxlen=500),
 }
 _log_subscribers: dict[str, list[asyncio.Queue]] = {
-    "default": [],
+    "nautilus": [], "default": [],
 }
 _log_lock = threading.Lock()
 
@@ -2111,7 +2118,7 @@ def _runs_register(rid: str, *, model: str, cluster: str, client: str,
     `pool_alias` lets the dashboard distinguish multi-pool Default runs: e.g.
     a request to alias `default-extra` carries `cluster='default'` AND
     `pool_alias='default-extra'`. Default alias = cluster name (back-compat
-    for the single default pool)."""
+    for the single Nautilus pool and the default `default` pool)."""
     ev = asyncio.Event()
     _active_runs[rid] = {
         "id": rid,
@@ -2302,6 +2309,8 @@ def discover_models_on_node(ssh: str, models_dir: str) -> list[str]:
 # ──────────────────────────────────────────────────────────────────────────────
 # Lifespan + global state
 # ──────────────────────────────────────────────────────────────────────────────
+_pool: Optional[RunnerPool] = None
+
 # Generic pool registry: cluster_id → alias → RunnerPool.
 #
 # A cluster may host multiple concurrent pools, each occupying a disjoint
@@ -2381,6 +2390,7 @@ def get_admin_lock(cluster_id: str) -> asyncio.Lock:
 
 
 _args: Optional[argparse.Namespace] = None
+_admin_lock = asyncio.Lock()
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Cluster-level degraded state (recovery ladder)
@@ -2445,6 +2455,7 @@ def _clear_cluster_degraded(cluster_id: str) -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    global _pool
     # SQLite history for runs + sync_jobs. Failure-tolerant: init returns
     # False on any error and all _persist.* calls become no-ops.
     try:
@@ -2466,6 +2477,14 @@ async def lifespan(app: FastAPI):
             _sweep_orphan_runners(_cid)
         except Exception as _e:
             sys.stderr.write(f"[api] orphan sweep ({_cid}) failed: {_e}\n")
+    initial = _initial_config()
+    if initial is not None:
+        try:
+            _pool = RunnerPool(**initial)
+            await _pool.start()
+        except Exception as e:
+            sys.stderr.write(f"[api] startup load (nautilus) failed: {e}\n")
+            _pool = None
     # Multi-pool restore (state file v2): iterate every cluster declared in
     # topology.yaml, restore whatever pools were running at last shutdown.
     # Within a cluster, sort the default alias first so any extra-alias load
@@ -2515,6 +2534,8 @@ async def lifespan(app: FastAPI):
         ttl_task.cancel()
         dead_task.cancel()
         cancel_task.cancel()
+        if _pool is not None:
+            await _pool.stop()
         for _cid, _alias, pool in list_all_pools():
             try:
                 await pool.stop()
@@ -2527,6 +2548,8 @@ def _apply_default_ttl_to_pools() -> None:
     Called at startup and after admin settings updates."""
     cfg = _load_cluster_config()
     ttl = int((cfg.get("settings") or {}).get("pool_ttl_seconds_default") or 0)
+    if _pool is not None:
+        _pool.ttl_seconds = ttl
     for _cid, _alias, pool in list_all_pools():
         pool.ttl_seconds = ttl
 
@@ -2552,7 +2575,7 @@ async def _dead_pool_sweeper() -> None:
         try:
             await asyncio.sleep(30)
             seen_clusters = set()
-            for cid, _alias, _p in list_all_pools():
+            for cid, _alias, _pool in list_all_pools():
                 seen_clusters.add(cid)
             for cid in seen_clusters:
                 purged = await _purge_dead_pools(cid)
@@ -2592,6 +2615,8 @@ async def _pool_ttl_sweeper() -> None:
     held for nothing during quiet hours. With ttl=1800 the cluster auto-
     yields so other pools can claim the RAM. operator keeps manual
     control via pinning (TODO) or via reloading explicitly.
+
+    We never touch `_pool` (the legacy nautilus pool — unused since 2026-05).
     """
     while True:
         try:
@@ -2610,6 +2635,37 @@ async def _pool_ttl_sweeper() -> None:
             return
         except Exception as e:
             sys.stderr.write(f"[ttl-sweeper] error: {e}\n")
+
+
+def _initial_config() -> Optional[dict]:
+    if _args.model:
+        return {
+            "model": _args.model, "mode": _args.mode,
+            "use_ap": _args.use_ap, "nodes_count": _args.nodes,
+            "kv_q8": getattr(_args, "kv_q8", False),
+        }
+    state = load_state()
+    if state and state.get("model"):
+        return {
+            "model": state["model"], "mode": state.get("mode", "pipeline"),
+            "use_ap": state.get("use_ap", False),
+            "nodes_count": state.get("nodes", 2),
+            "kv_q8": state.get("kv_q8", False),
+        }
+    return None
+
+
+def _initial_default_config() -> Optional[dict]:
+    state = load_state(cluster="default")
+    if state and state.get("model"):
+        return {
+            "model": state["model"], "mode": state.get("mode", "pipeline"),
+            "use_ap": state.get("use_ap", True),
+            "nodes_count": state.get("nodes", 3),
+            "kv_q8": state.get("kv_q8", False),
+        }
+    return None
+
 
 
 # Version is the single source of truth for the server identity. Bump at
@@ -2849,20 +2905,13 @@ async def help_topic(slug: str):
 
 @app.get("/health")
 async def health():
-    pools = list_all_pools()
-    if not pools:
+    if _pool is None:
         return {"status": "idle", "version": ODYSSEUS_VERSION}
-    total_alive = 0
-    total_nodes = 0
-    for _cid, _alias, pool in pools:
-        total_alive += pool.alive_count()
-        total_nodes += len(pool.runners)
+    alive = _pool.alive_count()
     return {
-        "status": "ok" if total_alive == total_nodes else "degraded",
+        "status": "ok" if alive == len(_pool.runners) else "degraded",
         "version": ODYSSEUS_VERSION,
-        "pools": len(pools),
-        "alive": total_alive,
-        "nodes": total_nodes,
+        "model": _pool.model, "alive": alive, "nodes": len(_pool.runners),
     }
 
 
@@ -4344,6 +4393,8 @@ async def admin_settings_update(req: ServerSettingsUpdate):
     # it now so the user doesn't have to unload+reload to see the effect.
     if req.system_prefix_text is not None:
         targets: list[tuple[RunnerPool, str]] = []
+        if _pool is not None:
+            targets.append((_pool, "nautilus"))
         for cid, alias, pool in list_all_pools():
             targets.append((pool, f"{cid}:{alias}"))
         for pool, name in targets:
@@ -4826,6 +4877,8 @@ async def _discover_unloaded_models() -> list[tuple[str, str, Optional[int]]]:
     if _discovery_cache["data"] is not None and (now - _discovery_cache["ts"]) < _DISCOVERY_TTL:
         return _discovery_cache["data"]
     loaded: set[str] = set()
+    if _pool is not None:
+        loaded.add(_short_model_name(_pool.model, models_dir_for("nautilus")))
     for cid, _alias, p in list_all_pools():
         loaded.add(_short_model_name(p.model, models_dir_for(cid)))
 
@@ -4881,8 +4934,8 @@ async def list_models(include_unloaded: bool = False):
     """OpenAI-compatible model listing.
 
     **Default behaviour (2026-05-18+)**: only **currently servable** models
-    are advertised — loaded pools and published cloud providers.
-    Models that exist on disk but aren't loaded
+    are advertised — loaded pools (default / nautilus aliases) and
+    published cloud providers. Models that exist on disk but aren't loaded
     are NOT exposed as model_ids, because:
 
       1. Auto-swap was never implemented (only routing to already-loaded
@@ -4923,6 +4976,7 @@ async def list_models(include_unloaded: bool = False):
             "x_odyssai": alias_caps,
         })
 
+    await _push_loaded(_pool, "nautilus", "nautilus")
     # Emit one entry per loaded pool across every cluster.
     for cid, alias, pool in list_all_pools():
         await _push_loaded(pool, cid, alias)
@@ -5025,8 +5079,8 @@ async def list_models(include_unloaded: bool = False):
 
 
 def _cluster_fallback_for(model_id: Optional[str]) -> Optional[str]:
-    """If `model_id` is a local cluster alias that has a configured fallback
-    cloud alias in its cluster_def, return it. Else None.
+    """If `model_id` is a local cluster alias (default/nautilus) that has a
+    configured fallback cloud alias in its cluster_def, return it. Else None.
 
     Cluster def field: `fallback: "or:hy3-preview"`.
     """
@@ -5086,9 +5140,9 @@ def classify_request(
 
 
 # Per-cluster acceptance map. False = refuse with a structured 400 message.
-# Default refuses probe + compile (those are routing mistakes). Other clusters
-# accept everything because they're already single-node so the overhead of
-# running a probe there is minimal.
+# Default refuses probe + compile (those are routing mistakes). Other clusters and
+# nautilus accept everything because they're already single-node so the
+# overhead of running a probe there is minimal.
 _CLUSTER_ACCEPTS: dict[str, dict[str, bool]] = {
     "default": {
         "probe":    False,
@@ -5127,12 +5181,15 @@ def _route_pool(model: Optional[str]) -> Optional[RunnerPool]:
       1. Match a cluster id → that cluster's default-alias pool
       2. Match an alias (across all clusters) → that pool
       3. Match a concrete model path against any loaded pool's `.model`
+      4. "nautilus" → legacy single grid (_pool)
 
     Returns None when no match — caller surfaces 404 with `ready_models`.
     """
     if not model:
         return None
     m = model.strip().lower()
+    if m == "nautilus":
+        return _pool
     # 1. Direct cluster-id match
     pool = get_pool(m)
     if pool is not None:
@@ -5145,6 +5202,8 @@ def _route_pool(model: Optional[str]) -> Optional[RunnerPool]:
     for _cid, _alias, pool in list_all_pools():
         if model == pool.model:
             return pool
+    if _pool is not None and model == _pool.model:
+        return _pool
     return None
 
 
@@ -5214,6 +5273,7 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
         # Every loaded Default alias is servable (default "default" + extras).
         for cid, alias, _ in list_all_pools():
             ready.append(alias if alias != DEFAULT_ALIAS else cid)
+        if _pool is not None:         ready.append("nautilus")
         # Cloud aliases are always ready.
         try:
             ready.extend(e["id"] for e in _cloud_entries_for_v1_models())
@@ -5682,6 +5742,7 @@ async def anthropic_messages(req: AnthropicMessagesRequest, request: Request):
         # Every loaded Default alias is servable (default "default" + extras).
         for cid, alias, _ in list_all_pools():
             ready.append(alias if alias != DEFAULT_ALIAS else cid)
+        if _pool is not None:         ready.append("nautilus")
         try:
             ready.extend(e["id"] for e in _cloud_entries_for_v1_models())
         except Exception:
@@ -5868,14 +5929,152 @@ async def anthropic_messages(req: AnthropicMessagesRequest, request: Request):
 # ──────────────────────────────────────────────────────────────────────────────
 # Admin endpoints
 # ──────────────────────────────────────────────────────────────────────────────
-# Removed 2026-05-29 with the legacy nautilus path: /admin/status,
-# /admin/models, /admin/models-dir, /admin/load, /admin/unload. The
-# multi-cluster parameterised routes under /admin/clusters/{cluster_id}/*
-# replaced them.
+@app.get("/admin/status")
+async def admin_status():
+    loading = _loading_snapshot(_nautilus_loading)
+    if _pool is None:
+        return {"loaded": False, "loading": loading}
+    uptime = time.time() - (_pool.started_at or time.time())
+    recent_tps = [m["tps"] for m in list(_metrics)[:10] if m["tps"] > 0]
+    return {
+        "loaded": True,
+        "loading": loading,
+        "model": _pool.model, "mode": _pool.mode,
+        "use_ap": _pool.use_ap, "nodes": _pool.nodes_count,
+        "kv_q8": _pool.kv_q8,
+        "draft_model": _pool.draft_model,
+        "num_draft_tokens": _pool.num_draft_tokens if _pool.draft_model else None,
+        "alive": _pool.alive_count(),
+        "load_s": _pool.load_s, "uptime_s": uptime,
+        "recent_avg_tps": round(sum(recent_tps) / len(recent_tps), 2) if recent_tps else None,
+        "recent_count": len(_metrics),
+    }
 
-# ModelsDirRequest is still used by /admin/clusters/{cluster_id}/models-dir.
+
+@app.get("/admin/models")
+async def admin_models(dir: Optional[str] = None):
+    """Discover models on Nautilus rank 0 (under `dir` or the saved models_dir)."""
+    rank0 = rank0_ssh_for_cluster("nautilus")
+    target_dir = dir or models_dir_for("nautilus")
+    if dir:
+        # Persist the override on explicit query
+        set_models_dir("nautilus", dir)
+    models = await asyncio.to_thread(discover_models_on_node, rank0, target_dir)
+    annotated = []
+    for m in models:
+        annotated.append({
+            "id": m,
+            "kind": "path",
+            "is_loaded": _pool is not None and _pool.model == m,
+        })
+    return {"data": annotated, "models_dir": target_dir}
+
+
 class ModelsDirRequest(BaseModel):
     dir: str
+
+
+@app.post("/admin/models-dir")
+async def admin_models_dir(req: ModelsDirRequest):
+    set_models_dir("nautilus", req.dir)
+    return {"cluster": "nautilus", "models_dir": req.dir}
+
+
+class LoadRequest(BaseModel):
+    model: str
+    mode: str = "pipeline"  # "pipeline" | "tensor"
+    use_ap: bool = False
+    nodes: int = 2  # 2 | 3 | 4
+    # None = take the cluster-wide default from /admin/settings (kv_q8_default).
+    # Explicit true/false still wins per request — important for eval runs that
+    # want a known cache type regardless of the global setting.
+    kv_q8: Optional[bool] = None
+    draft_model: Optional[str] = None  # speculative decoding, single-rank only
+    num_draft_tokens: int = 4
+    # Hot-swap: when False (default since 2026-05-18 audit), the old pool
+    # is stopped BEFORE the new one starts — no double-allocation in RAM.
+    # Set True to overlap the load with the old serving (faster cutover,
+    # but doubles RAM transiently). Default False prevents OOM on big models.
+    force_hot_swap: bool = False
+
+
+@app.post("/admin/load")
+async def admin_load(req: LoadRequest):
+    if req.mode not in ("pipeline", "tensor"):
+        raise HTTPException(400, f"invalid mode {req.mode}")
+    if "nautilus" not in DEFAULT_CLUSTER_DEFS:
+        raise HTTPException(404, "nautilus topology is not configured")
+    max_nodes = len(get_cluster_def("nautilus").get("nodes", [])) or 1
+    if req.nodes < 1 or req.nodes > max_nodes:
+        raise HTTPException(400, f"nautilus: invalid nodes {req.nodes}")
+
+    # Resolve kv_q8: explicit request value wins; fall back to cluster default.
+    kv_q8 = req.kv_q8 if req.kv_q8 is not None else get_kv_q8_default()
+
+    rank0_ssh = rank0_ssh_for_cluster("nautilus", req.nodes)
+    size_bytes = await get_model_size_bytes(rank0_ssh, req.model)
+    estimated_s = estimate_load_s(req.model, size_bytes, "nautilus", req.nodes)
+
+    global _pool
+    async with _admin_lock:
+        _begin_loading(_nautilus_loading, req.model, req.nodes, size_bytes, estimated_s)
+        try:
+            old = _pool
+            # Stop-old-before-start-new by default. Hot-swap kept its old
+            # name but the gate is now opt-in. See LoadRequest.force_hot_swap.
+            if old is not None and not req.force_hot_swap:
+                sys.stderr.write("[load] nautilus: stopping old pool before starting new (no hot-swap)\n")
+                await old.stop()
+                old = None  # mark consumed
+                _pool = None
+            new_pool = RunnerPool(
+                model=req.model, mode=req.mode,
+                use_ap=req.use_ap, nodes_count=req.nodes,
+                kv_q8=kv_q8,
+                draft_model=req.draft_model,
+                num_draft_tokens=req.num_draft_tokens,
+            )
+            try:
+                await new_pool.start()
+            except Exception as e:
+                try:
+                    await new_pool.stop()
+                except Exception:
+                    pass
+                raise HTTPException(500, f"load failed: {e}")
+            if old is not None:
+                # Only reached when force_hot_swap=True — the old pool ran
+                # alongside the new one's load.
+                await old.stop()
+            _pool = new_pool
+            save_state(req.model, req.mode, req.use_ap, req.nodes, kv_q8=kv_q8)
+            record_load_history("nautilus", req.model, _pool.load_s or 0.0,
+                                size_bytes, req.nodes)
+        finally:
+            _end_loading(_nautilus_loading)
+    await _maybe_auto_prewarm(_pool, "nautilus")
+    return {"loaded": True, "model": _pool.model, "load_s": _pool.load_s}
+
+
+@app.post("/admin/unload")
+async def admin_unload():
+    global _pool
+    async with _admin_lock:
+        if _pool is None:
+            # See admin_cluster_unload for the rationale: reap orphans even
+            # when pool state is None.
+            sweep = await asyncio.to_thread(_sweep_orphan_runners, "nautilus")
+        else:
+            await _pool.stop()
+            _pool = None
+            sweep = await asyncio.to_thread(_sweep_orphan_runners, "nautilus")
+    # Always clear persisted state so next start doesn't auto-reload.
+    try:
+        if STATE_FILE.exists():
+            STATE_FILE.unlink()
+    except Exception:
+        pass
+    return {"loaded": False, "sweep": sweep}
 
 
 @app.get("/admin/logs")
@@ -5944,7 +6143,7 @@ async def admin_sessions(cluster: Optional[str] = None):
 
 @app.get("/admin/metrics")
 async def admin_metrics(cluster: Optional[str] = None, limit: int = 50):
-    """Recent request metrics, optionally filtered by cluster ("default" or any other id).
+    """Recent request metrics, optionally filtered by cluster ("nautilus" or "default").
 
     Each entry: ts, client, cluster, model, ntoks, elapsed_s, ttft_s, tps,
     prompt_chars, tool_calls, session_kind.
@@ -6518,6 +6717,8 @@ def _pool_for_cluster_name(name: Optional[str]):
     """Map a cluster name to its default-alias pool. Returns None for unknown / unloaded."""
     if not name:
         return None
+    if name == "nautilus":
+        return _pool
     return get_pool(name)
 
 
@@ -8497,17 +8698,29 @@ async def _cluster_reset(cluster_id: str) -> dict:
 
     # 2. Stop the pool (handles state file + admin lock)
     try:
-        async with get_admin_lock(cluster_id):
-            # Stop ALL pools on this cluster (default + extras). Reset is
-            # a cluster-level recovery — partial reset doesn't make sense
-            # when JACCL is sick across all ranks.
-            for a, p in list_pools(cluster_id):
-                try:
-                    await p.stop()
-                except Exception as e:
-                    sys.stderr.write(f"[reset] {cluster_id}[{a}] stop error: {e}\n")
-                del_pool(cluster_id, a)
-        save_cluster_state_v2(cluster_id)
+        if cluster_id == "nautilus":
+            global _pool
+            async with _admin_lock:
+                if _pool is not None:
+                    await _pool.stop()
+                    _pool = None
+            try:
+                if STATE_FILE.exists():
+                    STATE_FILE.unlink()
+            except Exception:
+                pass
+        else:
+            async with get_admin_lock(cluster_id):
+                # Stop ALL pools on this cluster (default + extras). Reset is
+                # a cluster-level recovery — partial reset doesn't make sense
+                # when JACCL is sick across all ranks.
+                for a, p in list_pools(cluster_id):
+                    try:
+                        await p.stop()
+                    except Exception as e:
+                        sys.stderr.write(f"[reset] {cluster_id}[{a}] stop error: {e}\n")
+                    del_pool(cluster_id, a)
+            save_cluster_state_v2(cluster_id)
         _step("stop_pool", True)
     except Exception as e:
         _step("stop_pool", False, str(e))
@@ -8556,6 +8769,11 @@ async def admin_cluster_reset(cluster_id: str):
     return await _cluster_reset(cluster_id)
 
 
+@app.post("/admin/reset")
+async def admin_nautilus_reset():
+    return await _cluster_reset("nautilus")
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Cache prewarm — explicit re-trigger of the shared system-prefix cache.
 # Useful when the user edits the prefix text in settings and wants the new
@@ -8565,6 +8783,12 @@ async def admin_cluster_reset(cluster_id: str):
 class PrewarmRequest(BaseModel):
     text: Optional[str] = None  # None → use the saved system_prefix_text
     kv_q8: Optional[bool] = None  # None → cluster default
+
+
+def _pool_for_cluster(cluster: str):
+    if cluster == "nautilus":
+        return _pool
+    return get_pool(cluster)
 
 
 @app.post("/admin/{cluster}/prewarm")
@@ -8599,6 +8823,7 @@ async def admin_sessions_clear(req: SessionClearRequest):
     payload = {"cmd": "session_clear"}
     if req.session_id:
         payload["session_id"] = req.session_id
+    _broadcast_to_pool(_pool, payload)
     for _cid, _alias, p in list_all_pools():
         _broadcast_to_pool(p, payload)
     return {"ok": True, "session_id": req.session_id, "scope": "all_clusters"}
