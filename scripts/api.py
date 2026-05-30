@@ -2685,7 +2685,7 @@ def _initial_default_config() -> Optional[dict]:
 #   major (1.7.2 → 2.0.0) — breaking API or topology change
 #
 # Use `./scripts/bump-version.sh patch|minor|major` to bump + auto-commit.
-ODYSSEUS_VERSION = "1.7.20"
+ODYSSEUS_VERSION = "1.7.21"
 
 app = FastAPI(
     title="Odysseus (odyssai.eu)",
@@ -5445,12 +5445,16 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
         # clients render it as the reasoning channel, not the answer.
         reasoning_content_full = ""
         if req.enable_thinking is False and content:
-            # Seed in_think=True for models whose chat_template auto-opens
-            # the think block in the prompt (MiniMax M2). Otherwise the
-            # filter never enters think mode and routes the reasoning to
-            # delta.content. model_id is the pool.model (HF repo path),
-            # so the substring check sees e.g. "…/MiniMax-M2.7-MLX-8bit".
-            _seed_in_think = _model_auto_opens_think(model_id)
+            # Seed in_think=True ONLY for models that emit a think block even
+            # when enable_thinking=False (MiniMax-style templates that ignore
+            # the Jinja flag). Models that HONOR the flag (Qwen3.5/3.6) emit
+            # NO think block here — so seeding in_think=True would route their
+            # direct answer into reasoning_content and leave `content` empty
+            # (observed 2026-05-30: Qwen3.5-397B "hello" → empty content, the
+            # reply trapped in reasoning → Companion ghost). For those, seed
+            # False so the answer stays in content. model_id is the pool.model
+            # HF repo path (e.g. "…/MiniMax-M2.7-MLX-8bit").
+            _seed_in_think = _model_ignores_enable_thinking_flag(model_id)
             ts: dict = {"in_think": _seed_in_think, "carry": ""}
             visible_full, reasoning_full = _split_think_stream(content, ts)
             fl_vis, fl_reason = _flush_think_stream(ts)
@@ -5512,11 +5516,16 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
             # documented 2026-05-18) emit think blocks regardless of the
             # Jinja flag, so we filter at the wire.
             think_filter_active = (req.enable_thinking is False)
-            # Seed in_think=True for models whose chat_template auto-opens
-            # the think block in the prompt (MiniMax M2). See
-            # _model_auto_opens_think + _MODELS_AUTO_OPEN_THINK for context.
+            # Seed in_think=True ONLY for models that emit a think block even
+            # when enable_thinking=False (MiniMax-style templates that ignore
+            # the flag). Models that HONOR enable_thinking (Qwen3.5/3.6) emit
+            # NO think block when it's false — seeding in_think=True there
+            # routes their direct answer into reasoning_content and leaves
+            # `content` empty → Companion shows a ghost (observed 2026-05-30
+            # on Qwen3.5-397B). So gate the seed on "ignores the flag", not
+            # "auto-opens".
             _seed_in_think = (
-                think_filter_active and _model_auto_opens_think(model_id)
+                think_filter_active and _model_ignores_enable_thinking_flag(model_id)
             )
             think_state: dict = {"in_think": _seed_in_think, "carry": ""}
             async for ev in pool.submit(None, req.max_tokens or 512, req.enable_thinking,
