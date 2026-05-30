@@ -1236,9 +1236,11 @@ class RunnerProc:
             # signalled (TERM phase), 1 if no match. We don't care about
             # the exact rc here, just that we tried both phases.
             pattern = shlex.quote(RUNNER_MATCH_PATTERN)
+            # 24×0.5s = 12s grace so the runner's SIGTERM-driven Metal
+            # cleanup (free_metal) finishes on big models before SIGKILL.
             cmd = (
                 f"pkill -TERM -f {pattern} 2>/dev/null && "
-                f"for i in 1 2 3 4 5 6 7 8 9 10; do "
+                f"for i in $(seq 1 24); do "
                 f"  pgrep -f {pattern} >/dev/null 2>&1 || break; "
                 f"  sleep 0.5; "
                 f"done; "
@@ -1295,9 +1297,14 @@ def _sweep_orphan_runners(cluster_id: str,
     #   3. report the kill result + wired bytes so the caller can warn.
     cmd = (
         # ── phase 1: kill ────────────────────────────────────────────
+        # 24×0.5s = 12s grace. The runner now frees its Metal cache in its
+        # SIGTERM-driven exit path (runner.py free_metal); for a 200 GB+
+        # model the array deallocation + clear_cache can take several
+        # seconds, so we give it room before escalating to SIGKILL (which
+        # is what leaks the wired pages).
         f"if pgrep -f {pattern} >/dev/null 2>&1; then "
         f"  pkill -TERM -f {pattern} 2>/dev/null; "
-        f"  for i in 1 2 3 4 5 6 7 8 9 10; do "
+        f"  for i in $(seq 1 24); do "
         f"    pgrep -f {pattern} >/dev/null 2>&1 || break; "
         f"    sleep 0.5; "
         f"  done; "

@@ -1022,6 +1022,53 @@ def log(msg: str) -> None:
     sys.stderr.flush()
 
 
+def _active_gb() -> float:
+    """Best-effort MLX active (wired) memory in GB. 0.0 if the API is absent."""
+    try:
+        if hasattr(mx, "get_active_memory"):
+            return mx.get_active_memory() / (1024 ** 3)
+        if hasattr(mx, "metal") and hasattr(mx.metal, "get_active_memory"):
+            return mx.metal.get_active_memory() / (1024 ** 3)
+    except Exception:
+        pass
+    return 0.0
+
+
+def free_metal(reason: str = "") -> None:
+    """Explicitly release MLX/Metal buffer cache so wired memory is reclaimed.
+
+    The cluster's recurring "73 GB / 190 GB wired stuck until reboot" bug
+    comes from the runner exiting WITHOUT ever telling Metal to drop its
+    buffer cache — we were relying on implicit C++ destructors that don't
+    run on SIGKILL and aren't guaranteed even on a clean exit. Calling
+    `mx.clear_cache()` on every teardown (and after each model unload in
+    the persistent path) makes the reclaim explicit and reliable for the
+    common case where the process is still responsive.
+
+    NOTE: this cannot reclaim memory from a process that was already
+    SIGKILL'd mid-kernel — that genuinely needs a reboot. The point is to
+    stop GETTING into that state on normal load/unload cycles.
+    """
+    before = _active_gb()
+    try:
+        if hasattr(mx, "clear_cache"):
+            mx.clear_cache()
+        elif hasattr(mx, "metal") and hasattr(mx.metal, "clear_cache"):
+            mx.metal.clear_cache()
+    except Exception as e:
+        log(f"free_metal: clear_cache failed ({e})")
+        return
+    after = _active_gb()
+    log(f"free_metal{f' ({reason})' if reason else ''}: "
+        f"active {before:.1f} GB -> {after:.1f} GB")
+
+
+# Belt-and-suspenders: even if main() returns via an unexpected path, drop
+# the Metal cache on interpreter exit. Cheap no-op when already cleared.
+import atexit as _atexit
+_atexit.register(lambda: free_metal("atexit"))
+
+
 def shard_tensor(model, group):
     """Apply exo-style auto_parallel tensor sharding."""
     from auto_parallel import tensor_auto_parallel
@@ -1569,8 +1616,22 @@ def main() -> None:
                          rank, draft_model=draft_model,
                          num_draft_tokens=num_draft_tokens, world_size=size)
 
+    # Explicit teardown BEFORE the process exits. Two reasons:
+    #   1. Drop every model reference so the weights are deallocated, then
+    #      tell Metal to release its buffer cache (free_metal). Without this
+    #      the wired pages lingered until reboot (the 73-190 GB bug).
+    #   2. Returning from main() lets the JACCL group's C++ destructors run
+    #      ibv_destroy_qp, releasing the RDMA queue pairs cleanly so the next
+    #      init doesn't inherit a corrupted state.
+    try:
+        model = None
+        tokenizer = None
+        draft_model = None
+        free_metal("shutdown")
+    except Exception as e:
+        log(f"shutdown cleanup error: {e}")
     emit(rank, {"event": "bye"})
-    log("exiting cleanly (destructors will run ibv_destroy_qp)")
+    log("exiting cleanly (Metal cache cleared; destructors will run ibv_destroy_qp)")
 
 
 # ──────────────────────────────────────────────────────────────────────────────
