@@ -100,6 +100,28 @@ if _TOPOLOGY is None and os.environ.get("ODYSSEUS_TOPOLOGY"):
     )
 
 
+_SAFE_SSH_RE = re.compile(
+    r"^[A-Za-z0-9_][A-Za-z0-9._-]*@[A-Za-z0-9._-]+(:[0-9]{1,5})?$"
+)
+
+
+def _safe_ssh_target(target: str) -> str:
+    """Defense-in-depth: reject targets that could be parsed as SSH options.
+
+    The primary gate is NodeConfig._ssh_shape in topology.py (validated at
+    config-save time). This guard prevents a target that snuck in via a
+    hand-edited config file from reaching subprocess.
+    """
+    if "${" in target:
+        return target  # unexpanded env ref, skip until expansion
+    if not _SAFE_SSH_RE.match(target):
+        raise ValueError(
+            f"refusing ssh target {target!r}: not in user@host form, "
+            "possible option injection"
+        )
+    return target
+
+
 def _local_ssh_target() -> str:
     return os.environ.get("ODYSSEUS_LOCAL_SSH", f"{os.environ.get('USER', 'user')}@localhost")
 
@@ -978,7 +1000,7 @@ async def _ssh_ping(ssh_target: str) -> dict:
     try:
         p = await asyncio.to_thread(
             subprocess.run,
-            ["ssh", "-o", "ConnectTimeout=3", "-o", "BatchMode=yes", ssh_target,
+            ["ssh", "-o", "ConnectTimeout=3", "-o", "BatchMode=yes", _safe_ssh_target(ssh_target),
              "hostname && sysctl -n hw.memsize 2>/dev/null"],
             capture_output=True, text=True, timeout=8,
         )
@@ -1076,7 +1098,7 @@ class RunnerProc:
         self.node = node
         self.cluster = cluster
         self.proc = subprocess.Popen(
-            ["ssh", "-o", "ServerAliveInterval=10", node["ssh"], cmd],
+            ["ssh", "-o", "ServerAliveInterval=10", _safe_ssh_target(node["ssh"]), cmd],
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             text=True, bufsize=1,
         )
@@ -2685,7 +2707,7 @@ def _initial_default_config() -> Optional[dict]:
 #   major (1.7.2 → 2.0.0) — breaking API or topology change
 #
 # Use `./scripts/bump-version.sh patch|minor|major` to bump + auto-commit.
-ODYSSEUS_VERSION = "1.7.21"
+ODYSSEUS_VERSION = "1.7.22"
 
 app = FastAPI(
     title="Odysseus (odyssai.eu)",
@@ -6499,7 +6521,7 @@ _SYNC_MATRIX_TTL_S = 60.0
 def _ssh_exec(ssh_target: str, cmd: str, timeout: int = 12) -> tuple[int, str, str]:
     """Shared SSH helper for the matrix endpoint."""
     p = subprocess.run(
-        ["ssh", "-o", "ConnectTimeout=4", "-o", "BatchMode=yes", ssh_target, cmd],
+        ["ssh", "-o", "ConnectTimeout=4", "-o", "BatchMode=yes", _safe_ssh_target(ssh_target), cmd],
         capture_output=True, text=True, timeout=timeout,
     )
     return p.returncode, p.stdout, p.stderr

@@ -32,6 +32,12 @@ except ImportError as e:
         "topology.yaml support requires PyYAML — `pip install pyyaml`"
     ) from e
 
+# Strict allowlist: user@host or user@host:port. No leading '-', no spaces,
+# no shell metacharacters — prevents OpenSSH ProxyCommand injection via
+# option-prefixed ssh targets (e.g. -oProxyCommand=…).
+_SSH_RE = re.compile(
+    r"^[A-Za-z0-9_][A-Za-z0-9._-]*@[A-Za-z0-9._-]+(:[0-9]{1,5})?$"
+)
 
 # ── Pydantic schema ───────────────────────────────────────────────────────
 
@@ -51,11 +57,13 @@ class NodeConfig(BaseModel):
     @field_validator("ssh")
     @classmethod
     def _ssh_shape(cls, v: str) -> str:
-        # We expand ${ENV} late, so accept it here; otherwise basic shape check.
+        # We expand ${ENV} late, so accept it here; validate post-expansion before use.
         if "${" in v:
             return v
-        if "@" not in v:
-            raise ValueError(f"ssh target must include user@host: got {v!r}")
+        if not _SSH_RE.match(v):
+            raise ValueError(
+                f"invalid ssh target {v!r}: expected user@host[:port], no leading '-'"
+            )
         return v
 
 
