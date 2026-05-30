@@ -5125,6 +5125,18 @@ async function handleAct(e) {
   const v = el.dataset.v;
   const f = state.pending_form;
 
+  // Any interaction with a form control (dropdown / text input / checkbox)
+  // marks recent activity so the 5 s background poll defers its full-DOM
+  // re-render. Without this, a poll landing mid-selection wipes the
+  // picker via innerHTML and the choice silently reverts — the user had
+  // to retry 2-3× (reported 2026-05-30, on every picker incl. Telemak).
+  // We mark it HERE, before any early-returning handler, so it covers
+  // selects/inputs uniformly. (The button-based form controls — mode /
+  // node pills / KV toggle — keep their own marker further down.)
+  if (el.tagName === "INPUT" || el.tagName === "SELECT") {
+    state.form_interaction_at = Date.now();
+  }
+
   // Pick cluster
   if (act === "pick-cluster") { pickCluster(el.dataset.cluster); return; }
   if (act === "add-cluster")  { state.settings_open = true; state.settings_tab = "clusters"; render(); return; }
