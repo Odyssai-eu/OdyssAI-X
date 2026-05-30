@@ -3555,6 +3555,12 @@ function renderTelemakHomeCard(a, cid, label) {
           <div class="quick-actions">
             <button class="btn btn-sm" data-act="refresh">${Icon.refresh}<span>Refresh</span></button>
             <button class="btn btn-sm" data-act="cluster-settings" data-cluster="${cid}">${Icon.settings}<span>Cluster settings</span></button>
+            <span style="width:1px;align-self:stretch;background:var(--line);margin:2px 4px"></span>
+            <span style="align-self:center;font-size:11px;color:var(--ink-3);margin-right:2px">Service</span>
+            <button class="btn btn-sm" data-act="telemak-lifecycle" data-cluster="${cid}" data-life="start" title="Bootstrap the Telemak launchd service on its Mac (use after Quit)">${Icon.play || ""}<span>Start</span></button>
+            <button class="btn btn-sm" data-act="telemak-lifecycle" data-cluster="${cid}" data-life="stop" title="SIGTERM the process — KeepAlive relaunches it (soft bounce)"><span>Stop</span></button>
+            <button class="btn btn-sm" data-act="telemak-lifecycle" data-cluster="${cid}" data-life="restart" title="Kill + relaunch atomically — frees a wedged generation slot">${Icon.refresh}<span>Restart</span></button>
+            <button class="btn btn-sm btn-destructive" data-act="telemak-lifecycle" data-cluster="${cid}" data-life="quit" title="Boot the service out — stays DOWN until you press Start">${Icon.x || ""}<span>Quit</span></button>
           </div>
         </div>
       </div>
@@ -5975,6 +5981,40 @@ async function handleAct(e) {
       await refreshAll();
     } catch (err) {
       toast(`Unload failed: ${err.message}`, "err");
+    }
+    return;
+  }
+
+  // ── Telemak service lifecycle (launchd over SSH) ────────────────────
+  // Start / Stop / Restart / Quit the `eu.odyssai.telemak` launchd agent
+  // on the node. Restart is the wedged-slot fix; Quit boots it out (stays
+  // down). Both interrupt in-flight generation → confirm first.
+  if (act === "telemak-lifecycle") {
+    const cid = el.dataset.cluster;
+    const action = el.dataset.life;
+    if (!cid || !action) return;
+    const blurb = {
+      start: "Start the Telemak service",
+      stop: "Stop Telemak (KeepAlive relaunches it shortly)",
+      restart: "Restart Telemak — any generation in flight on this node is killed",
+      quit: "Quit Telemak — it stays DOWN until you press Start",
+    }[action] || action;
+    if ((action === "restart" || action === "quit") &&
+        !confirm(`${blurb}.\n\nProceed on ${cid} ?`)) return;
+    try {
+      const r = await fetch(`/admin/clusters/${encodeURIComponent(cid)}/telemak/lifecycle`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ action }),
+      });
+      const j = await r.json().catch(() => ({}));
+      if (!r.ok) throw new Error((j && (j.detail || j.message)) || `HTTP ${r.status}`);
+      if (j.ok) toast(`Telemak ${action} on ${cid} ✓`, "ok");
+      else toast(`Telemak ${action}: rc=${j.rc} ${(j.stderr || "").slice(0, 140)}`, "err");
+      // Give launchd a beat to settle, then re-poll status/health.
+      setTimeout(() => { refreshAll(); }, 1500);
+    } catch (err) {
+      toast(`Telemak ${action} failed: ${err.message}`, "err");
     }
     return;
   }

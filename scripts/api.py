@@ -2685,7 +2685,7 @@ def _initial_default_config() -> Optional[dict]:
 #   major (1.7.2 → 2.0.0) — breaking API or topology change
 #
 # Use `./scripts/bump-version.sh patch|minor|major` to bump + auto-commit.
-ODYSSEUS_VERSION = "1.7.19"
+ODYSSEUS_VERSION = "1.7.20"
 
 app = FastAPI(
     title="Odysseus (odyssai.eu)",
@@ -8699,6 +8699,95 @@ async def _telemak_proxy_unload(
     if not model:
         save_cluster_def(cluster_id, {"_telemak_loaded_model": None})
     return {"unloaded": True, "cluster": cluster_id, "model": model}
+
+
+# ── Telemak service lifecycle (launchd over SSH) ──────────────────────────
+#
+# Telemak runs as a per-node launchd *user agent* `eu.odyssai.telemak`
+# (KeepAlive=true) — the same service the Telemak menu-bar app drives. That
+# app can only Start/Stop when running locally (launchctl targets the user's
+# gui/$uid domain). Odysseus lifts that limit by running the exact same
+# launchctl verbs over SSH against the node. Verified: `launchctl print
+# gui/$uid/eu.odyssai.telemak` answers over SSH, so the gui domain is
+# reachable for an SSH'd command while the user is logged in.
+#
+# KeepAlive semantics (decided with the operator):
+#   start   → bootstrap (load + run); falls back to kickstart if already loaded
+#   stop    → SIGTERM the instance; KeepAlive relaunches it (a soft bounce)
+#   restart → kickstart -k (kill + relaunch atomically) — the wedged-slot fix
+#   quit    → bootout (remove the job from the domain; stays down until start)
+TELEMAK_LAUNCHD_LABEL = "eu.odyssai.telemak"
+TELEMAK_LAUNCHD_PLIST = "~/Library/LaunchAgents/eu.odyssai.telemak.plist"
+TELEMAK_LIFECYCLE_ACTIONS = ("start", "stop", "restart", "quit")
+
+
+def _telemak_lifecycle_cmd(action: str) -> Optional[str]:
+    """Map a lifecycle action to a launchctl command line run on the node.
+    `gui/$(id -u)` resolves to the logged-in user's GUI launchd domain."""
+    label = TELEMAK_LAUNCHD_LABEL
+    dom = "gui/$(id -u)"
+    if action == "start":
+        return (
+            f"launchctl bootstrap {dom} {TELEMAK_LAUNCHD_PLIST} 2>/dev/null "
+            f"|| launchctl kickstart {dom}/{label}"
+        )
+    if action == "stop":
+        return f"launchctl kill SIGTERM {dom}/{label}"
+    if action == "restart":
+        return f"launchctl kickstart -k {dom}/{label}"
+    if action == "quit":
+        return f"launchctl bootout {dom}/{label}"
+    return None
+
+
+class TelemakLifecycleRequest(BaseModel):
+    action: str  # start | stop | restart | quit
+
+
+@app.post("/admin/clusters/{cluster_id}/telemak/lifecycle")
+async def admin_telemak_lifecycle(cluster_id: str, req: TelemakLifecycleRequest):
+    """Start / stop / restart / quit the Telemak launchd service on its node.
+
+    Telemak-only (http-proxy single node). Resolves the node's SSH target
+    from the cluster def and runs the matching `launchctl` verb remotely.
+    """
+    if not cluster_exists(cluster_id):
+        raise HTTPException(404, f"unknown cluster {cluster_id}")
+    cd = get_cluster_def(cluster_id)
+    if cd.get("kind") != "telemak":
+        raise HTTPException(400, f"{cluster_id} is not a telemak cluster")
+    action = (req.action or "").strip().lower()
+    cmd = _telemak_lifecycle_cmd(action)
+    if not cmd:
+        raise HTTPException(
+            400,
+            f"invalid action {req.action!r} — expected one of "
+            f"{', '.join(TELEMAK_LIFECYCLE_ACTIONS)}",
+        )
+    nodes = cd.get("nodes") or []
+    ssh = (nodes[0] or {}).get("ssh") if nodes else None
+    if not ssh:
+        raise HTTPException(400, f"{cluster_id}: telemak node has no ssh target")
+    loop = asyncio.get_event_loop()
+    try:
+        rc, out, err = await loop.run_in_executor(None, _ssh_exec, ssh, cmd, 20)
+    except subprocess.TimeoutExpired:
+        raise HTTPException(504, f"launchctl {action} on {ssh} timed out")
+    except Exception as e:
+        raise HTTPException(502, f"ssh to {ssh} failed: {e}")
+    _telemak_cache_invalidate(cluster_id)
+    # launchctl returns non-zero for benign no-ops (bootstrap when already
+    # loaded, bootout when already out). Surface rc + streams so the dashboard
+    # can show a precise message rather than a blanket failure.
+    return {
+        "cluster": cluster_id,
+        "action": action,
+        "ok": rc == 0,
+        "rc": rc,
+        "ssh": ssh,
+        "stdout": (out or "").strip()[:400],
+        "stderr": (err or "").strip()[:400],
+    }
 
 
 @app.post("/admin/clusters/{cluster_id}/unload")
