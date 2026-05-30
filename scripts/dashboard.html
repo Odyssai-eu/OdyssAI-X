@@ -3480,6 +3480,7 @@ function renderTelemakHomeCard(a, cid, label) {
     `;
   }).join("");
 
+  // Free-text fallback (used by the "Or type an arbitrary model id" section).
   const loadFormBody = `
     <div class="field">
       <input class="ce-input mono" data-act="telemak-load-edit-model" data-cluster="${cid}" value="${escapeHtml(f.model || "")}" placeholder="inferencerlabs/Qwen3.6-35B-A3B-MLX-9bit" style="width:100%"/>
@@ -3487,6 +3488,43 @@ function renderTelemakHomeCard(a, cid, label) {
     </div>
     <div style="display:flex;gap:8px">
       <button class="btn btn-sm" style="background:var(--blue);color:white;border-color:var(--blue)" ${busy?"disabled":""} data-act="telemak-load-submit" data-cluster="${cid}">${busy?"Loading…":"Load"}</button>
+      ${loaded ? `<button class="btn btn-sm" data-act="telemak-load-cancel" data-cluster="${cid}">Cancel</button>` : ""}
+      ${f.error ? `<div style="color:var(--rust);font-size:12px;align-self:center">${escapeHtml(f.error)}</div>` : ""}
+    </div>
+  `;
+
+  // Picker form used by "Add another model" — a dropdown sourced from the
+  // models discovered on the Telemak node (same list as the Load
+  // configuration swap dropdown), so the operator can't typo a path
+  // (the 404 Sophie hit 2026-05-30: typed "Qwen3-Next-A3B-Instruct-8bit"
+  // instead of "Qwen3-Next-80B-A3B-Instruct-8bit"). A path field stays
+  // below as an escape hatch for ids not on disk.
+  const _availAdd = state.telemak_available_models?.[cid];
+  if (_availAdd == null && !state.fetching_telemak_models?.[cid]) {
+    // Lazy-fetch so the dropdown has data when the form opens. Safe: the
+    // fetch helper re-renders on resolve.
+    fetchTelemakAvailable(cid);
+  }
+  const _loadedSetAdd = new Set(modelsLoaded);
+  const _addCandidates = (_availAdd || []).filter(m => !_loadedSetAdd.has(m.id));
+  const loadFormPicker = `
+    <div class="field">
+      <select class="ce-input mono" data-act="telemak-load-edit-model" data-cluster="${cid}" style="width:100%">
+        <option value="">${_availAdd == null ? "Discovering models…" : (_addCandidates.length ? "— pick a model —" : "no other models on disk")}</option>
+        ${_addCandidates.map(m => {
+          const short = (m.id.split("/").pop() || m.id);
+          const sizeGB = m.size_bytes ? ` — ${(m.size_bytes/1024/1024/1024).toFixed(1)} GB` : "";
+          const sel = m.id === f.model ? "selected" : "";
+          return `<option value="${escapeHtml(m.id)}" ${sel}>${escapeHtml(short)}${sizeGB}</option>`;
+        }).join("")}
+      </select>
+      <div style="font-size:11px;color:var(--ink-2);margin-top:4px">Pick a model discovered on the Telemak node. Need an id that isn't on disk? Type it below.</div>
+    </div>
+    <div class="field">
+      <input class="ce-input mono" data-act="telemak-load-edit-model" data-cluster="${cid}" value="${escapeHtml(f.model || "")}" placeholder="…or an arbitrary repo id / path" style="width:100%;font-size:11px"/>
+    </div>
+    <div style="display:flex;gap:8px">
+      <button class="btn btn-sm" style="background:var(--blue);color:white;border-color:var(--blue)" ${busy || !f.model ? "disabled":""} data-act="telemak-load-submit" data-cluster="${cid}">${busy?"Loading…":"Load"}</button>
       ${loaded ? `<button class="btn btn-sm" data-act="telemak-load-cancel" data-cluster="${cid}">Cancel</button>` : ""}
       ${f.error ? `<div style="color:var(--rust);font-size:12px;align-self:center">${escapeHtml(f.error)}</div>` : ""}
     </div>
@@ -3542,7 +3580,7 @@ function renderTelemakHomeCard(a, cid, label) {
           ${formOpen ? `
             <div style="display:grid;gap:10px;max-width:680px;margin-top:14px;padding:14px;background:var(--surface);border:1px dashed var(--line);border-radius:8px">
               <div style="font-family:var(--font-display);font-weight:600;font-size:13px">Add another model</div>
-              ${loadFormBody}
+              ${loadFormPicker}
             </div>
           ` : ""}
         </div>
