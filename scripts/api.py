@@ -2169,6 +2169,32 @@ def _model_ignores_enable_thinking_flag(model_id: Optional[str]) -> bool:
     return any(key in needle for key in _MODELS_IGNORE_ENABLE_THINKING_FLAG)
 
 
+def _should_filter_think(model_id: Optional[str], enable_thinking) -> bool:
+    """Whether to split a <think> block off the wire into reasoning_content.
+
+    Single source of truth shared by the local-pool path AND the Telemak
+    proxy path so a model behaves identically however it's served (Sophie,
+    2026-05-31: Step-3.7 dérouled the think on Argo-local while the proxy
+    filtered it). Filter — and seed in_think=True, since these templates
+    auto-OPEN the block with no leading tag — whenever the model auto-opens
+    think:
+
+      * thinking ON  → route the reasoning into the collapsed channel
+        instead of letting it déroule into the answer.
+      * thinking OFF but the model IGNORES the flag (MiniMax, Step-3.7) →
+        it emits the block anyway, so keep filtering or `</think>` leaks
+        into `content`.
+
+    The ONLY no-filter case is a model that HONORS the flag with thinking
+    explicitly off (Qwen3.5/3.6): it emits no block, so seeding in_think
+    would trap its direct answer in reasoning_content → empty content →
+    Companion ghost (observed 2026-05-30 on Qwen3.5-397B).
+    """
+    if enable_thinking is False and not _model_ignores_enable_thinking_flag(model_id):
+        return False
+    return _model_auto_opens_think(model_id)
+
+
 def _split_think_stream(text: str, state: dict) -> tuple[str, str]:
     """Take one chunk of streamed text, return (visible, reasoning).
 
@@ -2807,7 +2833,7 @@ def _initial_default_config() -> Optional[dict]:
 #   major (1.7.2 → 2.0.0) — breaking API or topology change
 #
 # Use `./scripts/bump-version.sh patch|minor|major` to bump + auto-commit.
-ODYSSEUS_VERSION = "1.7.24"
+ODYSSEUS_VERSION = "1.7.25"
 
 app = FastAPI(
     title="Odysseus (odyssai.eu)",
@@ -5562,18 +5588,14 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
         # Move that content into `reasoning_content` so OpenAI-compat
         # clients render it as the reasoning channel, not the answer.
         reasoning_content_full = ""
-        if req.enable_thinking is False and content:
-            # Seed in_think=True ONLY for models that emit a think block even
-            # when enable_thinking=False (MiniMax-style templates that ignore
-            # the Jinja flag). Models that HONOR the flag (Qwen3.5/3.6) emit
-            # NO think block here — so seeding in_think=True would route their
-            # direct answer into reasoning_content and leave `content` empty
-            # (observed 2026-05-30: Qwen3.5-397B "hello" → empty content, the
-            # reply trapped in reasoning → Companion ghost). For those, seed
-            # False so the answer stays in content. model_id is the pool.model
-            # HF repo path (e.g. "…/MiniMax-M2.7-MLX-8bit").
-            _seed_in_think = _model_ignores_enable_thinking_flag(model_id)
-            ts: dict = {"in_think": _seed_in_think, "carry": ""}
+        # Same wire filter as the streaming path, same shared decision as the
+        # Telemak proxy (_should_filter_think): filter when thinking is ON
+        # (route the block to reasoning_content) AND when the model ignores
+        # enable_thinking=False (MiniMax/Step-3.7). model_id is pool.model,
+        # the concrete HF path, so the family match holds for pool aliases.
+        if _should_filter_think(model_id, req.enable_thinking) and content:
+            # Auto-open templates emit no leading <think> tag → seed True.
+            ts: dict = {"in_think": True, "carry": ""}
             visible_full, reasoning_full = _split_think_stream(content, ts)
             fl_vis, fl_reason = _flush_think_stream(ts)
             content = visible_full + fl_vis
@@ -5629,22 +5651,18 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
                      "created": created, "model": model_id,
                      "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}]}
             yield f"data: {json.dumps(first)}\n\n".encode()
-            # Per-stream <think>…</think> state. Only used when the request
-            # asked enable_thinking=False — some chat templates (MiniMax M2.7
-            # documented 2026-05-18) emit think blocks regardless of the
-            # Jinja flag, so we filter at the wire.
-            think_filter_active = (req.enable_thinking is False)
-            # Seed in_think=True ONLY for models that emit a think block even
-            # when enable_thinking=False (MiniMax-style templates that ignore
-            # the flag). Models that HONOR enable_thinking (Qwen3.5/3.6) emit
-            # NO think block when it's false — seeding in_think=True there
-            # routes their direct answer into reasoning_content and leaves
-            # `content` empty → Companion shows a ghost (observed 2026-05-30
-            # on Qwen3.5-397B). So gate the seed on "ignores the flag", not
-            # "auto-opens".
-            _seed_in_think = (
-                think_filter_active and _model_ignores_enable_thinking_flag(model_id)
-            )
+            # Per-stream <think>…</think> wire filter. Decision is shared
+            # with the Telemak proxy via _should_filter_think so a model
+            # behaves identically local vs proxied — filter when thinking is
+            # ON (route the block to the collapsed reasoning channel) AND when
+            # the model ignores enable_thinking=False (MiniMax/Step-3.7).
+            # model_id is pool.model (the concrete HF path), so the family
+            # match works even when the caller dialed a pool alias ("default").
+            think_filter_active = _should_filter_think(model_id, req.enable_thinking)
+            # When we filter, these templates auto-OPEN the block (no leading
+            # <think> tag), so seed in_think=True. _should_filter_think already
+            # excludes the honor-flag-thinking-off case that would ghost.
+            _seed_in_think = think_filter_active
             think_state: dict = {"in_think": _seed_in_think, "carry": ""}
             async for ev in pool.submit(None, req.max_tokens or 512, req.enable_thinking,
                                         messages=messages, tools=req.tools,
@@ -8340,12 +8358,8 @@ async def _telemak_proxy_chat_completion(
     # shows "The user is asking…</think>\n\n# Real story" in chat).
     # So for MiniMax (and any other model in the ignore list), keep the
     # filter on regardless of the flag.
-    enable_thinking = body.get("enable_thinking")
-    ignores_flag = _model_ignores_enable_thinking_flag(upstream_model)
-    if enable_thinking is False and not ignores_flag:
-        auto_think = False
-    else:
-        auto_think = _model_auto_opens_think(upstream_model)
+    # Shared decision with the local-pool path — see _should_filter_think.
+    auto_think = _should_filter_think(upstream_model, body.get("enable_thinking"))
     forward_body = dict(body)
     forward_body["model"] = upstream_model
     import httpx
