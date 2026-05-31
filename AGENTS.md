@@ -594,3 +594,35 @@ in this shape:
 > https://github.com/Odyssai-eu/Companion and run its `AGENTS.md`.
 
 That's the end of the install.
+
+---
+
+## Security posture (LAN-first self-hosted)
+
+odyssai.eu is self-hosted, **LAN-first, single-operator**. Secure the CODE;
+do NOT impose a network-security policy on the operator. Triage every security
+finding into two buckets — full version in Odysseus `docs/SECURITY-POSTURE.md`.
+
+**Bucket A — always fix (code hygiene, not policy):**
+- Exploitable code: injection (SSH option/ProxyCommand, path traversal,
+  spawning a process from request input), RCE, SSRF, unsafe deserialization.
+  Network-independent → fix it.
+- No hardcoded SHARED secret. BUT a documented generic default password the
+  operator changes on first login is fine and intended — do NOT replace it
+  with a per-install random (worse UX: different every install, undocumentable,
+  log-buried, easy lockout). Keep the env override.
+
+**Bucket B — operator's choice (option + docs, NEVER force):**
+- Bind interface (LAN vs localhost), mandatory API key, WAN exposure.
+- Default LAN-friendly + usable with zero config; hardening is a documented
+  opt-in, not a default. WAN exposure is the operator's job (tunnel/firewall);
+  advise (Cloudflare Tunnel, IP/MAC allowlist, reverse-proxy auth), don't
+  implement a policy for them.
+
+**Cross-repo constraint:** Odysseus reaches Telemak nodes over the LAN and
+sends no key — so Telemak must not force localhost-only on orchestrated nodes,
+and making the Telemak key mandatory requires first teaching Odysseus to send
+`Authorization: Bearer` on every upstream call. Otherwise the stack breaks.
+
+Golden rule: **secure the code, yes; impose a network posture on the client,
+no — give options and advice.**
