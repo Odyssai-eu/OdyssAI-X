@@ -2807,7 +2807,7 @@ def _initial_default_config() -> Optional[dict]:
 #   major (1.7.2 → 2.0.0) — breaking API or topology change
 #
 # Use `./scripts/bump-version.sh patch|minor|major` to bump + auto-commit.
-ODYSSEUS_VERSION = "1.7.22"
+ODYSSEUS_VERSION = "1.7.23"
 
 app = FastAPI(
     title="Odysseus (odyssai.eu)",
@@ -6181,22 +6181,47 @@ async def anthropic_messages(req: AnthropicMessagesRequest, request: Request):
 @app.get("/admin/status")
 async def admin_status():
     loading = _loading_snapshot(_nautilus_loading)
-    if _pool is None:
-        return {"loaded": False, "loading": loading}
-    uptime = time.time() - (_pool.started_at or time.time())
-    recent_tps = [m["tps"] for m in list(_metrics)[:10] if m["tps"] > 0]
+    # Honest "is anything loaded". The legacy single `_pool` (Nautilus) has
+    # been dissolved since 2026-05 and is always None, so reporting it alone
+    # made this endpoint claim loaded:false even when a CLUSTER pool (Argo/
+    # main, telemak…) was loaded. Aggregate the real pools via list_all_pools()
+    # — the same source /v1/models uses — so the signal stops lying.
+    cluster_pools = list_all_pools()  # [(cluster_id, alias, RunnerPool), …]
+    pools_out = [
+        {
+            "cluster": cid,
+            "alias": alias,
+            "model": pool.model,
+            "nodes": pool.nodes_count,
+            "alive": pool.alive_count(),
+        }
+        for cid, alias, pool in cluster_pools
+    ]
+    if _pool is None and not cluster_pools:
+        return {"loaded": False, "loading": loading, "pools": []}
+    if _pool is not None:
+        uptime = time.time() - (_pool.started_at or time.time())
+        recent_tps = [m["tps"] for m in list(_metrics)[:10] if m["tps"] > 0]
+        return {
+            "loaded": True,
+            "loading": loading,
+            "model": _pool.model, "mode": _pool.mode,
+            "use_ap": _pool.use_ap, "nodes": _pool.nodes_count,
+            "kv_q8": _pool.kv_q8,
+            "draft_model": _pool.draft_model,
+            "num_draft_tokens": _pool.num_draft_tokens if _pool.draft_model else None,
+            "alive": _pool.alive_count(),
+            "load_s": _pool.load_s, "uptime_s": uptime,
+            "recent_avg_tps": round(sum(recent_tps) / len(recent_tps), 2) if recent_tps else None,
+            "recent_count": len(_metrics),
+            "pools": pools_out,
+        }
+    # Cluster-pool-only reality (current): report honestly from the loaded pools.
     return {
         "loaded": True,
         "loading": loading,
-        "model": _pool.model, "mode": _pool.mode,
-        "use_ap": _pool.use_ap, "nodes": _pool.nodes_count,
-        "kv_q8": _pool.kv_q8,
-        "draft_model": _pool.draft_model,
-        "num_draft_tokens": _pool.num_draft_tokens if _pool.draft_model else None,
-        "alive": _pool.alive_count(),
-        "load_s": _pool.load_s, "uptime_s": uptime,
-        "recent_avg_tps": round(sum(recent_tps) / len(recent_tps), 2) if recent_tps else None,
-        "recent_count": len(_metrics),
+        "model": cluster_pools[0][2].model,
+        "pools": pools_out,
     }
 
 
