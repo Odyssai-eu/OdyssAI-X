@@ -37,6 +37,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import concurrent.futures
+import copy
 import json
 import os
 import random
@@ -49,7 +50,7 @@ import threading
 import time
 import uuid
 from collections import deque
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, contextmanager
 from pathlib import Path
 from typing import Any, AsyncIterator, Optional, Union
 from urllib.parse import urlparse
@@ -233,11 +234,10 @@ def get_enable_thinking_default() -> bool:
 
 
 def set_enable_thinking_default(value: bool) -> None:
-    cfg = _load_cluster_config()
-    settings = cfg.get("settings") or {}
-    settings["enable_thinking_default"] = bool(value)
-    cfg["settings"] = settings
-    _save_cluster_config(cfg)
+    with _cluster_config_txn() as cfg:
+        settings = cfg.get("settings") or {}
+        settings["enable_thinking_default"] = bool(value)
+        cfg["settings"] = settings
 DASHBOARD_FILE = Path(os.environ.get("DASHBOARD_FILE", _HERE / "dashboard.html"))
 ICON_FILE = Path(os.environ.get("ICON_FILE", _HERE / "odysseus.png"))
 # User Guide Markdown source. Tries env override first, then a list of
@@ -262,18 +262,66 @@ USER_GUIDE_DIR = _resolve_user_guide_dir()
 # ──────────────────────────────────────────────────────────────────────────────
 # Per-cluster config (models_dir + per-model load history). Persisted to file.
 # ──────────────────────────────────────────────────────────────────────────────
-def _load_cluster_config() -> dict:
+# cluster-config.json is the single flat-file store for settings, providers,
+# crew tokens, discovery state, models_dir + load history. It is read on the
+# hot inference path and mutated from ~12 admin sites + background sweepers,
+# so access is guarded by a re-entrant lock with a short read cache and an
+# atomic (tmp + os.replace) write. Mutators MUST go through
+# `_cluster_config_txn()` so the read-modify-write holds the lock end-to-end
+# and concurrent writers can't clobber each other (#22).
+_config_lock = threading.RLock()
+_config_cache: Optional[dict] = None
+_config_cache_ts: float = 0.0
+_CONFIG_TTL_S = 2.0
+
+
+def _read_cluster_config_from_disk() -> dict:
     try:
         return json.loads(CLUSTER_CONFIG_FILE.read_text())
     except Exception:
         return {}
 
 
+def _load_cluster_config() -> dict:
+    """Parsed cluster-config, cached up to _CONFIG_TTL_S. Returns a deep copy
+    so callers may mutate freely; mutations only persist via a txn / save."""
+    global _config_cache, _config_cache_ts
+    with _config_lock:
+        now = time.monotonic()
+        if _config_cache is not None and (now - _config_cache_ts) < _CONFIG_TTL_S:
+            return copy.deepcopy(_config_cache)
+        cfg = _read_cluster_config_from_disk()
+        _config_cache = cfg
+        _config_cache_ts = now
+        return copy.deepcopy(cfg)
+
+
 def _save_cluster_config(cfg: dict) -> None:
-    try:
-        CLUSTER_CONFIG_FILE.write_text(json.dumps(cfg, indent=2))
-    except Exception as e:
-        sys.stderr.write(f"[api] failed to save cluster config: {e}\n")
+    """Persist atomically (tmp + os.replace) under the config lock and refresh
+    the cache. Prefer `_cluster_config_txn()` for read-modify-write so the
+    read and write share one lock hold (no lost updates)."""
+    global _config_cache, _config_cache_ts
+    with _config_lock:
+        try:
+            tmp = CLUSTER_CONFIG_FILE.with_name(CLUSTER_CONFIG_FILE.name + ".tmp")
+            tmp.write_text(json.dumps(cfg, indent=2))
+            os.replace(tmp, CLUSTER_CONFIG_FILE)
+            _config_cache = copy.deepcopy(cfg)
+            _config_cache_ts = time.monotonic()
+        except Exception as e:
+            sys.stderr.write(f"[api] failed to save cluster config: {e}\n")
+
+
+@contextmanager
+def _cluster_config_txn():
+    """Atomic read-modify-write of cluster-config.json. Holds `_config_lock`
+    across the whole cycle, reads a FRESH copy from disk (bypassing the TTL
+    cache so we never write back a stale base), yields it for mutation, and
+    persists atomically on clean exit. Must NOT `await` inside the block."""
+    with _config_lock:
+        cfg = _read_cluster_config_from_disk()
+        yield cfg
+        _save_cluster_config(cfg)
 
 
 def models_dir_for(cluster: str) -> str:
@@ -282,9 +330,8 @@ def models_dir_for(cluster: str) -> str:
 
 
 def set_models_dir(cluster: str, path: str) -> None:
-    cfg = _load_cluster_config()
-    cfg.setdefault(cluster, {})["models_dir"] = path
-    _save_cluster_config(cfg)
+    with _cluster_config_txn() as cfg:
+        cfg.setdefault(cluster, {})["models_dir"] = path
 
 
 def get_load_history(cluster: str, model: str) -> Optional[dict]:
@@ -294,14 +341,13 @@ def get_load_history(cluster: str, model: str) -> Optional[dict]:
 
 def record_load_history(cluster: str, model: str, load_s: float, size_bytes: int,
                         nodes: int) -> None:
-    cfg = _load_cluster_config()
-    bucket = cfg.setdefault(cluster, {}).setdefault("load_history", {})
-    bucket[model] = {
-        "last_load_s": round(load_s, 2),
-        "size_bytes": int(size_bytes),
-        "nodes": nodes,
-    }
-    _save_cluster_config(cfg)
+    with _cluster_config_txn() as cfg:
+        bucket = cfg.setdefault(cluster, {}).setdefault("load_history", {})
+        bucket[model] = {
+            "last_load_s": round(load_s, 2),
+            "size_bytes": int(size_bytes),
+            "nodes": nodes,
+        }
 
 
 def get_cluster_max_nodes(cluster: str, default: int) -> int:
@@ -316,9 +362,8 @@ def get_cluster_max_nodes(cluster: str, default: int) -> int:
 
 
 def set_cluster_max_nodes(cluster: str, max_nodes: int) -> None:
-    cfg = _load_cluster_config()
-    cfg.setdefault(cluster, {})["max_nodes"] = int(max_nodes)
-    _save_cluster_config(cfg)
+    with _cluster_config_txn() as cfg:
+        cfg.setdefault(cluster, {})["max_nodes"] = int(max_nodes)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -416,11 +461,10 @@ def _cluster_enabled(cluster_id: str) -> bool:
 
 def save_cluster_def(cluster_id: str, updates: dict) -> None:
     """Persist a partial update to the cluster definition."""
-    cfg = _load_cluster_config()
-    cur = cfg.setdefault(cluster_id, {})
-    for k, v in updates.items():
-        cur[k] = v
-    _save_cluster_config(cfg)
+    with _cluster_config_txn() as cfg:
+        cur = cfg.setdefault(cluster_id, {})
+        for k, v in updates.items():
+            cur[k] = v
 
 
 def build_rdma_matrix(host_ids: list[str]) -> list[list[Optional[str]]]:
@@ -1093,13 +1137,24 @@ def remote_cmd(node: dict, nodes: list[dict], model: str, mode: str, port: int,
 # ──────────────────────────────────────────────────────────────────────────────
 # Runner pool
 # ──────────────────────────────────────────────────────────────────────────────
+# Max seconds `submit` waits for the next runner event before checking whether
+# rank-0 (the sole event producer) is still alive. Long enough not to trip on a
+# slow multi-node prefill, short enough to fail a dead runner promptly (#21).
+_GEN_IDLE_TIMEOUT_S = float(os.environ.get("ODYSSEUS_GEN_IDLE_TIMEOUT_S", "120"))
+
+
 class RunnerProc:
     def __init__(self, node: dict, cmd: str, on_event, cluster: str = "nautilus"):
         self.node = node
         self.cluster = cluster
+        # Only rank 0 produces events we parse; ranks > 0 would otherwise fill
+        # their stdout pipe buffer (no reader) and block the remote process on
+        # write(), stalling the distributed barrier -> deadlock. Send their
+        # stdout to DEVNULL so the kernel never back-pressures them (#23).
+        _stdout = subprocess.PIPE if node["rank"] == 0 else subprocess.DEVNULL
         self.proc = subprocess.Popen(
             ["ssh", "-o", "ServerAliveInterval=10", _safe_ssh_target(node["ssh"]), cmd],
-            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            stdin=subprocess.PIPE, stdout=_stdout, stderr=subprocess.PIPE,
             text=True, bufsize=1,
         )
         self.ready = threading.Event()
@@ -1671,13 +1726,35 @@ class RunnerPool:
                     r.proc.stdin.close()
             except Exception:
                 pass
-        # run blocking stops in a worker thread to avoid blocking the event loop
-        await asyncio.to_thread(lambda: [r.graceful_stop() for r in self.runners])
+        # Stop every rank concurrently and isolate failures: a single rank
+        # raising in graceful_stop() must not leave the others running (orphaned
+        # runners hold wired GPU memory), and a hung SSH on one rank must not
+        # serialise the whole teardown (#25).
+        def _stop_all(runners):
+            with concurrent.futures.ThreadPoolExecutor(
+                max_workers=max(1, len(runners))
+            ) as ex:
+                futs = {ex.submit(r.graceful_stop): r for r in runners}
+                for fut in concurrent.futures.as_completed(futs):
+                    try:
+                        fut.result()
+                    except Exception as e:
+                        host = futs[fut].node.get("ssh", "?")
+                        sys.stderr.write(f"[api] graceful_stop failed on {host}: {e}\n")
+        await asyncio.to_thread(_stop_all, list(self.runners))
         sys.stderr.write("[api] all runners stopped\n")
         self.runners.clear()
 
     def alive_count(self) -> int:
         return sum(1 for r in self.runners if r.proc.poll() is None)
+
+    def _rank0_alive(self) -> bool:
+        """True if the rank-0 runner (the sole event producer for `submit`)
+        is still running. Once it dies, no further events will ever arrive."""
+        for r in self.runners:
+            if r.node.get("rank") == 0:
+                return r.proc.poll() is None
+        return False
 
     async def submit(self, prompt: Optional[str], max_tokens: int,
                      enable_thinking: Optional[bool],
@@ -1718,8 +1795,21 @@ class RunnerPool:
             async with self.broadcast_lock:
                 for r in self.runners:
                     r.send(req)
+            # Bound the wait so a runner that dies mid-generation (rank-0 SSH
+            # process killed, node panic, JACCL queue-pair death) can't hang the
+            # request forever. If nothing arrives within the idle window AND the
+            # producer (rank 0) is gone, surface an error instead of blocking on
+            # a queue nobody will ever feed (#21).
             while True:
-                ev = await q.get()
+                try:
+                    ev = await asyncio.wait_for(q.get(), timeout=_GEN_IDLE_TIMEOUT_S)
+                except asyncio.TimeoutError:
+                    if not self._rank0_alive():
+                        raise RuntimeError(
+                            "runner died mid-generation "
+                            "(no events and rank-0 process is gone)"
+                        )
+                    continue  # still alive, just a quiet stretch — keep waiting
                 yield ev
                 if ev.get("event") == "done":
                     return
@@ -2501,11 +2591,17 @@ async def lifespan(app: FastAPI):
     # life. Without this, JACCL re-init fails (errno 16, queue pair busy) and
     # ~200 GB stays wired per zombie node until reboot. The sweep is idempotent
     # and cheap (~1s/node when nothing to kill).
-    for _cid in list(DEFAULT_CLUSTER_DEFS.keys()):
-        try:
-            _sweep_orphan_runners(_cid)
-        except Exception as _e:
-            sys.stderr.write(f"[api] orphan sweep ({_cid}) failed: {_e}\n")
+    # Run the per-cluster orphan sweeps OFF the event loop and in parallel:
+    # each does blocking SSH (up to ~15s/node), so calling them synchronously
+    # here stalls startup (and /health) for N*timeout when a node is down (#24).
+    _sweep_cids = list(DEFAULT_CLUSTER_DEFS.keys())
+    _sweep_results = await asyncio.gather(
+        *[asyncio.to_thread(_sweep_orphan_runners, _cid) for _cid in _sweep_cids],
+        return_exceptions=True,
+    )
+    for _cid, _res in zip(_sweep_cids, _sweep_results):
+        if isinstance(_res, Exception):
+            sys.stderr.write(f"[api] orphan sweep ({_cid}) failed: {_res}\n")
     initial = _initial_config()
     if initial is not None:
         try:
@@ -2563,6 +2659,10 @@ async def lifespan(app: FastAPI):
         ttl_task.cancel()
         dead_task.cancel()
         cancel_task.cancel()
+        # Await the cancelled sweepers before tearing pools down — otherwise a
+        # sweeper mid-operation (e.g. holding a cluster admin lock) is abandoned
+        # and the subsequent pool.stop() races its half-finished state (#24).
+        await asyncio.gather(ttl_task, dead_task, cancel_task, return_exceptions=True)
         if _pool is not None:
             await _pool.stop()
         for _cid, _alias, pool in list_all_pools():
@@ -3362,9 +3462,8 @@ def get_cloud_providers() -> dict:
 
 
 def save_cloud_providers(providers: dict) -> None:
-    cfg = _load_cluster_config()
-    cfg["cloud_providers"] = providers
-    _save_cluster_config(cfg)
+    with _cluster_config_txn() as cfg:
+        cfg["cloud_providers"] = providers
 
 
 def find_cloud_alias(model_id: Optional[str]) -> Optional[tuple[str, dict, dict]]:
@@ -4464,19 +4563,18 @@ async def admin_restart():
 
 @app.put("/admin/settings")
 async def admin_settings_update(req: ServerSettingsUpdate):
-    cfg = _load_cluster_config()
-    s = cfg.get("settings") or {}
-    if req.enable_thinking_default is not None:
-        s["enable_thinking_default"] = bool(req.enable_thinking_default)
-    if req.pool_ttl_seconds_default is not None:
-        # 0 disables the TTL sweeper for new pools.
-        s["pool_ttl_seconds_default"] = max(0, int(req.pool_ttl_seconds_default))
-    if req.kv_q8_default is not None:
-        s["kv_q8_default"] = bool(req.kv_q8_default)
-    if req.system_prefix_text is not None:
-        s["system_prefix_text"] = str(req.system_prefix_text)
-    cfg["settings"] = s
-    _save_cluster_config(cfg)
+    with _cluster_config_txn() as cfg:
+        s = cfg.get("settings") or {}
+        if req.enable_thinking_default is not None:
+            s["enable_thinking_default"] = bool(req.enable_thinking_default)
+        if req.pool_ttl_seconds_default is not None:
+            # 0 disables the TTL sweeper for new pools.
+            s["pool_ttl_seconds_default"] = max(0, int(req.pool_ttl_seconds_default))
+        if req.kv_q8_default is not None:
+            s["kv_q8_default"] = bool(req.kv_q8_default)
+        if req.system_prefix_text is not None:
+            s["system_prefix_text"] = str(req.system_prefix_text)
+        cfg["settings"] = s
     # Propagate to live pools so the change takes effect immediately, not
     # only after next load.
     _apply_default_ttl_to_pools()
@@ -4714,9 +4812,8 @@ def get_crew() -> list[dict]:
 
 
 def save_crew(crew: list[dict]) -> None:
-    cfg = _load_cluster_config()
-    cfg["crew"] = crew
-    _save_cluster_config(cfg)
+    with _cluster_config_txn() as cfg:
+        cfg["crew"] = crew
 
 
 def get_discovery_state() -> dict:
@@ -4737,9 +4834,8 @@ def get_discovery_state() -> dict:
 
 
 def set_discovery_state(state: dict) -> None:
-    cfg = _load_cluster_config()
-    cfg["discovery"] = state
-    _save_cluster_config(cfg)
+    with _cluster_config_txn() as cfg:
+        cfg["discovery"] = state
 
 
 def find_crew_by_token(plain_token: str) -> Optional[dict]:
@@ -7464,7 +7560,8 @@ async def admin_cluster_update(cluster_id: str, req: ClusterConfigUpdate):
         if not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,40}", cluster_id):
             raise HTTPException(400, f"cluster_id {cluster_id!r} must match [a-z0-9][a-z0-9-]{{0,40}} (URL-safe slug)")
         # Lift any tombstone if one existed for this id.
-        _save_cluster_config({**_load_cluster_config(), cluster_id: {}})
+        with _cluster_config_txn() as _cfg:
+            _cfg[cluster_id] = {}
 
     pool = _pool_for_cluster(cluster_id)
     current = get_cluster_def(cluster_id) if not creating else {}
@@ -7570,9 +7667,8 @@ async def admin_cluster_delete(cluster_id: str):
     pool = _pool_for_cluster(cluster_id)
     if pool is not None and getattr(pool, "loaded", False):
         await _auto_unload_cluster(cluster_id, reason="cluster removed via UI")
-    cfg = _load_cluster_config()
-    cfg[cluster_id] = {"_removed": True}
-    _save_cluster_config(cfg)
+    with _cluster_config_txn() as cfg:
+        cfg[cluster_id] = {"_removed": True}
     return {"ok": True, "removed": cluster_id}
 
 
