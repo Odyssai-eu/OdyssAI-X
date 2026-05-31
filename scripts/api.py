@@ -2142,7 +2142,7 @@ _THINK_MAX_PARTIAL = max(len(_THINK_OPEN), len(_THINK_CLOSE)) - 1  # 7
 #    content field. Do not modify the content field."
 # i.e. their stance is "don't disable thinking" — we route around them
 # by treating the auto-opened block as reasoning and stripping the close.
-_MODELS_AUTO_OPEN_THINK = ("minimax", "qwen3.5", "qwen3.6")
+_MODELS_AUTO_OPEN_THINK = ("minimax", "qwen3.5", "qwen3.6", "step-3.7", "step3p7")
 # Subset of _MODELS_AUTO_OPEN_THINK that IGNORES the `enable_thinking`
 # kwarg and always wraps reasoning in <think>...</think>. Per MiniMax M2
 # docs (2026-05-20 update): "The model's reasoning is wrapped in <think>
@@ -2152,7 +2152,7 @@ _MODELS_AUTO_OPEN_THINK = ("minimax", "qwen3.5", "qwen3.6")
 # MiniMax doesn't honor it, so we MUST keep the filter on for it even
 # when callers ask for no-thinking, otherwise the reasoning text leaks
 # into `content` verbatim (`</think>` literal visible to the user).
-_MODELS_IGNORE_ENABLE_THINKING_FLAG = ("minimax",)
+_MODELS_IGNORE_ENABLE_THINKING_FLAG = ("minimax", "step-3.7", "step3p7")
 
 
 def _model_auto_opens_think(model_id: Optional[str]) -> bool:
@@ -2807,7 +2807,7 @@ def _initial_default_config() -> Optional[dict]:
 #   major (1.7.2 → 2.0.0) — breaking API or topology change
 #
 # Use `./scripts/bump-version.sh patch|minor|major` to bump + auto-commit.
-ODYSSEUS_VERSION = "1.7.23"
+ODYSSEUS_VERSION = "1.7.24"
 
 app = FastAPI(
     title="Odysseus (odyssai.eu)",
