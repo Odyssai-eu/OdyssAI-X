@@ -1761,7 +1761,8 @@ class RunnerPool:
                      messages: Optional[list[dict]] = None,
                      tools: Optional[list[dict]] = None,
                      session_id: Optional[str] = None,
-                     request_id: Optional[str] = None) -> AsyncIterator[dict]:
+                     request_id: Optional[str] = None,
+                     reasoning_effort: Optional[str] = None) -> AsyncIterator[dict]:
         # Concurrent submits are allowed: the runner side handles serialisation
         # (single-rank uses BatchGenerator for true parallelism; multi-rank
         # serialises in the gen loop but tokens are routed by req_id).
@@ -1787,6 +1788,10 @@ class RunnerPool:
         if enable_thinking is None:
             enable_thinking = get_enable_thinking_default()
         req["enable_thinking"] = enable_thinking
+        # reasoning_effort: forwarded as a chat-template kwarg (Step-3.7 reads
+        # it). Only set when non-empty so models that don't read it are untouched.
+        if reasoning_effort:
+            req["reasoning_effort"] = reasoning_effort
         if session_id:
             req["session_id"] = session_id
         try:
@@ -2154,6 +2159,20 @@ _MODELS_AUTO_OPEN_THINK = ("minimax", "qwen3.5", "qwen3.6", "step-3.7", "step3p7
 # into `content` verbatim (`</think>` literal visible to the user).
 _MODELS_IGNORE_ENABLE_THINKING_FLAG = ("minimax", "step-3.7", "step3p7")
 
+# Models whose chat template reads a `reasoning_effort` system directive
+# (OpenAI o-series convention: minimal/low/medium/high). Step-3.7-Flash is a
+# reasoning-first "agent" model that ALWAYS opens a <think> block — there is
+# no enable_thinking off-switch — but it honors a "Reasoning: <effort>" line
+# injected into the system prompt. Without it the model defaults to heavy
+# reasoning (Sophie, 2026-05-31: "énorme thinking sans qu'on puisse le mettre
+# en false"). So default these to "minimal" when the caller didn't specify an
+# effort, keeping them fast/agentic by default while still overridable per
+# request (Companion Inference settings → reasoning_effort).
+_MODELS_REASONING_EFFORT_DEFAULT = {
+    "step-3.7": "minimal",
+    "step3p7": "minimal",
+}
+
 
 def _model_auto_opens_think(model_id: Optional[str]) -> bool:
     if not model_id:
@@ -2193,6 +2212,23 @@ def _should_filter_think(model_id: Optional[str], enable_thinking) -> bool:
     if enable_thinking is False and not _model_ignores_enable_thinking_flag(model_id):
         return False
     return _model_auto_opens_think(model_id)
+
+
+def _default_reasoning_effort(model_id: Optional[str]) -> Optional[str]:
+    """Per-model default `reasoning_effort` when the caller didn't pass one.
+
+    Keeps reasoning-first models (Step-3.7) fast by default instead of running
+    their heavy built-in default. Returns None for models that don't read the
+    directive — passing it to them would just inject an unused system line.
+    An explicit caller value always wins over this; this only fills the gap.
+    """
+    if not model_id:
+        return None
+    needle = model_id.lower()
+    for key, eff in _MODELS_REASONING_EFFORT_DEFAULT.items():
+        if key in needle:
+            return eff
+    return None
 
 
 def _split_think_stream(text: str, state: dict) -> tuple[str, str]:
@@ -2376,6 +2412,10 @@ class ChatCompletionRequest(BaseModel):
     max_tokens: Optional[int] = Field(default=512)
     stream: Optional[bool] = False
     enable_thinking: Optional[bool] = None
+    # OpenAI o-series reasoning dial (minimal/low/medium/high). Forwarded to
+    # the chat template as a "Reasoning: <effort>" system directive for models
+    # that read it (Step-3.7). None → per-model default (_default_reasoning_effort).
+    reasoning_effort: Optional[str] = None
     tools: Optional[list[dict]] = None
     tool_choice: Optional[Any] = None
     session_id: Optional[str] = None  # opt-in prefix-cache key (also: X-Session-Id header)
@@ -2833,7 +2873,7 @@ def _initial_default_config() -> Optional[dict]:
 #   major (1.7.2 → 2.0.0) — breaking API or topology change
 #
 # Use `./scripts/bump-version.sh patch|minor|major` to bump + auto-commit.
-ODYSSEUS_VERSION = "1.7.25"
+ODYSSEUS_VERSION = "1.7.26"
 
 app = FastAPI(
     title="Odysseus (odyssai.eu)",
@@ -5556,7 +5596,9 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
             async for ev in pool.submit(None, req.max_tokens or 512, req.enable_thinking,
                                         messages=messages, tools=req.tools,
                                         session_id=session_id,
-                                        request_id=completion_id):
+                                        request_id=completion_id,
+                                        reasoning_effort=(req.reasoning_effort
+                                                          or _default_reasoning_effort(model_id))):
                 if cancel_event.is_set():
                     run_status = "cancelled"
                     break
@@ -5667,7 +5709,9 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
             async for ev in pool.submit(None, req.max_tokens or 512, req.enable_thinking,
                                         messages=messages, tools=req.tools,
                                         session_id=session_id,
-                                        request_id=completion_id):
+                                        request_id=completion_id,
+                                        reasoning_effort=(req.reasoning_effort
+                                                          or _default_reasoning_effort(model_id))):
                 if await request.is_disconnected():
                     run_status = "disconnected"
                     break
@@ -6069,7 +6113,8 @@ async def anthropic_messages(req: AnthropicMessagesRequest, request: Request):
         async for ev in pool.submit(None, req.max_tokens, None,
                                     messages=oa_messages, tools=oa_tools,
                                     session_id=session_id,
-                                    request_id=msg_id):
+                                    request_id=msg_id,
+                                    reasoning_effort=_default_reasoning_effort(model_id)):
             if ev.get("event") == "token":
                 if ttft_s is None:
                     ttft_s = time.time() - t_start
@@ -6144,7 +6189,8 @@ async def anthropic_messages(req: AnthropicMessagesRequest, request: Request):
             async for ev in pool.submit(None, req.max_tokens, None,
                                         messages=oa_messages, tools=oa_tools,
                                         session_id=session_id,
-                                        request_id=msg_id):
+                                        request_id=msg_id,
+                                        reasoning_effort=_default_reasoning_effort(model_id)):
                 if await request.is_disconnected():
                     break
                 if ev.get("event") == "token":
@@ -8361,6 +8407,13 @@ async def _telemak_proxy_chat_completion(
     # Shared decision with the local-pool path — see _should_filter_think.
     auto_think = _should_filter_think(upstream_model, body.get("enable_thinking"))
     forward_body = dict(body)
+    # Per-model reasoning_effort default (Step-3.7 → minimal) when the client
+    # didn't specify one — keeps the proxied model fast by default, same as the
+    # local pool path. An explicit client value in body already carries over.
+    if not forward_body.get("reasoning_effort"):
+        _re_default = _default_reasoning_effort(upstream_model)
+        if _re_default:
+            forward_body["reasoning_effort"] = _re_default
     forward_body["model"] = upstream_model
     import httpx
     if not stream:
@@ -8491,6 +8544,12 @@ async def _telemak_proxy_messages(
 
     forward_body = dict(body)
     forward_body["model"] = upstream_model
+    # Per-model reasoning_effort default (Step-3.7 → minimal), same as the chat
+    # proxy + local pool path. Explicit client value in body carries over.
+    if not forward_body.get("reasoning_effort"):
+        _re_default = _default_reasoning_effort(upstream_model)
+        if _re_default:
+            forward_body["reasoning_effort"] = _re_default
 
     import httpx
     if not stream:

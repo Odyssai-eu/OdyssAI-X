@@ -1750,6 +1750,12 @@ def _run_legacy_main(model, tokenizer, repo: str, kv_q8_default: bool,
         chat_kwargs = {"add_generation_prompt": True, "tokenize": False}
         if enable_thinking is not None:
             chat_kwargs["enable_thinking"] = enable_thinking
+        # reasoning_effort: OpenAI o-series dial the template injects as a
+        # "Reasoning: <effort>" system directive (Step-3.7). Harmless for
+        # templates that don't read it — Jinja ignores the unused kwarg.
+        reasoning_effort = req.get("reasoning_effort", None)
+        if reasoning_effort:
+            chat_kwargs["reasoning_effort"] = reasoning_effort
         if tools:
             chat_kwargs["tools"] = tools
         try:
@@ -2098,6 +2104,11 @@ def _run_batched_main(model, tokenizer, repo: str, kv_q8_default: bool,
             chat_kwargs = {"add_generation_prompt": True, "tokenize": False}
             if enable_thinking is not None:
                 chat_kwargs["enable_thinking"] = enable_thinking
+            # reasoning_effort: see single-stream branch — template injects it
+            # as a "Reasoning: <effort>" system directive (Step-3.7).
+            reasoning_effort = req.get("reasoning_effort", None)
+            if reasoning_effort:
+                chat_kwargs["reasoning_effort"] = reasoning_effort
             if tools:
                 chat_kwargs["tools"] = tools
             try:
