@@ -2873,7 +2873,7 @@ def _initial_default_config() -> Optional[dict]:
 #   major (1.7.2 → 2.0.0) — breaking API or topology change
 #
 # Use `./scripts/bump-version.sh patch|minor|major` to bump + auto-commit.
-ODYSSEUS_VERSION = "1.7.26"
+ODYSSEUS_VERSION = "1.7.27"
 
 app = FastAPI(
     title="Odysseus (odyssai.eu)",
@@ -2935,10 +2935,17 @@ if ODYSSEUS_ADMIN_TOKEN:
         f"[api] /admin/* protected by Bearer token (length {len(ODYSSEUS_ADMIN_TOKEN)})\n"
     )
 else:
-    sys.stderr.write(
-        "[api] /admin/* is OPEN (no ODYSSEUS_ADMIN_TOKEN set). "
-        "Set the env var if you expose this engine beyond a trusted LAN.\n"
+    _ADMIN_OPEN_WARNING = (
+        "\n"
+        "╔══════════════════════════════════════════════════════════════╗\n"
+        "║  WARNING: /admin/* routes are OPEN — no auth required.      ║\n"
+        "║  Anyone on the network can load/unload models, read stats,  ║\n"
+        "║  and change cluster config.                                  ║\n"
+        "║  Set ODYSSEUS_ADMIN_TOKEN=<secret> to enable Bearer auth.   ║\n"
+        "║  Safe on a trusted LAN; harden before any WAN exposure.     ║\n"
+        "╚══════════════════════════════════════════════════════════════╝\n"
     )
+    sys.stderr.write(_ADMIN_OPEN_WARNING)
 
 
 @app.middleware("http")
@@ -3100,13 +3107,19 @@ async def help_topic(slug: str):
 
 @app.get("/health")
 async def health():
+    base = {
+        "version": ODYSSEUS_VERSION,
+        # Surfaces admin auth posture so operators can detect open installs
+        # programmatically (e.g. Companion shows a warning in Settings).
+        "admin_auth_enabled": bool(ODYSSEUS_ADMIN_TOKEN),
+    }
     if _pool is None:
-        return {"status": "idle", "version": ODYSSEUS_VERSION}
+        return {"status": "idle", **base}
     alive = _pool.alive_count()
     return {
         "status": "ok" if alive == len(_pool.runners) else "degraded",
-        "version": ODYSSEUS_VERSION,
         "model": _pool.model, "alive": alive, "nodes": len(_pool.runners),
+        **base,
     }
 
 
