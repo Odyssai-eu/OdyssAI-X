@@ -2873,7 +2873,7 @@ def _initial_default_config() -> Optional[dict]:
 #   major (1.7.2 → 2.0.0) — breaking API or topology change
 #
 # Use `./scripts/bump-version.sh patch|minor|major` to bump + auto-commit.
-ODYSSEUS_VERSION = "1.7.27"
+ODYSSEUS_VERSION = "1.7.28"
 
 app = FastAPI(
     title="Odysseus (odyssai.eu)",
@@ -8710,13 +8710,31 @@ async def _telemak_status(cluster_id: str, cd: dict) -> dict:
     last_error: Optional[str] = None
     if upstream:
         import httpx
+
+        async def _safe_get(client: "httpx.AsyncClient", url: str):
+            try:
+                r = await client.get(url)
+                return r if r.status_code == 200 else None
+            except Exception:
+                return None
+
         try:
             async with httpx.AsyncClient(timeout=4.0) as client:
-                r = await client.get(f"{upstream}/v1/models")
-                if r.status_code == 200:
+                # Fire all 5 upstream GETs in parallel — previously sequential,
+                # each waiting for the previous before starting (issue #26).
+                # Wall-clock latency = max(individual) instead of sum.
+                r_models, r_health, r_cap, r_activity, r_sessions = await asyncio.gather(
+                    _safe_get(client, f"{upstream}/v1/models"),
+                    _safe_get(client, f"{upstream}/health"),
+                    _safe_get(client, f"{upstream}/.well-known/inference-engine.json"),
+                    _safe_get(client, f"{upstream}/admin/activity"),
+                    _safe_get(client, f"{upstream}/admin/sessions"),
+                    return_exceptions=False,
+                )
+
+                if r_models is not None:
                     reachable = True
-                    data = r.json().get("data", [])
-                    for m in data:
+                    for m in r_models.json().get("data", []):
                         mid = m.get("id")
                         if not mid:
                             continue
@@ -8727,88 +8745,57 @@ async def _telemak_status(cluster_id: str, cd: dict) -> dict:
                             "draft_model": x.get("draft_model"),
                             "num_draft_tokens": x.get("num_draft_tokens"),
                         }
-                # /health is independent — fetch even if /v1/models bombed,
-                # the user wants to know the upstream's memory state.
-                try:
-                    h = await client.get(f"{upstream}/health")
-                    if h.status_code == 200:
-                        reachable = True
-                        hj = h.json()
-                        if not models_loaded:
-                            models_loaded = hj.get("models_loaded", []) or []
-                        wired_used_gb = hj.get("wired_memory_used_gb")
-                        wired_free_gb = hj.get("wired_memory_free_gb")
-                        avg_tok_s_recent = hj.get("avg_tok_s_recent")
-                        requests_served = hj.get("requests_served")
-                        uptime_s = hj.get("uptime_s")
-                        upstream_version = hj.get("version")
-                except Exception:
-                    pass
-                # Capability contract — tells us which speculative-decoding
-                # modes the engine supports (e.g. ["mtp_adapter"]). Combined
-                # with the per-model kind it gives "MTP active for this LLM".
-                try:
-                    cap = await client.get(f"{upstream}/.well-known/inference-engine.json")
-                    if cap.status_code == 200:
-                        cj = cap.json()
-                        spec_modes = (cj.get("capabilities", {}).get("speculative_decoding") or {}).get("modes") or []
-                except Exception:
-                    pass
-                # /admin/activity — canonical runtime activity readout
-                # (Telemak 0.6.15+). Gives us current_phase, current_tok_s,
-                # current_model, active_requests, last_error directly from
-                # the engine. When present, busy = (current_phase != idle),
-                # no heuristic needed.
-                try:
-                    act = await client.get(f"{upstream}/admin/activity")
-                    if act.status_code == 200:
-                        aj = act.json() or {}
-                        current_phase = aj.get("current_phase")
-                        current_model = aj.get("current_model")
-                        current_request_started_at = aj.get("current_request_started_at")
-                        current_generated_tokens = aj.get("current_generated_tokens")
-                        current_tok_s = aj.get("current_tok_s")
-                        active_requests = aj.get("active_requests")
-                        last_error = aj.get("last_error")
-                        if current_phase and current_phase != "idle":
-                            busy = True
-                except Exception:
-                    pass
-                # /admin/sessions — KV-cached sessions (Telemak 0.6.10+).
-                # Used for active_sessions_count + sessions_summary even
-                # when /admin/activity is available; falls back to driving
-                # the `busy` flag when /admin/activity isn't.
-                try:
-                    s = await client.get(f"{upstream}/admin/sessions")
-                    if s.status_code == 200:
-                        sess_list = (s.json() or {}).get("sessions") or []
-                        active_sessions_count = len(sess_list)
-                        if sess_list:
-                            recents = [
-                                float(x.get("last_used_s"))
-                                for x in sess_list
-                                if x.get("last_used_s") is not None
-                            ]
-                            if recents:
-                                last_request_seconds_ago = min(recents)
-                                # Only set busy from heuristic if /admin/activity
-                                # didn't already report a phase. The engine
-                                # truth-source wins.
-                                if current_phase is None:
-                                    busy = last_request_seconds_ago < BUSY_WINDOW_S
-                            # Trim per-session fields to what the dashboard
-                            # actually renders — id, kv size, last_used.
-                            sessions_summary = [
-                                {
-                                    "id": str(x.get("id"))[:12],
-                                    "model": x.get("model"),
-                                    "kv_size_mb": x.get("kv_size_mb"),
-                                    "last_used_s": x.get("last_used_s"),
-                                }
-                                for x in sess_list
-                            ]
-                except Exception:
-                    pass
+
+                if r_health is not None:
+                    reachable = True
+                    hj = r_health.json()
+                    if not models_loaded:
+                        models_loaded = hj.get("models_loaded", []) or []
+                    wired_used_gb = hj.get("wired_memory_used_gb")
+                    wired_free_gb = hj.get("wired_memory_free_gb")
+                    avg_tok_s_recent = hj.get("avg_tok_s_recent")
+                    requests_served = hj.get("requests_served")
+                    uptime_s = hj.get("uptime_s")
+                    upstream_version = hj.get("version")
+
+                if r_cap is not None:
+                    cj = r_cap.json()
+                    spec_modes = (cj.get("capabilities", {}).get("speculative_decoding") or {}).get("modes") or []
+
+                if r_activity is not None:
+                    aj = r_activity.json() or {}
+                    current_phase = aj.get("current_phase")
+                    current_model = aj.get("current_model")
+                    current_request_started_at = aj.get("current_request_started_at")
+                    current_generated_tokens = aj.get("current_generated_tokens")
+                    current_tok_s = aj.get("current_tok_s")
+                    active_requests = aj.get("active_requests")
+                    last_error = aj.get("last_error")
+                    if current_phase and current_phase != "idle":
+                        busy = True
+
+                if r_sessions is not None:
+                    sess_list = (r_sessions.json() or {}).get("sessions") or []
+                    active_sessions_count = len(sess_list)
+                    if sess_list:
+                        recents = [
+                            float(x.get("last_used_s"))
+                            for x in sess_list
+                            if x.get("last_used_s") is not None
+                        ]
+                        if recents:
+                            last_request_seconds_ago = min(recents)
+                            if current_phase is None:
+                                busy = last_request_seconds_ago < BUSY_WINDOW_S
+                        sessions_summary = [
+                            {
+                                "id": str(x.get("id"))[:12],
+                                "model": x.get("model"),
+                                "kv_size_mb": x.get("kv_size_mb"),
+                                "last_used_s": x.get("last_used_s"),
+                            }
+                            for x in sess_list
+                        ]
         except Exception:
             reachable = False
     # Derive mtp_enabled per model : engine reports an MTP mode AND model
@@ -9232,12 +9219,6 @@ async def admin_nautilus_reset():
 class PrewarmRequest(BaseModel):
     text: Optional[str] = None  # None → use the saved system_prefix_text
     kv_q8: Optional[bool] = None  # None → cluster default
-
-
-def _pool_for_cluster(cluster: str):
-    if cluster == "nautilus":
-        return _pool
-    return get_pool(cluster)
 
 
 @app.post("/admin/{cluster}/prewarm")
