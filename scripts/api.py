@@ -2873,7 +2873,7 @@ def _initial_default_config() -> Optional[dict]:
 #   major (1.7.2 → 2.0.0) — breaking API or topology change
 #
 # Use `./scripts/bump-version.sh patch|minor|major` to bump + auto-commit.
-ODYSSEUS_VERSION = "1.7.29"
+ODYSSEUS_VERSION = "1.7.30"
 
 app = FastAPI(
     title="Odysseus (odyssai.eu)",
@@ -8430,11 +8430,13 @@ async def _telemak_proxy_chat_completion(
     forward_body["model"] = upstream_model
     import httpx
     if not stream:
+        _t0 = time.time()
         try:
             async with httpx.AsyncClient(timeout=300.0) as client:
                 r = await client.post(f"{upstream}/v1/chat/completions", json=forward_body)
         except Exception as e:
             raise HTTPException(502, f"telemak upstream unreachable: {e}")
+        _elapsed = max(0.001, time.time() - _t0)
         if r.status_code >= 400:
             raise HTTPException(r.status_code, f"telemak upstream error: {r.text[:300]}")
         out = r.json()
@@ -8456,12 +8458,15 @@ async def _telemak_proxy_chat_completion(
                 choice["message"] = msg
         out["model"] = f"{cluster_id}:{requested_short_id}" if requested_short_id else cluster_id
         # Record metrics so Recent activity appears for Telemak clusters (#32).
+        # Non-stream: wall-clock = full latency. The client sees nothing until
+        # the whole response lands, so observed TTFT == elapsed (no separate
+        # first-token event exists for a non-streamed completion).
         _usage = out.get("usage") or {}
         record_metric(
             client="telemak-proxy",
             ntoks=_usage.get("completion_tokens") or 0,
-            elapsed_s=0.0,
-            ttft_s=None,
+            elapsed_s=_elapsed,
+            ttft_s=_elapsed,
             prompt_chars=(_usage.get("prompt_tokens") or 0) * 4,
             model=upstream_model,
             cluster=cluster_id,
