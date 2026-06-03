@@ -973,7 +973,7 @@ const state = {
   cluster_save_busy: {},
   cluster_save_err: {},
   metrics: [],
-  metrics_filter: "all",
+  metrics_filter: "cluster",  // "cluster" = follow selected cluster, "all" = global
   sessions: [],
   logs: [],
   logs_cluster: null,
@@ -5042,23 +5042,40 @@ function renderRunRow(m) {
 }
 
 // ─── Recent activity ────────────────────────────────────────────────
+// Default scope is the cluster you're currently looking at, not the global
+// firehose — when you're on "Tele-fast" you want Tele-fast's inferences,
+// not every cluster's. Toggle to "All" to see the global view.
 function renderRecentActivity() {
   const all = state.metrics || [];
-  const f = state.metrics_filter || "all";
-  const rows = f === "all" ? all : all.filter(r => r.cluster === f);
+  const sel = state.selected_cluster;
+  // metrics_filter: "cluster" (default — follow selected cluster) | "all"
+  const scope = state.metrics_filter || "cluster";
+  const clusterLabel = (CLUSTERS.find(c => c.id === sel)?.name) || sel || "This cluster";
+
+  const rows = (scope === "all" || !sel)
+    ? all
+    : all.filter(r => r.cluster === sel);
+
+  const buttons = [
+    { v: "cluster", label: clusterLabel },
+    { v: "all", label: "All" },
+  ];
+
   return `
     <section class="cluster-card">
       <div class="activity-head">
         <div class="left">
           <h2>Recent activity</h2>
-          <div class="sub">${all.length} inferences · last 60 min</div>
+          <div class="sub">${rows.length} inference${rows.length === 1 ? "" : "s"}${
+            scope === "all" ? " · all clusters" : ` · ${escapeHtml(clusterLabel)}`
+          } · last 60 min</div>
         </div>
         <div class="filters">
-          ${["all","default"].map(k => `<button data-act="metrics-filter" data-v="${k}" class="${f===k?"active":""}">${k==="all"?"All":k.charAt(0).toUpperCase()+k.slice(1)}</button>`).join("")}
+          ${buttons.map(b => `<button data-act="metrics-filter" data-v="${b.v}" class="${scope===b.v?"active":""}">${escapeHtml(b.label)}</button>`).join("")}
         </div>
       </div>
       ${rows.length === 0
-        ? `<div class="empty-state">No recorded inferences yet.</div>`
+        ? `<div class="empty-state">No recorded inferences yet${scope === "cluster" ? " for this cluster" : ""}.</div>`
         : `
           <div class="activity-cols">
             <span class="c-time">Time</span>
