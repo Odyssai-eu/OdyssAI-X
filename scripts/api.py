@@ -2873,7 +2873,7 @@ def _initial_default_config() -> Optional[dict]:
 #   major (1.7.2 → 2.0.0) — breaking API or topology change
 #
 # Use `./scripts/bump-version.sh patch|minor|major` to bump + auto-commit.
-ODYSSEUS_VERSION = "1.7.30"
+ODYSSEUS_VERSION = "1.7.31"
 
 app = FastAPI(
     title="Odysseus (odyssai.eu)",
@@ -3044,6 +3044,19 @@ async def dashboard():
     if not DASHBOARD_FILE.exists():
         return HTMLResponse("<h1>dashboard.html missing</h1>", status_code=500)
     return HTMLResponse(DASHBOARD_FILE.read_text())
+
+
+WALL_FILE = Path(os.environ.get("WALL_FILE", _HERE / "wall.html"))
+
+
+@app.get("/wall")
+async def status_wall():
+    """Standalone status wall — portrait black display for ops monitoring.
+    Same-origin so it can poll /admin/clusters without CORS. Read fresh per
+    request → hot-deploys via `docker cp` without a container restart."""
+    if not WALL_FILE.exists():
+        return HTMLResponse("<h1>wall.html missing</h1>", status_code=500)
+    return HTMLResponse(WALL_FILE.read_text())
 
 
 # ──────────────────────────────────────────────────────────────────────────────

@@ -1,0 +1,243 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>OdyssAI — Status Wall</title>
+<style>
+  :root {
+    --bg: #000000;
+    --card: #0a0d12;
+    --card-line: #1a2230;
+    --ink: #e8eef5;
+    --ink-2: #8a97a8;
+    --ink-3: #4a5568;
+    --green: #2ee06a;
+    --green-dim: #14361f;
+    --amber: #ffb020;
+    --amber-dim: #3a2c0a;
+    --red: #ff3b3b;
+    --red-dim: #3a1010;
+    --blue: #3d8bff;
+    --mono: "JetBrains Mono", "SF Mono", ui-monospace, monospace;
+    --disp: "Inter", -apple-system, system-ui, sans-serif;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body { background: var(--bg); color: var(--ink); font-family: var(--disp); height: 100%; }
+  body { padding: 24px; overflow-x: hidden; }
+
+  .wall-head {
+    display: flex; align-items: baseline; justify-content: space-between;
+    padding-bottom: 18px; margin-bottom: 18px;
+    border-bottom: 1px solid var(--card-line);
+  }
+  .wall-head .brand { font-size: 30px; font-weight: 300; letter-spacing: -0.02em; }
+  .wall-head .brand b { font-weight: 600; }
+  .wall-head .clock { font-family: var(--mono); font-size: 22px; color: var(--ink-2); }
+  .wall-head .health { font-family: var(--mono); font-size: 13px; color: var(--ink-3);
+                       text-transform: uppercase; letter-spacing: 0.1em; margin-top: 4px; }
+
+  .grid { display: flex; flex-direction: column; gap: 14px; }
+
+  .card {
+    background: var(--card); border: 1px solid var(--card-line);
+    border-radius: 14px; padding: 18px 20px; position: relative;
+    display: grid; grid-template-columns: 56px 1fr; gap: 16px; align-items: start;
+  }
+  .card.down  { border-color: var(--red);   box-shadow: 0 0 0 1px var(--red-dim), 0 0 30px -8px var(--red); }
+  .card.busy  { border-color: var(--amber); }
+
+  /* Status dot */
+  .dot-wrap { display: flex; align-items: center; justify-content: center; padding-top: 4px; }
+  .dot { width: 40px; height: 40px; border-radius: 50%; position: relative; }
+  .dot.green { background: var(--green); box-shadow: 0 0 24px -2px var(--green); }
+  .dot.amber { background: var(--amber); box-shadow: 0 0 24px -2px var(--amber); animation: pulse 1.3s infinite; }
+  .dot.red   { background: var(--red);   box-shadow: 0 0 32px 0 var(--red);   animation: pulse 0.9s infinite; }
+  .dot.grey  { background: var(--ink-3); }
+  @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.35; } }
+
+  .body { min-width: 0; }
+  .row1 { display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap; }
+  .name { font-size: 26px; font-weight: 600; letter-spacing: -0.01em; }
+  .badge { font-family: var(--mono); font-size: 10px; text-transform: uppercase;
+           letter-spacing: 0.08em; padding: 3px 8px; border-radius: 5px;
+           background: #131a24; color: var(--ink-2); border: 1px solid var(--card-line); }
+  .badge.telemak { color: #7db8ff; }
+  .badge.mlx { color: #b58cff; }
+  .state-txt { font-family: var(--mono); font-size: 13px; margin-left: auto;
+               text-transform: uppercase; letter-spacing: 0.06em; }
+  .state-txt.green { color: var(--green); }
+  .state-txt.amber { color: var(--amber); }
+  .state-txt.red   { color: var(--red); }
+  .state-txt.grey  { color: var(--ink-3); }
+
+  .model { font-family: var(--mono); font-size: 14px; color: var(--ink);
+           margin-top: 8px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .model .muted { color: var(--ink-3); }
+
+  .metrics { display: flex; flex-wrap: wrap; gap: 22px; margin-top: 14px; }
+  .metric { display: flex; flex-direction: column; gap: 2px; }
+  .metric .label { font-family: var(--mono); font-size: 10px; color: var(--ink-3);
+                   text-transform: uppercase; letter-spacing: 0.08em; }
+  .metric .value { font-family: var(--mono); font-size: 22px; font-weight: 500; }
+  .metric .value small { font-size: 13px; color: var(--ink-2); }
+
+  /* RAM bar */
+  .ram { margin-top: 14px; }
+  .ram .bartrack { height: 8px; background: #131a24; border-radius: 4px; overflow: hidden; margin-top: 6px; }
+  .ram .barfill { height: 100%; border-radius: 4px; transition: width 0.6s; }
+  .ram .barfill.ok   { background: var(--green); }
+  .ram .barfill.warn { background: var(--amber); }
+  .ram .barfill.crit { background: var(--red); }
+  .ram .legend { display: flex; justify-content: space-between; font-family: var(--mono);
+                 font-size: 11px; color: var(--ink-2); margin-top: 4px; }
+
+  .err { margin-top: 12px; padding: 8px 12px; background: var(--red-dim);
+         border: 1px solid var(--red); border-radius: 8px;
+         font-family: var(--mono); font-size: 12px; color: #ff9a9a;
+         white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+
+  .footer { text-align: center; font-family: var(--mono); font-size: 11px;
+            color: var(--ink-3); margin-top: 22px; letter-spacing: 0.05em; }
+  .stale { color: var(--amber); }
+</style>
+</head>
+<body>
+  <div class="wall-head">
+    <div>
+      <div class="brand"><b>odyssai</b> · status wall</div>
+      <div class="health" id="health">connecting…</div>
+    </div>
+    <div class="clock" id="clock">--:--:--</div>
+  </div>
+
+  <div class="grid" id="grid"></div>
+
+  <div class="footer" id="footer">polling every 4s</div>
+
+<script>
+const API = ""; // same-origin (served from Odysseus at /wall)
+const REFRESH_MS = 4000;
+
+function fmtUptime(s) {
+  if (s == null) return "—";
+  s = Math.floor(s);
+  const d = Math.floor(s / 86400), h = Math.floor((s % 86400) / 3600), m = Math.floor((s % 3600) / 60);
+  if (d > 0) return `${d}d ${h}h`;
+  if (h > 0) return `${h}h ${m}m`;
+  return `${m}m`;
+}
+function shortModel(path) {
+  if (!path) return null;
+  const leaf = path.split("/").pop() || path;
+  // strip org prefix already gone; keep readable
+  return leaf;
+}
+function classify(c, s) {
+  // Returns {dot, txt, label, cardClass}
+  if (!c.enabled) return { dot: "grey", label: "DISABLED", card: "" };
+  if (s == null) return { dot: "grey", label: "NO DATA", card: "" };
+  if (s.upstream_reachable === false) return { dot: "red", label: "DOWN", card: "down" };
+  if (!s.loaded) return { dot: "grey", label: "IDLE · NO MODEL", card: "" };
+  if (s.busy || (s.current_phase && s.current_phase !== "idle"))
+    return { dot: "amber", label: (s.current_phase || "BUSY").toUpperCase(), card: "busy" };
+  return { dot: "green", label: "READY", card: "" };
+}
+
+async function poll() {
+  let clusters;
+  try {
+    const r = await fetch(`${API}/admin/clusters`, { cache: "no-store" });
+    const j = await r.json();
+    clusters = j.data || j.clusters || j;
+  } catch (e) {
+    document.getElementById("health").innerHTML = `<span class="stale">engine unreachable</span>`;
+    return;
+  }
+
+  // Fetch all statuses in parallel
+  const statuses = await Promise.all(clusters.map(async (c) => {
+    try {
+      const r = await fetch(`${API}/admin/clusters/${encodeURIComponent(c.id)}/status`, { cache: "no-store" });
+      return await r.json();
+    } catch { return null; }
+  }));
+
+  let up = 0, down = 0, loaded = 0;
+  const cards = clusters.map((c, i) => {
+    const s = statuses[i];
+    const cl = classify(c, s);
+    if (cl.dot === "red") down++; else if (c.enabled) up++;
+    if (s && s.loaded) loaded++;
+
+    const kindBadge = c.kind === "telemak"
+      ? `<span class="badge telemak">telemak</span>`
+      : `<span class="badge mlx">mlx · ${c.node_count || 1}n</span>`;
+
+    const model = s && (s.model || (s.models_loaded && s.models_loaded[0]));
+    const modelLine = model
+      ? `<div class="model">${shortModel(model)}${(s.models_loaded && s.models_loaded.length > 1) ? ` <span class="muted">+${s.models_loaded.length - 1}</span>` : ""}</div>`
+      : `<div class="model muted">— no model loaded —</div>`;
+
+    // tok/s : live current_tok_s if generating, else recent average
+    const tps = (s && typeof s.current_tok_s === "number" && s.current_tok_s > 0)
+      ? s.current_tok_s
+      : (s && typeof s.avg_tok_s_recent === "number" ? s.avg_tok_s_recent : null);
+
+    const metrics = s ? `
+      <div class="metrics">
+        <div class="metric"><span class="label">tok/s</span><span class="value">${tps != null ? tps.toFixed(1) : "—"}</span></div>
+        <div class="metric"><span class="label">requests</span><span class="value">${s.requests_served ?? "—"}</span></div>
+        <div class="metric"><span class="label">sessions</span><span class="value">${s.active_sessions_count ?? 0}</span></div>
+        <div class="metric"><span class="label">uptime</span><span class="value">${fmtUptime(s.uptime_s)}</span></div>
+      </div>` : "";
+
+    // RAM (wired) bar
+    let ram = "";
+    if (s && typeof s.wired_memory_used_gb === "number" && typeof s.wired_memory_free_gb === "number") {
+      const used = s.wired_memory_used_gb, total = used + s.wired_memory_free_gb;
+      const pct = total > 0 ? (used / total) * 100 : 0;
+      const cls = pct > 92 ? "crit" : pct > 80 ? "warn" : "ok";
+      ram = `
+        <div class="ram">
+          <div class="legend"><span>RAM wired</span><span>${used.toFixed(0)} / ${total.toFixed(0)} GB · ${s.wired_memory_free_gb.toFixed(0)} free</span></div>
+          <div class="bartrack"><div class="barfill ${cls}" style="width:${pct.toFixed(0)}%"></div></div>
+        </div>`;
+    }
+
+    const err = (s && s.last_error)
+      ? `<div class="err" title="${String(s.last_error)}">⚠ ${String(s.last_error).slice(0, 80)}</div>`
+      : "";
+
+    return `
+      <div class="card ${cl.card}">
+        <div class="dot-wrap"><div class="dot ${cl.dot}"></div></div>
+        <div class="body">
+          <div class="row1">
+            <span class="name">${c.name || c.id}</span>
+            ${kindBadge}
+            <span class="state-txt ${cl.dot}">${cl.label}</span>
+          </div>
+          ${modelLine}
+          ${metrics}
+          ${ram}
+          ${err}
+        </div>
+      </div>`;
+  }).join("");
+
+  document.getElementById("grid").innerHTML = cards;
+  document.getElementById("health").innerHTML =
+    `${up} up · ${loaded} loaded${down ? ` · <span class="stale">${down} DOWN</span>` : ""}`;
+}
+
+function tick() {
+  const now = new Date();
+  document.getElementById("clock").textContent =
+    now.toLocaleTimeString("en-GB", { hour12: false });
+}
+setInterval(tick, 1000); tick();
+poll(); setInterval(poll, REFRESH_MS);
+</script>
+</body>
+</html>
