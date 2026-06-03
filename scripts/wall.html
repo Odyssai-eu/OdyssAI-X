@@ -81,6 +81,9 @@
                    text-transform: uppercase; letter-spacing: 0.08em; }
   .metric .value { font-family: var(--mono); font-size: 22px; font-weight: 500; }
   .metric .value small { font-size: 13px; color: var(--ink-2); }
+  .metric .value.disk-ok   { color: var(--ink); }
+  .metric .value.disk-warn { color: var(--amber); }
+  .metric .value.disk-crit { color: var(--red); }
 
   /* RAM bar */
   .ram { margin-top: 14px; }
@@ -163,6 +166,19 @@ async function poll() {
     } catch { return null; }
   }));
 
+  // Disk free per host (cross-host sync matrix, cached 60s server-side).
+  // Build cluster_id → [{label, free_bytes}] so each card can show its
+  // node(s) free space.
+  let diskByCluster = {};
+  try {
+    const r = await fetch(`${API}/admin/sync/matrix`, { cache: "no-store" });
+    const m = await r.json();
+    for (const h of (m.hosts || [])) {
+      if (h.free_bytes == null) continue;
+      (diskByCluster[h.cluster] ||= []).push({ label: h.label || h.id, free: h.free_bytes });
+    }
+  } catch { /* matrix optional — card just omits disk */ }
+
   let up = 0, down = 0, loaded = 0;
   const cards = clusters.map((c, i) => {
     const s = statuses[i];
@@ -184,12 +200,28 @@ async function poll() {
       ? s.current_tok_s
       : (s && typeof s.avg_tok_s_recent === "number" ? s.avg_tok_s_recent : null);
 
+    // Disk free — from the cross-host matrix. Single-node clusters show one
+    // figure; multi-node (Argo) shows the tightest node (the constraint).
+    let diskCell = "";
+    const dhosts = diskByCluster[c.id] || [];
+    if (dhosts.length) {
+      const GiB = 1024 ** 3;
+      const tightest = dhosts.reduce((a, b) => (b.free < a.free ? b : a));
+      const freeGB = tightest.free / GiB;
+      const dcls = freeGB < 50 ? "crit" : freeGB < 200 ? "warn" : "ok";
+      const multi = dhosts.length > 1 ? ` <span class="muted">(${dhosts.length}n min)</span>` : "";
+      const val = freeGB >= 1000 ? (freeGB / 1024).toFixed(1) + " <small>TB</small>"
+                                 : freeGB.toFixed(0) + " <small>GB</small>";
+      diskCell = `<div class="metric"><span class="label">disk free${multi}</span><span class="value disk-${dcls}">${val}</span></div>`;
+    }
+
     const metrics = s ? `
       <div class="metrics">
         <div class="metric"><span class="label">tok/s</span><span class="value">${tps != null ? tps.toFixed(1) : "—"}</span></div>
         <div class="metric"><span class="label">requests</span><span class="value">${s.requests_served ?? "—"}</span></div>
         <div class="metric"><span class="label">sessions</span><span class="value">${s.active_sessions_count ?? 0}</span></div>
         <div class="metric"><span class="label">uptime</span><span class="value">${fmtUptime(s.uptime_s)}</span></div>
+        ${diskCell}
       </div>` : "";
 
     // RAM (wired) bar
