@@ -2873,7 +2873,7 @@ def _initial_default_config() -> Optional[dict]:
 #   major (1.7.2 → 2.0.0) — breaking API or topology change
 #
 # Use `./scripts/bump-version.sh patch|minor|major` to bump + auto-commit.
-ODYSSEUS_VERSION = "1.7.28"
+ODYSSEUS_VERSION = "1.7.29"
 
 app = FastAPI(
     title="Odysseus (odyssai.eu)",
@@ -8455,12 +8455,26 @@ async def _telemak_proxy_chat_completion(
                     msg["reasoning_content"] = reasoning
                 choice["message"] = msg
         out["model"] = f"{cluster_id}:{requested_short_id}" if requested_short_id else cluster_id
+        # Record metrics so Recent activity appears for Telemak clusters (#32).
+        _usage = out.get("usage") or {}
+        record_metric(
+            client="telemak-proxy",
+            ntoks=_usage.get("completion_tokens") or 0,
+            elapsed_s=0.0,
+            ttft_s=None,
+            prompt_chars=(_usage.get("prompt_tokens") or 0) * 4,
+            model=upstream_model,
+            cluster=cluster_id,
+        )
         return out
 
     # Streaming path — parse SSE chunks, route delta.content through the
     # think filter, re-emit content + reasoning_content as separate deltas.
     async def _gen():
         state = {"in_think": True, "carry": ""} if auto_think else None
+        _ttft: list = []          # mutable cell for TTFT
+        _t0 = time.time()
+        _ntoks = 0
         async with httpx.AsyncClient(timeout=None) as client:
             async with client.stream("POST", f"{upstream}/v1/chat/completions", json=forward_body) as r:
                 if r.status_code >= 400:
@@ -8468,10 +8482,33 @@ async def _telemak_proxy_chat_completion(
                     yield f"data: {json.dumps({'error': {'message': f'telemak upstream {r.status_code}: {err_body}'}})}\n\n".encode()
                     return
                 if not auto_think:
-                    # No filter needed — just pipe bytes through.
+                    # No filter needed — pipe bytes through, count tokens from
+                    # usage chunk for metrics.
                     async for chunk in r.aiter_raw():
                         if chunk:
+                            if not _ttft:
+                                _ttft.append(time.time() - _t0)
+                            # Parse usage from SSE lines as they stream
+                            for line in chunk.split(b"\n"):
+                                s = line.strip()
+                                if s.startswith(b"data: ") and s != b"data: [DONE]":
+                                    try:
+                                        obj = json.loads(s[6:])
+                                        u = obj.get("usage") or {}
+                                        if u.get("completion_tokens"):
+                                            _ntoks = u["completion_tokens"]
+                                    except Exception:
+                                        pass
                             yield chunk
+                    record_metric(
+                        client="telemak-proxy",
+                        ntoks=_ntoks,
+                        elapsed_s=max(0.001, time.time() - _t0),
+                        ttft_s=_ttft[0] if _ttft else None,
+                        prompt_chars=0,
+                        model=upstream_model,
+                        cluster=cluster_id,
+                    )
                     return
                 # Auto-think filter mode: line-buffer the SSE stream so we
                 # can parse each `data: {...}` event, extract delta.content,
@@ -8495,9 +8532,28 @@ async def _telemak_proxy_chat_completion(
                                 yield f
                             yield b"data: [DONE]\n"
                             done_seen = True
+                            record_metric(
+                                client="telemak-proxy",
+                                ntoks=_ntoks,
+                                elapsed_s=max(0.001, time.time() - _t0),
+                                ttft_s=_ttft[0] if _ttft else None,
+                                prompt_chars=0,
+                                model=upstream_model,
+                                cluster=cluster_id,
+                            )
                             break
                         out_line = _telemak_filter_sse_line(line, state, cluster_id)
                         if out_line is not None:
+                            if not _ttft:
+                                _ttft.append(time.time() - _t0)
+                            # Track completion tokens from usage field
+                            try:
+                                obj = json.loads(line[6:]) if line.strip().startswith(b"data: ") else {}
+                                u = obj.get("usage") or {}
+                                if u.get("completion_tokens"):
+                                    _ntoks = u["completion_tokens"]
+                            except Exception:
+                                pass
                             yield out_line
                     if done_seen:
                         break
