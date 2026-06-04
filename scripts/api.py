@@ -3726,10 +3726,26 @@ async def _proxy_chat_completion(prov_id: str, prov: dict, entry: dict,
     #      defaults thinking ON, which wastes tokens on `<think>` for general
     #      chat. Client always retains override via the body.
     et = fwd.pop("enable_thinking", None)
-    if et is not None and "thinking" not in fwd:
-        fwd["thinking"] = bool(et)
-    elif et is None and "thinking" not in fwd:
-        fwd["thinking"] = get_enable_thinking_default()
+    # Resolve the effective thinking intent: an explicit client `thinking` /
+    # `enable_thinking` wins; otherwise inject the server-wide default (many
+    # upstreams default thinking ON, wasting tokens on <think> for plain chat).
+    _t = fwd.get("thinking", None)
+    if isinstance(_t, dict):
+        think_on = None  # client sent a structured config — leave it untouched
+    elif isinstance(_t, bool):
+        think_on = _t
+    elif et is not None:
+        think_on = bool(et)
+    else:
+        think_on = get_enable_thinking_default()
+    if think_on is not None:
+        # MiniMax's OpenAI-compatible API validates `thinking` as a
+        # ThinkingConfig OBJECT ({"type":"enabled"|"disabled"}), not the bare
+        # boolean that other upstreams accept or ignore. Translate per-upstream.
+        if "minimax" in str(upstream).lower():
+            fwd["thinking"] = {"type": "enabled" if think_on else "disabled"}
+        else:
+            fwd["thinking"] = think_on
     # OpenAI spec: streaming responses do NOT include `usage` in their final
     # chunk unless the client opts in via `stream_options.include_usage`.
     # Without it, clients (Companion) can't render prompt/completion tokens
