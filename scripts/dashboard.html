@@ -3462,9 +3462,6 @@ function renderTelemakHomeCard(a, cid, label) {
     const short = (id.split("/").pop() || id).toLowerCase();
     const alias = modelsLoaded.length === 1 ? cid : `${cid}:${short}`;
     const d = details[id] || {};
-    const mtpLine = d.mtp_enabled
-      ? `<div style="font-family:var(--font-mono);font-size:11px;color:var(--ink-2);margin-top:2px">MTP: <span style="color:var(--blue-deep);font-weight:600">${escapeHtml(d.draft_model || "mtp_adapter")}</span>${d.num_draft_tokens ? ` · window ${d.num_draft_tokens}` : ""}</div>`
-      : "";
     return `
       <div style="display:flex;align-items:center;gap:12px;padding:8px 12px;background:var(--surface);border:1px solid var(--line);border-radius:6px;font-family:var(--font-mono);font-size:12px">
         <div style="flex:1;min-width:0;display:flex;flex-direction:column;gap:0">
@@ -3472,7 +3469,6 @@ function renderTelemakHomeCard(a, cid, label) {
             ${kindBadge(d.kind)}
             <span style="font-weight:600;color:var(--ink);flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${escapeHtml(id)}</span>
           </div>
-          ${mtpLine}
         </div>
         <span style="color:var(--ink-3);font-size:11px;white-space:nowrap">alias: <span style="color:var(--ink-2)">${escapeHtml(alias)}</span></span>
         <button class="btn btn-xs btn-destructive" data-act="telemak-unload" data-cluster="${cid}" data-model="${escapeHtml(id)}" title="Unload ${escapeHtml(id)}">${Icon.x}<span>Unload</span></button>
@@ -3721,16 +3717,6 @@ function renderTelemakLoadConfig(cid, modelsLoaded) {
           </select>
         </div>
 
-        <div>
-          <div class="field-label" style="margin-bottom:4px">Multi token prediction</div>
-          <div style="display:flex;gap:6px;align-items:center">
-            <select class="ce-input mono" data-act="telemak-config-select-mtp" data-cluster="${cid}" style="flex:1">
-              ${buildOpts(mtpCandidates, true)}
-            </select>
-            <button class="btn btn-xs" data-act="telemak-config-refresh" data-cluster="${cid}" title="Re-scan">${Icon.refresh}</button>
-          </div>
-          <div style="font-size:10px;color:var(--ink-3);margin-top:3px">Optional. Pairs an MTP draft for speculative decoding.</div>
-        </div>
         <div style="display:flex;flex-direction:column;justify-content:space-between">
           <div style="font-size:12px;color:var(--ink-2)">${helpText}</div>
           <div style="display:flex;align-items:center;justify-content:flex-end;gap:14px">
