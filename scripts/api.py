@@ -62,7 +62,7 @@ from fastapi import FastAPI, HTTPException, Request
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import persistence as _persist  # noqa: E402
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, PlainTextResponse, StreamingResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Cluster topology
@@ -2410,6 +2410,10 @@ class ChatCompletionRequest(BaseModel):
     model: Optional[str] = None
     messages: list[ChatMessage]
     max_tokens: Optional[int] = Field(default=512)
+    # OpenAI's newer canonical output cap. Modern OpenAI-compatible clients
+    # (e.g. graphify) send max_completion_tokens instead of max_tokens; without
+    # this alias they get silently truncated to the max_tokens default (512).
+    max_completion_tokens: Optional[int] = None
     stream: Optional[bool] = False
     enable_thinking: Optional[bool] = None
     # OpenAI o-series reasoning dial (minimal/low/medium/high). Forwarded to
@@ -2419,6 +2423,13 @@ class ChatCompletionRequest(BaseModel):
     tools: Optional[list[dict]] = None
     tool_choice: Optional[Any] = None
     session_id: Optional[str] = None  # opt-in prefix-cache key (also: X-Session-Id header)
+
+    @model_validator(mode="after")
+    def _alias_max_completion_tokens(self) -> "ChatCompletionRequest":
+        # max_completion_tokens (newer OpenAI param) wins when explicitly set.
+        if self.max_completion_tokens is not None:
+            self.max_tokens = self.max_completion_tokens
+        return self
 
 
 def _now() -> int:

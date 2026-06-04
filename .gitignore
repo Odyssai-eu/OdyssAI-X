@@ -42,3 +42,6 @@ scripts/odysseus.db-*
 # OR uses the documented hot-patch flow in INSTALL-CLUSTER.md / DEPLOY.md).
 # Kept on disk for the maintainer; not tracked.
 scripts/deploy.sh
+
+# graphify knowledge graph artifacts (regenerated locally)
+graphify-out/
