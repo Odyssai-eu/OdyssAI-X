@@ -687,6 +687,93 @@ async def batch_get_model_sizes(ssh: str, paths: list[str]) -> dict[str, int]:
     return result
 
 
+# Mirror of the tensor-parallel ShardingStrategy dispatch in auto_parallel.py
+# (the isinstance() chain — search "tensor_parallel_sharding_strategy ="). The
+# orchestrator can't import auto_parallel (heavy mlx_lm imports, not present in
+# this container), so the list is duplicated here. Any model_type NOT in this
+# set is pipeline-only for multi-node (e.g. hy_v3). When a ShardingStrategy
+# branch is added in auto_parallel.py, add its model_type string here too.
+TENSOR_CAPABLE_MODEL_TYPES = frozenset({
+    "llama", "ministral3",
+    "deepseek_v3", "deepseek_v32", "kimi_k25", "deepseek_v4",
+    "minimax", "glm4_moe", "glm4_moe_lite",
+    "qwen3", "qwen3_moe", "qwen3_next", "qwen3_5", "qwen3_5_moe", "qwen3_vl",
+    "gpt_oss", "step3p5", "nemotron_h", "gemma4",
+})
+
+
+def _resolve_model_abspath(model: str, base_dir: str) -> str:
+    """Resolve a model id to an absolute path on the node. A leading '/' is
+    taken as-is; otherwise it's joined under the cluster's models_dir. Without
+    this, du/cat on a relative model id runs in the SSH home dir and silently
+    returns nothing — which made the RAM preflight degrade to 'size unknown,
+    proceed' (the guard was effectively a no-op for the normal relative-id
+    case)."""
+    if model.startswith("/"):
+        return model
+    return f"{base_dir.rstrip('/')}/{model}"
+
+
+async def get_model_arch_meta(ssh: str, abspath: str) -> dict:
+    """SSH to a node and read the model's config.json. Returns
+    {model_type, num_hidden_layers, num_key_value_heads} (None when absent).
+    Used to decide mode validity (tensor vs pipeline) WITHOUT loading the model.
+    Cascades into text_config/language_model like runner.py does for the
+    multimodal nests."""
+    miss = {"model_type": None, "num_hidden_layers": None, "num_key_value_heads": None}
+    cmd = f"cat {shlex.quote(abspath.rstrip('/') + '/config.json')} 2>/dev/null"
+    try:
+        out = await asyncio.to_thread(
+            subprocess.run,
+            ["ssh", "-o", "ConnectTimeout=5", "-o", "BatchMode=yes", ssh, cmd],
+            capture_output=True, text=True, timeout=15,
+        )
+        cfg = json.loads(out.stdout or "{}")
+    except Exception:
+        return miss
+    if not isinstance(cfg, dict):
+        return miss
+
+    def _nested(key):
+        return (
+            cfg.get(key)
+            or cfg.get("text_config", {}).get(key)
+            or cfg.get("language_model", {}).get(key)
+            or (cfg.get("text_config", {}).get("language_model", {}) or {}).get(key)
+        )
+    return {
+        "model_type": cfg.get("model_type"),
+        "num_hidden_layers": _nested("num_hidden_layers"),
+        "num_key_value_heads": _nested("num_key_value_heads"),
+    }
+
+
+def _validate_load_mode(model_type, num_layers, num_kv_heads,
+                        nodes_count: int, mode: str) -> tuple[bool, str]:
+    """Is (mode, nodes_count) valid for this model's ARCHITECTURE? Independent
+    of RAM — that's `_validate_load_fits`. Single-node is always mode-valid.
+
+      - pipeline : needs num_hidden_layers >= nodes_count (one stage per node).
+      - tensor   : needs the model_type to have a ShardingStrategy AND
+                   num_key_value_heads divisible by nodes_count.
+
+    Unknown metadata degrades to permissive (returns ok) so a config we can't
+    read never hard-blocks a load — the runtime remains the final arbiter."""
+    if nodes_count <= 1:
+        return True, ""
+    if mode == "pipeline":
+        if num_layers and num_layers < nodes_count:
+            return False, f"pipeline impossible : {num_layers} layers < {nodes_count} nodes"
+        return True, ""
+    if mode == "tensor":
+        if model_type and model_type not in TENSOR_CAPABLE_MODEL_TYPES:
+            return False, f"{model_type} n'a pas de stratégie tensor (pipeline only)"
+        if num_kv_heads and num_kv_heads % nodes_count != 0:
+            return False, f"KV-heads {num_kv_heads} non divisible par {nodes_count}"
+        return True, ""
+    return False, f"mode inconnu : {mode}"
+
+
 def _model_load_overhead_factor() -> float:
     """Multiplier applied to model size to estimate the RAM footprint during
     load. Accounts for: (1) the safetensors mmap'd alongside actually-used
@@ -8128,6 +8215,71 @@ class ArgoLoadRequest(BaseModel):
     node_indices: Optional[list[int]] = None
 
 
+@app.get("/admin/clusters/{cluster_id}/load-options")
+async def admin_cluster_load_options(cluster_id: str, model: str):
+    """Enumerate the VALID (nodes, mode) configurations for `model` on this
+    cluster — the data that lets the UI propose configs ("1", "1+2 pipeline",
+    "1+2+3 tensor", …) instead of a blind node-count picker.
+
+    For each node-count N (1..max), and each applicable mode, returns whether it
+    `fits` (RAM via _validate_load_fits AND mode-validity via _validate_load_mode)
+    plus a human reason when it doesn't. Infeasible options are INCLUDED (with
+    fits:false + reason) so the UI can grey them out rather than hide them."""
+    if not cluster_exists(cluster_id):
+        raise HTTPException(404, f"unknown cluster {cluster_id}")
+    cd = get_cluster_def(cluster_id)
+    if cd.get("kind") == "telemak":
+        # Single-node http-proxy: no node selection.
+        return {"data": [{"label": "1", "nodes": [0], "mode": "solo",
+                          "fits": True, "reason": ""}], "model_meta": {}}
+    cluster_max = len(cd.get("nodes", []))
+    effective_max = min(get_cluster_max_nodes(cluster_id, default=cluster_max), cluster_max)
+
+    # Read model size + arch once, from node index 0 (rank 0 of the full range).
+    topo = build_topology_from_indices(cluster_id, list(range(max(effective_max, 1))))
+    rank0_ssh = topo[0]["ssh"]
+    base_dir = topo[0].get("models_dir") or models_dir_for(cluster_id)
+    model_abspath = _resolve_model_abspath(model, base_dir)
+    arch = await get_model_arch_meta(rank0_ssh, model_abspath)
+    size_bytes = await get_model_size_bytes(rank0_ssh, model_abspath)
+    mt = arch.get("model_type")
+    layers = arch.get("num_hidden_layers")
+    kv = arch.get("num_key_value_heads")
+
+    options = []
+    for n in range(1, effective_max + 1):
+        label_nodes = "+".join(str(i + 1) for i in range(n))
+        fit_ok, fit_reason, fit_detail = _validate_load_fits(size_bytes, cluster_id, n)
+        modes = ["solo"] if n == 1 else ["pipeline", "tensor"]
+        for mode in modes:
+            # solo reuses the pipeline arch-validity (always ok for n==1).
+            mode_ok, mode_reason = _validate_load_mode(
+                mt, layers, kv, n, "pipeline" if mode == "solo" else mode)
+            fits = bool(fit_ok and mode_ok)
+            reason = mode_reason or ("" if fit_ok else fit_reason)
+            options.append({
+                "label": label_nodes if mode == "solo" else f"{label_nodes} {mode}",
+                "nodes": list(range(n)),
+                "nodes_count": n,
+                "mode": mode,
+                "fits": fits,
+                "reason": reason,
+                "fit_detail": fit_detail,
+            })
+    return {
+        "data": options,
+        "model_meta": {
+            "model": model,
+            "model_type": mt,
+            "num_hidden_layers": layers,
+            "num_key_value_heads": kv,
+            "size_bytes": size_bytes,
+            "size_gb": round(size_bytes / 1024**3, 1) if size_bytes else None,
+            "tensor_capable": (mt in TENSOR_CAPABLE_MODEL_TYPES) if mt else None,
+        },
+    }
+
+
 @app.post("/admin/clusters/{cluster_id}/load")
 async def admin_cluster_load(cluster_id: str, req: ArgoLoadRequest):
     if not cluster_exists(cluster_id):
@@ -8231,7 +8383,31 @@ async def admin_cluster_load(cluster_id: str, req: ArgoLoadRequest):
 
     topo = build_topology_from_indices(cluster_id, node_indices)
     rank0_ssh = topo[0]["ssh"]
-    size_bytes = await get_model_size_bytes(rank0_ssh, req.model)
+    # Resolve to an absolute path before sizing/reading config — a relative
+    # model id would run du/cat in the SSH home dir and silently return nothing,
+    # turning the RAM preflight into a no-op (see _resolve_model_abspath).
+    base_dir = topo[0].get("models_dir") or models_dir_for(cluster_id)
+    model_abspath = _resolve_model_abspath(req.model, base_dir)
+
+    # Mode/architecture preflight: reject combinations the model can't do
+    # (tensor on a pipeline-only model_type, KV-heads not divisible by N,
+    # pipeline with more nodes than layers) BEFORE spawning runners that would
+    # just die at the barrier. Independent of the RAM check below.
+    arch = await get_model_arch_meta(rank0_ssh, model_abspath)
+    mode_ok, mode_reason = _validate_load_mode(
+        arch.get("model_type"), arch.get("num_hidden_layers"),
+        arch.get("num_key_value_heads"), nodes_count, req.mode,
+    )
+    if not mode_ok and not getattr(req, "force", False):
+        raise HTTPException(400, {
+            "error": "invalid_mode_for_model",
+            "message": mode_reason,
+            "detail": {"mode": req.mode, "nodes": nodes_count, **arch},
+            "hint": "Pick a valid (nodes, mode) combo — see GET "
+                    f"/admin/clusters/{cluster_id}/load-options?model={req.model}",
+        })
+
+    size_bytes = await get_model_size_bytes(rank0_ssh, model_abspath)
     ok, reason, detail = _validate_load_fits(size_bytes, cluster_id, nodes_count)
     if not ok and not getattr(req, "force", False):
         raise HTTPException(400, {

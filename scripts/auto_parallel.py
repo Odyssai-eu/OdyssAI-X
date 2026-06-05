@@ -83,6 +83,15 @@ if TYPE_CHECKING:
     from mlx_lm.models.cache import Cache
 
 
+# NOTE: the set of model_types that have a tensor-parallel ShardingStrategy
+# (the isinstance() dispatch below — search "tensor_parallel_sharding_strategy =")
+# is mirrored in the orchestrator as `TENSOR_CAPABLE_MODEL_TYPES` in api.py.
+# auto_parallel runs on the compute nodes (heavy mlx_lm imports); api.py runs in
+# the orchestrator container (no mlx). They can't share a module without dual
+# deploy, so the list is duplicated there. When you add a ShardingStrategy branch
+# here, add its model_type string to TENSOR_CAPABLE_MODEL_TYPES in api.py too.
+
+
 _pending_prefill_sends: list[tuple[mx.array, int, mx.distributed.Group]] = []
 
 

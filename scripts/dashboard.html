@@ -961,6 +961,7 @@ const state = {
   cluster_status: {},        // {[id]: GET /admin/clusters/{id}/status payload}
   cluster_models: {},        // {[id]: GET /admin/clusters/{id}/models data}
   cluster_models_dir: {},    // {[id]: models_dir string}
+  load_options: {},          // {[`${cluster}::${model}`]: GET /load-options resp}
   // Convenience alias for the currently-selected cluster's status — kept
   // for back-compat with the many render functions that read state.default.
   // Updated each refresh; do not write here directly.
@@ -4378,6 +4379,10 @@ function renderLoadConfig(a) {
   const dir = state.default_models_dir;
   const models = state.default_models;
   const selectedModel = f.default_model || (models[0] && models[0].id) || "";
+  // Kick off the authoritative load-options fetch (real arch + tensor
+  // capability). Fire-and-forget: cached after first call, re-renders on
+  // arrival so the pills upgrade from heuristic to truth.
+  fetchLoadOptions(state.selected_cluster, selectedModel);
   // Resolve the node count to display. When the user hasn't explicitly
   // picked one, default to the smallest topology that fits the selected
   // model. Falls back to 3 only if we don't yet have capacity data — then
@@ -4605,7 +4610,48 @@ function isLoadConfigChanged(a, f) {
 
 // Compute per-mode verdict from model name + node count.
 // Heuristics: hy_v3 → tensor unsupported. Qwen3/GLM4-MoE family → KV heads typically 8.
+// Fetch the authoritative load-options (real config.json arch + tensor
+// capability) for a (cluster, model) and cache it. Re-renders on arrival so the
+// node/mode pills upgrade from heuristic to truth. Best-effort: a failure just
+// leaves modeVerdicts on its name-based fallback.
+async function fetchLoadOptions(cluster, model) {
+  if (!cluster || !model) return;
+  const key = `${cluster}::${model}`;
+  if (state.load_options[key]) return;  // cached
+  state.load_options[key] = { _loading: true };
+  try {
+    const resp = await getJson(
+      `/admin/clusters/${encodeURIComponent(cluster)}/load-options?model=${encodeURIComponent(model)}`
+    );
+    state.load_options[key] = resp || {};
+  } catch {
+    state.load_options[key] = {};  // give up; fallback heuristic stays
+  }
+  render();
+}
+
 function modeVerdicts(modelName, nodes) {
+  // Authoritative path: when /load-options has been fetched for the current
+  // selection, derive mode validity from the model's REAL config.json arch
+  // (num_key_value_heads, num_hidden_layers) + the backend's tensor-capability
+  // — never name regex. The fallback below only runs while that's in flight.
+  const cluster = state.selected_cluster;
+  const sel = state.pending_form?.default_model;
+  const mm = sel ? state.load_options?.[`${cluster}::${sel}`]?.model_meta : null;
+  if (mm && mm.model_type) {
+    const kv = mm.num_key_value_heads;
+    const layers = mm.num_hidden_layers;
+    const tensorOk = !!mm.tensor_capable && (!kv || kv % nodes === 0);
+    const tensorReason = !mm.tensor_capable
+      ? `${mm.model_type} not in auto_parallel`
+      : (kv && kv % nodes !== 0 ? `KV heads ${kv} ÷ ${nodes} ≠ int` : "");
+    const pipeOk = !layers || layers >= nodes;
+    return {
+      pipeline: { ok: pipeOk, reason: pipeOk ? "" : `${layers} layers < ${nodes} nodes` },
+      tensor:   { ok: tensorOk, reason: tensorReason },
+    };
+  }
+  // Fallback heuristic (name-based) — used only until /load-options lands.
   const name = (modelName || "").toLowerCase();
   const isHy3 = /hy[_-]?v?3|hy3-preview/i.test(name);
   const isQwen3 = /qwen3/i.test(name);
@@ -6181,6 +6227,8 @@ async function handleAct(e) {
   if (act === "form-default-model"){
     // Both `change` and `input` fire on <select>; either gives us el.value.
     f.default_model = el.value;
+    // Pull the authoritative load-options for the newly-picked model.
+    fetchLoadOptions(state.selected_cluster, f.default_model);
     // Snap nodes to the smallest topology that fits the new model, but
     // only when the user hadn't manually overridden it (or when their
     // override won't fit anymore). Saves them from picking nodes=3 for
