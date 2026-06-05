@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
 <meta charset="utf-8" />
-<title>Odysseus — odyssai.eu</title>
+<title>OdyssAI-X — odyssai.eu</title>
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <link rel="icon" type="image/png" href="/odysseus.png" />
 <link rel="preconnect" href="https://fonts.googleapis.com">
@@ -1065,7 +1065,7 @@ function showAuthOverlay(msg) {
     <div class="auth-backdrop"></div>
     <div class="auth-modal">
       <div class="auth-title">Admin token required</div>
-      <div class="auth-sub">Odysseus admin endpoints are protected. Paste the value of <span class="mono">ODYSSEUS_ADMIN_TOKEN</span> from the container env.</div>
+      <div class="auth-sub">OdyssAI-X admin endpoints are protected. Paste the value of <span class="mono">ODYSSEUS_ADMIN_TOKEN</span> from the container env.</div>
       ${msg ? `<div class="auth-err">${msg}</div>` : ''}
       <input id="auth-input" type="password" class="auth-input mono" placeholder="paste token…" autocomplete="off"/>
       <div class="auth-actions">
@@ -1802,7 +1802,7 @@ curl "${baseUrl}/chat/completions" \\
   -H "Content-Type: application/json" \\
   -d '{
     "model": "${model}",
-    "messages": [{"role": "user", "content": "Hello from Odysseus"}]
+    "messages": [{"role": "user", "content": "Hello from OdyssAI-X"}]
   }'`,
     };
   }
@@ -1813,9 +1813,9 @@ curl "${baseUrl}/chat/completions" \\
 `{
   "$schema": "https://opencode.ai/config.json",
   "provider": {
-    "odysseus": {
+    "odyssai-x": {
       "npm": "@ai-sdk/openai-compatible",
-      "name": "Odysseus",
+      "name": "OdyssAI-X",
       "options": {
         "baseURL": "${baseUrl}",
         "apiKey": "dummy"
@@ -1832,7 +1832,7 @@ curl "${baseUrl}/chat/completions" \\
   if (clientId === "continue") {
     return {
       body:
-`name: Odysseus
+`name: OdyssAI-X
 version: 1.0.0
 schema: v1
 models:
@@ -1851,7 +1851,7 @@ models:
   if (clientId === "anthropic") {
     return {
       body:
-`# Odysseus speaks the Anthropic Messages API (/v1/messages +
+`# OdyssAI-X speaks the Anthropic Messages API (/v1/messages +
 # /v1/messages/count_tokens), so Claude Code and the Anthropic SDK
 # both work. Point them at the base WITHOUT the /v1 suffix:
 export ANTHROPIC_BASE_URL="${baseUrlNoV1}"
@@ -1865,7 +1865,7 @@ curl "${baseUrlNoV1}/v1/messages" \\
   -d '{
     "model": "${model}",
     "max_tokens": 256,
-    "messages": [{"role": "user", "content": "Hello from Odysseus"}]
+    "messages": [{"role": "user", "content": "Hello from OdyssAI-X"}]
   }'`,
     };
   }
@@ -1967,7 +1967,7 @@ function renderSettingsEndpoints() {
 function renderSettingsAbout() {
   const v = state.version_info || {};
   const fields = [
-    ["Server", v.name || "Odysseus"],
+    ["Server", v.name || "OdyssAI-X"],
     ["Version", v.version || "—"],
     ["Python", v.python || "—"],
     ["mlx", v.mlx || "—"],
@@ -1978,7 +1978,7 @@ function renderSettingsAbout() {
     <div style="display:flex;flex-direction:column;gap:20px">
       <div style="background:var(--surface);border:1px solid var(--line);border-radius:12px;padding:24px;display:flex;flex-direction:column;gap:18px">
         <div style="display:flex;align-items:baseline;gap:14px">
-          <h2 style="margin:0;font-family:var(--font-display);font-size:28px;letter-spacing:-0.025em">Odysseus</h2>
+          <h2 style="margin:0;font-family:var(--font-display);font-size:28px;letter-spacing:-0.025em">OdyssAI-X</h2>
           <span class="mono" style="font-size:14px;color:var(--blue-deep);font-weight:600">v${escapeHtml(v.version || "—")}</span>
         </div>
         <div style="font-size:13px;color:var(--ink-2);line-height:1.6;max-width:560px">
@@ -2064,7 +2064,7 @@ function renderSettingsGeneral() {
       <div style="background:var(--surface);border:1px solid var(--line);border-radius:12px;padding:18px;display:flex;flex-direction:column;gap:14px">
         <div>
           <div class="field-label">Server</div>
-          <div style="font-size:12px;color:var(--ink-2);margin-top:2px">Process control. The container's restart policy brings Odysseus back up after exit.</div>
+          <div style="font-size:12px;color:var(--ink-2);margin-top:2px">Process control. The container's restart policy brings OdyssAI-X back up after exit.</div>
         </div>
         <div style="display:flex;gap:10px">
           <button class="btn btn-sm" style="color:var(--rust);border-color:var(--line)" data-act="server-restart">${Icon.refresh}<span>Restart server</span></button>
@@ -2268,7 +2268,7 @@ function renderTelemakEditorBody(id, draft, cfg, poolLoaded) {
         <input class="ce-input mono" data-act="cluster-edit-telemak-models-dir" data-cluster="${id}" value="${escapeHtml(draft.models_dir || "")}" placeholder="/Volumes/models/odysseus"/>
       </div>
       <div style="font-size:11px;color:var(--ink-2);background:var(--ink-soft,#f5f5f5);padding:10px 12px;border-radius:6px;margin-top:4px">
-        Telemak runs as a native Swift binary on a single Mac. Odysseus only proxies HTTP — no runner spawning, no pipeline/tensor parallel, no RDMA wiring.
+        Telemak runs as a native Swift binary on a single Mac. OdyssAI-X only proxies HTTP — no runner spawning, no pipeline/tensor parallel, no RDMA wiring.
         Use the Home tab to load a model on this cluster.
       </div>
     </div>
@@ -2495,7 +2495,7 @@ function renderSettingsProviders() {
       </div>
 
       ${providers.length === 0 && !draft ? `
-        <div class="empty-state">No cloud providers configured. Add one to expose OpenRouter / OpenAI / etc. through Odysseus.</div>
+        <div class="empty-state">No cloud providers configured. Add one to expose OpenRouter / OpenAI / etc. through OdyssAI-X.</div>
       ` : ""}
 
       <div style="display:flex;flex-direction:column;gap:14px">
@@ -2504,7 +2504,7 @@ function renderSettingsProviders() {
       </div>
 
       <div style="margin-top:8px;padding-top:14px;border-top:1px solid var(--line);font-size:11px;color:var(--ink-3);line-height:1.5">
-        Any OpenAI-compatible upstream — cloud (OpenRouter / OpenAI / Anthropic) or local LAN (vLLM, Ollama, LM Studio). Routed by Odysseus. API key optional for LAN. Toggle to disable without delete.
+        Any OpenAI-compatible upstream — cloud (OpenRouter / OpenAI / Anthropic) or local LAN (vLLM, Ollama, LM Studio). Routed by OdyssAI-X. API key optional for LAN. Toggle to disable without delete.
       </div>
     </div>
   `;
@@ -2739,7 +2739,7 @@ function renderSettingsCrew() {
 
       <div>
         <div class="field-label">Active companions</div>
-        <div style="font-size:12px;color:var(--ink-2);margin-top:2px;padding-bottom:14px">Clients paired with this Odysseus. They use a scoped <span class="mono">crew</span> token (chat only — no admin write).</div>
+        <div style="font-size:12px;color:var(--ink-2);margin-top:2px;padding-bottom:14px">Clients paired with this OdyssAI-X. They use a scoped <span class="mono">crew</span> token (chat only — no admin write).</div>
         ${crew.length === 0
           ? `<div class="empty-state">No companions paired yet. Enable discovery below to add one.</div>`
           : `<div style="display:flex;flex-direction:column;gap:10px">${crew.map(renderCrewRow).join("")}</div>`}
@@ -3253,7 +3253,7 @@ function renderHeader() {
       <div class="brand">
         <div class="brand-glyph"></div>
         <div class="brand-wordmark">
-          <div class="title">Odysseus</div>
+          <div class="title">OdyssAI-X</div>
           <div class="sub">odyssai.eu · distributed inference engine</div>
         </div>
       </div>
@@ -3695,7 +3695,7 @@ function renderTelemakLoadConfig(cid, modelsLoaded) {
           <div class="section-sub">Swap to a different model</div>
         </div>
         <!-- "Manage models →" intentionally absent on Telemak screens.
-             The Models tab targets Odysseus-managed pools (load/unload
+             The Models tab targets OdyssAI-X-managed pools (load/unload
              planning, capacity-aware multi-pool routing) — none of that
              applies here. Telemak owns its model lifecycle itself; the
              "Load configuration" block above is the operator surface
@@ -5161,7 +5161,7 @@ function renderFooter() {
         <span class="sep"> · </span>
         <span class="italic">Mobilis in Mobile</span>
       </div>
-      <div>Odysseus · odyssai.eu</div>
+      <div>OdyssAI-X · odyssai.eu</div>
     </div>
   `;
 }
@@ -5838,7 +5838,7 @@ async function handleAct(e) {
     return;
   }
   if (act === "server-restart") {
-    if (!confirm("Restart Odysseus server? Active streams will drop. Container restart policy brings it back in ~5s.")) return;
+    if (!confirm("Restart OdyssAI-X server? Active streams will drop. Container restart policy brings it back in ~5s.")) return;
     try {
       const r = await fetch("/admin/restart", {
         method: "POST",
