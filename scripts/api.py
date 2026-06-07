@@ -1228,6 +1228,27 @@ def remote_cmd(node: dict, nodes: list[dict], model: str, mode: str, port: int,
 # rank-0 (the sole event producer) is still alive. Long enough not to trip on a
 # slow multi-node prefill, short enough to fail a dead runner promptly (#21).
 _GEN_IDLE_TIMEOUT_S = float(os.environ.get("ODYSSEUS_GEN_IDLE_TIMEOUT_S", "120"))
+# No-progress watchdog (2026-06-07). `_rank0_alive()` only polls the LOCAL ssh
+# client, which stays connected (ServerAliveInterval=10) even when the remote
+# runner is wedged in an MLX/JACCL collective emitting zero tokens — that hung a
+# request silently for ~5h. These cap the wall-clock with NO `token` progress,
+# separately for the (necessarily silent) prefill phase and the inter-token
+# decode phase. Generous prefill budget: a healthy 19k-token prefill cost ~150s
+# in prod and declared contexts reach 1M tokens, so we only abort well beyond
+# the legitimate window. Both env-overridable.
+_GEN_PREFILL_DEADLINE_S = float(os.environ.get("ODYSSEUS_GEN_PREFILL_DEADLINE_S", "600"))
+_GEN_DECODE_DEADLINE_S = float(os.environ.get("ODYSSEUS_GEN_DECODE_DEADLINE_S", "90"))
+# Conservative floor prefill throughput (tok/s) used to scale the prefill
+# deadline by estimated prompt size: a 1M-token context legitimately prefills
+# for minutes, so a flat 600s would false-positive on it. prefill_deadline =
+# max(_GEN_PREFILL_DEADLINE_S, est_prompt_tokens / _MIN_PREFILL_TPS).
+_MIN_PREFILL_TPS = max(1.0, float(os.environ.get("ODYSSEUS_MIN_PREFILL_TPS", "20")))
+
+# At most one watchdog-triggered recovery ladder per cluster in flight: multiple
+# wedged in-flight requests would otherwise each spawn a duplicate _cluster_reset
+# (which cancels runs and may clear the degraded flag mid-recovery). Also holds a
+# strong ref so the detached task isn't GC'd (asyncio keeps only weak refs).
+_WATCHDOG_RECOVERY_BY_CLUSTER: dict = {}
 
 
 class RunnerProc:
@@ -1892,16 +1913,80 @@ class RunnerPool:
             # request forever. If nothing arrives within the idle window AND the
             # producer (rank 0) is gone, surface an error instead of blocking on
             # a queue nobody will ever feed (#21).
+            #
+            # No-progress watchdog: `_rank0_alive()` only proves the local ssh
+            # client is up, NOT that the remote runner is making progress — a
+            # runner wedged in an MLX/JACCL collective keeps ssh connected while
+            # emitting zero tokens (the ~5h silent hang of 2026-06-07). So we
+            # also bound the wall-clock with no `token` progress and, on breach,
+            # mark the pool+cluster degraded, best-effort cancel, fire the
+            # recovery ladder, and fail the request. `token` is the only
+            # real-progress event (runner emits no heartbeat), so it is the only
+            # thing that resets the deadline.
+            # Prompt-size-aware prefill budget: a 1M-token context legitimately
+            # prefills for minutes, so scale the prefill deadline by an estimated
+            # prompt size at a conservative floor throughput — only a TRUE hang
+            # exceeds it. Decode, once started, gets the tight _GEN_DECODE budget.
+            _est_prompt_toks = (
+                len(prompt or "")
+                + sum(len(str(m.get("content", ""))) for m in (messages or []))
+            ) / 4.0
+            prefill_deadline = max(_GEN_PREFILL_DEADLINE_S, _est_prompt_toks / _MIN_PREFILL_TPS)
+            last_progress = time.monotonic()
+            seen_token = False
             while True:
+                deadline = _GEN_DECODE_DEADLINE_S if seen_token else prefill_deadline
+                stalled = time.monotonic() - last_progress
+                # No-progress watchdog (checked every iteration, not only on
+                # timeout, so a stream of non-token events can't mask a wedge):
+                # ssh up (so _rank0_alive passes) but the remote runner is stuck
+                # emitting no tokens past the budget.
+                if stalled >= deadline and self._rank0_alive():
+                    phase = "decode" if seen_token else "prefill"
+                    # Mark degraded FIRST (refuses new loads 409 + flags this
+                    # pool), best-effort cancel, then fire the recovery ladder
+                    # DETACHED — it stops+sweeps this very pool, so it cannot be
+                    # awaited from inside this pool's own generator — and fail.
+                    self.degraded = True
+                    self.degraded_reason = "gen no-progress watchdog"
+                    self.degraded_at = time.time()
+                    _mark_cluster_degraded(
+                        self.cluster, "gen no-progress watchdog",
+                        {"phase": phase, "no_progress_s": round(stalled, 1),
+                         "request_id": req_id, "alias": self.alias},
+                    )
+                    try:
+                        await self.cancel(req_id)
+                    except Exception:
+                        pass
+                    # One recovery ladder per cluster at a time; concurrent
+                    # wedged requests just fail without spawning duplicates.
+                    if self.cluster not in _WATCHDOG_RECOVERY_BY_CLUSTER:
+                        _t = asyncio.create_task(_cluster_reset(self.cluster))
+                        _WATCHDOG_RECOVERY_BY_CLUSTER[self.cluster] = _t
+                        _t.add_done_callback(
+                            lambda _done, c=self.cluster: _WATCHDOG_RECOVERY_BY_CLUSTER.pop(c, None)
+                        )
+                    raise RuntimeError(
+                        f"runner wedged mid-generation: no token for "
+                        f"{stalled:.0f}s in {phase} phase — pool marked "
+                        f"degraded, recovery triggered"
+                    )
                 try:
-                    ev = await asyncio.wait_for(q.get(), timeout=_GEN_IDLE_TIMEOUT_S)
+                    # Wake at the deadline (so the check above fires promptly),
+                    # capped at the rank-0 liveness cadence.
+                    wait = min(_GEN_IDLE_TIMEOUT_S, max(0.5, deadline - stalled))
+                    ev = await asyncio.wait_for(q.get(), timeout=wait)
                 except asyncio.TimeoutError:
                     if not self._rank0_alive():
                         raise RuntimeError(
                             "runner died mid-generation "
                             "(no events and rank-0 process is gone)"
                         )
-                    continue  # still alive, just a quiet stretch — keep waiting
+                    continue  # loop top re-checks the no-progress deadline
+                if ev.get("event") == "token":
+                    last_progress = time.monotonic()
+                    seen_token = True
                 yield ev
                 if ev.get("event") == "done":
                     return
