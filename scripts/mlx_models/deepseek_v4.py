@@ -30,17 +30,19 @@
 # incremental-decode KV cache (full-recompute on decode). No custom Metal kernel;
 # dense-mask emulation throughout.
 #
-# REAL-MODEL STATUS (2026-06-07): the real 282GB DeepSeek-V4-Flash-8bit LOADS and runs
-# a CORRECT single-node forward (".../France is" -> " Paris", 2.6s). This module's
-# distributed pipeline path is also CORRECT — a tiny + a full-real-per-layer 6-layer
-# variant both run 3-node fine. The full 43-layer model DEADLOCKS distributed: a
-# full-scale MLX-distributed eval/collective scheduling issue (a rank's LOCAL mx.eval
-# couples to a pending collective on another rank → circular wait, only manifesting
-# when per-rank compute is slow enough). It is NOT a bug in this module — see
-# PLAN-REVIEW-LOG-dsv4.md "Distributed deadlock diagnosis". Two infra blockers remain
-# for distributed serving (V4-Pro, Odyssai-eu/OdyssAI-X#35): that deadlock + a
-# wired-memory leak on reload. The Hy3-pattern cache + the flat-3D HC activation here
-# are kept (correct + pipeline-friendly), but did not by themselves fix the deadlock.
+# REAL-MODEL STATUS (updated 2026-06-08 after empirical A/B on real V4-Flash 3-node):
+# the real 282GB DeepSeek-V4-Flash-8bit LOADS and runs a CORRECT single-node forward
+# (".../France is" -> " Paris", 2.6s). The earlier "MLX-distributed collective
+# deadlock" framing was a MISDIAGNOSIS — corrected here:
+#   (1) Q8 CACHE CRASH (THIS FIX): with kv_q8 (prod default), the Hy3 cache read hit
+#       QuantizedKVCache's tuple return -> rank 0 crashed mid-forward, surviving ranks
+#       busy-waited -> looked like a deadlock. Fixed below (dequantize-on-read).
+#   (2) rank-0 COMPUTE HANG = the wired-memory leak (blocker B): gone on clean memory.
+#   (3) RESIDUAL: on clean memory the LAST rank still wedges materializing its shard
+#       (some op) — under diagnosis (per-layer-eval trace), not yet root-caused.
+# Blocker B (wired leak survives process exit) is a macOS Metal-driver issue, not this
+# module; mitigated by reboot / load-once. See SESSION-2026-06-08 + PLAN-REVIEW-LOG-dsv4.md.
+# The Hy3-pattern cache + flat-3D HC activation are kept (correct + pipeline-friendly).
 
 import math
 from dataclasses import dataclass, field
@@ -354,7 +356,16 @@ class DeepseekV4FlashAttention(nn.Module):
             # mx.depends(cache.keys, send) retroactively couples downstream → the distributed
             # deadlock). Bonus: correct decode for contexts <= window (cached window covers
             # all real keys; the mask limits the active window to `self.window`).
-            kvf, _ = cache.update_and_fetch(kv[:, None, :, :], kv[:, None, :, :])  # [b,1,total,d]
+            kvf, _ = cache.update_and_fetch(kv[:, None, :, :], kv[:, None, :, :])  # [b,1,total,d] or quantized tuple
+            if isinstance(kvf, tuple):
+                # kv_q8: QuantizedKVCache.update_and_fetch returns (data, scales,
+                # biases) tuples, not arrays. Our Hy3-latent attention needs the
+                # dense array (it concatenates compressed KV + builds masks), so
+                # dequantize on read. Q8 is the prod default for big-MoE; this path
+                # is never hit single-node with a plain/None cache, which is why
+                # validation missed it and rank 0 crashed mid-forward distributed
+                # (TypeError: tuple indices ...), masquerading as a deadlock.
+                kvf = mx.dequantize(*kvf, group_size=cache.group_size, bits=cache.bits)
             kv = kvf[:, 0]                                                          # [b,total,d]
         n_real = kv.shape[1]                          # cached window length (= s at prefill)
         if self.compressor is not None:
