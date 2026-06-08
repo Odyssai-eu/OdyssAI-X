@@ -356,15 +356,17 @@ class DeepseekV4FlashAttention(nn.Module):
             # mx.depends(cache.keys, send) retroactively couples downstream → the distributed
             # deadlock). Bonus: correct decode for contexts <= window (cached window covers
             # all real keys; the mask limits the active window to `self.window`).
-            kvf, _ = cache.update_and_fetch(kv[:, None, :, :], kv[:, None, :, :])  # [b,1,total,d] or quantized tuple
-            if isinstance(kvf, tuple):
-                # kv_q8: QuantizedKVCache.update_and_fetch returns (data, scales,
-                # biases) tuples, not arrays. Our Hy3-latent attention needs the
-                # dense array (it concatenates compressed KV + builds masks), so
-                # dequantize on read. Q8 is the prod default for big-MoE; this path
-                # is never hit single-node with a plain/None cache, which is why
-                # validation missed it and rank 0 crashed mid-forward distributed
-                # (TypeError: tuple indices ...), masquerading as a deadlock.
+            kvf, _ = cache.update_and_fetch(kv[:, None, :, :], kv[:, None, :, :])  # [b,1,total,d] or quantized (data,scales,biases)
+            if isinstance(kvf, (tuple, list)):
+                # kv_q8: QuantizedKVCache.update_and_fetch returns the keys as a
+                # (data, scales, biases) triple — a TUPLE in isolation but a LIST
+                # once it has flowed through tree_map / mx.depends in the pipeline
+                # path (so we accept both). Our Hy3-latent attention needs the dense
+                # array (it concatenates compressed KV + builds masks), so dequantize
+                # on read. Q8 is the prod default for big-MoE; this path is never hit
+                # single-node with a plain/None cache, which is why validation missed
+                # it and ranks crashed mid-forward distributed (TypeError: tuple/list
+                # indices ...), masquerading as a deadlock.
                 kvf = mx.dequantize(*kvf, group_size=cache.group_size, bits=cache.bits)
             kv = kvf[:, 0]                                                          # [b,total,d]
         n_real = kv.shape[1]                          # cached window length (= s at prefill)
