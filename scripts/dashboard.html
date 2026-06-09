@@ -4794,6 +4794,11 @@ function renderHFDownload(clusterId) {
   const dls = state.downloads || [];
   const f = state.pending_form;
   const cluster = clusterId || state.selected_cluster;
+  // Remember which cluster this form was rendered for, so dl-start submits to
+  // the SAME cluster. The form opens from Settings (settings_selected_cluster)
+  // or the matrix view (cid) — neither is state.selected_cluster, which is what
+  // dl-start used to read, so the node selection never matched (#dashboard).
+  f.dl_cluster = cluster;
   // Multi-host pools use the targets picker; single-node pools (kind defaults
   // to mlx-distributed with one host) collapse to the first host automatically.
   const isArgo = (state.cluster_defs?.[cluster]?.nodes?.length || 1) > 1;
@@ -5853,7 +5858,7 @@ async function handleAct(e) {
     }
     return;
   }
-  if (act === "settings-pick-cluster") { state.settings_selected_cluster = v; render(); return; }
+  if (act === "settings-pick-cluster") { state.settings_selected_cluster = v; if (state.pending_form) state.pending_form.default_targets = {}; render(); return; }
   if (act === "settings-add-cluster") { toast("Add cluster — editor wiring next iteration", "err"); return; }
 
   // ── Add Telemak — register an http-proxy cluster from the dashboard ──
@@ -6591,7 +6596,10 @@ async function handleAct(e) {
   // sent so private/gated repos work.
   if (act === "dl-start") {
     if (!f.hf_repo || !f.hf_repo.includes("/")) { toast("repo must be org/name", "err"); return; }
-    const cluster = state.selected_cluster || "default";
+    // Use the cluster the form was actually rendered for (Settings / matrix
+    // view), NOT state.selected_cluster — that mismatch was the "Select at
+    // least one node" bug when the form cluster ≠ the main-view cluster.
+    const cluster = f.dl_cluster || state.selected_cluster || "default";
     const nodes = clusterTargetNodes(cluster);
     const tgtState = f.default_targets || {};
     const targets = nodes.filter(n => tgtState[n.host] === true).map(n => n.host);
