@@ -3027,12 +3027,16 @@ async def lifespan(app: FastAPI):
     # because it was kill -9'd or the node rebooted). Without this,
     # ghost runs sit in /admin/runs forever.
     cancel_task = asyncio.create_task(_cancelling_sweeper())
+    # #40 — JACCL stability loop: keepalive health (WU2) → controlled recovery
+    # (WU3), plus age-based preventive reload (WU1) for long-running jaccl pools.
+    jaccl_task = asyncio.create_task(_jaccl_stability_loop())
     try:
         yield
     finally:
         ttl_task.cancel()
         dead_task.cancel()
         cancel_task.cancel()
+        jaccl_task.cancel()
         # Await the cancelled sweepers before tearing pools down — otherwise a
         # sweeper mid-operation (e.g. holding a cluster admin lock) is abandoned
         # and the subsequent pool.stop() races its half-finished state (#24).
@@ -3138,6 +3142,194 @@ async def _pool_ttl_sweeper() -> None:
             return
         except Exception as e:
             sys.stderr.write(f"[ttl-sweeper] error: {e}\n")
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# #40 — JACCL stability: keepalive health (WU2) + preventive reload (WU1) +
+# controlled recovery (WU3). The ~45h crash is the UNCONTROLLED QPT_UC death;
+# this bounds its PROBABILITY (reset QPs before the window) and its BLAST RADIUS
+# (detect a dead/hung peer in minutes → recover automatically, vs a 187GB-wired
+# orphan sitting until a human notices). Tunables are env-overridable.
+# ──────────────────────────────────────────────────────────────────────────────
+_JACCL_STABILITY_ENABLED = os.environ.get("JACCL_STABILITY_ENABLED", "1") == "1"
+_JACCL_KEEPALIVE_INTERVAL_S = float(os.environ.get("JACCL_KEEPALIVE_INTERVAL_S", "90"))
+_JACCL_KEEPALIVE_TIMEOUT_S = float(os.environ.get("JACCL_KEEPALIVE_TIMEOUT_S", "20"))
+_JACCL_KEEPALIVE_FAIL_THRESHOLD = int(os.environ.get("JACCL_KEEPALIVE_FAIL_THRESHOLD", "2"))
+_JACCL_PREVENTIVE_RELOAD_AGE_S = float(
+    os.environ.get("JACCL_PREVENTIVE_RELOAD_AGE_S", str(30 * 3600)))
+# WU3 auto-recovery (reboot-all + reload on a keepalive-detected hang) is the
+# highest-stakes action — it reboots a prod cluster. Default OFF until the
+# recovery ladder is validated end-to-end on a real peer-death: when off, the
+# loop still DETECTS + logs the keepalive failure (the early-warning signal)
+# but takes no disruptive action. Flip JACCL_AUTO_RECOVERY_ENABLED=1 to arm it.
+_JACCL_AUTO_RECOVERY_ENABLED = os.environ.get("JACCL_AUTO_RECOVERY_ENABLED", "0") == "1"
+
+
+def _jaccl_log(cluster_id: str, text: str) -> None:
+    """Operator-visible line (dashboard runner-log panel) + stderr."""
+    line = f"[jaccl-stability] {text}"
+    try:
+        _push_log_line(cluster_id, 0, line)
+    except Exception:
+        pass
+    sys.stderr.write(line + "\n")
+
+
+def _pool_reload_request(pool: RunnerPool) -> ArgoLoadRequest:
+    """Snapshot EVERY live load param so a reload reproduces the exact pool, not
+    ArgoLoadRequest defaults (Codex #8). force=True skips the preflight size
+    check — the same model fit a moment ago."""
+    return ArgoLoadRequest(
+        model=pool.model, mode=pool.mode, use_ap=pool.use_ap,
+        nodes=pool.nodes_count, kv_q8=pool.kv_q8,
+        draft_model=pool.draft_model, num_draft_tokens=pool.num_draft_tokens,
+        force=True, alias=pool.alias, node_indices=pool.node_indices,
+    )
+
+
+async def _preventive_reload(cluster_id: str, pool: RunnerPool) -> None:
+    """WU1 — controlled unload+reload of ONE pool to reset its QPs before the
+    ~45h window. Reuses admin_cluster_load (stop-old-start-new for the same
+    alias) so registry/state/locks are handled and OTHER pools are untouched
+    (Codex #7). Caller holds the maintenance claim."""
+    req = _pool_reload_request(pool)
+    age_h = (time.time() - (pool.started_at or time.time())) / 3600.0
+    _jaccl_log(cluster_id, f"preventive reload {pool.alias} (age {age_h:.1f}h, "
+               f"model={pool.model}, nodes={pool.node_indices or pool.nodes_count})")
+    try:
+        res = await admin_cluster_load(cluster_id, req)
+        _jaccl_log(cluster_id, f"preventive reload done: loaded={res.get('loaded')} "
+                   f"load_s={res.get('load_s')}")
+    except Exception as e:
+        _jaccl_log(cluster_id, f"preventive reload FAILED: {e}")
+
+
+async def _wait_nodes_reachable(cluster_id: str, timeout_s: float = 360.0) -> bool:
+    """Poll SSH on every cluster host until all respond — needed after reboot-all,
+    which returns as soon as the reboots are ISSUED, not when the nodes are back."""
+    member_ids = _cluster_host_ids(cluster_id)
+    targets = [h.get("ssh") for h in (_resolve_host(hid) for hid in member_ids)
+               if h and h.get("ssh")]
+    if not targets:
+        return False
+    await asyncio.sleep(25)  # let the macs actually go down before polling
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        pings = await asyncio.gather(*[_ssh_ping(t) for t in targets])
+        if all(p.get("ok") for p in pings):
+            return True
+        await asyncio.sleep(10)
+    return False
+
+
+async def _keepalive_recovery_ladder(cluster_id: str, req: ArgoLoadRequest) -> None:
+    """WU3 — recovery for a keepalive-detected hang. The surviving ranks are
+    stuck in a C++ all_sum (dead UC peer, no timeout), so a graceful stop can't
+    clear the QPs — only a reboot does. Ladder: reboot-all → wait nodes up →
+    reload from the captured snapshot → clear degraded on success."""
+    try:
+        _jaccl_log(cluster_id, "recovery: reboot-all (hung QP, dead peer)")
+        await admin_cluster_reboot_all(cluster_id)
+    except Exception as e:
+        _jaccl_log(cluster_id, f"recovery reboot-all error: {e}")
+        return
+    if not await _wait_nodes_reachable(cluster_id):
+        _jaccl_log(cluster_id, "recovery: nodes did not return in time — left degraded")
+        return
+    try:
+        res = await admin_cluster_load(cluster_id, req)
+        _jaccl_log(cluster_id, f"recovery reload: loaded={res.get('loaded')} "
+                   f"load_s={res.get('load_s')}")
+        if res.get("loaded"):
+            _clear_cluster_degraded(cluster_id)
+    except Exception as e:
+        _jaccl_log(cluster_id, f"recovery reload error: {e}")
+
+
+def _fire_keepalive_recovery(cluster_id: str, pool: RunnerPool, res: dict) -> None:
+    """WU3 trigger — mark degraded and launch the recovery ladder, deduped per
+    cluster via the existing watchdog map. Snapshots the reload config BEFORE
+    the pool is torn down."""
+    if cluster_id in _WATCHDOG_RECOVERY_BY_CLUSTER:
+        return
+    if not _JACCL_AUTO_RECOVERY_ENABLED:
+        # Early-warning only: surface the failure loudly, take NO disruptive
+        # action (no degraded flag, no reboot) until the recovery ladder is
+        # validated and explicitly armed via JACCL_AUTO_RECOVERY_ENABLED=1.
+        _jaccl_log(cluster_id, f"keepalive FAILED threshold ({pool.alias}, "
+                   f"{pool.keepalive_fails} misses) — auto-recovery DISARMED, "
+                   f"reboot-all+reload would run if armed. Manual: POST "
+                   f"/admin/clusters/{cluster_id}/reset or reboot-all.")
+        return
+    pool.degraded = True
+    pool.degraded_reason = "keepalive timeout — peer unresponsive"
+    pool.degraded_at = time.time()
+    _mark_cluster_degraded(cluster_id, "keepalive timeout — peer unresponsive",
+                           {"alias": pool.alias, "fails": pool.keepalive_fails,
+                            "reason": res.get("reason"), "detail": res.get("error")})
+    req = _pool_reload_request(pool)
+    _jaccl_log(cluster_id, f"keepalive recovery FIRED ({pool.alias}): "
+               f"{pool.keepalive_fails} consecutive misses")
+    t = asyncio.create_task(_keepalive_recovery_ladder(cluster_id, req))
+    _WATCHDOG_RECOVERY_BY_CLUSTER[cluster_id] = t
+    t.add_done_callback(
+        lambda _d, c=cluster_id: _WATCHDOG_RECOVERY_BY_CLUSTER.pop(c, None))
+
+
+async def _jaccl_stability_loop() -> None:
+    """#40 — per-tick health for every loaded distributed (jaccl) pool:
+      WU1 preventive reload when age > threshold AND idle;
+      WU2 keepalive probe (idle only — else it queues behind a gen and could
+          time out on a healthy pool);
+      WU3 controlled recovery on KEEPALIVE_FAIL_THRESHOLD consecutive misses.
+    Skips pools already degraded or under recovery."""
+    if not _JACCL_STABILITY_ENABLED:
+        sys.stderr.write("[jaccl-stability] disabled via env\n")
+        return
+    while True:
+        try:
+            await asyncio.sleep(_JACCL_KEEPALIVE_INTERVAL_S)
+            for cluster_id, alias, pool in list_all_pools():
+                if getattr(pool, "backend", "jaccl") != "jaccl":
+                    continue
+                if pool.degraded or _cluster_is_degraded(cluster_id):
+                    continue
+                if cluster_id in _WATCHDOG_RECOVERY_BY_CLUSTER:
+                    continue
+                # WU1 — preventive reload (idle + old). Claim maintenance so no
+                # gen starts mid-reload; if busy, defer to a later tick.
+                age = time.time() - (pool.started_at or time.time())
+                if age >= _JACCL_PREVENTIVE_RELOAD_AGE_S:
+                    if pool._try_claim_maintenance():
+                        try:
+                            await _preventive_reload(cluster_id, pool)
+                        finally:
+                            pool._release_maintenance()
+                    continue  # reloaded (or busy) — skip keepalive this tick
+                # WU2 — keepalive probe, idle only.
+                if not pool._try_claim_maintenance():
+                    continue
+                try:
+                    res = await pool.keepalive(timeout_s=_JACCL_KEEPALIVE_TIMEOUT_S)
+                finally:
+                    pool._release_maintenance()
+                if res.get("ok"):
+                    if pool.keepalive_fails:
+                        _jaccl_log(cluster_id,
+                                   f"keepalive recovered ({alias}, rtt {res.get('rtt_ms')}ms)")
+                    pool.keepalive_fails = 0
+                else:
+                    pool.keepalive_fails += 1
+                    _jaccl_log(cluster_id,
+                        f"keepalive miss {pool.keepalive_fails}/"
+                        f"{_JACCL_KEEPALIVE_FAIL_THRESHOLD} ({alias}): "
+                        f"{res.get('reason')} {res.get('error')}")
+                    if pool.keepalive_fails >= _JACCL_KEEPALIVE_FAIL_THRESHOLD:
+                        _fire_keepalive_recovery(cluster_id, pool, res)  # WU3
+        except asyncio.CancelledError:
+            return
+        except Exception as e:
+            sys.stderr.write(f"[jaccl-stability] loop error: {e}\n")
 
 
 def _initial_config() -> Optional[dict]:
