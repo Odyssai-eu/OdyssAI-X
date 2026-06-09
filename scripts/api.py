@@ -1349,13 +1349,19 @@ class RunnerProc:
                 self.ready.set()
             self._on_event(ev)
 
-    def send(self, obj: dict):
+    def send(self, obj: dict) -> bool:
+        """Write a command to the runner's stdin. Returns True on success,
+        False if the pipe is closed/broken — the keepalive (#40) relies on this
+        to detect a PARTIAL broadcast (some ranks unreachable) and bail instead
+        of awaiting an ack that can never arrive. Existing callers ignore it."""
         if self.proc.stdin and not self.proc.stdin.closed:
             try:
                 self.proc.stdin.write(json.dumps(obj) + "\n")
                 self.proc.stdin.flush()
+                return True
             except (BrokenPipeError, OSError):
-                pass
+                return False
+        return False
 
     def graceful_stop(self, soft=10.0, term=10.0):
         try:
@@ -1633,6 +1639,26 @@ class RunnerPool:
         # `settings.pool_ttl_seconds_default` at start time.
         self.last_used_at: float = time.time()
         self.ttl_seconds: int = 0
+        # #40 foundation — pool-level busy/idle tracking + maintenance gate.
+        # `busy_count` counts in-flight distributed forwards (gen + prewarm)
+        # at the POOL level, so idle-gating works for EVERY protocol (OpenAI,
+        # Anthropic, …) — unlike `_active_runs`, which some routes skip.
+        # The keepalive (WU2) and preventive reload (WU1) only act when a pool
+        # is idle, and claim it via `_try_claim_maintenance()` so no forward can
+        # start mid-action. `_idle_gate` is SET when the pool is free to accept
+        # forwards, CLEARED while a maintenance action holds the pool.
+        self.busy_count: int = 0
+        self.maintenance: bool = False
+        self._idle_gate: asyncio.Event = asyncio.Event()
+        self._idle_gate.set()
+        # WU2/WU3 keepalive health: consecutive missed keepalives. Reset to 0 on
+        # any successful keepalive; WU3 fires controlled recovery at threshold.
+        self.keepalive_fails: int = 0
+        self.last_keepalive_ok_at: Optional[float] = None
+        # WU4 groundwork: which transport this pool actually initialised with.
+        # Defaults to the cluster backend; only jaccl pools have the QP bug, so
+        # the keepalive/preventive-reload machinery targets jaccl pools.
+        self.backend: str = "jaccl"
         # Degraded state — set when we detect a JACCL queue-pair death, a
         # rank that crashed mid-gen with a recognizable RDMA errno, or a
         # post-sweep wired-memory leak. Reloads that would reuse the
@@ -1864,6 +1890,38 @@ class RunnerPool:
                 return r.proc.poll() is None
         return False
 
+    def is_idle(self) -> bool:
+        """No in-flight distributed forwards and not already under maintenance."""
+        return self.busy_count == 0 and not self.maintenance
+
+    def _try_claim_maintenance(self) -> bool:
+        """Atomically claim the pool for a maintenance action (keepalive /
+        preventive reload) — returns True only if the pool was idle. Fully
+        synchronous (no await), so it can't interleave with submit's own
+        busy-claim. While held, `_idle_gate` is cleared so new forwards wait."""
+        if self.maintenance or self.busy_count > 0:
+            return False
+        self.maintenance = True
+        self._idle_gate.clear()
+        return True
+
+    def _release_maintenance(self) -> None:
+        self.maintenance = False
+        self._idle_gate.set()
+
+    async def _acquire_busy(self) -> None:
+        """Wait out any maintenance window, then atomically mark the pool busy.
+        The sync re-check after the gate await is what closes the race against a
+        maintenance claim that lands while we were parked on the gate."""
+        while True:
+            await self._idle_gate.wait()
+            if not self.maintenance:
+                self.busy_count += 1
+                return
+
+    def _release_busy(self) -> None:
+        self.busy_count = max(0, self.busy_count - 1)
+
     async def submit(self, prompt: Optional[str], max_tokens: int,
                      enable_thinking: Optional[bool],
                      messages: Optional[list[dict]] = None,
@@ -1902,6 +1960,10 @@ class RunnerPool:
             req["reasoning_effort"] = reasoning_effort
         if session_id:
             req["session_id"] = session_id
+        # #40: mark the pool busy (idle-gating for keepalive + preventive reload)
+        # only now that the request is fully built and about to broadcast, so a
+        # build-time error can't leak the counter. Released in the finally below.
+        await self._acquire_busy()
         try:
             # Tight broadcast window so concurrent submits don't interleave
             # bytes on the runner stdins.
@@ -1992,6 +2054,7 @@ class RunnerPool:
                     return
         finally:
             self._listeners.pop(req_id, None)
+            self._release_busy()
 
     async def cancel(self, request_id: str) -> int:
         """Broadcast a hard-cancel command for `request_id` to every rank.
@@ -2037,6 +2100,7 @@ class RunnerPool:
         req: dict = {"cmd": "prewarm", "id": req_id, "text": text}
         if kv_q8 is not None:
             req["kv_q8"] = bool(kv_q8)
+        await self._acquire_busy()
         try:
             async with self.broadcast_lock:
                 for r in self.runners:
@@ -2046,6 +2110,50 @@ class RunnerPool:
             except asyncio.TimeoutError:
                 return {"ok": False, "error": f"prewarm timeout after {timeout_s}s"}
             return {"ok": bool(ev.get("ok")), "result": ev.get("result")}
+        finally:
+            self._listeners.pop(req_id, None)
+            self._release_busy()
+
+    async def keepalive(self, timeout_s: float = 20.0) -> dict:
+        """WU2 — exercise the JACCL group with a tiny all_sum to (a) keep the
+        QPT_UC connections warm and (b) surface a dead/hung peer EARLY, while
+        the orchestrator can still drive a controlled recovery (vs the silent
+        ~45h crash that leaves a wired-memory orphan).
+
+        Caller MUST hold the maintenance claim (`_try_claim_maintenance`) so no
+        gen is queued ahead of (or behind) this collective — otherwise the
+        all_sum could sit behind a long gen and time out on a healthy pool.
+
+        Returns {ok, rtt_ms} or {ok: False, error, reason}. `reason` is:
+          - 'partial_broadcast' : the keepalive reached only some ranks → the
+            ones it reached will block in all_sum → treat as a peer failure.
+          - 'timeout'           : no rank-0 ack within timeout → peer hung/dead.
+        Single-node pools (size 1) short-circuit to ok (no group to probe)."""
+        if len(self.runners) <= 1:
+            return {"ok": True, "rtt_ms": 0.0, "reason": "single_node"}
+        req_id = uuid.uuid4().hex[:8]
+        q: asyncio.Queue = asyncio.Queue()
+        self._listeners[req_id] = q
+        req = {"cmd": "keepalive", "id": req_id}
+        t0 = time.monotonic()
+        try:
+            # Fail-fast broadcast: r.send swallows BrokenPipe and returns False
+            # on a dead stdin. A PARTIAL broadcast desyncs the collective (the
+            # ranks that got it block in all_sum), so we must NOT then await an
+            # ack that can't come — report partial_broadcast immediately.
+            async with self.broadcast_lock:
+                sent = sum(1 for r in self.runners if r.send(req))
+            if sent != len(self.runners):
+                return {"ok": False, "error": f"keepalive reached {sent}/{len(self.runners)} ranks",
+                        "reason": "partial_broadcast"}
+            try:
+                ev = await asyncio.wait_for(q.get(), timeout=timeout_s)
+            except asyncio.TimeoutError:
+                return {"ok": False, "error": f"keepalive timeout after {timeout_s}s",
+                        "reason": "timeout"}
+            rtt_ms = (time.monotonic() - t0) * 1000.0
+            self.last_keepalive_ok_at = time.time()
+            return {"ok": bool(ev.get("ok", True)), "rtt_ms": round(rtt_ms, 1)}
         finally:
             self._listeners.pop(req_id, None)
 
@@ -9608,6 +9716,27 @@ async def admin_cluster_reset(cluster_id: str):
 @app.post("/admin/reset")
 async def admin_nautilus_reset():
     return await _cluster_reset("nautilus")
+
+
+@app.post("/admin/clusters/{cluster_id}/keepalive")
+async def admin_cluster_keepalive(cluster_id: str):
+    """#40 — manual JACCL keepalive probe. Exercises the group with a tiny
+    all_sum and reports rtt; this is the same RunnerPool.keepalive() the
+    background health loop (WU1–WU3) drives. Claims the pool's maintenance gate
+    so the probe can't race an in-flight generation."""
+    if not cluster_exists(cluster_id):
+        raise HTTPException(404, f"unknown cluster {cluster_id}")
+    pool = _pool_for_cluster_name(cluster_id)
+    if pool is None:
+        raise HTTPException(404, f"{cluster_id}: no pool loaded")
+    if not pool._try_claim_maintenance():
+        return {"cluster": cluster_id, "ok": False, "skipped": True,
+                "error": "pool busy (in-flight gen or maintenance)"}
+    try:
+        res = await pool.keepalive()
+    finally:
+        pool._release_maintenance()
+    return {"cluster": cluster_id, **res}
 
 
 # ──────────────────────────────────────────────────────────────────────────────

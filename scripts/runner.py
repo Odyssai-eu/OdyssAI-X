@@ -1614,7 +1614,8 @@ def main() -> None:
             f"speculative={draft_model is not None})")
         _run_legacy_main(model, tokenizer, repo, kv_q8_default, stop_requested,
                          rank, draft_model=draft_model,
-                         num_draft_tokens=num_draft_tokens, world_size=size)
+                         num_draft_tokens=num_draft_tokens, world_size=size,
+                         group=group)
 
     # Explicit teardown BEFORE the process exits. Two reasons:
     #   1. Drop every model reference so the weights are deallocated, then
@@ -1641,7 +1642,7 @@ def main() -> None:
 def _run_legacy_main(model, tokenizer, repo: str, kv_q8_default: bool,
                      stop_requested: dict, rank: int,
                      draft_model=None, num_draft_tokens: int = 4,
-                     world_size: int = 1) -> None:
+                     world_size: int = 1, group=None) -> None:
     # Expanded stop set. `stream_generate` already breaks on
     # tokenizer.eos_token_id, but chat-tuned models often emit a "next-turn"
     # marker first (GLM emits <|user|>, Qwen emits <|im_end|>, etc.). Without
@@ -1721,6 +1722,25 @@ def _run_legacy_main(model, tokenizer, repo: str, kv_q8_default: bool,
             if rank == 0:
                 emit(rank, {"event": "prewarm", "id": req.get("id", ""),
                             "ok": result is not None, "result": result})
+            continue
+        if cmd == "keepalive":
+            # #40 WU2 — all ranks exercise the JACCL group together (a tiny
+            # all_sum) to keep the QPT_UC connections warm and let the
+            # orchestrator detect a dead/hung peer early. Only rank 0 acks. A
+            # dead peer makes this all_sum hang (UC has no timeout) — that hang
+            # is exactly the signal the orchestrator's keepalive timeout catches.
+            if group is not None and world_size > 1:
+                try:
+                    _ka = mx.distributed.all_sum(mx.array([1.0]), group=group)
+                    mx.eval(_ka)
+                except Exception as e:
+                    log(f"keepalive all_sum error: {e}")
+                    if rank == 0:
+                        emit(rank, {"event": "keepalive_ok", "id": req.get("id", ""),
+                                    "ok": False, "error": str(e)})
+                    continue
+            if rank == 0:
+                emit(rank, {"event": "keepalive_ok", "id": req.get("id", ""), "ok": True})
             continue
         if cmd != "gen":
             log(f"unknown cmd: {cmd}")
