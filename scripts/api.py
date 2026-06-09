@@ -2167,8 +2167,17 @@ def load_cluster_state_v2(cluster_id: str) -> list[dict]:
     return []
 
 
-# Ring buffer of recent request metrics
+# Ring buffer of recent request metrics (global — feeds the cross-cluster
+# throughput stats). NOTE: a single high-volume cluster (e.g. the autocomplete
+# service on tele-fast) can fill all 50 slots in minutes, evicting every other
+# cluster's rows — which left "Recent activity" empty on every other Telemak
+# card (#32). The per-cluster buffers below are what the dashboard panel reads.
 _metrics: deque = deque(maxlen=50)
+
+# Per-cluster recent metrics so a chatty cluster can't crowd the others out of
+# the dashboard's "Recent activity" panel (#32). Keyed by cluster id, created
+# on demand in record_metric().
+_metrics_by_cluster: dict[str, deque] = {}
 
 # Runner stderr line buffers + SSE subscribers, per cluster. Each line is
 # {ts, cluster, rank, text}. Subscribers receive new lines via asyncio queues.
@@ -2250,7 +2259,7 @@ def record_metric(client: str, ntoks: int, elapsed_s: float, ttft_s: Optional[fl
                   tool_calls: int = 0,
                   session_kind: Optional[str] = None,
                   status: str = "completed") -> None:
-    _metrics.appendleft({
+    row = {
         "ts": time.time(),
         "client": client,
         "cluster": cluster,
@@ -2263,7 +2272,15 @@ def record_metric(client: str, ntoks: int, elapsed_s: float, ttft_s: Optional[fl
         "tool_calls": tool_calls,
         "session_kind": session_kind,
         "status": status,
-    })
+    }
+    _metrics.appendleft(row)
+    # Also retain per-cluster so the dashboard can show each cluster's own
+    # recent activity regardless of a noisy neighbour's volume (#32).
+    if cluster:
+        dq = _metrics_by_cluster.get(cluster)
+        if dq is None:
+            dq = _metrics_by_cluster[cluster] = deque(maxlen=100)
+        dq.appendleft(row)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -6705,16 +6722,37 @@ async def admin_sessions(cluster: Optional[str] = None):
 
 
 @app.get("/admin/metrics")
-async def admin_metrics(cluster: Optional[str] = None, limit: int = 50):
-    """Recent request metrics, optionally filtered by cluster ("nautilus" or "default").
+async def admin_metrics(cluster: Optional[str] = None, limit: int = 50,
+                        per_cluster: int = 20):
+    """Recent request metrics, optionally filtered by cluster.
+
+    Without a `cluster` filter the response is balanced PER cluster (up to
+    `per_cluster` rows each), not the global last-`limit`. This is the #32 fix:
+    a high-volume cluster (the autocomplete service) used to fill the global
+    50-slot ring buffer in minutes and crowd every other cluster out of the
+    dashboard's "Recent activity" panel.
 
     Each entry: ts, client, cluster, model, ntoks, elapsed_s, ttft_s, tps,
     prompt_chars, tool_calls, session_kind.
     """
-    rows = list(_metrics)
     if cluster:
-        rows = [r for r in rows if r.get("cluster") == cluster]
-    return {"data": rows[:limit], "filter": {"cluster": cluster, "limit": limit}}
+        dq = _metrics_by_cluster.get(cluster)
+        if dq is not None:
+            rows = list(dq)[:limit]
+        else:
+            # Cluster hasn't recorded since restart — fall back to the global
+            # buffer so the contract still returns whatever's there.
+            rows = [r for r in _metrics if r.get("cluster") == cluster][:limit]
+        return {"data": rows, "filter": {"cluster": cluster, "limit": limit}}
+    # No filter: take up to per_cluster from each cluster, merge, sort by ts —
+    # every cluster gets representation, none can monopolise the panel.
+    merged: list[dict] = []
+    for dq in _metrics_by_cluster.values():
+        merged.extend(list(dq)[:per_cluster])
+    merged.sort(key=lambda r: r.get("ts", 0), reverse=True)
+    rows = merged if merged else list(_metrics)
+    return {"data": rows, "filter": {"cluster": None, "limit": limit,
+                                     "per_cluster": per_cluster}}
 
 
 class HFDownloadRequest(BaseModel):
