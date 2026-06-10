@@ -67,7 +67,12 @@ ssh -o BatchMode=yes "$NODE" "
   set -e
   hostname
   uname -m | grep -q arm64 || { echo 'ERROR: not Apple Silicon (arm64)'; exit 1; }
-  python3.11 --version 2>/dev/null || python3 --version || { echo 'ERROR: Python 3.11+ required'; exit 1; }
+  # Non-interactive ssh misses /opt/homebrew/bin — extend PATH before probing.
+  # Fail FAST when python3.11 is absent: the system python3 (3.9) used to fall
+  # through silently, building a venv for which mlx>=0.30 has no wheels
+  # (cryptic 'No matching distribution for mlx==0.31.2' much later).
+  export PATH=\"/opt/homebrew/bin:/usr/local/bin:\$PATH\"
+  python3.11 --version 2>/dev/null || { echo 'ERROR: python3.11 not found — brew install python@3.11 (system python3 is too old for current mlx wheels)'; exit 1; }
   mkdir -p $REMOTE_DIR
   mkdir -p $MODELS_DIR
 "
@@ -93,8 +98,9 @@ echo "[3/4] Setting up Python venv on $NODE (pinned via requirements-node.txt)�
 ssh "$NODE" "
   set -e
   cd $REMOTE_DIR
+  export PATH=\"/opt/homebrew/bin:/usr/local/bin:\$PATH\"
   if [ ! -d .venv ]; then
-    python3.11 -m venv .venv 2>/dev/null || python3 -m venv .venv
+    python3.11 -m venv .venv
   fi
   ./.venv/bin/pip install --quiet --upgrade pip
   ./.venv/bin/pip install --quiet -r requirements-node.txt
