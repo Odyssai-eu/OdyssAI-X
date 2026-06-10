@@ -60,6 +60,16 @@ class ModelArgs(_bml.ModelArgs):
     num_kv_heads_for_linear_attn: Optional[int] = None
     linear_silu: bool = False
 
+    @classmethod
+    def from_dict(cls, params):
+        # A required-no-default parent field can't be re-defaulted in a
+        # dataclass subclass (ordering violation). Some conversions
+        # (inferencerlabs 3.7bit) omit norm_topk_prob — family convention
+        # (DeepSeek-style noaux_tc sigmoid routing) normalizes top-k probs.
+        params = dict(params)
+        params.setdefault("norm_topk_prob", True)
+        return super().from_dict(params)
+
 
 class MLAAttention(nn.Module):
     """DeepSeek-style MLA (q-lora + absorbed embed_q/unembed_out).
