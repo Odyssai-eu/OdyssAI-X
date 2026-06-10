@@ -7298,7 +7298,12 @@ async def _probe_host(host: dict) -> dict:
     # is treated as a model if it contains a `config.json` (HF/MLX convention);
     # otherwise we list ITS children one level deeper and emit names as
     # `org/model`. Top-level model folders (legacy layout) still work.
-    cmd = (
+    # The probe must NOT run in the node's login shell: zsh aborts the WHOLE
+    # command on an unmatched glob ("no matches found" — e.g. an org dir that
+    # exists but is still empty on a fresh node), so the node showed zero
+    # models despite having some. POSIX sh leaves unmatched globs literal and
+    # the [ -d ] guards filter them — wrap everything in /bin/sh -c.
+    inner = (
         f"if [ ! -d {shlex.quote(md)} ]; then echo ___NOMODELS___; exit 0; fi; "
         f"FREE=$(df -k {shlex.quote(md)} | awk 'NR==2 {{print $4}}'); "
         f"echo \"___FREE___$FREE\"; "
@@ -7319,6 +7324,7 @@ async def _probe_host(host: dict) -> dict:
         f"  fi; "
         f"done"
     )
+    cmd = f"/bin/sh -c {shlex.quote(inner)}"
     try:
         rc, stdout, stderr = await asyncio.to_thread(_ssh_exec, ssh, cmd, 14)
         if rc != 0:
