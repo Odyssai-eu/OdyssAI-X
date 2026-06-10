@@ -41,7 +41,7 @@ LOCATION="odyssai"
 LOG="/var/log/eu.odyssai.rdma-onboard.log"
 
 EXIT_READY=0; EXIT_NEEDS_REBOOT=10; EXIT_NEEDS_APPLY=11
-EXPECT=0; CONSOLE=0; ALLOW_ACTIVE=0
+EXPECT=0; CONSOLE=0; ALLOW_ACTIVE=0; MIGRATE_EXO=0; EXO_LOCATION_CLEANUP=0
 CONVERGE_DEADLINE="${ODYSSAI_CONVERGE_DEADLINE:-120}"
 
 is_root() { [ "$(id -u)" -eq 0 ]; }
@@ -193,14 +193,31 @@ guard_not_ssh() {
   return 0
 }
 
+exo_present() {
+  [ -f /Library/LaunchDaemons/io.exo.networksetup.plist ] && return 0
+  launchctl print system/io.exo.networksetup >/dev/null 2>&1 && return 0
+  location_exists "exo" && return 0
+  ls "/Library/Application Support/EXO/"disable_bridge*.sh >/dev/null 2>&1 && return 0
+  return 1
+}
+
 guard_no_exo() {
-  local hits=""
-  [ -f /Library/LaunchDaemons/io.exo.networksetup.plist ] && hits="${hits} plist"
-  launchctl print system/io.exo.networksetup >/dev/null 2>&1 && hits="${hits} loaded-job"
-  location_exists "exo" && hits="${hits} location-exo"
-  ls "/Library/Application Support/EXO/"disable_bridge*.sh >/dev/null 2>&1 && hits="${hits} legacy-script"
-  [ -z "$hits" ] || die "exo network setup detected on this Mac (${hits# }). Two daemons would fight over the network location every ~30 min. Migrate first: sudo launchctl bootout system/io.exo.networksetup ; remove /Library/LaunchDaemons/io.exo.networksetup.plist and '/Library/Application Support/EXO' ; then re-run."
-  return 0
+  exo_present || return 0
+  if [ "$MIGRATE_EXO" = "1" ]; then
+    # User chose "replace": retire exo's network setup so the two daemons never
+    # fight over the location. exo's recipe and ours are functionally identical
+    # (ours is vendored from theirs) — the node keeps working through this.
+    log "migrating off exo (user choice): stopping io.exo.networksetup…"
+    launchctl bootout system/io.exo.networksetup 2>/dev/null || true
+    rm -f /Library/LaunchDaemons/io.exo.networksetup.plist
+    rm -rf "/Library/Application Support/EXO"
+    # The "exo" location may still be CURRENT; our recipe creates+switches to
+    # "odyssai" right after, then we drop the leftover location.
+    EXO_LOCATION_CLEANUP=1
+    log "exo daemon removed; its location will be dropped after the switch."
+    return 0
+  fi
+  die "exo network setup detected on this Mac. CHOICE REQUIRED: keep exo (abort — this Mac stays managed by exo) or replace it (re-run with --migrate-exo). Two daemons would fight over the network location every ~30 min, so silent coexistence is refused."
 }
 
 guard_mgmt_not_static() {
@@ -278,7 +295,11 @@ check() {
     exit "$EXIT_NEEDS_REBOOT"
   fi
 
-  log "needs_apply: node not provisioned (location='${loc}', daemon $(daemon_loaded && echo loaded || echo not-loaded))."
+  if exo_present; then
+    log "needs_apply (exo present): this Mac is managed by exo — the operator must choose: keep exo or replace it (--migrate-exo)."
+  else
+    log "needs_apply: node not provisioned (location='${loc}', daemon $(daemon_loaded && echo loaded || echo not-loaded))."
+  fi
   exit "$EXIT_NEEDS_APPLY"
 }
 
@@ -349,6 +370,11 @@ apply() {
   done
   [ "$ok" = "1" ] || die "management did not converge within ${CONVERGE_DEADLINE}s (location=$(current_location), en0=$(ipconfig getifaddr "$(mgmt_device)" 2>/dev/null || echo none)). State: applied-no-daemon."
   log "management converged: en0=$(ipconfig getifaddr "$(mgmt_device)" 2>/dev/null) location=$(current_location)"
+  if [ "$EXO_LOCATION_CLEANUP" = "1" ] && location_exists "exo"; then
+    networksetup -deletelocation "exo" >/dev/null 2>&1 \
+      && log "exo location dropped (migration complete)." \
+      || log "warn: could not drop the exo location — remove it manually later."
+  fi
   wifi_usable && log "Wi-Fi lifeline re-associated: $(ipconfig getifaddr "$(wifi_device)" 2>/dev/null)" \
               || log "note: Wi-Fi not (yet) re-associated — check Known Networks if you need the lifeline."
 
@@ -441,7 +467,7 @@ revert() {
   snapshot_json "post-revert"
 }
 
-usage() { echo "usage: $0 [--check | --apply --console [--expect N] [--allow-active-node] | --revert]" >&2; exit 2; }
+usage() { echo "usage: $0 [--check | --apply --console [--expect N] [--allow-active-node] [--migrate-exo] | --revert]" >&2; exit 2; }
 
 main() {
   local cmd="${1:-}"; [ -n "$cmd" ] || usage; shift || true
@@ -450,6 +476,7 @@ main() {
       --expect)            [ -n "${2:-}" ] || die "--expect needs a number"; case "$2" in *[!0-9]*) die "--expect must be numeric";; esac; EXPECT="$2"; shift 2 ;;
       --console)           CONSOLE=1; shift ;;
       --allow-active-node) ALLOW_ACTIVE=1; shift ;;
+      --migrate-exo)       MIGRATE_EXO=1; shift ;;
       *) usage ;;
     esac
   done
