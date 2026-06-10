@@ -1,0 +1,14 @@
+Odysseus (OdyssAI engine)
+Copyright 2026 OdyssAI (odyssai.eu)
+
+This product includes software developed by third parties:
+
+* scripts/odyssai-network-setup.sh (the Thunderbolt/RDMA network recipe, installed
+  on cluster nodes as the eu.odyssai.networksetup LaunchDaemon payload) is derived
+  from exo (https://github.com/exo-explore/exo),
+  Copyright 2025 Exo Technologies Ltd,
+  licensed under the Apache License, Version 2.0.
+  Source commit: 09f9ea313f72e261f40a94cea4c0e3681b31af23 (2026-06-03).
+  The file header carries a "MODIFIED" notice describing the changes.
+  scripts/rdma-onboard.sh (the guard driver around that recipe) credits the same
+  mechanism.
