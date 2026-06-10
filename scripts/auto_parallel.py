@@ -33,6 +33,14 @@ except ImportError:
     V4Attention = None    # type: ignore[assignment,misc]
     DeepseekV4Model = None  # type: ignore[assignment,misc]
     _HAS_DEEPSEEK_V4 = False
+try:
+    from mlx_lm.models.bailing_moe_linear import (
+        LanguageModel as BailingMoeLinearInnerModel,
+    )
+    _HAS_BAILING_MOE_LINEAR = True
+except ImportError:
+    BailingMoeLinearInnerModel = None  # type: ignore[assignment,misc]
+    _HAS_BAILING_MOE_LINEAR = False
 from mlx_lm.models.deepseek_v32 import DeepseekV32MLP
 from mlx_lm.models.deepseek_v32 import Model as DeepseekV32Model
 from mlx_lm.models.gemma4 import Model as Gemma4Model
@@ -378,6 +386,41 @@ def pipeline_auto_parallel(
                 ssm_idx=inner_model_instance.ssm_idx,
                 has_linear=bool(linear_layers),
             )
+
+    if _HAS_BAILING_MOE_LINEAR and isinstance(
+        inner_model_instance, BailingMoeLinearInnerModel
+    ):
+        # bailing_moe_linear (Ling/Ring hybrid family) hardcodes attn_idx =
+        # layer_group_size - 1 and gla_idx = 0 as GLOBAL layer indices
+        # (bailing_moe_linear.py:483-484); after slicing, cache[] is local so
+        # they must point at LOCAL layers of the right kind. A shard whose
+        # start is not a multiple of layer_group_size otherwise resolves
+        # cache[attn_idx] to a linear-attention ArraysCache and dies with
+        # "make_mask() got an unexpected keyword argument 'return_array'"
+        # (#43 — observed deterministically on ranks whose start % 8 == 4).
+        # DecoderLayer.is_global marks full-attention layers; attribute reads
+        # traverse the Pipeline{First,Last}Layer wrappers via CustomMlxLayer.
+        attn_layers = [
+            i for i, layer in enumerate(layers) if getattr(layer, "is_global", False)
+        ]
+        gla_layers = [
+            i
+            for i, layer in enumerate(layers)
+            if not getattr(layer, "is_global", True)
+        ]
+        if not attn_layers or not gla_layers:
+            # The model computes BOTH masks/offsets from one layer of each
+            # kind — a shard missing a kind cannot run. Fail loudly with the
+            # re-cut hint instead of producing garbage (shards >= group size
+            # always contain both kinds; only <8-layer shards can hit this).
+            missing = "full-attention" if not attn_layers else "linear-attention"
+            raise ValueError(
+                f"bailing_moe_linear pipeline shard [{start_layer},{end_layer}) "
+                f"contains no {missing} layer — re-cut the pipeline so every "
+                f"shard spans at least one full layer group (layer_group_size)."
+            )
+        inner_model_instance.attn_idx = attn_layers[0]
+        inner_model_instance.gla_idx = gla_layers[0]
 
     if isinstance(inner_model_instance, NemotronHInnerModel):
         # NemotronH uses block_type: "M" (Mamba/SSM), "*" (Attention), "E" (MoE), "-" (MLP)
