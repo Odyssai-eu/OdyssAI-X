@@ -387,8 +387,17 @@ def pipeline_auto_parallel(
                 has_linear=bool(linear_layers),
             )
 
-    if _HAS_BAILING_MOE_LINEAR and isinstance(
-        inner_model_instance, BailingMoeLinearInnerModel
+    # Duck-typed: matches mlx-lm's bailing_moe_linear.LanguageModel AND the
+    # vendored patches/bailing_hybrid_model.LanguageModel (and any future
+    # hybrid using the same attn_idx/gla_idx + per-layer is_global contract) —
+    # an isinstance on the stock class alone misses the vendored module.
+    if (
+        hasattr(inner_model_instance, "attn_idx")
+        and hasattr(inner_model_instance, "gla_idx")
+        and any(hasattr(l, "is_global") for l in layers)
+    ) or (
+        _HAS_BAILING_MOE_LINEAR
+        and isinstance(inner_model_instance, BailingMoeLinearInnerModel)
     ):
         # bailing_moe_linear (Ling/Ring hybrid family) hardcodes attn_idx =
         # layer_group_size - 1 and gla_idx = 0 as GLOBAL layer indices
