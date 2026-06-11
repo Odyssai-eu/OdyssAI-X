@@ -1857,20 +1857,26 @@ def _run_legacy_main(model, tokenizer, repo: str, kv_q8_default: bool,
             gen_kwargs["num_draft_tokens"] = num_draft_tokens
         cancelled_mid_gen = False
         for res in stream_generate(model, tokenizer, gen_input, **gen_kwargs):
+            tok_id = getattr(res, "token", None)
+            # Extra stop check, BEFORE emitting the token's text. Chat-tuned
+            # models emit a next-turn marker (<|im_end|>, <|role_end|>,
+            # <|user|>…) to end the assistant turn. When that marker IS the
+            # tokenizer's nominal eos (Qwen's <|im_end|>), stream_generate
+            # stops on its own and never yields the marker's text. When it is
+            # NOT (Ring-2.x: eos=<|endoftext|> but turns end on <|role_end|>),
+            # stream_generate yields the marker as normal text — so we must
+            # break BEFORE appending it, or it leaks into the completion
+            # (the "391<|role_end|>" bug). See _resolve_eos_token_seqs.
+            if isinstance(tok_id, int) and tok_id in _stop_ids:
+                break
             buf.append(res.text)
             full_text_parts.append(res.text)
-            tok_id = getattr(res, "token", None)
             if isinstance(tok_id, int):
                 gen_token_ids.append(tok_id)
             ntoks += 1
             if len(buf) >= emit_batch_n:
                 emit(rank, {"event": "token", "id": req_id, "text": "".join(buf)})
                 buf.clear()
-            # Extra stop check: GLM/Qwen/Llama/Gemma chat-tuned models emit a
-            # next-turn marker BEFORE the tokenizer's nominal eos. stream_generate
-            # doesn't know about those; we do (see _resolve_eos_token_seqs).
-            if isinstance(tok_id, int) and tok_id in _stop_ids:
-                break
             # Hard cancel: the reader thread set our req_id in _cancelled_ids
             # when /admin/runs/{id}/cancel propagated to us. Break out of
             # the generator so MLX stops computing and we surface a clean
