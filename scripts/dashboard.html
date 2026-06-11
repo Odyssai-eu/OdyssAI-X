@@ -299,6 +299,20 @@ h1, h2, h3 { margin: 0; }
 .led-bar .on-orange { background: #D47A2A; }
 .led-bar .on-red { background: var(--rust); }
 
+/* Global cluster-RAM bar — model footprint over total cluster RAM. Sits in
+   col-info, summing what the loaded model weighs across every node. Reuses
+   ledSegments() so the colour ramp matches the per-node bars exactly. */
+.global-ram { display: flex; flex-direction: column; gap: 11px; padding-top: 6px; margin-top: 2px; border-top: 1px solid var(--line-soft); }
+.global-ram .gr-row { display: flex; flex-direction: row; align-items: baseline; justify-content: space-between; gap: 12px; }
+.global-ram .gr-label { font-family: var(--font-display); font-size: 17px; font-weight: 700; color: var(--ink); letter-spacing: -0.01em; }
+.global-ram .gr-stack { display: flex; flex-direction: row; align-items: baseline; gap: 7px; }
+.global-ram .gr-pct { font-family: var(--font-display); font-size: 32px; font-weight: 700; color: var(--ink); letter-spacing: -0.02em; line-height: 1; }
+.global-ram .gr-pct.muted { color: var(--ink-3); }
+.global-ram .gr-pct-sm { font-size: 13px; font-weight: 600; color: var(--ink-2); }
+.global-ram .gr-gb { font-family: var(--font-mono); font-size: 12px; color: var(--ink-2); margin-left: 4px; }
+.global-ram .global-led { height: 12px; }
+.global-ram .global-led > div { height: 12px; border-radius: 3px; }
+
 /* Per-node diagnostic line: runner.py inventory + RDMA port states.
    Sits below the LED bar inside .node-row. Pills are compact, mono-font,
    colored by health. Orphan = red (zombie runner without a loaded pool). */
@@ -4021,6 +4035,7 @@ function renderStatusSplit(a, clusterId) {
         ${renderModelLine(a)}
         ${renderMetricsRow(a)}
         ${renderMetaRow(a)}
+        ${renderGlobalRam(a, clusterId)}
       </div>
       <div class="col-telemetry">
         ${renderTelemetryHead()}
@@ -4190,6 +4205,44 @@ function renderMetaRow(a) {
       <div class="item"><span class="cap">Draft</span><span class="val${a.draft_model?"":" muted"}">${a.draft_model ? escapeHtml(truncatePath(a.draft_model, 40)) : "none"}</span></div>
       <div class="sep"></div>
       <div class="item"><span class="cap">Sessions</span><span class="val">${(state.sessions||[]).length} active</span></div>
+    </div>
+  `;
+}
+
+// Global cluster-RAM bar — the model's footprint over the whole cluster's RAM.
+// The per-node bars to the right each show one machine's RAM; this aggregates
+// the loaded model against the summed RAM of every probed node (e.g. a 766 GB
+// checkpoint on 1536 GB of cluster RAM → 50%). Numerator prefers the model's
+// known size (matches the checkpoint exactly); falls back to summed runner RSS.
+function renderGlobalRam(a, clusterId) {
+  const tele = clusterTelemetry(clusterId);
+  if (!tele.length) return "";
+  const ramTotalB = tele.reduce((s, h) => s + (h.ram_total_bytes || 0), 0);
+  if (!ramTotalB) return "";
+  let modelB = 0;
+  if (a.loaded) {
+    const modelList = state.cluster_models?.[clusterId] || state.default_models || [];
+    const m = (modelList || []).find(x => x.id === a.model);
+    if (m && m.size_bytes) modelB = m.size_bytes;
+    if (!modelB) modelB = tele.reduce((s, h) =>
+      s + ((h.runner_procs && h.runner_procs[0] && h.runner_procs[0].rss_bytes) || 0), 0);
+  }
+  const pct = modelB ? Math.min(100, Math.round(modelB / ramTotalB * 100)) : 0;
+  const totalGb = gbBytes(ramTotalB);
+  const gbText = modelB
+    ? `${gbBytes(modelB).toFixed(0)}GB / ${totalGb.toFixed(0)}GB`
+    : `— / ${totalGb.toFixed(0)}GB`;
+  return `
+    <div class="global-ram">
+      <div class="gr-row">
+        <div class="gr-label">Global</div>
+        <div class="gr-stack">
+          <div class="gr-pct${modelB ? "" : " muted"}">${pct}</div>
+          <div class="gr-pct-sm">%</div>
+          <div class="gr-gb">${gbText}</div>
+        </div>
+      </div>
+      <div class="led-bar global-led">${ledSegments(pct)}</div>
     </div>
   `;
 }
