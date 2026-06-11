@@ -1,40 +1,54 @@
 #!/usr/bin/env python3
-"""ring26_convert_q6.py — conversion Ring-2.6-1T FP8 -> MLX Q6/g64, auditée.
+"""bailing_convert.py — conversion bailing_hybrid 1T (FP8 -> MLX), auditée.
 
-Seed du futur odyssai-convert (Odysseus#48, WU1+WU2). Tourne en local sur
-ultra-512. Leçons d'avril intégrées (#43) :
+Convertit la famille inclusionAI bailing_hybrid (Ring-2.5/2.6, Ling-2.6, …)
+depuis le FP8 compressed-tensors d'origine vers du MLX quantifié (Q6, Q8, …),
+en local sur ultra-512. Seed de odyssai-convert (Odysseus#48, WU1+WU2).
+
+Leçons d'avril intégrées (#43) :
   * décodage FP8 E4M3 + weight_scale par canal (LUT, jamais de cast naïf)
   * absorption kv_b_proj -> embed_q (transposé) / unembed_out — la transform
     validée par golden test torch-vs-mlx (0,2 %)
-  * drop des couches MTP (nextn, layers.80)
-  * AUDIT INLINE : à chaque couche, corrélation dequant(Q6) vs source — la
+  * drop des couches MTP (nextn, dernière couche)
+  * AUDIT INLINE : à chaque couche, corrélation dequant(quant) vs source — la
     conversion s'invalide d'elle-même sous le seuil
+  * dimensions LUES DU CONFIG (jamais hardcodées) — un modèle de la famille aux
+    dims légèrement différentes ne peut pas produire un garbage silencieux
   * manifest de provenance écrit dans la sortie
   * résumable : une couche déjà écrite est sautée
 
-Usage (sur .29):
-  ~/mlx-cluster/.venv/bin/python ring26_convert_q6.py \
-      /Volumes/models/mlx/safe/inclusionAI/Ring-2.6-1T \
-      /Volumes/models/odysseus/odyssai/Ring-2.6-1T-mlx-6bit
+Usage (sur .29) :
+  ~/mlx-cluster/.venv/bin/python bailing_convert.py SRC DST [--bits 6|8]
+
+  # Ling-2.6 en Q6 puis Q8
+  bailing_convert.py /Volumes/models/mlx/safe/inclusionAI/Ling-2.6-1T \
+      /Volumes/models/odysseus/odyssai/Ling-2.6-1T-mlx-6bit --bits 6
+  bailing_convert.py /Volumes/models/mlx/safe/inclusionAI/Ling-2.6-1T \
+      /Volumes/models/odysseus/odyssai/Ling-2.6-1T-mlx-8bit --bits 8
 """
 
 from __future__ import annotations
 
+import argparse
 import json
 import shutil
 import struct
-import sys
 import time
 from pathlib import Path
 
 import mlx.core as mx
 import numpy as np
 
+# Recette de quantification — posée par les arguments CLI dans main(), lue à
+# l'exécution partout ailleurs (les défauts de fonction sont None pour que la
+# mutation ici prenne effet — voir quantize_into).
 GS, BITS = 64, 6
 GATE_GS, GATE_BITS = 64, 8
-AUDIT_THRESHOLD = 0.985   # corr minimale dequant(Q6) vs source par tenseur audité
-H, NOPE, VDIM, LORA = 64, 128, 128, 512   # Ring-2.6-1T (mêmes dims que 2.5)
-N_LAYERS, N_EXPERTS, FIRST_DENSE = 80, 256, 4
+AUDIT_THRESHOLD = 0.985   # corr minimale dequant vs source par tenseur audité
+
+# Dimensions de l'archi — dérivées du config.json dans main(), jamais figées.
+H = NOPE = VDIM = LORA = 0
+N_LAYERS = N_EXPERTS = FIRST_DENSE = LGS = 0
 
 # ---------------------------------------------------------------- lecture src
 
@@ -130,10 +144,18 @@ def quantize_into(
     name: str,
     w32: np.ndarray,
     overrides: dict[str, dict],
-    gs: int = GS,
-    bits: int = BITS,
+    gs: int | None = None,
+    bits: int | None = None,
 ) -> tuple[np.ndarray, str]:
-    """Quantifie un poids 2D/3D ; retourne (dequant_np, nom) pour l'audit."""
+    """Quantifie un poids 2D/3D ; retourne (dequant_np, nom) pour l'audit.
+
+    gs/bits à None => recette par défaut courante (GS/BITS, mutés dans main).
+    Tout couple différent de la recette par défaut est listé en override dans
+    quantization_config (ex. le gate, gardé plus précis que le corps Q6)."""
+    if gs is None:
+        gs = GS
+    if bits is None:
+        bits = BITS
     w = mx.array(w32).astype(mx.bfloat16)
     qw, sc, bi = mx.quantize(w, group_size=gs, bits=bits)
     out[f"{name}.weight"] = qw
@@ -148,12 +170,45 @@ def quantize_into(
 
 
 def main() -> int:
-    src = Path(sys.argv[1])
-    dst = Path(sys.argv[2])
+    global GS, BITS, GATE_GS, GATE_BITS
+    global H, NOPE, VDIM, LORA, N_LAYERS, N_EXPERTS, FIRST_DENSE, LGS
+
+    ap = argparse.ArgumentParser(description="Convert a bailing_hybrid 1T FP8 checkpoint to MLX (audited).")
+    ap.add_argument("src", help="source dir (FP8 compressed-tensors)")
+    ap.add_argument("dst", help="output dir (MLX quantized)")
+    ap.add_argument("--bits", type=int, default=6, help="body quant bits (default 6)")
+    ap.add_argument("--group-size", type=int, default=64, help="body quant group size (default 64)")
+    ap.add_argument("--gate-bits", type=int, default=8, help="router gate bits (default 8 — kept precise)")
+    ap.add_argument("--gate-group-size", type=int, default=64, help="router gate group size (default 64)")
+    args = ap.parse_args()
+
+    GS, BITS = args.group_size, args.bits
+    GATE_GS, GATE_BITS = args.gate_group_size, args.gate_bits
+
+    src = Path(args.src)
+    dst = Path(args.dst)
+    cfg = json.loads((src / "config.json").read_text())
+
+    # — dimensions de l'archi, lues du config (jamais hardcodées) —
+    H = cfg["num_attention_heads"]
+    NOPE = cfg["qk_nope_head_dim"]
+    VDIM = cfg["v_head_dim"]
+    LORA = cfg["kv_lora_rank"]
+    N_LAYERS = cfg["num_hidden_layers"]
+    N_EXPERTS = cfg["num_experts"]
+    FIRST_DENSE = cfg["first_k_dense_replace"]
+    LGS = cfg["layer_group_size"]
+    if cfg.get("model_type") != "bailing_hybrid":
+        print(f"WARN: model_type={cfg.get('model_type')} (attendu bailing_hybrid) — "
+              f"structure de poids supposée identique, vérifie le manifest/audit.", flush=True)
+
     rd = ShardReader(src)
     out = Output(dst)
     t0 = time.time()
     worst: tuple[float, str] = (1.0, "")
+    print(f"src={src.name} bits={BITS}/g{GS} gate={GATE_BITS}/g{GATE_GS} "
+          f"layers={N_LAYERS} experts={N_EXPERTS} dense<{FIRST_DENSE} group={LGS} "
+          f"H={H} nope={NOPE} v={VDIM} lora={LORA}", flush=True)
 
     def audit(name: str, deq: np.ndarray, ref: np.ndarray) -> None:
         nonlocal worst
@@ -166,7 +221,7 @@ def main() -> int:
                 f"AUDIT FAIL: {name} corr={c:.4f} < {AUDIT_THRESHOLD} — conversion invalide."
             )
 
-    # ---- couches 0..79 (80 = MTP, droppée) --------------------------------
+    # ---- couches 0..N-1 (dernière = MTP, droppée) -------------------------
     for layer in range(N_LAYERS):
         tag = f"{layer:05d}"
         if out.done(tag):
@@ -186,7 +241,7 @@ def main() -> int:
 
         P = f"model.layers.{layer}"
         tensors: dict[str, mx.array] = {}
-        is_global = (layer + 1) % 8 == 0
+        is_global = (layer + 1) % LGS == 0
 
         # — attention —
         if is_global:
@@ -224,7 +279,7 @@ def main() -> int:
                 w = rd.read(f"{P}.mlp.{sub}.weight")
                 quantize_into(tensors, f"{P}.mlp.{sub}", w, out.quant_overrides)
         else:
-            # gate (8-bit) + expert_bias (fp32 brut)
+            # gate (precise) + expert_bias (fp32 brut)
             gw = rd.read(f"{P}.mlp.gate.weight")
             quantize_into(tensors, f"{P}.mlp.gate.gate_proj", gw, out.quant_overrides,
                           gs=GATE_GS, bits=GATE_BITS)
@@ -273,7 +328,6 @@ def main() -> int:
         print("[top] ok", flush=True)
 
     # ---- config / tokenizer / index / manifest ------------------------------
-    cfg = json.loads((src / "config.json").read_text())
     cfg.pop("quantization_config", None)
     cfg.pop("auto_map", None)
     cfg["num_nextn_predict_layers"] = 0
@@ -296,14 +350,18 @@ def main() -> int:
     (dst / "model.safetensors.index.json").write_text(json.dumps(index, indent=1))
 
     manifest = {
-        "tool": "ring26_convert_q6.py v0 (seed odyssai-convert, Odysseus#48)",
+        "tool": "bailing_convert.py v1 (seed odyssai-convert, Odysseus#48)",
         "date": time.strftime("%Y-%m-%d %H:%M:%S"),
         "machine": "ultra-512",
         "source": str(src),
         "source_format": "FP8 compressed-tensors (E4M3 + weight_scale)",
+        "model_type": cfg.get("model_type"),
         "recipe": {"bits": BITS, "group_size": GS,
                    "gate_override": {"bits": GATE_BITS, "group_size": GATE_GS},
-                   "mtp_dropped": True, "absorption": "kv_b->embed_q/unembed_out"},
+                   "mtp_dropped": True, "absorption": "kv_b->embed_q/unembed_out",
+                   "dims": {"heads": H, "qk_nope": NOPE, "v": VDIM, "kv_lora": LORA,
+                            "layers": N_LAYERS, "experts": N_EXPERTS,
+                            "first_dense": FIRST_DENSE, "layer_group": LGS}},
         "audit": {"threshold": AUDIT_THRESHOLD,
                   "worst": {"corr": worst[0], "tensor": worst[1]},
                   "samples": out.audit},
@@ -315,4 +373,4 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    raise SystemExit(main())
