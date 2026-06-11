@@ -1412,7 +1412,10 @@ def _resolve_eos_token_seqs(tokenizer) -> list[list[int]]:
     extra_names = ("<|im_end|>", "<|eot_id|>", "<|end_of_text|>", "<|endoftext|>",
                    "<end_of_turn>", "</s>",
                    # GLM-4.6 / 5.1 turn boundaries
-                   "<|user|>", "<|observation|>")
+                   "<|user|>", "<|observation|>",
+                   # Bailing / Ring-2.x turn boundary (eos_token is <|endoftext|>
+                   # but the chat template ends assistant turns with this)
+                   "<|role_end|>")
     for name in extra_names:
         try:
             tid = tokenizer.convert_tokens_to_ids(name)
