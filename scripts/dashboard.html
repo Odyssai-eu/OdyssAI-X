@@ -4413,13 +4413,20 @@ function computeFitCheck(cluster, selectedModel, nodes) {
   }
   const modelGB = m.size_bytes / (1024**3);
   const ramGB = cap.total_ram_gb;
-  const maxLoadGB = cap.max_loadable_gb;
+  // Pipeline mode splits capacity-aware on heterogeneous clusters — the
+  // backend exposes its (higher) ceiling separately. Tensor stays on the
+  // even-split bound.
+  const mode = state.pending_form?.default_mode || "pipeline";
+  const loadableBytes = (mode === "pipeline" && cap.max_loadable_pipeline_bytes)
+    ? cap.max_loadable_pipeline_bytes
+    : cap.max_loadable_bytes;
+  const maxLoadGB = loadableBytes / (1024**3);
   const overheadFactor = cdef?.model_overhead_factor || status?.model_overhead_factor || 1.15;
   const requiredGB = modelGB * overheadFactor;
-  if (m.size_bytes > cap.max_loadable_bytes) {
+  if (m.size_bytes > loadableBytes) {
     return {
       fits: false,
-      reason: `${modelGB.toFixed(1)} GB × ${overheadFactor} = ${requiredGB.toFixed(1)} GB required, only ${maxLoadGB.toFixed(1)} GB loadable on ${nodes} node${nodes>1?"s":""} (${ramGB.toFixed(0)} GB total)`,
+      reason: `${modelGB.toFixed(1)} GB × ${overheadFactor} = ${requiredGB.toFixed(1)} GB required, only ${maxLoadGB.toFixed(1)} GB loadable on ${nodes} node${nodes>1?"s":""} (${ramGB.toFixed(0)} GB total, ${mode} split)`,
       modelGB, ramGB, requiredGB,
     };
   }

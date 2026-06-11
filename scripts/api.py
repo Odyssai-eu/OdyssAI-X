@@ -834,8 +834,32 @@ def _cluster_total_ram_bytes(cluster: str, nodes_count: int) -> tuple[int, list[
     return total, out
 
 
+def _hetero_pipeline_ceiling(per_node: list[dict]) -> int:
+    """Max model bytes loadable in PIPELINE mode under the capacity-aware
+    split the loader actually performs (see ram_weights_csv in start_runners):
+    each rank's shard is proportional to its weight (wired_limit | raw RAM),
+    and must fit its budget (wired_limit | 0.75×RAM) with the +10%
+    activations factor. Returns 0 when the loader would NOT activate the
+    capacity-aware split (a weight missing, or all nodes identical — in
+    which case the even-split math of the caller is already exact)."""
+    weights: list[int] = []
+    budgets: list[int] = []
+    for nd in per_node:
+        w = nd.get("wired_limit_bytes") or nd.get("ram_bytes") or 0
+        b = nd.get("wired_limit_bytes") or int((nd.get("ram_bytes") or 0) * 0.75)
+        if not w or not b:
+            return 0
+        weights.append(int(w))
+        budgets.append(int(b))
+    if len(weights) < 2 or len(set(weights)) == 1:
+        return 0
+    sw = sum(weights)
+    return int(min(b * sw / (1.10 * w) for w, b in zip(weights, budgets)))
+
+
 def _validate_load_fits(model_size_bytes: int, cluster: str,
-                         nodes_count: int) -> tuple[bool, str, dict]:
+                         nodes_count: int,
+                         mode: Optional[str] = None) -> tuple[bool, str, dict]:
     """Returns (ok, reason, detail) for a (model, nodes) combo.
 
     Two checks (both must pass):
@@ -913,8 +937,21 @@ def _validate_load_fits(model_size_bytes: int, cluster: str,
             f"on {nodes_count} node{'s' if nodes_count>1 else ''}. Use more nodes or pick a smaller model."
         ), detail
 
-    # Check #2 : per-rank shard vs smallest node
+    # Check #2 : per-rank shard vs smallest node. The naive form assumes an
+    # EVEN split — but in pipeline mode the loader performs a capacity-aware
+    # split (shards ∝ wired_limit, see ram_weights_csv), so on heterogeneous
+    # clusters the big node absorbs the difference. Mirror that here, or the
+    # gate refuses loads the engine handles fine (Ling-Q8 1T on 512+4×256).
     if per_rank_required > per_node_budget and per_node_budget > 0:
+        if mode == "pipeline":
+            ceiling = _hetero_pipeline_ceiling(per_node)
+            if ceiling and model_size_bytes <= ceiling:
+                detail["capacity_aware_split"] = True
+                detail["hetero_ceiling_gb"] = round(ceiling / 1024**3, 1)
+                return True, (
+                    f"fits via capacity-aware pipeline split "
+                    f"(ceiling {detail['hetero_ceiling_gb']} GB)"
+                ), detail
         src_note = "from telemetry-probed wired_limit_mb" if budget_source == "wired_limit_mb" else "from default 0.75×RAM (telemetry has no wired_limit data)"
         return False, (
             f"per-rank shard {detail['per_rank_required_gb']} GB exceeds smallest node's safe "
@@ -8165,6 +8202,10 @@ async def admin_cluster_get(cluster_id: str):
             overall_max = int(total / _model_load_overhead_factor())
             per_rank_max = int(min_budget / 1.10) if min_budget else 0
             max_loadable = min(overall_max, per_rank_max * n) if per_rank_max else overall_max
+            # Pipeline mode splits capacity-aware on heterogeneous clusters —
+            # its ceiling is higher than the even-split bound above.
+            hetero = _hetero_pipeline_ceiling(per_node) if n > 1 else 0
+            max_loadable_pipeline = min(overall_max, hetero) if hetero else max_loadable
             capacity_by_nodes[str(n)] = {
                 "total_ram_bytes": total,
                 "total_ram_gb": round(total / 1024**3, 1),
@@ -8173,6 +8214,8 @@ async def admin_cluster_get(cluster_id: str):
                 "min_node_budget_gb": round(min_budget / 1024**3, 1),
                 "max_loadable_bytes": max_loadable,
                 "max_loadable_gb": round(max_loadable / 1024**3, 1),
+                "max_loadable_pipeline_bytes": max_loadable_pipeline,
+                "max_loadable_pipeline_gb": round(max_loadable_pipeline / 1024**3, 1),
                 "per_rank_max_gb": round(per_rank_max / 1024**3, 1),
                 "per_node": per_node,
             }
@@ -8678,9 +8721,12 @@ async def admin_cluster_load_options(cluster_id: str, model: str):
     options = []
     for n in range(1, effective_max + 1):
         label_nodes = "+".join(str(i + 1) for i in range(n))
-        fit_ok, fit_reason, fit_detail = _validate_load_fits(size_bytes, cluster_id, n)
         modes = ["solo"] if n == 1 else ["pipeline", "tensor"]
         for mode in modes:
+            # Fit is mode-dependent: pipeline gets the capacity-aware split.
+            fit_ok, fit_reason, fit_detail = _validate_load_fits(
+                size_bytes, cluster_id, n,
+                mode="pipeline" if mode in ("solo", "pipeline") else mode)
             # solo reuses the pipeline arch-validity (always ok for n==1).
             mode_ok, mode_reason = _validate_load_mode(
                 mt, layers, kv, n, "pipeline" if mode == "solo" else mode)
@@ -8837,7 +8883,8 @@ async def admin_cluster_load(cluster_id: str, req: ArgoLoadRequest):
         })
 
     size_bytes = await get_model_size_bytes(rank0_ssh, model_abspath)
-    ok, reason, detail = _validate_load_fits(size_bytes, cluster_id, nodes_count)
+    ok, reason, detail = _validate_load_fits(size_bytes, cluster_id, nodes_count,
+                                             mode=req.mode)
     if not ok and not getattr(req, "force", False):
         raise HTTPException(400, {
             "error": "model_too_big_for_cluster",
