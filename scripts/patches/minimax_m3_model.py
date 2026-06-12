@@ -456,8 +456,17 @@ class MiniMaxM3Model(nn.Module):
         if self.pipeline_rank < self.pipeline_size - 1:
             h = mx.distributed.recv_like(h, (self.pipeline_rank + 1))
 
-        for i in range(self.num_layers):
-            h = self.layers[self.start_idx + i](h, mask, cache[i])
+        # Itération robuste aux DEUX conventions de découpe pipeline :
+        #   - mlx-lm .pipeline() : liste paddée de None (start_idx..end_idx)
+        #   - auto_parallel (engine) : tranche COMPACTE + wrappers de comms,
+        #     sans remettre num_layers (sa whitelist isinstance ne nous
+        #     connaît pas) — l'arithmétique start_idx+i ferait IndexError.
+        ci = 0
+        for layer in self.layers:
+            if layer is None:
+                continue
+            h = layer(h, mask, cache[ci] if ci < len(cache) else None)
+            ci += 1
 
         if self.pipeline_rank != 0:
             h = mx.distributed.send(h, (self.pipeline_rank - 1) % self.pipeline_size)
@@ -480,7 +489,8 @@ class Model(nn.Module):
         return self.lm_head(out)
 
     def make_cache(self):
-        return [M3CacheLayer() for _ in range(self.model.num_layers)]
+        n = sum(1 for l in self.model.layers if l is not None)
+        return [M3CacheLayer() for _ in range(n)]
 
     def sanitize(self, weights):
         # 1) text tower only, prefix stripped

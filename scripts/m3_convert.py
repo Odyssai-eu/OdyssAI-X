@@ -276,6 +276,13 @@ def main() -> int:
     cfg.setdefault("rope_theta", rp.get("rope_theta", 5e6))
     cfg.setdefault("partial_rotary_factor", rp.get("partial_rotary_factor", 0.5))
     cfg.pop("quantization_config", None)
+    # AutoTokenizer lit ce config : sans tokenizer_class, un model_type inconnu
+    # part en validation stricte PreTrainedConfig et explose (leçon du premier
+    # load M3, 2026-06-12 23:42). eos/bos : le text_config ne les porte pas —
+    # l'eos authentique est celui du tokenizer ([e~[ = 200020 pour M3).
+    cfg["tokenizer_class"] = "PreTrainedTokenizerFast"
+    cfg.setdefault("eos_token_id", 200020)
+    cfg.setdefault("bos_token_id", 200019)
     q = {"group_size": gs, "bits": bits, "mode": "affine"}
     cfg["quantization"] = q
     cfg["quantization_config"] = dict(q)
