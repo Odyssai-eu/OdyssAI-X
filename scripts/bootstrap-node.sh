@@ -63,7 +63,13 @@ echo
 
 # 1. Verify SSH + Python on the node
 echo "[1/4] Checking SSH + Python on $NODE…"
-ssh -o BatchMode=yes "$NODE" "
+# First-contact friendliness: accept-new pins the host key on first
+# connection (the GUI runs us non-interactively — without this, a brand-new
+# target fails "Host key verification failed" / exit 255). Known keys are
+# still verified; only UNKNOWN hosts are added.
+SSH_OPTS="-o BatchMode=yes -o StrictHostKeyChecking=accept-new"
+
+ssh $SSH_OPTS "$NODE" "
   set -e
   hostname
   uname -m | grep -q arm64 || { echo 'ERROR: not Apple Silicon (arm64)'; exit 1; }
@@ -79,7 +85,7 @@ ssh -o BatchMode=yes "$NODE" "
 
 # 2. Copy the scripts the orchestrator will spawn + the pinned requirements
 echo "[2/4] Syncing runner + helpers + requirements to $NODE…"
-scp -q \
+scp $SSH_OPTS -q \
   "$REPO_ROOT/scripts/runner.py" \
   "$REPO_ROOT/scripts/auto_parallel.py" \
   "$REPO_ROOT/scripts/exo_stubs.py" \
@@ -90,12 +96,12 @@ scp -q \
   "$NODE:$REMOTE_DIR/"
 
 # Patches directory (per-model fixes loaded at runner boot)
-ssh "$NODE" "mkdir -p $REMOTE_DIR/patches"
-scp -q "$REPO_ROOT/scripts/patches/"*.py "$NODE:$REMOTE_DIR/patches/"
+ssh $SSH_OPTS "$NODE" "mkdir -p $REMOTE_DIR/patches"
+scp $SSH_OPTS -q "$REPO_ROOT/scripts/patches/"*.py "$NODE:$REMOTE_DIR/patches/"
 
 # 3. Create + populate the venv on the node, pinning via requirements-node.txt
 echo "[3/4] Setting up Python venv on $NODE (pinned via requirements-node.txt)…"
-ssh "$NODE" "
+ssh $SSH_OPTS "$NODE" "
   set -e
   cd $REMOTE_DIR
   export PATH=\"/opt/homebrew/bin:/usr/local/bin:\$PATH\"
@@ -108,7 +114,7 @@ ssh "$NODE" "
 
 # 4. Smoke test
 echo "[4/4] Smoke test on $NODE…"
-ssh "$NODE" "
+ssh $SSH_OPTS "$NODE" "
   cd $REMOTE_DIR
   ./.venv/bin/python -c 'import mlx.core; import mlx_lm; print(\"OK\", mlx.core.__version__, mlx_lm.__version__)'
 "
