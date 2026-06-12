@@ -3446,11 +3446,11 @@ def _initial_default_config() -> Optional[dict]:
 #   major (1.7.2 → 2.0.0) — breaking API or topology change
 #
 # Use `./scripts/bump-version.sh patch|minor|major` to bump + auto-commit.
-ENGINE_VERSION = "1.7.32"
+APP_VERSION = "1.7.32"
 
 app = FastAPI(
     title="OdyssAI-X (odyssai.eu)",
-    version=ENGINE_VERSION,
+    version=APP_VERSION,
     lifespan=lifespan,
 )
 
@@ -3461,7 +3461,7 @@ async def admin_version():
     import platform as _platform
     info: dict = {
         "name": "OdyssAI-X",
-        "version": ENGINE_VERSION,
+        "version": APP_VERSION,
         "python": _platform.python_version(),
         "platform": _platform.platform(),
     }
@@ -3694,7 +3694,7 @@ async def help_topic(slug: str):
 @app.get("/health")
 async def health():
     base = {
-        "version": ENGINE_VERSION,
+        "version": APP_VERSION,
         # Surfaces admin auth posture so operators can detect open installs
         # programmatically (e.g. Companion shows a warning in Settings).
         "admin_auth_enabled": bool(ADMIN_TOKEN),
