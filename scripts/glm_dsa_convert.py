@@ -102,6 +102,15 @@ class LoraFuser:
         self.applied.add(name)
         return w32 + self.scale * (b @ a)
 
+    def mark_prefix_done(self, prefix: str) -> None:
+        """Reprise : une couche déjà écrite par un run PRÉCÉDENT (même
+        adaptateur — le manifest en fait foi) a déjà ses deltas fusionnés ;
+        on les compte comme consommés pour que le garde-fou final reste
+        exact à travers pilot + reprises."""
+        for n in self.pairs:
+            if n.startswith(prefix):
+                self.applied.add(n)
+
     def report(self) -> dict:
         missed = sorted(set(self.pairs) - self.applied)
         return {
@@ -113,9 +122,13 @@ class LoraFuser:
 
 class NoFuser:
     scale = 0.0
+    applied: set = set()
 
     def fuse(self, name: str, w32: np.ndarray) -> np.ndarray:
         return w32
+
+    def mark_prefix_done(self, prefix: str) -> None:
+        pass
 
     def report(self) -> dict:
         return {"expected": 0, "applied": 0, "missed": []}
@@ -204,6 +217,7 @@ def main() -> int:
                 out.weight_map[k] = out.shard_name(tag)
                 o0, o1 = meta["data_offsets"]
                 out.total += o1 - o0
+            fuser.mark_prefix_done(f"model.layers.{layer}.")
             print(f"[{layer:02d}] déjà fait — skip", flush=True)
             continue
 
@@ -287,6 +301,8 @@ def main() -> int:
         return 0
 
     # ---- top-level -----------------------------------------------------------
+    if out.done("top"):
+        fuser.mark_prefix_done("lm_head")
     if not out.done("top"):
         tensors = {}
         w = rd.read("model.embed_tokens.weight")
