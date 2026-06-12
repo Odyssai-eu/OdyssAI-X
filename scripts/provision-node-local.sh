@@ -20,14 +20,14 @@ VENV="$CLUSTER_DIR/.venv"
 log() { echo "[node-base] $*" >&2; }
 
 [ "$(id -u)" -eq 0 ] && {
-  echo "ERREUR: ne pas lancer en root — le venv appartiendrait à root et" >&2
-  echo "l'orchestrateur (ssh utilisateur) ne le trouverait jamais." >&2
+  echo "ERROR: do not run as root — the venv would belong to root and" >&2
+  echo "the orchestrator (user ssh) would never find it." >&2
   exit 1
 }
-[ "$(uname -m)" = "arm64" ] || { echo "ERREUR: Apple Silicon requis." >&2; exit 1; }
+[ "$(uname -m)" = "arm64" ] || { echo "ERROR: Apple Silicon required." >&2; exit 1; }
 
 for v in ODYSSAI_PY_TARBALL ODYSSAI_WHEELS_DIR ODYSSAI_SCRIPTS_DIR ODYSSAI_REQS; do
-  [ -n "${!v:-}" ] && [ -e "${!v}" ] || { echo "ERREUR: $v manquant (${!v:-non posé})." >&2; exit 1; }
+  [ -n "${!v:-}" ] && [ -e "${!v}" ] || { echo "ERROR: $v missing (${!v:-unset})." >&2; exit 1; }
 done
 
 mkdir -p "$CLUSTER_DIR"
@@ -36,29 +36,29 @@ mkdir -p "$CLUSTER_DIR"
 PY_MARK="$PY_DIR/.odyssai-python-version"
 WANT="$(basename "$ODYSSAI_PY_TARBALL")"
 if [ ! -x "$PY_DIR/bin/python3.11" ] || [ "$(cat "$PY_MARK" 2>/dev/null)" != "$WANT" ]; then
-  log "extraction du python embarqué ($WANT)…"
+  log "extracting the embedded python ($WANT)…"
   rm -rf "$PY_DIR"
   mkdir -p "$PY_DIR"
   # l'archive install_only contient un répertoire racine "python/"
   tar -xzf "$ODYSSAI_PY_TARBALL" -C "$CLUSTER_DIR"
   printf '%s' "$WANT" > "$PY_MARK"
 else
-  log "python embarqué déjà en place."
+  log "embedded python already in place."
 fi
 "$PY_DIR/bin/python3.11" --version >&2
 
 # 2. venv + wheels vendorisées (zéro réseau).
 if [ ! -x "$VENV/bin/python" ]; then
-  log "création du venv…"
+  log "creating the venv…"
   "$PY_DIR/bin/python3.11" -m venv "$VENV"
 fi
-log "installation des dépendances depuis les wheels embarquées…"
+log "installing dependencies from the embedded wheels…"
 "$VENV/bin/pip" install --quiet --no-index \
   --find-links "$ODYSSAI_WHEELS_DIR" \
   --upgrade -r "$ODYSSAI_REQS"
 
 # 3. Scripts du node (runner + helpers + patches).
-log "copie des scripts du node…"
+log "copying node scripts…"
 for f in runner.py auto_parallel.py exo_stubs.py inference.py inference_pipe.py persistence.py; do
   [ -f "$ODYSSAI_SCRIPTS_DIR/$f" ] && cp "$ODYSSAI_SCRIPTS_DIR/$f" "$CLUSTER_DIR/$f"
 done
@@ -75,4 +75,4 @@ import mlx_lm
 print(f"OK mlx={mx.__version__} mlx_lm={mlx_lm.__version__}")
 PY
 
-log "node prêt — $CLUSTER_DIR (.venv + runner + patches)."
+log "node ready — $CLUSTER_DIR (.venv + runner + patches)."
