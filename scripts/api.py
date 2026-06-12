@@ -1,4 +1,4 @@
-"""Odysseus (odyssai.eu) — orchestration API + dashboard for distributed MLX inference.
+"""OdyssAI-X (odyssai.eu) — orchestration API + dashboard for distributed MLX inference.
 
 Manages multiple operator-defined clusters (declared in topology.yaml),
 sharing a common model layout under the configured models_dir on every node.
@@ -9,7 +9,7 @@ Serves:
   GET  /v1/models           -> OpenAI-style listing (across all clusters)
   POST /v1/chat/completions -> OpenAI chat, routed by model id
 
-Admin (no auth by default — see ODYSSEUS_ADMIN_TOKEN):
+Admin (no auth by default — see ODYSSAI_X_ADMIN_TOKEN):
   GET  /admin/clusters
   GET  /admin/clusters/{id}                 — full cluster def + capacity
   PUT  /admin/clusters/{id}                 — partial update
@@ -65,6 +65,42 @@ from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, PlainTex
 from pydantic import BaseModel, Field, model_validator
 
 # ──────────────────────────────────────────────────────────────────────────────
+# Engine env contract — ODYSSAI_X_* (the public name), with the legacy
+# ODYSSEUS_* names dual-read (deprecated 2026-06-12). Deployed compose files
+# and operator shells keep working; a one-time stderr note nudges the rename.
+# ──────────────────────────────────────────────────────────────────────────────
+_ENV_DEPRECATED_SEEN: set = set()
+
+
+def env_get(suffix: str, default=None):
+    """Engine env lookup: ODYSSAI_X_<suffix>, then legacy ODYSSEUS_<suffix>."""
+    new = f"ODYSSAI_X_{suffix}"
+    if new in os.environ:
+        return os.environ[new]
+    old = f"ODYSSEUS_{suffix}"
+    if old in os.environ:
+        if old not in _ENV_DEPRECATED_SEEN:
+            _ENV_DEPRECATED_SEEN.add(old)
+            sys.stderr.write(f"[api] DEPRECATED env {old} — rename to {new}\n")
+        return os.environ[old]
+    return default
+
+
+def env_value_by_name(name: str):
+    """Resolve an env var BY NAME with prefix bridging. Provider configs
+    persist `api_key_env` names — a stored ODYSSEUS_* name must keep
+    resolving after the operator renames the variable, and vice versa."""
+    v = os.environ.get(name)
+    if v is not None:
+        return v
+    if name.startswith("ODYSSEUS_"):
+        return os.environ.get("ODYSSAI_X_" + name[len("ODYSSEUS_"):])
+    if name.startswith("ODYSSAI_X_"):
+        return os.environ.get("ODYSSEUS_" + name[len("ODYSSAI_X_"):])
+    return None
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # Cluster topology
 # ──────────────────────────────────────────────────────────────────────────────
 try:
@@ -79,10 +115,10 @@ try:
     _TOPOLOGY = _load_topology()
 except Exception as _e:
     # Missing PyYAML or malformed YAML is a configuration error when the
-    # operator explicitly provides ODYSSEUS_TOPOLOGY. Without a topology file,
+    # operator explicitly provides ODYSSAI_X_TOPOLOGY. Without a topology file,
     # boot with a neutral localhost single-node default instead of leaking any
     # author's LAN into the open-source runtime.
-    if os.environ.get("ODYSSEUS_TOPOLOGY"):
+    if env_get("TOPOLOGY"):
         raise
     print(f"[topology] WARNING: could not load topology: {_e!r}; "
           f"using neutral localhost fallback", flush=True)
@@ -94,10 +130,10 @@ except Exception as _e:
                 host = host[: -len(suffix)]
         return host
 
-if _TOPOLOGY is None and os.environ.get("ODYSSEUS_TOPOLOGY"):
+if _TOPOLOGY is None and env_get("TOPOLOGY"):
     raise RuntimeError(
-        f"ODYSSEUS_TOPOLOGY is set but no topology was loaded: "
-        f"{os.environ['ODYSSEUS_TOPOLOGY']}"
+        f"ODYSSAI_X_TOPOLOGY is set but no topology was loaded: "
+        f"{env_get('TOPOLOGY')}"
     )
 
 
@@ -124,7 +160,7 @@ def _safe_ssh_target(target: str) -> str:
 
 
 def _local_ssh_target() -> str:
-    return os.environ.get("ODYSSEUS_LOCAL_SSH", f"{os.environ.get('USER', 'user')}@localhost")
+    return env_get("LOCAL_SSH", f"{os.environ.get('USER', 'user')}@localhost")
 
 
 NEUTRAL_DEFAULT_CLUSTER_ID = "default"
@@ -132,7 +168,7 @@ NEUTRAL_DEFAULT_CLUSTER_ID = "default"
 
 def _neutral_cluster_defs() -> dict[str, dict]:
     ssh = _local_ssh_target()
-    host = os.environ.get("ODYSSEUS_LOCAL_HOST_ID", _host_id_from_ssh(ssh))
+    host = env_get("LOCAL_HOST_ID", _host_id_from_ssh(ssh))
     return {
         NEUTRAL_DEFAULT_CLUSTER_ID: {
             "name": "Local",
@@ -175,13 +211,13 @@ else:
 
 # Default canonical model directory on every node, every cluster.
 # Flat layout: org--repo dirs or symlinks.
-DEFAULT_MODELS_DIR = os.environ.get("ODYSSEUS_DEFAULT_MODELS_DIR", "/Volumes/models/odysseus")
+DEFAULT_MODELS_DIR = env_get("DEFAULT_MODELS_DIR", "/Volumes/models/odysseus")
 
 COORDINATOR_RANK = 0
-REMOTE_CLUSTER_DIR = os.environ.get("ODYSSEUS_REMOTE_CLUSTER_DIR", "$HOME/mlx-cluster").rstrip("/")
-RUNNER_REMOTE = os.environ.get("ODYSSEUS_RUNNER_REMOTE", f"{REMOTE_CLUSTER_DIR}/runner.py")
-PYTHON_REMOTE = os.environ.get("ODYSSEUS_PYTHON_REMOTE", f"{REMOTE_CLUSTER_DIR}/.venv/bin/python")
-RUNNER_MATCH_PATTERN = os.environ.get("ODYSSEUS_RUNNER_MATCH_PATTERN", "mlx-cluster/runner.py")
+REMOTE_CLUSTER_DIR = env_get("REMOTE_CLUSTER_DIR", "$HOME/mlx-cluster").rstrip("/")
+RUNNER_REMOTE = env_get("RUNNER_REMOTE", f"{REMOTE_CLUSTER_DIR}/runner.py")
+PYTHON_REMOTE = env_get("PYTHON_REMOTE", f"{REMOTE_CLUSTER_DIR}/.venv/bin/python")
+RUNNER_MATCH_PATTERN = env_get("RUNNER_MATCH_PATTERN", "mlx-cluster/runner.py")
 
 _HERE = Path(__file__).resolve().parent
 CLUSTER_CONFIG_FILE = Path(os.environ.get("CLUSTER_CONFIG_FILE", _HERE / "cluster-config.json"))
@@ -190,9 +226,9 @@ CLUSTER_CONFIG_FILE = Path(os.environ.get("CLUSTER_CONFIG_FILE", _HERE / "cluste
 def state_file_for(cluster_id: str) -> Path:
     """Per-cluster persisted state. Lives next to cluster-config.json so
     operators get a single backup/restore unit. Env override:
-    ODYSSEUS_STATE_DIR sets the directory; individual files are
+    ODYSSAI_X_STATE_DIR sets the directory; individual files are
     `state-<cluster_id>.json`."""
-    state_dir = Path(os.environ.get("ODYSSEUS_STATE_DIR", _HERE))
+    state_dir = Path(env_get("STATE_DIR", _HERE))
     return state_dir / f"state-{cluster_id}.json"
 
 
@@ -201,10 +237,10 @@ def state_file_for(cluster_id: str) -> Path:
 STATE_FILE = Path(os.environ.get("STATE_FILE", _HERE / "state.json"))
 # SQLite history for runs + sync jobs. Defaults to /app/data/ (the Docker
 # volume that holds state.json + cluster-config.json), so history survives
-# container restarts. Env override: ODYSSEUS_DB_PATH.
+# container restarts. Env override: ODYSSAI_X_DB_PATH.
 _DEFAULT_DB = Path("/app/data/odysseus.db") if Path("/app/data").is_dir() \
               else _HERE / "odysseus.db"
-PERSIST_DB_PATH = Path(os.environ.get("ODYSSEUS_DB_PATH", _DEFAULT_DB))
+PERSIST_DB_PATH = Path(env_get("DB_PATH", _DEFAULT_DB))
 
 # Server-wide policy: when a chat request doesn't explicitly set
 # `enable_thinking`, what should we do? Default: false (suppress reasoning
@@ -426,7 +462,7 @@ def cluster_exists(cluster_id: str) -> bool:
 
 def active_cluster_ids() -> list[str]:
     """Union of topology.yaml clusters + dashboard-added entries, minus
-    tombstones. Source of truth for "which clusters does Odysseus publish".
+    tombstones. Source of truth for "which clusters does OdyssAI-X publish".
 
     cluster-config.json carries cluster definitions alongside unrelated
     top-level sections ('crew', 'discovery', 'settings', ...) that
@@ -577,7 +613,7 @@ def validate_cluster_def(cluster_id: str, new_def: dict) -> Optional[str]:
         return f"exactly 1 master required (got {len(masters)})"
 
     # Telemak (single-Mac native runtime) — http-proxy passthrough to a Swift
-    # binary running on a Mac on the LAN. The Odysseus orchestrator does not
+    # binary running on a Mac on the LAN. The OdyssAI-X orchestrator does not
     # spawn the runner — it just proxies HTTP requests. Single node by design.
     if kind == "telemak":
         if backend != "http-proxy":
@@ -1018,7 +1054,7 @@ def _loading_snapshot(state: dict) -> Optional[dict]:
 # ──────────────────────────────────────────────────────────────────────────────
 # `hf` is the shipped Python entrypoint of the remote venv. User-pip installs
 # vary by Python version, so we point at the configured venv path instead.
-HF_BIN_REMOTE = os.environ.get("ODYSSEUS_HF_BIN_REMOTE", f"{REMOTE_CLUSTER_DIR}/.venv/bin/hf")
+HF_BIN_REMOTE = env_get("HF_BIN_REMOTE", f"{REMOTE_CLUSTER_DIR}/.venv/bin/hf")
 
 _downloads: dict[str, dict] = {}
 # Per-job → per-host process map. Host-keyed so cancel can target one target
@@ -1036,7 +1072,7 @@ async def _hf_dl_one(dl_id: str, host: dict, repo: str,
     models_dir = host.get("models_dir") or "/Volumes/models/mlx-vlm"
     # Models from HF land under `<org>/<name>` so the matrix sees them at
     # the right hierarchy (e.g. `inferencerlabs/Hy3-preview-MLX-9bit`).
-    # That matches the layout the rest of Odysseus expects.
+    # That matches the layout the rest of OdyssAI-X expects.
     target = f"{models_dir}/{repo}"
     slot["host"] = host["id"]
     slot["ssh"] = ssh
@@ -1264,7 +1300,7 @@ def remote_cmd(node: dict, nodes: list[dict], model: str, mode: str, port: int,
 # Max seconds `submit` waits for the next runner event before checking whether
 # rank-0 (the sole event producer) is still alive. Long enough not to trip on a
 # slow multi-node prefill, short enough to fail a dead runner promptly (#21).
-_GEN_IDLE_TIMEOUT_S = float(os.environ.get("ODYSSEUS_GEN_IDLE_TIMEOUT_S", "120"))
+_GEN_IDLE_TIMEOUT_S = float(env_get("GEN_IDLE_TIMEOUT_S", "120"))
 # No-progress watchdog (2026-06-07). `_rank0_alive()` only polls the LOCAL ssh
 # client, which stays connected (ServerAliveInterval=10) even when the remote
 # runner is wedged in an MLX/JACCL collective emitting zero tokens — that hung a
@@ -1273,13 +1309,13 @@ _GEN_IDLE_TIMEOUT_S = float(os.environ.get("ODYSSEUS_GEN_IDLE_TIMEOUT_S", "120")
 # decode phase. Generous prefill budget: a healthy 19k-token prefill cost ~150s
 # in prod and declared contexts reach 1M tokens, so we only abort well beyond
 # the legitimate window. Both env-overridable.
-_GEN_PREFILL_DEADLINE_S = float(os.environ.get("ODYSSEUS_GEN_PREFILL_DEADLINE_S", "600"))
-_GEN_DECODE_DEADLINE_S = float(os.environ.get("ODYSSEUS_GEN_DECODE_DEADLINE_S", "90"))
+_GEN_PREFILL_DEADLINE_S = float(env_get("GEN_PREFILL_DEADLINE_S", "600"))
+_GEN_DECODE_DEADLINE_S = float(env_get("GEN_DECODE_DEADLINE_S", "90"))
 # Conservative floor prefill throughput (tok/s) used to scale the prefill
 # deadline by estimated prompt size: a 1M-token context legitimately prefills
 # for minutes, so a flat 600s would false-positive on it. prefill_deadline =
 # max(_GEN_PREFILL_DEADLINE_S, est_prompt_tokens / _MIN_PREFILL_TPS).
-_MIN_PREFILL_TPS = max(1.0, float(os.environ.get("ODYSSEUS_MIN_PREFILL_TPS", "20")))
+_MIN_PREFILL_TPS = max(1.0, float(env_get("MIN_PREFILL_TPS", "20")))
 
 # At most one watchdog-triggered recovery ladder per cluster in flight: multiple
 # wedged in-flight requests would otherwise each spawn a duplicate _cluster_reset
@@ -3155,7 +3191,7 @@ async def _pool_ttl_sweeper() -> None:
     """Every 30s, scan local pools and auto-unload any that's been idle past
     its `ttl_seconds`. No-op when ttl_seconds=0 (the default — opt-in).
 
-    Why this lives in Odysseus: a 3-node Default costs 3 nodes' worth of RAM
+    Why this lives in OdyssAI-X: a 3-node Default costs 3 nodes' worth of RAM
     held for nothing during quiet hours. With ttl=1800 the cluster auto-
     yields so other pools can claim the RAM. operator keeps manual
     control via pinning (TODO) or via reloading explicitly.
@@ -3410,11 +3446,11 @@ def _initial_default_config() -> Optional[dict]:
 #   major (1.7.2 → 2.0.0) — breaking API or topology change
 #
 # Use `./scripts/bump-version.sh patch|minor|major` to bump + auto-commit.
-ODYSSEUS_VERSION = "1.7.31"
+ENGINE_VERSION = "1.7.32"
 
 app = FastAPI(
-    title="Odysseus (odyssai.eu)",
-    version=ODYSSEUS_VERSION,
+    title="OdyssAI-X (odyssai.eu)",
+    version=ENGINE_VERSION,
     lifespan=lifespan,
 )
 
@@ -3424,8 +3460,8 @@ async def admin_version():
     """Identity + runtime info for the About tab. Cheap (no probes)."""
     import platform as _platform
     info: dict = {
-        "name": "Odysseus",
-        "version": ODYSSEUS_VERSION,
+        "name": "OdyssAI-X",
+        "version": ENGINE_VERSION,
         "python": _platform.python_version(),
         "platform": _platform.platform(),
     }
@@ -3446,9 +3482,9 @@ async def admin_version():
 # ──────────────────────────────────────────────────────────────────────────────
 # Admin auth middleware (opt-in)
 # ──────────────────────────────────────────────────────────────────────────────
-# Odysseus is a LAN-bound engine by default. /admin/* is OPEN unless the
+# OdyssAI-X is a LAN-bound engine by default. /admin/* is OPEN unless the
 # operator deliberately opts into Bearer-token auth by setting
-# ODYSSEUS_ADMIN_TOKEN in the environment.
+# ADMIN_TOKEN in the environment.
 #
 # When to set it:
 #   - You're exposing the engine beyond your LAN (Cloudflare tunnel,
@@ -3465,11 +3501,11 @@ async def admin_version():
 # headers in browsers, so we also accept the token as a `?token=…` query
 # param when auth is enabled.
 
-ODYSSEUS_ADMIN_TOKEN = (os.environ.get("ODYSSEUS_ADMIN_TOKEN") or "").strip()
+ADMIN_TOKEN = (env_get("ADMIN_TOKEN") or "").strip()
 
-if ODYSSEUS_ADMIN_TOKEN:
+if ADMIN_TOKEN:
     sys.stderr.write(
-        f"[api] /admin/* protected by Bearer token (length {len(ODYSSEUS_ADMIN_TOKEN)})\n"
+        f"[api] /admin/* protected by Bearer token (length {len(ADMIN_TOKEN)})\n"
     )
 else:
     _ADMIN_OPEN_WARNING = (
@@ -3478,7 +3514,7 @@ else:
         "║  WARNING: /admin/* routes are OPEN — no auth required.      ║\n"
         "║  Anyone on the network can load/unload models, read stats,  ║\n"
         "║  and change cluster config.                                  ║\n"
-        "║  Set ODYSSEUS_ADMIN_TOKEN=<secret> to enable Bearer auth.   ║\n"
+        "║  Set ODYSSAI_X_ADMIN_TOKEN=<secret> to enable Bearer auth.  ║\n"
         "║  Safe on a trusted LAN; harden before any WAN exposure.     ║\n"
         "╚══════════════════════════════════════════════════════════════╝\n"
     )
@@ -3513,7 +3549,7 @@ async def _admin_token_middleware(request: Request, call_next):
         # any crew via /admin/crew/{id} — not /self — so this is rejected
         # unless admin token is provided which is silly but not harmful).
 
-    if not ODYSSEUS_ADMIN_TOKEN:
+    if not ADMIN_TOKEN:
         # Dev mode — admin routes open. We still update crew last_seen below.
         response = await call_next(request)
         _maybe_update_crew_last_seen(path, bearer, response)
@@ -3523,7 +3559,7 @@ async def _admin_token_middleware(request: Request, call_next):
         return await call_next(request)
 
     if path.startswith("/admin/"):
-        if bearer != ODYSSEUS_ADMIN_TOKEN:
+        if bearer != ADMIN_TOKEN:
             return JSONResponse(
                 {"detail": "missing or invalid admin token"},
                 status_code=401,
@@ -3543,7 +3579,7 @@ def _maybe_update_crew_last_seen(path: str, bearer: Optional[str], response) -> 
     if not bearer or not path.startswith("/v1/"):
         return
     # Ignore admin token on /v1/* (works but isn't a crew member)
-    if bearer == ODYSSEUS_ADMIN_TOKEN:
+    if bearer == ADMIN_TOKEN:
         return
     entry = find_crew_by_token(bearer)
     if entry:
@@ -3566,7 +3602,7 @@ async def serve_odysseus_icon():
     # container (/app/odysseus.png) and from local dev (sibling of api.py).
     candidates = [
         Path("/app/odysseus.png"),
-        Path(os.environ.get("ODYSSEUS_ICON", "")) if os.environ.get("ODYSSEUS_ICON") else None,
+        Path(env_get("ICON", "")) if env_get("ICON") else None,
         _HERE / "odysseus.png",
         _HERE.parent / "logo" / "odysseus.png",
     ]
@@ -3658,10 +3694,10 @@ async def help_topic(slug: str):
 @app.get("/health")
 async def health():
     base = {
-        "version": ODYSSEUS_VERSION,
+        "version": ENGINE_VERSION,
         # Surfaces admin auth posture so operators can detect open installs
         # programmatically (e.g. Companion shows a warning in Settings).
-        "admin_auth_enabled": bool(ODYSSEUS_ADMIN_TOKEN),
+        "admin_auth_enabled": bool(ADMIN_TOKEN),
     }
     if _pool is None:
         return {"status": "idle", **base}
@@ -4000,12 +4036,12 @@ async def _model_capabilities(
 def _engine_metadata() -> dict:
     """Static engine metadata exposed at /.well-known/inference-engine.json."""
     return {
-        "name": "Odysseus",
+        "name": "OdyssAI-X",
         "vendor": "odyssai.eu",
         "version": ENGINE_VERSION,
         "api_compat": ["openai/v1", "anthropic/v1"],
         "auth": {
-            "required": bool(ODYSSEUS_ADMIN_TOKEN),
+            "required": bool(ADMIN_TOKEN),
             "scheme": "bearer",
             "scope": "/admin/*",
             "public_routes": ["/v1/*", "/health", "/.well-known/*"],
@@ -4059,10 +4095,10 @@ async def well_known_engine():
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Cloud providers — Odysseus-as-gateway for cloud-hosted models
+# Cloud providers — OdyssAI-X-as-gateway for cloud-hosted models
 # ──────────────────────────────────────────────────────────────────────────────
 # Companion / external clients hit /v1/chat/completions with model="or:foo"
-# and Odysseus proxies to OpenRouter (or any OpenAI-compat upstream) using
+# and OdyssAI-X proxies to OpenRouter (or any OpenAI-compat upstream) using
 # the API key stored in env. All OpenAI-compat — no protocol translation.
 # Config lives in cluster-config.json under "cloud_providers".
 #
@@ -4074,7 +4110,7 @@ DEFAULT_CLOUD_PROVIDERS: dict[str, dict] = {
     # Example shape — actual user config goes in cluster-config.json:
     # "openrouter": {
     #   "api_base": "https://openrouter.ai/api/v1",
-    #   "api_key_env": "ODYSSEUS_OPENROUTER_KEY",
+    #   "api_key_env": "ODYSSAI_X_OPENROUTER_KEY",
     #   "published": [
     #     {"alias": "or:claude-haiku",
     #      "upstream": "anthropic/claude-haiku-4-5",
@@ -4120,9 +4156,9 @@ def find_cloud_alias(model_id: Optional[str]) -> Optional[tuple[str, dict, dict]
 # plug-and-play against a custom ANTHROPIC_BASE_URL without the user
 # setting ANTHROPIC_MODEL. Inspired by free-claude-code's tier routing.
 _ANTHROPIC_TIER_ENV = {
-    "opus":   "ODYSSEUS_ANTHROPIC_OPUS",
-    "sonnet": "ODYSSEUS_ANTHROPIC_SONNET",
-    "haiku":  "ODYSSEUS_ANTHROPIC_HAIKU",
+    "opus":   "ANTHROPIC_OPUS",
+    "sonnet": "ANTHROPIC_SONNET",
+    "haiku":  "ANTHROPIC_HAIKU",
 }
 
 
@@ -4142,8 +4178,8 @@ def _resolve_anthropic_tier(model_id: Optional[str]) -> Optional[str]:
     """Map a canonical Claude tier name → an operator-chosen local model.
 
     Resolution order, per tier (opus/sonnet/haiku):
-      1. tier-specific env var (ODYSSEUS_ANTHROPIC_{OPUS,SONNET,HAIKU})
-      2. catch-all env var ODYSSEUS_ANTHROPIC_MODEL
+      1. tier-specific env var (ODYSSAI_X_ANTHROPIC_{OPUS,SONNET,HAIKU})
+      2. catch-all env var ODYSSAI_X_ANTHROPIC_MODEL
       3. plug-and-play fallback = first servable local model
 
     Returns `model_id` unchanged when it isn't a Claude tier name, or when
@@ -4167,10 +4203,10 @@ def _resolve_anthropic_tier(model_id: Optional[str]) -> Optional[str]:
         else None
     )
     if tier:
-        env_target = os.environ.get(_ANTHROPIC_TIER_ENV[tier])
+        env_target = env_get(_ANTHROPIC_TIER_ENV[tier])
         if env_target:
             return env_target
-    catch_all = os.environ.get("ODYSSEUS_ANTHROPIC_MODEL")
+    catch_all = env_get("ANTHROPIC_MODEL")
     if catch_all:
         return catch_all
     return _first_servable_model() or model_id
@@ -4189,7 +4225,7 @@ def _cloud_provider_key(prov: dict) -> Optional[str]:
     env_var = prov.get("api_key_env")
     if not env_var:
         return None
-    return (os.environ.get(env_var) or "").strip() or None
+    return (env_value_by_name(env_var) or "").strip() or None
 
 
 # Known upstream quirks we work around in the proxy. Keep in sync with
@@ -4223,7 +4259,7 @@ async def _proxy_chat_completion(prov_id: str, prov: dict, entry: dict,
     anthropic.com today), we transparently translate the OpenAI request
     to Anthropic /v1/messages and translate the response back. Same UX
     as upstreams that speak both wire formats natively. Lets a client
-    client (OpenAI shape) call Claude through Odysseus without knowing
+    client (OpenAI shape) call Claude through OdyssAI-X without knowing
     about the protocol split.
     """
     if _provider_protocol(prov) == "anthropic":
@@ -4292,7 +4328,7 @@ async def _proxy_chat_completion(prov_id: str, prov: dict, entry: dict,
         "content-type": "application/json",
         # OpenRouter-specific (ignored by other providers):
         "http-referer": "https://odyssai.eu",
-        "x-title": "Odysseus",
+        "x-title": "OdyssAI-X",
     }
     if api_key:
         headers["authorization"] = f"Bearer {api_key}"
@@ -5089,7 +5125,7 @@ def _redact_provider(prov_id: str, prov: dict) -> dict:
         "api_key_set": _cloud_provider_key(prov) is not None,
         "api_key_source": (
             "config" if (prov.get("api_key") or "").strip()
-            else ("env" if prov.get("api_key_env") and (os.environ.get(prov["api_key_env"]) or "").strip()
+            else ("env" if prov.get("api_key_env") and (env_value_by_name(prov["api_key_env"]) or "").strip()
                   else "none")
         ),
         "published": prov.get("published") or [],
@@ -5187,7 +5223,7 @@ async def admin_settings_get():
 
 @app.post("/admin/restart")
 async def admin_restart():
-    """Restart the Odysseus FastAPI process. The Docker container's
+    """Restart the OdyssAI-X FastAPI process. The Docker container's
     `restart: unless-stopped` policy brings us back up immediately. Useful
     when you've edited cluster-config.json on disk or pulled new code via
     `docker cp` and don't want to SSH into the Docker host just to bounce the
@@ -5263,7 +5299,7 @@ PROVIDER_TEMPLATES = [
         "label": "OpenAI",
         "api_base": "https://api.openai.com/v1",
         "protocol": "openai",
-        "api_key_env": "ODYSSEUS_OPENAI_KEY",
+        "api_key_env": "ODYSSAI_X_OPENAI_KEY",
         "hint": "OpenAI's API, or any OpenAI-compatible upstream (vLLM, "
                 "Ollama, LM Studio, mlx-vlm…). Replace api_base if pointing to "
                 "a local server.",
@@ -5286,7 +5322,7 @@ PROVIDER_TEMPLATES = [
         "label": "Anthropic",
         "api_base": "https://api.anthropic.com",
         "protocol": "anthropic",
-        "api_key_env": "ODYSSEUS_ANTHROPIC_KEY",
+        "api_key_env": "ODYSSAI_X_ANTHROPIC_KEY",
         "hint": "Anthropic's API. Speaks /v1/messages natively — clients get a "
                 "Claude-shape passthrough. Default aliases are the current "
                 "Claude tiers; edit if Anthropic releases newer ones.",
@@ -5310,7 +5346,7 @@ PROVIDER_TEMPLATES = [
         "label": "OpenRouter",
         "api_base": "https://openrouter.ai/api/v1",
         "protocol": "openai",
-        "api_key_env": "ODYSSEUS_OPENROUTER_KEY",
+        "api_key_env": "ODYSSAI_X_OPENROUTER_KEY",
         "hint": "Aggregator for many cloud models (Anthropic, DeepSeek, Qwen, "
                 "Mistral, …). Single key, OpenAI shape. Default aliases use the "
                 "`or:` prefix convention — extend with any model from "
@@ -5427,10 +5463,10 @@ async def admin_providers_upstream(provider_id: str):
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Crew & pairing — companion clients discover and pair with Odysseus
+# Crew & pairing — companion clients discover and pair with OdyssAI-X
 # ──────────────────────────────────────────────────────────────────────────────
 # Discovery model: the operator opens the gate ("Enable discovery"), the host-side
-# mDNS watcher advertises Odysseus on `_odyssai-engine._tcp.local.`, the
+# mDNS watcher advertises OdyssAI-X on `_odyssai-engine._tcp.local.`, the
 # first Companion that calls POST /admin/pair gets a crew token, gate
 # auto-closes. No PIN — the open gate IS the auth, scoped to LAN.
 #
@@ -5880,7 +5916,7 @@ async def list_models(include_unloaded: bool = False):
                     },
                 })
 
-    # Published cloud aliases (Odysseus-as-gateway). Always advertised
+    # Published cloud aliases (OdyssAI-X-as-gateway). Always advertised
     # because they're always servable — the upstream takes care of itself.
     cloud = _cloud_entries_for_v1_models()
     for entry in cloud:
@@ -8144,7 +8180,7 @@ async def admin_inventory():
 
 @app.get("/admin/clusters")
 async def admin_clusters_list():
-    """Compact list of every cluster Odysseus publishes — id, display name,
+    """Compact list of every cluster OdyssAI-X publishes — id, display name,
     backend, master SSH/host, total node count, enabled flag. Used by
     external bench/cockpit UIs (odyssai-services) so they don't have to
     hardcode the cluster IDs.
@@ -8521,7 +8557,7 @@ async def admin_cluster_status(cluster_id: str):
         raise HTTPException(404, f"unknown cluster {cluster_id}")
     # kind=telemak: short-circuit to a single-node "what's loaded" view.
     # The upstream is the source of truth — we query it once and shape the
-    # response into Odysseus' status format so the dashboard reuses the
+    # response into OdyssAI-X' status format so the dashboard reuses the
     # mlx-distributed renderers without crashing.
     cd_t = get_cluster_def(cluster_id)
     if cd_t.get("kind") == "telemak":
@@ -9421,7 +9457,7 @@ async def _telemak_status(cluster_id: str, cd: dict) -> dict:
     (singular) populated with the first entry so older dashboard code that
     only checks "any model loaded?" still works.
 
-    Shape stays compatible with Odysseus' mlx-distributed cluster status so
+    Shape stays compatible with OdyssAI-X' mlx-distributed cluster status so
     the dashboard renderers don't crash on the kind=telemak branch.
     """
     upstream = (cd.get("upstream") or "").rstrip("/")
@@ -9616,7 +9652,7 @@ async def _telemak_status(cluster_id: str, cd: dict) -> dict:
 
 async def _telemak_proxy_load(cluster_id: str, cd: dict, req) -> dict:
     """Proxy POST /admin/load to the Telemak upstream and reshape the response
-    into Odysseus' standard load-response shape so the dashboard renders it
+    into OdyssAI-X' standard load-response shape so the dashboard renders it
     without a special-case."""
     upstream = (cd.get("upstream") or "").rstrip("/")
     if not upstream:
@@ -9684,7 +9720,7 @@ async def _telemak_proxy_unload(
 # Telemak runs as a per-node launchd *user agent* `eu.odyssai.telemak`
 # (KeepAlive=true) — the same service the Telemak menu-bar app drives. That
 # app can only Start/Stop when running locally (launchctl targets the user's
-# gui/$uid domain). Odysseus lifts that limit by running the exact same
+# gui/$uid domain). OdyssAI-X lifts that limit by running the exact same
 # launchctl verbs over SSH against the node. Verified: `launchctl print
 # gui/$uid/eu.odyssai.telemak` answers over SSH, so the gui domain is
 # reachable for an SSH'd command while the user is logged in.

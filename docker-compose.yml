@@ -15,7 +15,7 @@ services:
       # non-empty value flips /admin/* to require `Authorization: Bearer
       # <token>`. EventSource also accepts ?token=… as a fallback.
       ODYSSEUS_ADMIN_TOKEN: ${ODYSSEUS_ADMIN_TOKEN:-}
-      ODYSSEUS_TOPOLOGY: /root/.odysseus/topology.yaml
+      ODYSSAI_X_TOPOLOGY: /root/.odysseus/topology.yaml
       # The Mac user the container should SSH back as for single-node
       # installs. topology.example.yaml expands ${ODYSSEUS_NODE_USER}
       # rather than ${USER} so the in-container expansion doesn't

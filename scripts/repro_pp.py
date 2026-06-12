@@ -7,7 +7,7 @@ prompt lengths) returns WRONG DATA or HANGS once you cross ~3 ranks. This script
 reproduces that and validates the full-group all_sum barrier stop-gap, WITHOUT
 importing auto_parallel / mlx_lm (kept light: only mx.distributed primitives).
 
-It mirrors Odysseus' pipeline forward:
+It mirrors OdyssAI-X' pipeline forward:
   - N ranks in a chain. Each forward micro-step:
       r > 0   : x = recv_like(template, r-1)   (PipelineFirstLayer)
       all     : y = layer-compute(x)           (the layer body)

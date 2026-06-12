@@ -3,7 +3,7 @@
 
 Convertit la famille inclusionAI bailing_hybrid (Ring-2.5/2.6, Ling-2.6, …)
 depuis le FP8 compressed-tensors d'origine vers du MLX quantifié (Q6, Q8, …),
-en local sur ultra-512. Seed de odyssai-convert (Odysseus#48, WU1+WU2).
+en local sur ultra-512. Seed de odyssai-convert (OdyssAI-X#48, WU1+WU2).
 
 Leçons d'avril intégrées (#43) :
   * décodage FP8 E4M3 + weight_scale par canal (LUT, jamais de cast naïf)
@@ -350,7 +350,7 @@ def main() -> int:
     (dst / "model.safetensors.index.json").write_text(json.dumps(index, indent=1))
 
     manifest = {
-        "tool": "bailing_convert.py v1 (seed odyssai-convert, Odysseus#48)",
+        "tool": "bailing_convert.py v1 (seed odyssai-convert, OdyssAI-X#48)",
         "date": time.strftime("%Y-%m-%d %H:%M:%S"),
         "machine": "ultra-512",
         "source": str(src),

@@ -344,7 +344,7 @@ def main() -> int:
     (dst / "model.safetensors.index.json").write_text(json.dumps(index, indent=1))
 
     manifest = {
-        "tool": "glm_dsa_convert.py v1 (famille 2 odyssai-convert, Odysseus#48)",
+        "tool": "glm_dsa_convert.py v1 (famille 2 odyssai-convert, OdyssAI-X#48)",
         "date": time.strftime("%Y-%m-%d %H:%M:%S"),
         "machine": "ultra-512",
         "source": str(src),

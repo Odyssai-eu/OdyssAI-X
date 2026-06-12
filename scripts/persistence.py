@@ -1,4 +1,4 @@
-"""SQLite persistence for Odysseus runs + sync jobs.
+"""SQLite persistence for OdyssAI-X runs + sync jobs.
 
 Volatile in-memory dicts (`_active_runs`, `_sync_jobs`) lose state on container
 restart, which kills diagnostics value: when an issue happens, the run that

@@ -2,7 +2,7 @@
 #
 # HunYuan-3 (Tencent) — `model_type: hy_v3`, arch `HYV3ForCausalLM`.
 #
-# Port mlx-lm pour Odysseus. HYV3 = MoE DeepSeek-V3 (router sigmoid + biais
+# Port mlx-lm pour OdyssAI-X. HYV3 = MoE DeepSeek-V3 (router sigmoid + biais
 # d'experts + expert partagé + first_k_dense_replace) GREFFÉ sur une attention
 # GQA standard avec qk_norm (style Qwen3) — PAS de MLA. Les poids du quant
 # InferencerLabs sont déjà au layout mlx-lm (switch_mlp fused, router.gate,
@@ -10,7 +10,7 @@
 #
 # Déploiement : ce fichier va dans `mlx_lm/models/hy_v3.py` de chaque venv
 # mlx-cluster (synchro identique entre nodes). Le sharding distribué passe par
-# le `pipeline_auto_parallel` générique d'Odysseus (slice `.layers`) — d'où une
+# le `pipeline_auto_parallel` générique d'OdyssAI-X (slice `.layers`) — d'où une
 # boucle forward simple ici plutôt que le PipelineMixin de mlx-lm.
 
 from dataclasses import dataclass, field
@@ -252,7 +252,7 @@ class Model(nn.Module):
         return self.model.layers
 
     def shard(self, group: Optional[mx.distributed.Group] = None):
-        """Tensor-parallel optionnel (non requis pour le pipeline Odysseus).
+        """Tensor-parallel optionnel (non requis pour le pipeline OdyssAI-X).
         Shard les têtes d'attention + les projections MLP/MoE par node."""
         group = group or mx.distributed.init()
         N = group.size()

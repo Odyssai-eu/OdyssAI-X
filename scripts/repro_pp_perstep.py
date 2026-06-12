@@ -2,7 +2,7 @@
 """Standalone pipeline-parallel repro for JACCL #3149 (consecutive send/recv,
 different shapes -> wrong data or HANG) and the PER-STEP CPU-barrier stop-gap.
 
-This faithfully mimics Odysseus' pipeline forward WITHOUT importing
+This faithfully mimics OdyssAI-X' pipeline forward WITHOUT importing
 auto_parallel / mlx_lm (kept light/fast — only mx.distributed primitives):
 
   - N ranks in a chain. Each "forward micro-step":

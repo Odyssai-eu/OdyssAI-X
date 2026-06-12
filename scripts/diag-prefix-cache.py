@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Diagnostic: prefix cache effectiveness on any Odysseus cluster.
+"""Diagnostic: prefix cache effectiveness on any OdyssAI-X cluster.
 
 Sends two requests with the same `session_id`:
 - Probe 1 (cold): only system + user. Should be a miss → full prefill paid.
@@ -11,10 +11,10 @@ Reports TTFT, prompt_tokens (when available), and the cache hit status
 inferred from the runner log.
 
 Usage:
-  ODYSSEUS_URL=http://<your-odysseus-host>:8000 \
+  ODYSSAI_X_URL=http://<your-engine-host>:8000 \
   python3 scripts/diag-prefix-cache.py <model-id>
 
-The cluster must be loaded (curl $ODYSSEUS_URL/admin/clusters/<id> →
+The cluster must be loaded (curl $ODYSSAI_X_URL/admin/clusters/<id> →
 nodes.loaded:true).
 """
 
@@ -29,9 +29,9 @@ import uuid
 import httpx
 
 
-URL = os.environ.get("ODYSSEUS_URL")
+URL = os.environ.get("ODYSSAI_X_URL") or os.environ.get("ODYSSEUS_URL")
 if not URL:
-    sys.exit("set ODYSSEUS_URL env var (e.g. http://<your-host>:8000) before running")
+    sys.exit("set ODYSSAI_X_URL env var (e.g. http://<your-host>:8000) before running")
 
 
 SYSTEM_PROMPT = (
@@ -131,7 +131,7 @@ def main():
         print(f"  ❌ Probe 2 is not faster than probe 1. Cache miss or"
               f" divergence. Look for `fp16·divergent` in runner logs.")
     print()
-    print("To verify, tail the Odysseus container logs and grep for the "
+    print("To verify, tail the OdyssAI-X container logs and grep for the "
           "session id:")
     print(f"  ssh <odysseus-host> '/usr/local/bin/docker logs "
           f"mlx-odyss-eu 2>&1' | grep '{session_id[:6]}'")

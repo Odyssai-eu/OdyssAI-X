@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Bootstrap an Apple Silicon Mac as an Odysseus cluster node.
+# Bootstrap an Apple Silicon Mac as an OdyssAI-X cluster node.
 #
 # The orchestrator (this repo, running in Docker) SSHes into each cluster
 # node and expects to find:
@@ -52,7 +52,7 @@ NODE="$1"
 # sign intact through this script and through SSH; the remote shell
 # does the expansion.
 MODELS_DIR="${2:-\$HOME/mlx-models}"
-REMOTE_DIR="${ODYSSEUS_REMOTE_CLUSTER_DIR:-\$HOME/mlx-cluster}"
+REMOTE_DIR="${ODYSSAI_X_REMOTE_CLUSTER_DIR:-${ODYSSEUS_REMOTE_CLUSTER_DIR:-\$HOME/mlx-cluster}}"
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 

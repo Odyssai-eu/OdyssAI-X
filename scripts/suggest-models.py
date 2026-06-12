@@ -54,7 +54,7 @@ class ModelSuggestion:
 # (third-party converters publish many more variants); it's the
 # shortest list we're confident loads end-to-end with mlx-lm with no
 # quantization surprises. For anything outside this set, operators
-# point huggingface-cli at any HF repo they want — Odysseus doesn't
+# point huggingface-cli at any HF repo they want — OdyssAI-X doesn't
 # care who packaged it as long as it's a valid mlx-lm directory.
 #
 # Order: ascending size, so the agent picks the right tier per RAM.

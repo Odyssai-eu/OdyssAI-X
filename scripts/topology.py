@@ -1,6 +1,7 @@
 """Cluster topology loader.
 
-Reads `~/.odysseus/topology.yaml` (or the path in `ODYSSEUS_TOPOLOGY`)
+Reads `~/.odysseus/topology.yaml` (or the path in `ODYSSAI_X_TOPOLOGY`,
+legacy `ODYSSEUS_TOPOLOGY` still honoured)
 and exposes the cluster definitions in the shape api.py wants:
 
   - nodes_for(cluster: str, size: int) -> list[NodeDef]
@@ -169,8 +170,9 @@ def _expand_env_recursive(obj):
 
 
 def default_topology_path() -> Path:
-    """Resolve ~/.odysseus/topology.yaml unless ODYSSEUS_TOPOLOGY env is set."""
-    p = os.environ.get("ODYSSEUS_TOPOLOGY")
+    """Resolve ~/.odysseus/topology.yaml unless ODYSSAI_X_TOPOLOGY (or legacy
+    ODYSSEUS_TOPOLOGY) is set."""
+    p = os.environ.get("ODYSSAI_X_TOPOLOGY") or os.environ.get("ODYSSEUS_TOPOLOGY")
     if p:
         return Path(p).expanduser()
     return Path.home() / ".odysseus" / "topology.yaml"

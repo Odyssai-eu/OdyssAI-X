@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Bump ODYSSEUS_VERSION in scripts/api.py.
+# Bump ENGINE_VERSION in scripts/api.py.
 #
 # Usage:
 #   ./scripts/bump-version.sh patch    # 1.7.2 → 1.7.3
@@ -23,9 +23,9 @@ esac
 
 cd "$(dirname "$0")/.."
 
-CUR=$(grep -E '^ODYSSEUS_VERSION = "' scripts/api.py | head -1 | sed -E 's/.*"([^"]+)".*/\1/')
+CUR=$(grep -E '^ENGINE_VERSION = "' scripts/api.py | head -1 | sed -E 's/.*"([^"]+)".*/\1/')
 if [[ -z "$CUR" ]]; then
-  echo "✗ couldn't read current ODYSSEUS_VERSION from scripts/api.py" >&2
+  echo "✗ couldn't read current ENGINE_VERSION from scripts/api.py" >&2
   exit 1
 fi
 
@@ -39,13 +39,13 @@ esac
 # Use a portable sed (works on macOS + GNU). Match the line precisely so
 # we don't touch the documentation example above the constant.
 if [[ "$(uname)" == "Darwin" ]]; then
-  sed -i '' "s|^ODYSSEUS_VERSION = \"$CUR\"|ODYSSEUS_VERSION = \"$NEW\"|" scripts/api.py
+  sed -i '' "s|^ENGINE_VERSION = \"$CUR\"|ENGINE_VERSION = \"$NEW\"|" scripts/api.py
 else
-  sed -i "s|^ODYSSEUS_VERSION = \"$CUR\"|ODYSSEUS_VERSION = \"$NEW\"|" scripts/api.py
+  sed -i "s|^ENGINE_VERSION = \"$CUR\"|ENGINE_VERSION = \"$NEW\"|" scripts/api.py
 fi
 
 # Sanity check the edit landed.
-if ! grep -qE "^ODYSSEUS_VERSION = \"$NEW\"" scripts/api.py; then
+if ! grep -qE "^ENGINE_VERSION = \"$NEW\"" scripts/api.py; then
   echo "✗ failed to write new version $NEW into scripts/api.py" >&2
   exit 1
 fi

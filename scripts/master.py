@@ -29,9 +29,9 @@ from topology import load_topology, to_nodes_dict
 
 NODES: list[dict] = []
 COORDINATOR_RANK = 0
-REMOTE_CLUSTER_DIR = os.environ.get("ODYSSEUS_REMOTE_CLUSTER_DIR", "$HOME/mlx-cluster").rstrip("/")
-RUNNER_REMOTE = os.environ.get("ODYSSEUS_RUNNER_REMOTE", f"{REMOTE_CLUSTER_DIR}/runner.py")
-PYTHON_REMOTE = os.environ.get("ODYSSEUS_PYTHON_REMOTE", f"{REMOTE_CLUSTER_DIR}/.venv/bin/python")
+REMOTE_CLUSTER_DIR = (os.environ.get("ODYSSAI_X_REMOTE_CLUSTER_DIR") or os.environ.get("ODYSSEUS_REMOTE_CLUSTER_DIR") or "$HOME/mlx-cluster").rstrip("/")
+RUNNER_REMOTE = (os.environ.get("ODYSSAI_X_RUNNER_REMOTE") or os.environ.get("ODYSSEUS_RUNNER_REMOTE") or f"{REMOTE_CLUSTER_DIR}/runner.py")
+PYTHON_REMOTE = (os.environ.get("ODYSSAI_X_PYTHON_REMOTE") or os.environ.get("ODYSSEUS_PYTHON_REMOTE") or f"{REMOTE_CLUSTER_DIR}/.venv/bin/python")
 
 
 def load_nodes(cluster: str, size: int) -> list[dict]:
@@ -39,7 +39,7 @@ def load_nodes(cluster: str, size: int) -> list[dict]:
     if topo is None:
         raise SystemExit(
             "No topology.yaml found. Copy config/topology.example.yaml to "
-            "~/.odysseus/topology.yaml or set ODYSSEUS_TOPOLOGY."
+            "~/.odysseus/topology.yaml or set ODYSSAI_X_TOPOLOGY."
         )
     if cluster not in topo.clusters:
         raise SystemExit(f"Cluster {cluster!r} not found in topology.yaml")
