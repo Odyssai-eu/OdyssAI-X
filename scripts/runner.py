@@ -214,12 +214,67 @@ MODEL_SAMPLING_DEFAULTS: dict[str, dict] = {
     "minimax": {
         "temp": 0.7,
         "top_p": 0.9,
-        "repetition_penalty": 1.15,
-        # 128 catches multi-paragraph cycles (the NEMO-20-5 loop was a
-        # ~150-token block repeating; 20 was way too short to detect).
-        "repetition_context_size": 128,
+        # 1.1, not 1.15: above ~1.15 on creative prose the penalty starts
+        # hitting words that MUST recur (names, "fréquence", articles) and
+        # pushes the model toward rarer alternatives — including high-frequency
+        # CJK tokens. That is exactly the M3 zh-leak (陪伴/可能 on attachment
+        # beats) we observed on the Bruit-Blanc run. See OdyssAI-X#53.
+        "repetition_penalty": 1.1,
+        # 512, not 128: M3's verbatim clause loops recur at 200-400 tokens'
+        # distance ("équations fondamentales régissant fonctionnement système"
+        # ~10x). mlx-lm's repetition_penalty only looks back
+        # repetition_context_size tokens, so 128 never even sees the clause it
+        # is repeating. 512 covers the multi-paragraph cycle.
+        "repetition_context_size": 512,
+        # The surgical tool. Hard-bans repeating any 4-gram (HF-style), which
+        # kills verbatim clause recycling without touching normal reuse of
+        # common short words — where repetition_penalty is a blunt hammer.
+        # mlx-lm has no native support; see make_no_repeat_ngram_processor.
+        "no_repeat_ngram_size": 4,
     },
 }
+
+
+def make_no_repeat_ngram_processor(ngram_size: int):
+    """A logits processor that hard-bans repeating any `ngram_size`-gram, the
+    way HF transformers' `no_repeat_ngram_size` does. mlx-lm ships repetition /
+    presence / frequency penalties but not this — and those penalties are the
+    wrong tool for M3's failure mode: they soft-discount individual *tokens*
+    seen in the last N positions, whereas M3 recycles whole *clauses* verbatim
+    ("équations fondamentales régissant fonctionnement système" ~10x in one
+    Bruit-Blanc run). Banning the n-gram kills the clause loop surgically
+    without touching legitimate reuse of common short words. See OdyssAI-X#53.
+
+    Signature matches mlx-lm processors: (tokens, logits) -> logits, where
+    `tokens` is the full mx.array of prompt+generated ids (it grows by >=1 each
+    call — verified against mlx-lm 0.31.3 generate.py, `mx.concat`) and `logits`
+    is the [1, vocab] current-step logits. State is per-processor (rebuilt fresh
+    per request by _build_sampling_for) and updated incrementally, so the cost
+    is O(new tokens) per step — amortized O(1) — not O(context).
+    """
+    n = int(ngram_size)
+    history: list[int] = []
+    prefix_map: dict[tuple, set] = {}
+
+    def processor(tokens, logits):
+        # Sync the running history with the token array, indexing every newly
+        # completed n-gram: its (n-1)-token prefix maps to the token that
+        # followed. The first call delivers the whole prompt at once.
+        cur_len = int(tokens.shape[0]) if hasattr(tokens, "shape") else len(tokens)
+        if cur_len > len(history):
+            tail = tokens[len(history):]
+            new_ids = tail.tolist() if hasattr(tail, "tolist") else list(tail)
+            for t in new_ids:
+                history.append(int(t))
+                if len(history) >= n:
+                    prefix_map.setdefault(tuple(history[-n:-1]), set()).add(history[-1])
+        if len(history) >= n - 1:
+            banned = prefix_map.get(tuple(history[-(n - 1):]))
+            if banned:
+                logits[:, mx.array(list(banned))] = -float("inf")
+        return logits
+
+    return processor
 
 
 def _build_sampling_for(repo: str):
@@ -243,6 +298,13 @@ def _build_sampling_for(repo: str):
                     params["repetition_context_size"]
                 )
             logits_processors = make_logits_processors(**lp_kwargs) if lp_kwargs else None
+            # no_repeat_ngram_size is not an mlx-lm penalty kwarg — append our
+            # own processor to the (possibly empty) list.
+            nrn = params.get("no_repeat_ngram_size")
+            if nrn and int(nrn) >= 2:
+                if logits_processors is None:
+                    logits_processors = []
+                logits_processors.append(make_no_repeat_ngram_processor(int(nrn)))
             return sampler, logits_processors
     return None, None
 
