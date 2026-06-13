@@ -2501,6 +2501,37 @@ _THINK_OPEN = "<think>"
 _THINK_CLOSE = "</think>"
 _THINK_MAX_PARTIAL = max(len(_THINK_OPEN), len(_THINK_CLOSE)) - 1  # 7
 
+# Per-model think markers. Most reasoning models wrap in <think>…</think>;
+# MiniMax-M3 uses its own <mm:think>…</mm:think> pair (token 200059/200060).
+# Without the right pair, the splitter seeds in_think=True, hunts for the
+# wrong close marker forever, and traps the WHOLE answer in reasoning_content
+# (content=null) — exactly M3's first-smoke symptom (2026-06-13).
+_THINK_MARKERS = {
+    "minimax-m3": ("<mm:think>", "</mm:think>"),
+}
+
+
+def _model_think_markers(model_id: Optional[str]) -> tuple[str, str]:
+    needle = (model_id or "").lower()
+    for key, pair in _THINK_MARKERS.items():
+        if key in needle:
+            return pair
+    return _THINK_OPEN, _THINK_CLOSE
+
+
+def _seed_in_think(model_id: Optional[str], enable_thinking) -> bool:
+    """Should a filtered stream START already inside a think block?
+
+    True for templates that PREFILL the open tag into the prompt (the model
+    emits only the body + close): the classic auto-open family (M2, Qwen3.5/6,
+    Step-3.7). M3 only prefills `<mm:think>` when thinking is EXPLICITLY
+    enabled; in adaptive mode it emits its own open tag, so seeding True would
+    eat the literal tag — seed False there and let the filter catch it.
+    """
+    if "minimax-m3" in (model_id or "").lower():
+        return enable_thinking is True
+    return True
+
 # Models whose chat_template auto-prefills `<think>\n` at the end of the
 # prompt, leaving the model to emit just the reasoning body and a closing
 # `</think>` tag. Without compensation, our filter never sees the open
@@ -2524,10 +2555,14 @@ _MODELS_AUTO_OPEN_THINK = ("minimax", "qwen3.5", "qwen3.6", "step-3.7", "step3p7
 # tags within the content field. Do not modify the content field."
 # Qwen3.5 and Qwen3.6 honor the flag — when Companion sends
 # enable_thinking=false they actually stop thinking, no filter needed.
-# MiniMax doesn't honor it, so we MUST keep the filter on for it even
+# MiniMax-M2 doesn't honor it, so we MUST keep the filter on for it even
 # when callers ask for no-thinking, otherwise the reasoning text leaks
 # into `content` verbatim (`</think>` literal visible to the user).
-_MODELS_IGNORE_ENABLE_THINKING_FLAG = ("minimax", "step-3.7", "step3p7")
+# M3 is DELIBERATELY excluded: its template honors thinking_mode="disabled"
+# (mapped from enable_thinking in the runner), so no-thinking truly emits no
+# block and forcing the filter would ghost the answer. Hence "minimax-m2",
+# not bare "minimax".
+_MODELS_IGNORE_ENABLE_THINKING_FLAG = ("minimax-m2", "step-3.7", "step3p7")
 
 # Models whose chat template reads a `reasoning_effort` system directive
 # (OpenAI o-series convention: minimal/low/medium/high). Step-3.7-Flash is a
@@ -2610,6 +2645,9 @@ def _split_think_stream(text: str, state: dict) -> tuple[str, str]:
     whichever bucket matches state["in_think"] — `_flush_think_stream` does
     that.
     """
+    open_m = state.get("open", _THINK_OPEN)
+    close_m = state.get("close", _THINK_CLOSE)
+    max_partial = max(len(open_m), len(close_m)) - 1
     text = state.get("carry", "") + (text or "")
     state["carry"] = ""
     visible_parts: list[str] = []
@@ -2617,30 +2655,30 @@ def _split_think_stream(text: str, state: dict) -> tuple[str, str]:
 
     while text:
         if state.get("in_think"):
-            idx = text.find(_THINK_CLOSE)
+            idx = text.find(close_m)
             if idx == -1:
                 # No close marker — emit body up to the last few chars that
-                # could be the start of `</think>`. Hold those back.
-                tail_len = min(len(text), _THINK_MAX_PARTIAL)
+                # could be the start of the close tag. Hold those back.
+                tail_len = min(len(text), max_partial)
                 if len(text) > tail_len:
                     reasoning_parts.append(text[:-tail_len])
                 state["carry"] = text[-tail_len:] if tail_len else ""
                 text = ""
             else:
                 reasoning_parts.append(text[:idx])
-                text = text[idx + len(_THINK_CLOSE):]
+                text = text[idx + len(close_m):]
                 state["in_think"] = False
         else:
-            idx = text.find(_THINK_OPEN)
+            idx = text.find(open_m)
             if idx == -1:
-                tail_len = min(len(text), _THINK_MAX_PARTIAL)
+                tail_len = min(len(text), max_partial)
                 if len(text) > tail_len:
                     visible_parts.append(text[:-tail_len])
                 state["carry"] = text[-tail_len:] if tail_len else ""
                 text = ""
             else:
                 visible_parts.append(text[:idx])
-                text = text[idx + len(_THINK_OPEN):]
+                text = text[idx + len(open_m):]
                 state["in_think"] = True
 
     return "".join(visible_parts), "".join(reasoning_parts)
@@ -6251,8 +6289,14 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
         # enable_thinking=False (MiniMax/Step-3.7). model_id is pool.model,
         # the concrete HF path, so the family match holds for pool aliases.
         if _should_filter_think(model_id, req.enable_thinking) and content:
-            # Auto-open templates emit no leading <think> tag → seed True.
-            ts: dict = {"in_think": True, "carry": ""}
+            open_m, close_m = _model_think_markers(model_id)
+            # Seed in_think=True only when the open tag was PREFILLED into the
+            # prompt (output begins mid-thought, no leading open). If the model
+            # emitted its own open — M3 adaptive mode — seed False and let the
+            # filter catch it. Full content in hand here, so detect directly.
+            seed = not content.lstrip().startswith(open_m)
+            ts: dict = {"in_think": seed, "carry": "",
+                        "open": open_m, "close": close_m}
             visible_full, reasoning_full = _split_think_stream(content, ts)
             fl_vis, fl_reason = _flush_think_stream(ts)
             content = visible_full + fl_vis
@@ -6316,11 +6360,15 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
             # model_id is pool.model (the concrete HF path), so the family
             # match works even when the caller dialed a pool alias ("default").
             think_filter_active = _should_filter_think(model_id, req.enable_thinking)
-            # When we filter, these templates auto-OPEN the block (no leading
-            # <think> tag), so seed in_think=True. _should_filter_think already
-            # excludes the honor-flag-thinking-off case that would ghost.
-            _seed_in_think = think_filter_active
-            think_state: dict = {"in_think": _seed_in_think, "carry": ""}
+            # Seed in_think + pick the right markers per model. Most templates
+            # auto-OPEN (prefilled tag) → seed True; M3 adaptive emits its own
+            # open → seed False (see _seed_in_think). _should_filter_think
+            # already excludes the honor-flag-thinking-off ghost case.
+            _open_m, _close_m = _model_think_markers(model_id)
+            think_state: dict = {
+                "in_think": think_filter_active and _seed_in_think(model_id, req.enable_thinking),
+                "carry": "", "open": _open_m, "close": _close_m,
+            }
             async for ev in pool.submit(None, req.max_tokens or 512, req.enable_thinking,
                                         messages=messages, tools=req.tools,
                                         session_id=session_id,
@@ -9175,7 +9223,9 @@ async def _telemak_proxy_chat_completion(
             for choice in out.get("choices", []) or []:
                 msg = choice.get("message") or {}
                 raw = msg.get("content") or ""
-                state = {"in_think": True, "carry": ""}
+                _om, _cm = _model_think_markers(upstream_model)
+                state = {"in_think": not raw.lstrip().startswith(_om),
+                         "carry": "", "open": _om, "close": _cm}
                 vis, reas = _split_think_stream(raw, state)
                 vis2, reas2 = _flush_think_stream(state)
                 visible = (vis + vis2).lstrip()
@@ -9204,7 +9254,12 @@ async def _telemak_proxy_chat_completion(
     # Streaming path — parse SSE chunks, route delta.content through the
     # think filter, re-emit content + reasoning_content as separate deltas.
     async def _gen():
-        state = {"in_think": True, "carry": ""} if auto_think else None
+        if auto_think:
+            _om, _cm = _model_think_markers(upstream_model)
+            state = {"in_think": _seed_in_think(upstream_model, body.get("enable_thinking")),
+                     "carry": "", "open": _om, "close": _cm}
+        else:
+            state = None
         _ttft: list = []          # mutable cell for TTFT
         _t0 = time.time()
         _ntoks = 0
