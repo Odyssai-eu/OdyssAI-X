@@ -138,6 +138,19 @@ def main() -> int:
                          "logit-floor corruption at ~Q6 size / single-node "
                          "(OdyssAI-X#53).")
     ap.add_argument("--group-size", type=int, default=64)
+    # MSA selection fix (OdyssAI-X#53). The reference ships sparse_local_block=1 /
+    # sparse_topk_blocks=16, which EVICTS the recent blocks carrying rare-token
+    # spelling at long context (>2048) -> name drift / typos / fusions. Widening
+    # the guaranteed local window to 8 (1024 recent keys) + the budget to 24 (so
+    # the 8 forced blocks don't cannibalise the indexer's free slots) fixed it:
+    # canary T01 scored 445 (Elma 41/41, longueur cible) vs 407.5 at 1/16, en
+    # gardant ~36x de sparsité à 128k. Tunable ici.
+    ap.add_argument("--local-blocks", type=int, default=8,
+                    help="index_local_blocks: # of recent 128-key blocks always kept "
+                         "(reference 1; 8 = MSA fix).")
+    ap.add_argument("--topk-blocks", type=int, default=24,
+                    help="index_topk_blocks: total selected blocks per query "
+                         "(reference 16; 24 = MSA fix, laisse ~16 slots libres indexer).")
     ap.add_argument("--limit-layers", type=int, default=0)
     args = ap.parse_args()
 
@@ -293,6 +306,12 @@ def main() -> int:
                           ("index_local_blocks", "sparse_local_block")):
         if legacy in sc:
             cfg[flat] = sc[legacy]
+    # Override the reference 1/16 with the MSA-fix selection (see --local-blocks /
+    # --topk-blocks). The reference values evict local fidelity at long context;
+    # 8/24 is the validated fix (canari 445 vs 407.5). The indexer SCORING budget
+    # stays as shipped; this only widens what the gather is guaranteed to keep.
+    cfg["index_local_blocks"] = args.local_blocks
+    cfg["index_topk_blocks"] = args.topk_blocks
     rp = cfg.get("rope_parameters") or {}
     cfg.setdefault("rope_theta", rp.get("rope_theta", 5e6))
     cfg.setdefault("partial_rotary_factor", rp.get("partial_rotary_factor", 0.5))
