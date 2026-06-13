@@ -1604,9 +1604,13 @@ def main() -> None:
     # cache helpers so prefix-cache reuse works in both.
     # Speculative decoding (draft_model) requires the legacy path — mlx-lm's
     # BatchGenerator doesn't currently accept a draft_model.
+    # minimax_m3 forces the legacy single-slot path: its MSA mask + decode
+    # block-gather (OdyssAI-X#53) assume a SCALAR cache offset (B=1). The
+    # BatchGenerator cache exposes a non-scalar offset → `mx.arange(offset+S)`
+    # TypeError in MiniMaxM3Model.__call__. B>1 batched M3 is phase-2 scope.
     use_batched = (size == 1) and _BATCH_AVAILABLE and (draft_model is None) and (
         os.environ.get("RUNNER_BATCH", "1") == "1"
-    )
+    ) and ("minimax-m3" not in repo.lower())
     if use_batched:
         log("entering batched main loop (BatchGenerator)")
         _run_batched_main(model, tokenizer, repo, kv_q8_default, stop_requested,
