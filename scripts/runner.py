@@ -211,7 +211,12 @@ _cancelled_lock = threading.Lock()
 #
 # If no entry matches, mlx-lm defaults apply — same behavior as before.
 MODEL_SAMPLING_DEFAULTS: dict[str, dict] = {
-    "minimax": {
+    # MiniMax-M3 (bilingual prose engine). MUST come before the general
+    # "minimax" entry — first match wins, and "minimax-m3" is a substring of
+    # the repo path while "minimax" alone is the fallback for other MiniMax
+    # checkpoints (e.g. M2.x coder/tool models, where no_repeat_ngram would
+    # wrongly ban legitimate repeated syntax/JSON/indentation).
+    "minimax-m3": {
         "temp": 0.7,
         "top_p": 0.9,
         # 1.1, not 1.15: above ~1.15 on creative prose the penalty starts
@@ -230,7 +235,18 @@ MODEL_SAMPLING_DEFAULTS: dict[str, dict] = {
         # kills verbatim clause recycling without touching normal reuse of
         # common short words — where repetition_penalty is a blunt hammer.
         # mlx-lm has no native support; see make_no_repeat_ngram_processor.
+        # SCOPED to M3 (prose) on purpose — do NOT inherit it into "minimax".
         "no_repeat_ngram_size": 4,
+    },
+    # Other MiniMax checkpoints (M2.x coder/tool). Conservative, unchanged from
+    # the original guardrail — no no_repeat_ngram (would break code/tool output).
+    "minimax": {
+        "temp": 0.7,
+        "top_p": 0.9,
+        "repetition_penalty": 1.15,
+        # 128 catches multi-paragraph cycles (the NEMO-20-5 loop was a
+        # ~150-token block repeating; 20 was way too short to detect).
+        "repetition_context_size": 128,
     },
 }
 
