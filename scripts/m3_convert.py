@@ -9,7 +9,13 @@ Sortie = nommage hub conservé (model.layers.N.self_attn.*, block_sparse_moe.*)
 avec les experts STACKÉS en switch_mlp.{gate,down,up}_proj quantifiés — le
 layout que minimax_m3.py consomme directement (son sanitize passe les noms
 stackés tels quels). Config aplati : text_config -> top-level, model_type
-"minimax_m3", layer_types/mlp_layer_types EXPLICITES, champs index_* plats.
+"minimax_m3", champs index_* plats. (PAS de layer_types/mlp_layer_types : le
+validateur strict de transformers 5.9.0 rejette "minimax_m3_sparse" au load
+tokenizer — le modèle dérive 3-full/57-sparse depuis sparse_attention_config.)
+
+Quant mixte : --head-bits 8 (avec --bits 6) lève embed_tokens + lm_head à 8-bit
+(la projection vocab bilingue) en laissant les experts à 6-bit -> fixe la
+corruption logit-floor du lm_head à ~taille Q6, single-node (OdyssAI-X#53).
 
 Recette : corps Q6/g64 ; indexer MSA gardé en bf16 (la sélection de blocs est
 le système nerveux du modèle — 57x(512+128)x6144 poids, ~0,5 GB, le prix de
@@ -125,11 +131,18 @@ def main() -> int:
     ap.add_argument("src")
     ap.add_argument("dst")
     ap.add_argument("--bits", type=int, default=6)
+    ap.add_argument("--head-bits", type=int, default=0,
+                    help="bits for embed_tokens + lm_head (0 = same as --bits). "
+                         "Set 8 with --bits 6 for the MIXED quant that lifts only "
+                         "the bilingual vocab projection — fixes the lm_head "
+                         "logit-floor corruption at ~Q6 size / single-node "
+                         "(OdyssAI-X#53).")
     ap.add_argument("--group-size", type=int, default=64)
     ap.add_argument("--limit-layers", type=int, default=0)
     args = ap.parse_args()
 
     gs, bits = args.group_size, args.bits
+    head_bits = args.head_bits or bits
     src, dst = Path(args.src), Path(args.dst)
     full_cfg = json.loads((src / "config.json").read_text())
     if full_cfg.get("model_type") not in ("minimax_m3_vl", "minimax_m3"):
@@ -157,7 +170,8 @@ def main() -> int:
     t0 = time.time()
     worst: tuple[float, str] = (1.0, "")
     n_do = args.limit_layers or NL
-    print(f"src={src.name} bits={bits}/g{gs} layers={NL} (run {n_do}) experts={NE} "
+    head_note = f" head={head_bits}" if head_bits != bits else ""
+    print(f"src={src.name} bits={bits}/g{gs}{head_note} layers={NL} (run {n_do}) experts={NE} "
           f"sparse={sum(1 for t in layer_types if 'sparse' in t)} "
           f"moe={sum(1 for t in mlp_layer_types if t == 'sparse')}", flush=True)
 
@@ -250,10 +264,10 @@ def main() -> int:
     if not out.done("top"):
         tensors = {}
         w = rd.read(f"{H}model.embed_tokens.weight")
-        deq, nm = qinto(tensors, "model.embed_tokens", w, gs, bits)
+        deq, nm = qinto(tensors, "model.embed_tokens", w, gs, head_bits)
         audit(nm, deq, w)
         w = rd.read(f"{H}lm_head.weight")
-        deq, nm = qinto(tensors, "lm_head", w, gs, bits)
+        deq, nm = qinto(tensors, "lm_head", w, gs, head_bits)
         audit(nm, deq, w)
         keep_bf16(tensors, "model.norm.weight", rd.read(f"{H}model.norm.weight"))
         out.write_shard("top", tensors)
@@ -263,8 +277,15 @@ def main() -> int:
     # ---- config / tokenizer / index / manifest ------------------------------
     cfg = dict(tc)
     cfg["model_type"] = "minimax_m3"
-    cfg["layer_types"] = layer_types
-    cfg["mlp_layer_types"] = mlp_layer_types
+    # Do NOT emit layer_types / mlp_layer_types. transformers 5.9.0's strict
+    # PreTrainedConfig validator rejects the custom "minimax_m3_sparse" value at
+    # AutoTokenizer-load time -> the runner's tokenizer load crashes ("3 ranks
+    # died"). Pop any inherited from the source too. The vendored model derives
+    # the 3-full / 57-sparse structure from sparse_attention_config + the
+    # index_* fields below; the working Q6 and the validated Q8-3node both run
+    # WITHOUT these keys. See OdyssAI-X#53.
+    cfg.pop("layer_types", None)
+    cfg.pop("mlp_layer_types", None)
     for flat, legacy in (("index_n_heads", "sparse_num_index_heads"),
                           ("index_head_dim", "sparse_index_dim"),
                           ("index_block_size", "sparse_block_size"),
@@ -283,7 +304,19 @@ def main() -> int:
     cfg["tokenizer_class"] = "PreTrainedTokenizerFast"
     cfg.setdefault("eos_token_id", 200020)
     cfg.setdefault("bos_token_id", 200019)
+    # Quantization config. Uniform unless head_bits differs (MIXED quant:
+    # embed_tokens + lm_head at head_bits, everything else at bits). mlx_lm's
+    # load_model keys per-module overrides by module PATH in config["quantization"]:
+    #   def class_predicate(p, m):
+    #       if p in config["quantization"]: return config["quantization"][p]
+    #       ...
+    # so the two head modules carry their own {group_size, bits} dict and the
+    # rest fall through to the global bits.
     q = {"group_size": gs, "bits": bits, "mode": "affine"}
+    if head_bits != bits:
+        head_q = {"group_size": gs, "bits": head_bits, "mode": "affine"}
+        q["model.embed_tokens"] = dict(head_q)
+        q["lm_head"] = dict(head_q)
     cfg["quantization"] = q
     cfg["quantization_config"] = dict(q)
     (dst / "config.json").write_text(json.dumps(cfg, indent=2))
@@ -306,7 +339,7 @@ def main() -> int:
         "source_format": "BF16 safetensors (minimax_m3_vl)",
         "model_type": "minimax_m3",
         "scope": "text tower only — vision tower + projector dropped",
-        "recipe": {"bits": bits, "group_size": gs,
+        "recipe": {"bits": bits, "head_bits": head_bits, "group_size": gs,
                    "indexer": "bf16 (non quantifié)",
                    "router_gate": "bf16 + e_score_correction_bias f32 (bruts)",
                    "experts": "stack switch_mlp (w1->gate, w2->down, w3->up)"},
