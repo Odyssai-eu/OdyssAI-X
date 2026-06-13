@@ -1,0 +1,32 @@
+[
+  {
+    "name": "name-Elma-vs-Elna",
+    "context": "Elma cala la pince sur le bornier, vérifia l'ampérage, resserra. Le transformateur ronronnait sous ses doigts. Pip planait à hauteur d'épaule, sa LED bleue clignotant. Elle rangea les outils, descendit dans la rue. Plus tard,",
+    "good": " Elma",
+    "bad": " Elna"
+  },
+  {
+    "name": "name-Elma-vs-Elca",
+    "context": "Elma brancha son terminal sur le port de diagnostic. Authentification acceptée. Elle ferma les paupières et se concentra sur le son du Réseau. Quand elle rouvrit les yeux,",
+    "good": " Elma",
+    "bad": " Elca"
+  },
+  {
+    "name": "fr-yeux-vs-en-eyes",
+    "context": "Elle ne regardait pas l'écran. Elle se concentra sur le son et ferma les",
+    "good": " yeux",
+    "bad": " eyes"
+  },
+  {
+    "name": "fr-une-vs-es-una",
+    "context": "Non pas détruire le Réseau — elle ne pouvait pas, et ne voulait pas — mais ajuster ses priorités. Pas une destruction.",
+    "good": " Une réécriture",
+    "bad": " Una réécriture"
+  },
+  {
+    "name": "fr-merge-helice-control",
+    "context": "Le drone corrigea son angle de vol. L'hélice arrière",
+    "good": " sifflait",
+    "bad": "sifflait"
+  }
+]
