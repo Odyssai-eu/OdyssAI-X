@@ -193,8 +193,19 @@ class SparseMoeBlock(nn.Module):
 class M3CacheLayer(KVCache):
     """KV cache + the indexer's key history (sparse layers only).
 
-    `idx_keys` mirrors the reference SparseCacheLayer.update_index: plain
-    append, no eviction — selection happens at score time, not storage time.
+    `idx_keys` is OFFSET-INDEXED onto the SAME `self.offset` as the main KV
+    (KVCache pre-allocates in `step` blocks and `trim()` just decrements
+    `offset`). A plain append would ignore trim — the engine's prefix-cache
+    reuse / context trim shrinks the main KV's offset, and a desynced
+    idx_keys then builds a sparse mask whose key-length exceeds the main
+    attention's, broadcast-crashing SDPA (568 vs 426 in prod; reproduced as
+    21 vs 13 after trim(8) on a 20-token prefill). Mirroring update_and_fetch
+    keeps both in lockstep through prefill, decode AND trim.
+
+    Ordering note: the indexer runs BEFORE the main update_and_fetch in a
+    given layer's forward, so `self.offset` here is still the pre-update
+    position (prev); we write [prev:prev+S] and return [:prev+S] WITHOUT
+    advancing offset — the main update_and_fetch advances it.
     """
 
     def __init__(self):
@@ -202,11 +213,39 @@ class M3CacheLayer(KVCache):
         self.idx_keys = None
 
     def update_index(self, idx_k):
-        if self.idx_keys is None:
-            self.idx_keys = idx_k
-        else:
-            self.idx_keys = mx.concatenate([self.idx_keys, idx_k], axis=-2)
-        return self.idx_keys
+        prev = self.offset
+        s = idx_k.shape[2]
+        if self.idx_keys is None or (prev + s) > self.idx_keys.shape[2]:
+            b, h, _, d = idx_k.shape
+            n_steps = (self.step + s - 1) // self.step
+            new = mx.zeros((b, h, n_steps * self.step, d), idx_k.dtype)
+            if self.idx_keys is not None:
+                if prev % self.step != 0:
+                    self.idx_keys = self.idx_keys[..., :prev, :]
+                self.idx_keys = mx.concatenate([self.idx_keys, new], axis=2)
+            else:
+                self.idx_keys = new
+        self.idx_keys[..., prev : prev + s, :] = idx_k
+        return self.idx_keys[..., : prev + s, :]
+
+    @property
+    def state(self):
+        # Carry idx_keys alongside (keys, values) so session save/restore
+        # never drops it (which would leave idx_keys=None at offset>0).
+        base = super().state
+        ik = None if self.idx_keys is None else self.idx_keys[..., : self.offset, :]
+        return (*base, ik) if isinstance(base, tuple) else (base, ik)
+
+    @state.setter
+    def state(self, v):
+        *base, ik = v
+        KVCache.state.fset(self, base[0] if len(base) == 1 else tuple(base))
+        self.idx_keys = ik
+
+    def to_quantized(self, group_size: int = 64, bits: int = 4):
+        # The indexer history must stay fp — refuse KV quantization so the
+        # sparse path keeps a coherent idx_keys (M3 loads kv_q8=False).
+        return self
 
 
 class Indexer(nn.Module):
