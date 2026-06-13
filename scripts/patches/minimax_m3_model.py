@@ -40,6 +40,12 @@ from mlx_lm.models.base import BaseModelArgs, scaled_dot_product_attention
 from mlx_lm.models.cache import KVCache
 from mlx_lm.models.switch_layers import SwitchGLU
 
+# Phase 1 (OdyssAI-X#53): decode block-gather is the production path. Set to
+# False to force the legacy dense-mask path everywhere — used by the golden test
+# (golden_decode.py) to obtain the exact reference output to diff against, and
+# as a kill-switch if the gather is ever suspected. Does not affect prefill.
+DECODE_BLOCK_GATHER = True
+
 
 @dataclass
 class ModelArgs(BaseModelArgs):
@@ -353,6 +359,71 @@ class Indexer(nn.Module):
         )
         return mask
 
+    def gather_decode(self, inds, num_blocks, k_len, offset, k, v, n_repeat, dtype):
+        """DECODE block-gather (S_q == 1, voie A exact).
+
+        Physically realise the MSA: instead of computing q·kᵀ over all k_len
+        keys and masking (build_block_mask), gather ONLY the ≤topk selected
+        blocks (≤topk*block keys) from the post-update main K/V and attend over
+        that fixed-size subset. Returns (k_sub, v_sub, sub_mask) ready for SDPA:
+          k_sub/v_sub : [B, H, T_kv, D]  (kv-heads already repeated to H)
+          sub_mask    : [B, 1, 1, T_kv]  additive 0/-inf
+
+        `inds` is [B, 1, topk] (S_q==1), -1 for invalid slots. The composed
+        additive mask is valid(slot≠-1) ∧ causal(gpos<=offset) ∧ in_range(gpos<k_len).
+        Both the -1 slots and the partial-last-block overflow get the SAME
+        double-guard (clamp the gather index to a safe in-bounds value AND mask
+        the slot to -inf) so neither leaks a real key. Validated empirically:
+        challenge2_maskcompose.py (set-equality + numeric < 1e-6 vs dense) and
+        challenge3.py (partial last block + cache order).
+        """
+        B = inds.shape[0]
+        topk = inds.shape[2]
+        block = self.block_size
+        T_kv = topk * block
+        Hkv, D = k.shape[1], k.shape[3]
+
+        # block index -> absolute key positions: blk*block + [0..block).
+        # clamp the -1 slots to block 0 (a SAFE in-bounds block) — the additive
+        # mask will -inf them, so the clamp never leaks block 0's keys.
+        safe_blk = mx.where(
+            inds < 0, mx.array(0, mx.int32), inds.astype(mx.int32)
+        )  # [B, 1, topk]
+        within = mx.arange(block)
+        gpos = (
+            safe_blk[..., None] * block + within[None, None, None, :]
+        ).reshape(B, T_kv)  # [B, T_kv] absolute key positions
+
+        # double-guard #2: the last selected block may be partial (its tail
+        # covers positions >= k_len that don't exist). Clamp the GATHER index to
+        # k_len-1 so take_along_axis never reads out of bounds, then -inf those
+        # slots via in_range below.
+        gpos_clamped = mx.minimum(gpos, mx.array(k_len - 1, mx.int32))
+        gidx = mx.broadcast_to(gpos_clamped[:, None, :, None], (B, Hkv, T_kv, D))
+        k_sub = mx.take_along_axis(k, gidx, axis=2)  # [B, Hkv, T_kv, D]
+        v_sub = mx.take_along_axis(v, gidx, axis=2)
+        if n_repeat > 1:
+            k_sub = mx.repeat(k_sub, n_repeat, axis=1)
+            v_sub = mx.repeat(v_sub, n_repeat, axis=1)
+
+        # composed additive mask over the gathered slots:
+        #   valid   = slot was a real selected block (not a -1 pad)
+        #   causal  = key position <= query position (offset, the single decode pos)
+        #   in_range= key position is a REAL key (< k_len), excludes partial-block pad
+        valid_slot = inds >= 0  # [B, 1, topk]
+        valid = mx.broadcast_to(
+            valid_slot[..., None], (B, 1, topk, block)
+        ).reshape(B, T_kv)
+        causal = gpos <= offset
+        in_range = gpos < k_len
+        keep = valid & causal & in_range  # [B, T_kv]
+        sub_mask = mx.where(
+            keep[:, None, None, :],
+            mx.array(0.0, dtype=dtype),
+            mx.array(mx.finfo(mx.float32).min, dtype=dtype),
+        )
+        return k_sub, v_sub, sub_mask
+
 
 class Attention(nn.Module):
     def __init__(self, args: ModelArgs, layer_idx: int):
@@ -393,18 +464,37 @@ class Attention(nn.Module):
             base=self.rope_theta, scale=1.0, offset=offset,
         )
 
-        sparse_mask = None
+        # Indexer runs BEFORE update_and_fetch (it reads/writes idx_keys onto the
+        # pre-update offset); the gather then reads the K/V RETURNED by
+        # update_and_fetch (the full post-update main KV), never idx_keys.
+        inds = num_blocks = k_len_idx = None
         if self.indexer is not None:
             inds, num_blocks, k_len_idx = self.indexer(x, offset, cache)
-            sparse_mask = self.indexer.build_block_mask(
-                inds, num_blocks, k_len_idx, offset, S, q.dtype
-            )
 
         if cache is not None:
             k, v = cache.update_and_fetch(k, v)
 
-        if sparse_mask is not None:
-            attn_mask = sparse_mask
+        # DECODE block-gather (phase 1, voie A exact): at S_q == 1 with a context
+        # past the useful regime (k_len > topk*block), physically attend only the
+        # selected blocks instead of computing the full q·kᵀ + dense mask. Below
+        # the threshold all blocks are selected (sparse == dense) so we keep the
+        # dense-mask path; prefill (S > 1) always keeps the dense-mask path.
+        thresh = self.indexer.topk_blocks * self.indexer.block_size if self.indexer else 0
+        if DECODE_BLOCK_GATHER and self.indexer is not None and S == 1 and k_len_idx > thresh:
+            n_repeat = self.num_heads // self.num_kv_heads
+            k_sub, v_sub, sub_mask = self.indexer.gather_decode(
+                inds, num_blocks, k_len_idx, offset, k, v, n_repeat, q.dtype
+            )
+            out = scaled_dot_product_attention(
+                q, k_sub, v_sub, cache=None, scale=self.scale, mask=sub_mask
+            )
+            out = out.transpose(0, 2, 1, 3).reshape(B, S, -1)
+            return self.o_proj(out)
+
+        if self.indexer is not None:
+            attn_mask = self.indexer.build_block_mask(
+                inds, num_blocks, k_len_idx, offset, S, q.dtype
+            )
         else:
             attn_mask = mask
 
