@@ -1,32 +1,64 @@
-# Plan Review Log: #40 JACCL stability (full package)
+# Plan Review Log : attention block-sparse (MSA) M3 — phase 1
 
-Pivot validated empirically (3× controlled unload+reload, 0 errno, wired freed, ~5s). Design written to PLAN.md, then cross-model adversarial review by Codex (read-only). MAX_ROUNDS=1 (ad-hoc, not a full grill loop).
+Act 1 (grill-with-docs) complete — plan locked, `CONTEXT-msa.md` créé + ADR-0002
+écrit. 6 décisions résolues : cible 128K (TTFT+decode) / exactitude A défaut,
+B prefill-only avec porte qualité / Python single-node / gather pur-MLX (Metal
+= phase 2) / attention principale seule (indexer = phase 2) / critère relatif.
+MAX_ROUNDS=5.
 
 ## Round 1 — Codex (VERDICT: REVISE)
 
-Codex raised 10 findings against the prod-automation plan. Verified the two highest-impact ones in code:
-
-| # | Finding | Arbitration |
-|---|---|---|
-| 1 | `ring` backend not wired — `runner.py:1497` hardcodes `backend="jaccl"`; config-level `ring` is fiction. | **ACCEPT.** WU4 is not docs-only: must plumb backend through `remote_cmd` → runner `mx.distributed.init(backend=...)` + store `pool.backend`. Verified the hardcode. |
-| 2 | Idle detection via `_active_runs` unsafe — Anthropic `/v1/messages` doesn't register runs → traffic looks idle. | **ACCEPT.** Foundational fix: a pool-level in-flight counter (`busy_count`) incremented in `RunnerPool.submit`/`prewarm`, used by ALL protocols. Replaces `_active_runs` for idle-gating. |
-| 3 | TOCTOU between idle-check and reload/keepalive (request arrives in the gap). | **ACCEPT.** Pool `maintenance` flag: scheduler/keepalive set it, recheck `busy_count==0`, then act; `submit` refuses/queues while maintenance. |
-| 4 | `broadcast_lock` only serializes stdin writes, not no-gen. | **ACCEPT** (same gate as #2/#3 — keepalive requires `busy_count==0` under the maintenance gate). |
-| 5 | Partial broadcast silent — `send()` swallows `BrokenPipeError` → keepalive reaches some ranks → they block in all_sum. | **ACCEPT.** Keepalive broadcast must be fail-fast with per-rank send result; partial delivery → immediate degraded+recover, don't await a doomed all_sum. |
-| 6 | `_cluster_reset` does cancel→stop→sweep, NOT reboot-all/reload. | **ACCEPT.** Verified (api.py:9505-9598). WU3 recovery for a hung QP needs: degraded → reboot-all (clears orphan QP that stop can't) → node-up wait → reload from captured snapshot. Build the explicit ladder; don't assume `_cluster_reset` recovers service. |
-| 7 | Don't reuse `_auto_unload_cluster` (unloads EVERY pool + unlinks state). | **ACCEPT.** Alias-scoped reload under `get_admin_lock(cluster_id)`, preserving other pools. |
-| 8 | Reload config snapshot must include ALL `RunnerPool` fields (use_ap, draft_model, num_draft_tokens, emit_batch, kv_q8, alias, node_indices). | **ACCEPT.** Snapshot every constructor field before stop; reload from snapshot, not `ArgoLoadRequest` defaults. |
-| 9 | Pool state lacks `backend`; some topology checks use nonexistent `pool.loaded` (7918/7962). | **ACCEPT** for adding `pool.backend`. Note the `pool.loaded` reference for a separate hygiene check. |
-| 10 | Keepalive delivery valid only if rank-0 emits with the id; implement `RunnerPool.keepalive()` like `prewarm()` with listener registered BEFORE broadcast. | **ACCEPT** (matches the `_listeners`/`_on_event` pattern at 1626/1646). |
+16 findings. Les marquants :
+- **BLOCKER indexer dense quadratique** : à 128K prefill, `q@kᵀ` de l'indexer `[B,4,S,K]` reste O(S·K) → le prefill ne devient pas vraiment rapide même avec l'attention principale sparse.
+- **BLOCKER union prefill quasi-dense** : tuile 128 req × top16 à 128K peut couvrir presque tout le contexte.
+- `mx.take(axis=2)` applique les mêmes indices à tout le batch ; MSA renvoie `[B,S,topk]` → `take_along_axis` broadcasté.
+- SDPA MLX = masque broadcast, pas ragged → `T_kv` fixe par tuile + masque additif `[B,1,T_q,T_kv]`.
+- `-1` (blocs invalides) dangereux au gather → clamp index sûr + masque `-inf`.
+- « bit-identical » trop fort (ordre de réduction softmax) → équivalence math + tol CPU, indices triés par position.
+- Masque causal intra-bloc = condition d'exactitude (le bloc local contient des futurs pour les 1res requêtes).
+- Seuil : dense si `k_len <= 2048`, sparse strictement `> 2048`.
+- BatchGenerator casse l'hypothèse B=1 (single-node ≠ single-request).
+- Mémoire 128K sous-estimée : KV fp16 + `idx_keys` en plus des 355 GB poids ; `_cache_size_bytes` ignore `idx_keys`.
+- Baseline dense 128K peut OOM (masque `[B,1,S,K]`) → cap + extrapolation.
+- 3 couches full-attention restent O(n²) → plancher prefill à profiler.
+- Voie B contredit « sans changer la sortie » → hors critère de livraison, flag expérimental.
+- Observabilité : logger union size, gathered keys, fallback, timings indexer/gather/SDPA, mémoire max.
+- **Alternative plus simple : decode-only d'abord** (sans craquer l'indexer ; prefill exact exige l'indexer tiled).
 
 ### Claude's response
-All 10 accepted — the review is correct and material. Net effect: the "full package" is larger and more prod-correctness-sensitive than the 8-pt estimate. Two findings change scope: WU4 (ring) needs real backend plumbing, and WU3 recovery needs an explicit reboot-all+reload ladder (not `_cluster_reset`). Findings #2/#3/#4 converge on a **foundational prerequisite**: a pool-level busy-counter + maintenance gate, which must land FIRST.
 
-Revised implementation order:
-0. **Foundational** — `RunnerPool.busy_count` + `maintenance` flag, incremented/checked in `submit`/`prewarm` across all protocols (OpenAI + Anthropic). (addresses #2/#3/#4)
-1. **WU2 keepalive** — `RunnerPool.keepalive()` (listener-before-broadcast, per-rank send-result, fail-fast on partial) + runner `keepalive` cmd. (addresses #5/#10)
-2. **WU1 scheduler** — alias-scoped reload from a full pool-field snapshot, gated on busy_count==0 + maintenance, age via `started_at`. (addresses #7/#8)
-3. **WU3 recovery** — explicit ladder: consecutive-fail threshold → degraded → reboot-all → node-up wait → reload from snapshot. (addresses #6)
-4. **WU4 ring** — plumb `backend` through remote_cmd → runner init + `pool.backend`; then document. (addresses #1/#9)
+**Recadrage majeur accepté : phase 1 = DECODE-ONLY.** La synthèse de Codex (findings indexer-dense + union-blow-up + decode-only) converge : le prefill exact-sparse exige de craquer l'indexer (déjà scopé phase 2) ET souffre du blow-up d'union. Le decode, lui, gagne énormément (≤2048 vs k_len, ~62× à 128K) **sans** toucher l'indexer (S_q=1 → indexer trivial), exact, bas risque. C'est aussi le coût que Companion paie par token. Donc : **phase 1 = decode block-gather exact ; prefill block-sparse + indexer tiled + kernel Metal = phase 2.** (Revoit la réponse Q1 « les deux phases » → à faire bénir par Sophie au sign-off.)
 
-VERDICT carried: REVISE → re-scoped. Single round.
+**Corrections techniques intégrées au plan** : `take_along_axis` broadcasté (pas `take`) ; `T_kv` fixe + masque additif `[B,1,T_q,T_kv]` (pas de ragged) ; `-1` clampé + masqué `-inf` ; exactitude reformulée « équivalence math, < 1e-6 CPU, indices triés » (pas bit-identical) ; composition `selected ∧ causal ∧ valid` explicite ; seuil strict `> 2048` ; ordre indexer→update KV→gather épinglé ; chemin legacy single-slot confirmé (M3 tourne `_run_legacy_main`, B=1) + B>1 hors scope ; budget mémoire = poids + KV fp16 + `idx_keys` (calculé) ; baseline 8k/32k réel + cap OOM sur 128k dense ; observabilité ajoutée.
+
+**Rejeté/différé** : voie B sort du critère d'acceptation (flag expérimental, pas livrable). Sparsification indexer + prefill = phase 2 (pas un rejet, un séquencement).
+
+## Round 2 — Codex (VERDICT: REVISE)
+
+Blockers du round 1 confirmés traités. 5 nouveaux points fins :
+- Bench 128K decode pas exécutable tel quel (cache 128K à constituer ; prefill dense OOM) → méthode explicite (injection synthétique harness + prefill-court-puis-génère en prod).
+- « Forcer legacy » trop vague → `RUNNER_BATCH=0` explicite (détection `model_type==minimax_m3`).
+- « ~62× » surestimé → ignore l'indexer decode (scanne tout, O(K)/token) + 3 full layers ; reformuler en réduction-K principale 62× mais gain réel ~10-13× borné par l'indexer.
+- Tolérance golden trop absolue → deux niveaux : fp32 CPU < 1e-6, dtype prod tolérance réaliste + non-régression logits/tokens.
+- Caches session/prewarm désactivés seulement « au bench » → aussi en prod long-contexte tant que `idx_keys` n'est pas compté.
+
+### Claude's response
+
+**Les 5 acceptés et intégrés** (aucun rejet). Le plus important : le « 62× »
+était trompeur — à S_q=1 l'indexer reste O(K)/token et devient le plancher, donc
+le gain decode phase-1 est ~10-13× (mesuré), et craquer l'indexer (phase 2)
+débloque le reste. Goal reformulé honnêtement. Cache 128K : injection synthétique
+au harness + prefill-court-puis-génère en prod, méthode figée identique
+baseline/sparse. `RUNNER_BATCH=0` épinglé. Golden à deux niveaux (fp32 CPU +
+dtype prod non-régression). Caches off en prod long-contexte aussi.
+
+## Round 3 — Codex (VERDICT: APPROVED)
+
+Les 5 points intégrés. Plan cohérent pour une phase 1 decode-only ; blockers
+prefill/indexer/union hors scope, hypothèses MLX cadrées, `RUNNER_BATCH=0`
+explicite, méthode bench 128K viable. Deux nits non-bloquants : (1) « 3 full
+layers O(n²) » vrai au prefill, O(K) au decode — déjà neutralisé par la phrase
+suivante ; (2) golden dtype prod doit comparer les tenseurs réellement produits
+par le modèle chargé (poids Q6 + activations) — **foldé** dans le plan.
+
+**Convergé en 3 rounds.** Plan verrouillé.
