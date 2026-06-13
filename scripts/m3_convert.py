@@ -136,7 +136,8 @@ def main() -> int:
                          "Set 8 with --bits 6 for the MIXED quant that lifts only "
                          "the bilingual vocab projection — fixes the lm_head "
                          "logit-floor corruption at ~Q6 size / single-node "
-                         "(OdyssAI-X#53).")
+                         "(OdyssAI-X#53). head_bits>=16 = keep bf16 / full-precision "
+                         "head (e.g. --bits 8 --head-bits 16).")
     ap.add_argument("--group-size", type=int, default=64)
     # MSA selection fix (OdyssAI-X#53). The reference ships sparse_local_block=1 /
     # sparse_topk_blocks=16, which EVICTS the recent blocks carrying rare-token
@@ -276,12 +277,17 @@ def main() -> int:
     # ---- top-level -----------------------------------------------------------
     if not out.done("top"):
         tensors = {}
-        w = rd.read(f"{H}model.embed_tokens.weight")
-        deq, nm = qinto(tensors, "model.embed_tokens", w, gs, head_bits)
-        audit(nm, deq, w)
-        w = rd.read(f"{H}lm_head.weight")
-        deq, nm = qinto(tensors, "lm_head", w, gs, head_bits)
-        audit(nm, deq, w)
+        # embed_tokens + lm_head at head_bits. mx.quantize only supports 2..8 bits,
+        # so head_bits>=16 means "keep bf16" (full-precision head — the experts-Q8
+        # + bf16-head variant): write the raw weight; config['quantization'] marks
+        # these modules False so the loader skips quantizing them. Lossless, no audit.
+        for nm in ("model.embed_tokens", "lm_head"):
+            w = rd.read(f"{H}{nm}.weight")
+            if head_bits >= 16:
+                keep_bf16(tensors, f"{nm}.weight", w)
+            else:
+                deq, _ = qinto(tensors, nm, w, gs, head_bits)
+                audit(nm, deq, w)
         keep_bf16(tensors, "model.norm.weight", rd.read(f"{H}model.norm.weight"))
         out.write_shard("top", tensors)
         mx.clear_cache()
@@ -333,9 +339,15 @@ def main() -> int:
     # rest fall through to the global bits.
     q = {"group_size": gs, "bits": bits, "mode": "affine"}
     if head_bits != bits:
-        head_q = {"group_size": gs, "bits": head_bits, "mode": "affine"}
-        q["model.embed_tokens"] = dict(head_q)
-        q["lm_head"] = dict(head_q)
+        if head_bits >= 16:
+            # bf16 head: mark False so load_model's class_predicate skips quant
+            # on these two modules (loaded full-precision).
+            q["model.embed_tokens"] = False
+            q["lm_head"] = False
+        else:
+            head_q = {"group_size": gs, "bits": head_bits, "mode": "affine"}
+            q["model.embed_tokens"] = dict(head_q)
+            q["lm_head"] = dict(head_q)
     cfg["quantization"] = q
     cfg["quantization_config"] = dict(q)
     (dst / "config.json").write_text(json.dumps(cfg, indent=2))
