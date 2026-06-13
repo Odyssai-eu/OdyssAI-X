@@ -92,8 +92,16 @@ class ModelArgs(BaseModelArgs):
             "index_topk_blocks": "sparse_topk_blocks",
             "index_local_blocks": "sparse_local_block",
         }
+        # The nested sparse_attention_config is a LEGACY fallback: apply it ONLY
+        # when the flat index_* field is still at its dataclass default (i.e. the
+        # config did not set it explicitly). The previous unconditional override
+        # silently clobbered every explicit flat value — so index_topk_blocks /
+        # index_local_blocks edits (converter override OR config edit) NEVER took
+        # effect, and the model always ran the source's 1/16. Verified 2026-06-13.
+        _defaults = {"index_n_heads": 4, "index_head_dim": 128, "index_block_size": 128,
+                     "index_topk_blocks": 16, "index_local_blocks": 1}
         for flat, old in legacy.items():
-            if old in sc:
+            if old in sc and getattr(self, flat) == _defaults.get(flat):
                 setattr(self, flat, sc[old])
         freq = sc.get("sparse_attention_freq")
         if self.layer_types is None:
