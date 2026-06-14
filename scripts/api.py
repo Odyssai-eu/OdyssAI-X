@@ -1751,39 +1751,41 @@ class RunnerPool:
 
     async def start(self):
         self._loop = asyncio.get_running_loop()
-        # Pre-flight: validate the model layout on rank-0 before sshing the
-        # runner. Avoids cryptic KeyErrors mid-load (cf. Mistral 3.5 2026-05-15:
-        # FP8 layout had no language_model.* keys, the runner crashed 90s in).
-        # Best-effort: failure to probe (e.g. unusual node schema) doesn't
-        # block the load — we just log and continue.
-        rank0_node = next((n for n in self.nodes if n.get("rank") == 0), None)
-        if rank0_node and self.model:
-                # Nodes carry an already-composed ssh string like "user@host".
-            # Fall back to ip-style fields if present, then skip if neither
-            # is available so we don't break exotic topologies.
-            ssh_target = (
-                rank0_node.get("ssh")
-                or (f"{rank0_node.get('user','admin')}@{rank0_node['ip']}"
-                    if rank0_node.get("ip") else None)
-            )
-            if ssh_target:
+        # Pre-flight: validate the model is PRESENT and COMPLETE on EVERY target
+        # node (not just rank-0) before sshing the runners. A model rsync'd to
+        # rank-0 but missing/half-copied on the others used to pass and then
+        # crash mid-load with a cryptic per-rank HFValidationError (bf16 5-node,
+        # rsync unfinished, 2026-06-14). Reject upfront, naming the bad node(s).
+        # Per node best-effort: an SSH/probe ERROR (not a model-absent verdict)
+        # logs and is skipped so exotic topologies don't false-block.
+        if self.model:
+            async def _probe_node(n):
+                ssh_t = (
+                    n.get("ssh")
+                    or (f"{n.get('user','admin')}@{n['ip']}" if n.get("ip") else None)
+                )
+                if not ssh_t:
+                    return None
                 try:
-                    # Pass rank-0 models_dir so the validator can `cd` into
-                    # it before checking relative model paths. Without this
-                    # the SSH session defaults to $HOME and every relative
-                    # model id resolves to a missing path → false negative.
-                    rank0_models_dir = rank0_node.get("models_dir")
                     ok, err = await _validate_model_layout(
-                        ssh_target, self.model, models_dir=rank0_models_dir
+                        ssh_t, self.model, models_dir=n.get("models_dir")
                     )
-                    if not ok:
-                        raise RuntimeError(f"model layout invalid: {err}")
-                except RuntimeError:
-                    raise
                 except Exception as e:
                     sys.stderr.write(
-                        f"[api] layout pre-check skipped ({e}); proceeding\n"
+                        f"[api] layout probe skipped on {n.get('host', ssh_t)} ({e})\n"
                     )
+                    return None
+                return None if ok else f"{n.get('host', ssh_t)} → {err}"
+            problems = [
+                r for r in await asyncio.gather(*[_probe_node(n) for n in self.nodes])
+                if isinstance(r, str)
+            ]
+            if problems:
+                raise RuntimeError(
+                    "model not present/complete on all target nodes — "
+                    + "; ".join(problems)
+                    + ". Rsync the model to every node before loading."
+                )
         port = random_ephemeral_port()
         devices = [n["rdma"] for n in sorted(self.nodes, key=lambda x: x["rank"])]
         devices_json = json.dumps(devices)
@@ -3903,28 +3905,34 @@ async def _validate_model_layout(ssh_target: str, model_path: str,
     are checked as-is regardless of models_dir.
     """
     p = model_path.rstrip("/")
-    is_absolute = p.startswith("/")
-    # `cd $models_dir` only when model_path is relative. For absolute paths
-    # we leave the working directory alone — the absolute path resolves
-    # correctly from $HOME or anywhere else.
-    cd_prefix = ""
-    if not is_absolute and models_dir:
-        cd_prefix = f"cd {shlex.quote(models_dir)} && "
-    # Probe in one command:
-    #   1. config.json exists + non-empty
-    #   2. at least one *.safetensors file
-    #   3. tokenizer present (config.json | tokenizer.json | tokenizer.model)
-    script = (
-        f'{cd_prefix}'
-        f'[ -s {shlex.quote(p)}/config.json ] || {{ echo MISSING_CONFIG; exit 0; }} && '
-        f'ls {shlex.quote(p)}/*.safetensors >/dev/null 2>&1 || {{ echo MISSING_WEIGHTS; exit 0; }} && '
-        f'{{ [ -s {shlex.quote(p)}/tokenizer.json ] || '
-        f'   [ -s {shlex.quote(p)}/tokenizer.model ] || '
-        f'   [ -s {shlex.quote(p)}/tokenizer_config.json ]; }} '
-        f'|| {{ echo MISSING_TOKENIZER; exit 0; }} && echo OK'
+    # One SSH round-trip running a python3 probe on the node. Checks PRESENCE
+    # (config.json + >=1 safetensors + tokenizer) AND COMPLETENESS (no in-progress
+    # *.hfdl download markers, and every shard listed in model.safetensors.index.json
+    # actually on disk). The completeness half catches a half-finished rsync — a
+    # partial copy used to pass the old shell probe and crash mid-load per-rank.
+    remote_py = (
+        "import json,os,glob,sys\n"
+        "p=" + json.dumps(p) + "\n"
+        "md=" + json.dumps(models_dir or "") + "\n"
+        "d=p if os.path.isabs(p) else (os.path.join(md,p) if md else p)\n"
+        "cj=os.path.join(d,'config.json')\n"
+        "if not (os.path.isfile(cj) and os.path.getsize(cj)>0): print('MISSING_CONFIG'); sys.exit()\n"
+        "st=glob.glob(os.path.join(d,'*.safetensors'))\n"
+        "if not st: print('MISSING_WEIGHTS'); sys.exit()\n"
+        "if not any(os.path.isfile(os.path.join(d,t)) and os.path.getsize(os.path.join(d,t))>0 "
+        "for t in ('tokenizer.json','tokenizer.model','tokenizer_config.json')): print('MISSING_TOKENIZER'); sys.exit()\n"
+        "if glob.glob(os.path.join(d,'*.hfdl')): print('INCOMPLETE_DOWNLOAD'); sys.exit()\n"
+        "ix=os.path.join(d,'model.safetensors.index.json')\n"
+        "sharded=any('-of-' in os.path.basename(f) for f in st) or len(st)>1\n"
+        "if sharded:\n"
+        " if not (os.path.isfile(ix) and os.path.getsize(ix)>0): print('INCOMPLETE_INDEX'); sys.exit()\n"
+        " want=set(json.load(open(ix)).get('weight_map',{}).values())\n"
+        " have=set(os.path.basename(f) for f in st)\n"
+        " if want-have: print('INCOMPLETE_SHARDS:%d'%len(want-have)); sys.exit()\n"
+        "print('OK')\n"
     )
     cmd = ["ssh", "-o", "ConnectTimeout=4", "-o", "BatchMode=yes",
-           ssh_target, script]
+           ssh_target, "python3 -c " + shlex.quote(remote_py)]
     try:
         proc = await asyncio.create_subprocess_exec(
             *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
@@ -3939,6 +3947,13 @@ async def _validate_model_layout(ssh_target: str, model_path: str,
             return False, f"no *.safetensors files at {p}"
         if out == "MISSING_TOKENIZER":
             return False, f"no tokenizer (tokenizer.json/model) at {p}"
+        if out == "INCOMPLETE_DOWNLOAD":
+            return False, f"download still in progress (.hfdl markers) at {p}"
+        if out == "INCOMPLETE_INDEX":
+            return False, f"sharded model missing model.safetensors.index.json at {p} (rsync unfinished?)"
+        if out.startswith("INCOMPLETE_SHARDS"):
+            n = out.split(":", 1)[1] if ":" in out else "?"
+            return False, f"incomplete — {n} safetensors shard(s) missing at {p} (rsync unfinished?)"
         # SSH itself failed (host down, perms…). Conservative: don't block.
         err = (stderr or b"").decode("utf-8", "ignore").strip()[:200]
         return False, f"ssh check failed ({ssh_target}): {err or 'unknown'}"
