@@ -219,24 +219,35 @@ MODEL_SAMPLING_DEFAULTS: dict[str, dict] = {
     "minimax-m3": {
         "temp": 0.7,
         "top_p": 0.9,
-        # 1.1, not 1.15: above ~1.15 on creative prose the penalty starts
-        # hitting words that MUST recur (names, "fréquence", articles) and
-        # pushes the model toward rarer alternatives — including high-frequency
-        # CJK tokens. That is exactly the M3 zh-leak (陪伴/可能 on attachment
-        # beats) we observed on the Bruit-Blanc run. See OdyssAI-X#53.
-        "repetition_penalty": 1.1,
+        # 1.05, not 1.1/1.15: ABOVE ~1.15 the penalty hits words that MUST
+        # recur (names, "fréquence", articles) and pushes toward rarer
+        # alternatives — including high-frequency CJK tokens (the zh-leak
+        # 陪伴/可能). But even 1.1 was too strong at the thematically-critical
+        # final beat: on a Bruit-Blanc Q8 run (2026-06-14) the model bailed to
+        # EOS at "Elma a entendu la [fréquence]" because "fréquence" (used 4x)
+        # was penalized below the stop token, cutting the killer final image.
+        # 1.05 keeps a light touch on real loops (n=8 ngram ban does the heavy
+        # lifting) without starving the recurring words the story is built on.
+        "repetition_penalty": 1.05,
         # 512, not 128: M3's verbatim clause loops recur at 200-400 tokens'
         # distance ("équations fondamentales régissant fonctionnement système"
         # ~10x). mlx-lm's repetition_penalty only looks back
         # repetition_context_size tokens, so 128 never even sees the clause it
         # is repeating. 512 covers the multi-paragraph cycle.
         "repetition_context_size": 512,
-        # The surgical tool. Hard-bans repeating any 4-gram (HF-style), which
-        # kills verbatim clause recycling without touching normal reuse of
-        # common short words — where repetition_penalty is a blunt hammer.
-        # mlx-lm has no native support; see make_no_repeat_ngram_processor.
-        # SCOPED to M3 (prose) on purpose — do NOT inherit it into "minimax".
-        "no_repeat_ngram_size": 4,
+        # Hard-bans repeating any N-gram (HF-style) to kill verbatim clause
+        # recycling. 8, NOT 4: at n=4 the ban fires after only a 3-token prefix
+        # match, which in narrative prose hits LEGITIMATE repeats constantly
+        # (character actions "...sur son épaule" → bans "gauche"/"droite";
+        # recurring names) and forces the model into garbled mid-word
+        # substitutions ("épaucherche", "habituellle") — corruption that
+        # compounds with context length. Verified on a 2800-word Bruit-Blanc Q8
+        # run (2026-06-14): the typos clustered exactly where common phrases
+        # recurred. n=8 still catches real loops (a looping clause of unit>=4
+        # tokens repeats 8-grams across its boundary) but spares legitimate
+        # short prose repeats. mlx-lm has no native support; see
+        # make_no_repeat_ngram_processor. SCOPED to M3 — do NOT inherit into "minimax".
+        "no_repeat_ngram_size": 8,
     },
     # Other MiniMax checkpoints (M2.x coder/tool). Conservative, unchanged from
     # the original guardrail — no no_repeat_ngram (would break code/tool output).
