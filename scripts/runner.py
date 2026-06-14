@@ -248,6 +248,19 @@ MODEL_SAMPLING_DEFAULTS: dict[str, dict] = {
         # short prose repeats. mlx-lm has no native support; see
         # make_no_repeat_ngram_processor. SCOPED to M3 — do NOT inherit into "minimax".
         "no_repeat_ngram_size": 8,
+        # CJK language-lock: bans the ~55,600 CJK/Hangul/kana/fullwidth token
+        # ids from the vocab. M3 is bilingual fr/zh, so the Chinese tokens carry
+        # a small but non-zero mass everywhere. Empirically (2026-06-14): greedy
+        # is clean (argmax is always French), and min_p does NOT cut the leak —
+        # the zh synonyms that leak (改良/无处不在 after "Sonde audio"/"était")
+        # are COMPETITIVE candidates (~5% rel. prob at temp 0.7), above any sane
+        # min_p floor, so temp sampling draws one ~1 run in 2 over a long text.
+        # No sampling lever removes it cleanly; only a deterministic ban does,
+        # and a ban touches ZERO French logits (the model falls to the French
+        # #1 candidate greedy already picked — verified, prose intact). Odysseus
+        # serves M3 as a French writer and never needs zh output, so the ban is
+        # default-on. SCOPED to M3 (the "minimax" fallback below does NOT lock).
+        "cjk_lock": True,
     },
     # Other MiniMax checkpoints (M2.x coder/tool). Conservative, unchanged from
     # the original guardrail — no no_repeat_ngram (would break code/tool output).
@@ -304,7 +317,63 @@ def make_no_repeat_ngram_processor(ngram_size: int):
     return processor
 
 
-def _build_sampling_for(repo: str):
+_CJK_BANNED_CACHE: dict = {}
+
+
+def _cjk_banned_ids(tokenizer):
+    """Token ids whose decoded text contains a CJK / Hangul / kana / fullwidth
+    char. Scanned once per tokenizer (~15-20s over the 200k vocab) then cached.
+    Decode-based, not raw-vocab-string: byte-level BPE tokens for CJK chars are
+    byte-encoded in the raw vocab (e.g. 'æ\\x94¹' for 改) and would be missed;
+    decode([id]) reconstructs the real character. See cjk_lock in
+    MODEL_SAMPLING_DEFAULTS for why M3 needs this.
+    """
+    key = id(tokenizer)
+    cached = _CJK_BANNED_CACHE.get(key)
+    if cached is not None:
+        return cached
+
+    def is_cjk(c):
+        o = ord(c)
+        return (0x3000 <= o <= 0x303F or 0x3040 <= o <= 0x30FF or
+                0x3400 <= o <= 0x4DBF or 0x4E00 <= o <= 0x9FFF or
+                0xAC00 <= o <= 0xD7AF or 0x1100 <= o <= 0x11FF or
+                0xF900 <= o <= 0xFAFF or 0xFF00 <= o <= 0xFFEF or
+                0x20000 <= o <= 0x2FA1F)
+
+    try:
+        V = int(getattr(tokenizer, "vocab_size", 0) or len(tokenizer.get_vocab()))
+    except Exception:
+        V = len(tokenizer.get_vocab())
+    banned = []
+    for tid in range(V):
+        try:
+            s = tokenizer.decode([tid])
+        except Exception:
+            continue
+        if s and any(is_cjk(c) for c in s):
+            banned.append(tid)
+    arr = mx.array(banned)
+    _CJK_BANNED_CACHE[key] = arr
+    log(f"cjk_lock: banned {len(banned)}/{V} CJK/Hangul token ids")
+    return arr
+
+
+def make_cjk_lock_processor(tokenizer):
+    """A logits processor that hard-bans every CJK/Hangul/kana token (-inf),
+    deterministically suppressing the French->Chinese leak without touching any
+    French logit. Cost per step is one scatter over the cached banned-id array,
+    negligible against the MoE forward."""
+    banned = _cjk_banned_ids(tokenizer)
+
+    def processor(tokens, logits):
+        logits[:, banned] = -float("inf")
+        return logits
+
+    return processor
+
+
+def _build_sampling_for(repo: str, tokenizer=None):
     """Return (sampler, logits_processors) for this model, or (None, None)
     to use mlx-lm defaults. Match is case-insensitive substring on repo path.
     """
@@ -332,6 +401,13 @@ def _build_sampling_for(repo: str):
                 if logits_processors is None:
                     logits_processors = []
                 logits_processors.append(make_no_repeat_ngram_processor(int(nrn)))
+            # CJK language-lock (M3 French-serving). Flag-gated, needs the
+            # tokenizer to scan the vocab; appended last so it overrides any
+            # other processor's score on a CJK id.
+            if params.get("cjk_lock") and tokenizer is not None:
+                if logits_processors is None:
+                    logits_processors = []
+                logits_processors.append(make_cjk_lock_processor(tokenizer))
             return sampler, logits_processors
     return None, None
 
@@ -1943,7 +2019,7 @@ def _run_legacy_main(model, tokenizer, repo: str, kv_q8_default: bool,
         # defaults intact for everything except listed models. This
         # prevents the MiniMax-style degenerate repetition loops without
         # changing behavior for Qwen/GLM/Hy3/etc which are fine on greedy.
-        _sampler, _lp = _build_sampling_for(repo)
+        _sampler, _lp = _build_sampling_for(repo, tokenizer)
         if _sampler is not None:
             gen_kwargs["sampler"] = _sampler
         if _lp is not None:
