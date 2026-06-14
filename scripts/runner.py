@@ -373,9 +373,68 @@ def make_cjk_lock_processor(tokenizer):
     return processor
 
 
-def _build_sampling_for(repo: str, tokenizer=None):
+# ── Request-type detection (prose vs code) ─────────────────────────────────
+# Per-request sampling profile (integration report §9.1). MODEL_SAMPLING_DEFAULTS
+# is keyed per-MODEL, but M3 is BOTH a prose writer AND a coder — and the prose
+# profile's no_repeat_ngram ban drops operators in code (T03/T04/C01 all failed
+# ONLY on token-drops: missing comma / "=" / identifier). A light heuristic flips
+# the profile per request: STRONG code signals only, so prose (Bruit Blanc, GDPR)
+# stays prose. False positive = a prose loop slips through; false negative = code
+# token-drops — we bias toward catching real code without flagging prose.
+_CODE_EXT_RE = re.compile(
+    r"\.(py|js|ts|tsx|jsx|swift|c|cc|cpp|h|hpp|rs|go|java|rb|sh|bash|sql|kt|"
+    r"php|scala|lua|mm|cs|jl)\b", re.I)
+_CODE_VERB_RE = re.compile(
+    r"\b(écris|ecris|write|crée|cree|create|implémente|implemente|implement|"
+    r"génère|genere|generate|coder?|debug|débug|debogue|refactor|corrige|fix)\b",
+    re.I)
+_CODE_NOUN_RE = re.compile(
+    r"\b(script|fonction|function|classe|class|programme|program|CLI|module|"
+    r"méthode|method|endpoint|regex|algorithme|algorithm|snippet)\b", re.I)
+
+
+def _last_user_text(messages) -> str:
+    for m in reversed(messages or []):
+        if isinstance(m, dict) and m.get("role") == "user":
+            c = m.get("content")
+            if isinstance(c, str):
+                return c
+            if isinstance(c, list):
+                return " ".join(
+                    p.get("text", "") for p in c
+                    if isinstance(p, dict) and p.get("type") in (None, "text")
+                )
+    return ""
+
+
+def _looks_like_code_request(messages, tools=None) -> bool:
+    """Conservative: True only on strong code signals — a ``` fence, a source
+    file extension, a code verb + code noun IN PROXIMITY (same clause), or
+    injected tools (= the auto-router judged this agentic/code intent).
+    Proximity matters: a prose spec can carry an incidental "function" (e.g. the
+    Bruit-Blanc JSON's `function_narrative` key) far from an "Écris" — that must
+    NOT flip the profile on the very prompt the prose sampling was tuned for."""
+    if tools:
+        return True
+    txt = _last_user_text(messages)
+    if not txt:
+        return False
+    if "```" in txt:
+        return True
+    if _CODE_EXT_RE.search(txt):
+        return True
+    # code verb with a code noun within ~40 chars (either side) = real intent.
+    for vm in _CODE_VERB_RE.finditer(txt):
+        window = txt[max(0, vm.start() - 40): vm.end() + 40]
+        if _CODE_NOUN_RE.search(window):
+            return True
+    return False
+
+
+def _build_sampling_for(repo: str, tokenizer=None, is_code: bool = False):
     """Return (sampler, logits_processors) for this model, or (None, None)
     to use mlx-lm defaults. Match is case-insensitive substring on repo path.
+    `is_code` flips M3 to a code-safe profile (drops the prose no_repeat_ngram).
     """
     needle = repo.lower()
     for key, params in MODEL_SAMPLING_DEFAULTS.items():
@@ -395,12 +454,19 @@ def _build_sampling_for(repo: str, tokenizer=None):
                 )
             logits_processors = make_logits_processors(**lp_kwargs) if lp_kwargs else None
             # no_repeat_ngram_size is not an mlx-lm penalty kwarg — append our
-            # own processor to the (possibly empty) list.
+            # own processor to the (possibly empty) list. SKIPPED for code
+            # requests (§9.1): the ban is tuned for prose clause-loops; in code
+            # it drops ultra-frequent n-grams (", ", "= None", " is ", "var.")
+            # → missing comma / "=" / identifier = syntax errors. rep_penalty
+            # (soft) + cjk_lock stay on, so the prose guardrails aren't lost.
             nrn = params.get("no_repeat_ngram_size")
             if nrn and int(nrn) >= 2:
-                if logits_processors is None:
-                    logits_processors = []
-                logits_processors.append(make_no_repeat_ngram_processor(int(nrn)))
+                if is_code:
+                    log(f"sampling[{key}]: code request → no_repeat_ngram (n={nrn}) disabled")
+                else:
+                    if logits_processors is None:
+                        logits_processors = []
+                    logits_processors.append(make_no_repeat_ngram_processor(int(nrn)))
             # CJK language-lock (M3 French-serving). Flag-gated, needs the
             # tokenizer to scan the vocab; appended last so it overrides any
             # other processor's score on a CJK id.
@@ -2019,7 +2085,11 @@ def _run_legacy_main(model, tokenizer, repo: str, kv_q8_default: bool,
         # defaults intact for everything except listed models. This
         # prevents the MiniMax-style degenerate repetition loops without
         # changing behavior for Qwen/GLM/Hy3/etc which are fine on greedy.
-        _sampler, _lp = _build_sampling_for(repo, tokenizer)
+        # Prose-vs-code detection (§9.1): M3 codes well but the prose
+        # no_repeat_ngram ban drops operators. Flip to the code-safe profile
+        # when the request looks like code (strong signals only).
+        _is_code = _looks_like_code_request(messages, tools)
+        _sampler, _lp = _build_sampling_for(repo, tokenizer, is_code=_is_code)
         if _sampler is not None:
             gen_kwargs["sampler"] = _sampler
         if _lp is not None:
