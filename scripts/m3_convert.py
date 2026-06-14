@@ -112,6 +112,13 @@ def corr(a: np.ndarray, b: np.ndarray) -> float:
 
 def qinto(out, name, w32, gs, bits):
     w = mx.array(w32).astype(mx.bfloat16)
+    if bits >= 16:
+        # Full bf16 — no quantization (mx.quantize supports 2..8 bits only). The
+        # source is bf16, so bf16->bf16 is EXACTLY lossless (audit corr == 1.0).
+        # Same `.weight` naming as the quant path but no scales/biases; the config
+        # omits the quantization block so the loader keeps these modules bf16.
+        out[f"{name}.weight"] = w
+        return w32, name
     qw, sc, bi = mx.quantize(w, group_size=gs, bits=bits)
     out[f"{name}.weight"] = qw
     out[f"{name}.scales"] = sc
@@ -337,19 +344,27 @@ def main() -> int:
     #       ...
     # so the two head modules carry their own {group_size, bits} dict and the
     # rest fall through to the global bits.
-    q = {"group_size": gs, "bits": bits, "mode": "affine"}
-    if head_bits != bits:
-        if head_bits >= 16:
-            # bf16 head: mark False so load_model's class_predicate skips quant
-            # on these two modules (loaded full-precision).
-            q["model.embed_tokens"] = False
-            q["lm_head"] = False
-        else:
-            head_q = {"group_size": gs, "bits": head_bits, "mode": "affine"}
-            q["model.embed_tokens"] = dict(head_q)
-            q["lm_head"] = dict(head_q)
-    cfg["quantization"] = q
-    cfg["quantization_config"] = dict(q)
+    if bits >= 16:
+        # Full bf16 model — NO quantization block at all, so load_model keeps
+        # every module full-precision. Experts are still restructured into
+        # switch_mlp and the indexer/router/norms stay bf16 as in the quant
+        # recipes. (head_bits is also >=16 here, so the head is bf16 too.)
+        cfg.pop("quantization", None)
+        cfg.pop("quantization_config", None)
+    else:
+        q = {"group_size": gs, "bits": bits, "mode": "affine"}
+        if head_bits != bits:
+            if head_bits >= 16:
+                # bf16 head: mark False so load_model's class_predicate skips quant
+                # on these two modules (loaded full-precision).
+                q["model.embed_tokens"] = False
+                q["lm_head"] = False
+            else:
+                head_q = {"group_size": gs, "bits": head_bits, "mode": "affine"}
+                q["model.embed_tokens"] = dict(head_q)
+                q["lm_head"] = dict(head_q)
+        cfg["quantization"] = q
+        cfg["quantization_config"] = dict(q)
     (dst / "config.json").write_text(json.dumps(cfg, indent=2))
 
     for f in src.glob("*"):
