@@ -261,6 +261,12 @@ MODEL_SAMPLING_DEFAULTS: dict[str, dict] = {
         # serves M3 as a French writer and never needs zh output, so the ban is
         # default-on. SCOPED to M3 (the "minimax" fallback below does NOT lock).
         "cjk_lock": True,
+        # EOS guard (report §9.4): pin every stop token to the gap it held below
+        # the natural content leader BEFORE the repetition penalty, so the
+        # penalty can no longer promote EOS by side effect (the "fréquence"
+        # mid-sentence bailout). Parameter-free, monotonic-safe. SCOPED to M3 —
+        # the "minimax" fallback below does NOT enable it.
+        "eos_guard": True,
     },
     # Other MiniMax checkpoints (M2.x coder/tool). Conservative, unchanged from
     # the original guardrail — no no_repeat_ngram (would break code/tool output).
@@ -373,6 +379,72 @@ def make_cjk_lock_processor(tokenizer):
     return processor
 
 
+def make_eos_guard_processors(stop_ids):
+    """Decouple the stop decision from the repetition penalty — report §9.4.
+
+    M3's `repetition_penalty` was doing EOS control by side effect: it discounts
+    recently-seen content tokens, so when a *thematic* word (the Bruit-Blanc
+    "fréquence", recurring 4x) is pushed below the stop token, the model emits
+    EOS mid-sentence and the ending is cut. The historical fix was to hand-tune
+    the penalty down to 1.05 — a magic number "calibré à fréquence" that couples
+    two concerns which should be independent.
+
+    This is the parameter-free decoupling. Returns (snapshot, clamp), two
+    cooperating logits processors:
+      • `snapshot` runs FIRST (raw logits) and records, per step, the gap each
+        stop token sits below the natural content leader: gap0 = leader0 - stop0,
+        where leader0 = max over NON-stop logits before any penalty.
+      • `clamp` runs LAST (after rep-penalty + ngram + cjk) and enforces
+        stop <= leader1 - gap0, where leader1 = max over surviving NON-stop
+        logits.
+    Effect: a stop token keeps EXACTLY its pre-penalty standing relative to the
+    content leader — no more, no less. A stop that naturally led (gap0 < 0) gets
+    a cap above the leader, so a genuine end is never suppressed (no runaway). A
+    stop the model did not want (gap0 > 0) can never close that gap by penalty
+    alone, so there is no penalty-induced premature EOS. The gap is *measured*,
+    not chosen: no tunable threshold replaces the old 1.05. Cost is two
+    vocab-wide maxes per step, negligible against the MoE forward (cf. cjk_lock).
+
+    Order is load-bearing: snapshot must be inserted at the FRONT of the
+    processor chain and clamp APPENDED at the end (see _build_sampling_for). The
+    guard is monotonic — it only ever lowers a stop logit that the penalty would
+    have promoted, never raises anything — so it cannot make a clean run worse.
+    """
+    ids = sorted({int(s) for s in stop_ids})
+    if not ids:
+        def _noop(tokens, logits):
+            return logits
+        return _noop, _noop
+    stop_arr = mx.array(ids)
+    NEG = -float("inf")
+    state: dict = {"gap0": None, "neg_mask": None}
+
+    def _neg_mask(logits):
+        nm = state["neg_mask"]
+        if nm is None or nm.shape != logits.shape:
+            nm = mx.zeros(logits.shape, dtype=logits.dtype)
+            nm[:, stop_arr] = NEG
+            state["neg_mask"] = nm
+        return state["neg_mask"]
+
+    def snapshot(tokens, logits):
+        leader0 = mx.max(logits + _neg_mask(logits), axis=-1, keepdims=True)
+        state["gap0"] = leader0 - logits[:, stop_arr]
+        return logits
+
+    def clamp(tokens, logits):
+        gap0 = state["gap0"]
+        if gap0 is None:
+            return logits
+        leader1 = mx.max(logits + _neg_mask(logits), axis=-1, keepdims=True)
+        if not (float(leader1.sum()) > NEG):
+            return logits  # all non-stop logits banned — let the stop through.
+        logits[:, stop_arr] = mx.minimum(logits[:, stop_arr], leader1 - gap0)
+        return logits
+
+    return snapshot, clamp
+
+
 # ── Request-type detection (prose vs code) ─────────────────────────────────
 # Per-request sampling profile (integration report §9.1). MODEL_SAMPLING_DEFAULTS
 # is keyed per-MODEL, but M3 is BOTH a prose writer AND a coder — and the prose
@@ -474,6 +546,18 @@ def _build_sampling_for(repo: str, tokenizer=None, is_code: bool = False):
                 if logits_processors is None:
                     logits_processors = []
                 logits_processors.append(make_cjk_lock_processor(tokenizer))
+            # EOS guard (report §9.4): decouple the stop decision from the
+            # repetition penalty. snapshot goes to the FRONT of the chain (must
+            # see the raw, pre-penalty logits); clamp is appended at the very END
+            # (must see the fully penalized logits) — the order is load-bearing.
+            if params.get("eos_guard") and tokenizer is not None:
+                _stops = {s[0] for s in _resolve_eos_token_seqs(tokenizer) if s}
+                if _stops:
+                    _snap, _clamp = make_eos_guard_processors(_stops)
+                    if logits_processors is None:
+                        logits_processors = []
+                    logits_processors.insert(0, _snap)
+                    logits_processors.append(_clamp)
             return sampler, logits_processors
     return None, None
 
