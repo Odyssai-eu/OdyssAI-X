@@ -1316,6 +1316,10 @@ _GEN_DECODE_DEADLINE_S = float(env_get("GEN_DECODE_DEADLINE_S", "90"))
 # for minutes, so a flat 600s would false-positive on it. prefill_deadline =
 # max(_GEN_PREFILL_DEADLINE_S, est_prompt_tokens / _MIN_PREFILL_TPS).
 _MIN_PREFILL_TPS = max(1.0, float(env_get("MIN_PREFILL_TPS", "20")))
+# Metal frees wired pages ASYNC after a killed runner exits; the orphan sweep
+# re-reads wired after this grace before declaring a leak (the 166.7 GB phantom
+# of 2026-06-16 that read 8 GB seconds later). Env-overridable.
+_WIRED_REPOLL_GRACE_S = float(env_get("WIRED_REPOLL_GRACE_S", "10"))
 
 # At most one watchdog-triggered recovery ladder per cluster in flight: multiple
 # wedged in-flight requests would otherwise each spawn a duplicate _cluster_reset
@@ -1614,6 +1618,28 @@ def _sweep_orphan_runners(cluster_id: str,
                         pass
                 else:
                     kill_result = line  # last non-WIRED line wins
+            # Metal frees wired pages ASYNC after the killed process exits, so an
+            # immediate read false-positives a leak (166.7 GB at kill → 8 GB a few
+            # seconds later, 2026-06-16). If the first read is high, wait out the
+            # async free and re-read once (the probe is idempotent — orphans are
+            # already gone) before judging.
+            if wired_bytes and wired_bytes > WIRED_WARN_THRESHOLD:
+                time.sleep(_WIRED_REPOLL_GRACE_S)
+                try:
+                    rr = subprocess.run(
+                        ["ssh", "-o", "ConnectTimeout=5", "-o", "StrictHostKeyChecking=no",
+                         ssh, cmd],
+                        capture_output=True, text=True, timeout=timeout_per_node,
+                    )
+                    for line in (rr.stdout or "").splitlines():
+                        if line.strip().startswith("WIRED_BYTES="):
+                            try:
+                                wired_bytes = int(line.strip().split("=", 1)[1])
+                            except (ValueError, IndexError):
+                                pass
+                            break
+                except Exception:
+                    pass
             wired_warn = bool(wired_bytes and wired_bytes > WIRED_WARN_THRESHOLD)
             return {
                 "host": host,
@@ -1711,6 +1737,11 @@ class RunnerPool:
         # `ttl_seconds`. ttl_seconds=0 disables. Default sourced from
         # `settings.pool_ttl_seconds_default` at start time.
         self.last_used_at: float = time.time()
+        # Pool-level liveness for the no-progress watchdog: monotonic time of the
+        # last token emitted for ANY request. A request queued behind a long one
+        # on the serialised multi-rank runner reads this so it isn't mistaken for
+        # a wedge (head-of-line blocking false-positive, 2026-06-16).
+        self.last_token_at: float = time.monotonic()
         self.ttl_seconds: int = 0
         # #40 foundation — pool-level busy/idle tracking + maintenance gate.
         # `busy_count` counts in-flight distributed forwards (gen + prewarm)
@@ -1743,6 +1774,11 @@ class RunnerPool:
         self.degraded_at: Optional[float] = None
 
     def _on_event(self, ev: dict):
+        # Any token (for ANY request) proves the runner is making progress and is
+        # not wedged — stamp the pool-level liveness clock the no-progress
+        # watchdog reads (head-of-line fix, 2026-06-16).
+        if ev.get("event") == "token":
+            self.last_token_at = time.monotonic()
         req_id = ev.get("id")
         if req_id and req_id in self._listeners:
             q = self._listeners[req_id]
@@ -2073,7 +2109,13 @@ class RunnerPool:
             seen_token = False
             while True:
                 deadline = _GEN_DECODE_DEADLINE_S if seen_token else prefill_deadline
-                stalled = time.monotonic() - last_progress
+                # Pool-aware: the runner is WEDGED only if it emits no token for
+                # ANY request within the deadline. Without this, a request queued
+                # behind a long-running one on the serialised multi-rank runner
+                # false-fires a phantom "wedged in prefill" + recovery (the
+                # head-of-line crash of 2026-06-16). `self.last_token_at` is bumped
+                # by _on_event on every token from any request.
+                stalled = time.monotonic() - max(last_progress, self.last_token_at)
                 # No-progress watchdog (checked every iteration, not only on
                 # timeout, so a stream of non-token events can't mask a wedge):
                 # ssh up (so _rank0_alive passes) but the remote runner is stuck
