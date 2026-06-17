@@ -1,575 +1,291 @@
-# INSTALL-CLUSTER.md — guided multi-node setup
+# INSTALL-CLUSTER.md — install the odyssai.eu stack with the OdyssAI Configurator
 
-> This file is a runbook for AI coding agents (Claude Code, Codex,
-> Cursor, Aider, …). When the user wants to set up an Odysseus cluster
-> end-to-end — 1 to 5 Apple Silicon nodes, plus an orchestrator host,
-> plus optionally Companion as the chat client — follow this doc
-> top-to-bottom.
+> **Audience: a human operator.** This is the recommended, no-terminal path:
+> download the **OdyssAI Configurator** (a native macOS app, DMG / drag-to-
+> Applications), and click through a wizard that installs each component on the
+> right machine and builds the RDMA topology for you.
 >
-> If the user only wants ONE component installed (engine only, client
-> only, single node only), use `AGENTS.md` instead — it has the
-> per-component runbook with the 6 install patterns.
->
-> This doc is for the "I have N Macs, drive me through the whole
-> install in one session" case.
+> Installing with an **AI agent** instead? Use [`AGENTS.md`](AGENTS.md) — same
+> result, driven by the `odyssai-configure` CLI. Need the bare scripted path
+> (Linux orchestrator, CI, no macOS GUI)? See the **Advanced / headless**
+> appendix at the end.
 
-## What you will install
+---
 
-| Component | Where | Why |
-|---|---|---|
-| **Cluster nodes** (1-5) | Each Apple Silicon Mac that will run MLX runners | Compute. One pool per cluster, but pools share nodes via JACCL/ring. |
-| **Orchestrator** | One Docker host (can be one of the nodes, or a separate Mac mini / Linux box) | The Odysseus container — REST API + dashboard + SSHes to nodes |
-| **Companion** (optional) | Same Docker host or another | The chat client — web UI, memory, projects, MCP |
-| **Models directory** | Each node OR a shared external SSD | Where MLX weights live on disk |
+## 1. What you are building
 
-You will end this runbook with a working `/v1/chat/completions` endpoint
-serving a real open-weights model, with `/admin/clusters/<your-name>`
-visible to the dashboard.
+The **odyssai.eu** stack is three components, each on its own machine. The
+orchestrator (**OdyssAI-X**) *never runs inference itself* — it routes requests
+to MLX cluster nodes **or** to a single-Mac Telemak runtime. That is why a cheap
+Mac mini can drive expensive Mac Studios.
 
-## Stage 0 — Plan the deployment
+| Component | What it is | Target machine | How the Configurator installs it |
+|---|---|---|---|
+| **Engine** | the MLX engine (`runner.py` + `venv` + `mlx`/`mlx-lm`) | **Mac Studio** (Apple Silicon) | SSH provisioning via `bootstrap-node.sh` |
+| **Serveur** | **OdyssAI-X** (orchestrator) **+ Companion** (chat client + memory) | **Mac mini** (Apple Silicon) | Docker stack (`app` + Postgres `db` + `nemo-memory` embedder) |
+| **Telemak** | single-Mac runtime | any one Mac | drag-and-drop of `Telemak.app` |
 
-Ask the user the following before touching anything. Build a plan
-table in the conversation; once the user confirms, proceed.
+Two deployment modes:
 
+- **Cluster** — Serveur **+ N Mac Studio** nodes wired over **RDMA / Thunderbolt 5**. Backend `jaccl`, multi-node topology.
+- **Solo** — Serveur **+ 1 Mac running Telemak**. OdyssAI-X drives Telemak over `http-proxy`. No RDMA.
+
+> The single-Mac case is **always Telemak**, never OdyssAI-X alone — OdyssAI-X is
+> always the orchestrator-on-a-server.
+
+---
+
+## 2. Hardware & network you need
+
+- **Serveur** → a **Mac mini Apple Silicon**. It can't be a cheap x86 box: the
+  memory embedder (`nemo-memory` = `lightrag-mlx` + an MLX model) requires Apple
+  Silicon.
+- **Engine** → one or more **Mac Studio** (Apple Silicon). macOS 14+ recommended,
+  Python 3.11+ (the bootstrap creates the venv).
+- **Telemak** → any Mac (Solo mode).
+- **Network**:
+  - Cluster mode → one **TB5 cable per node-to-node link** for the RDMA mesh, plus normal LAN for SSH/API.
+  - **Remote Login** (System Settings → General → Sharing) enabled on every Engine node, reachable by SSH key from the Serveur.
+- **Disk**: ~5 GB per node for the venv after `mlx`+`mlx-lm`, plus your models (plan ~1.2× the model file size for KV cache + overhead).
+
+---
+
+## 3. Step 0 — Get the Configurator
+
+The Configurator is **not signed with an Apple Developer ID** (deliberate:
+open-source, outside the App Store). Two ways to get it:
+
+- **Build locally (recommended for a technical operator)** — a locally built
+  `.app` has no quarantine bit and opens directly:
+  ```bash
+  git clone https://github.com/Odyssai-eu/Odyssai-config.git
+  cd Odyssai-config
+  sh scripts/package-dmg.sh        # → dist/OdyssAI-Configurator-<ver>.dmg
+  ```
+- **Download the DMG** (GitHub release / AirDrop) — macOS sets the quarantine
+  bit and Gatekeeper blocks the first launch. Unblock **without reinstalling**:
+  - **No terminal**: System Settings → Privacy & Security → **“Open Anyway”** after a first open attempt.
+  - **One line**: `xattr -dr com.apple.quarantine "/Applications/OdyssAI Configurator.app"`
+
+Then drag **OdyssAI Configurator.app** to **Applications** and launch it. The
+wizard flow is: **Profile → Dependencies → Configuration → Installation →
+Topology → Validation.**
+
+---
+
+## 4. Mode Cluster — Serveur + N Mac Studio (RDMA)
+
+### Step 1 — Install the Serveur (on the Mac mini)
+
+1. Launch the Configurator **on the Mac mini**, pick profile **Serveur**.
+2. **Dependencies**: the wizard checks for Docker and guides the install if missing.
+3. **Installation**: it runs the Companion Docker stack (`docker compose up -d`,
+   `--build` because the images are `:local`): `app`, `db` (Postgres 17),
+   `nemo-memory` (MLX embedder).
+4. Result: **OdyssAI-X on `:8000`** and **Companion on `:3100`**.
+
+Verify the engine is up:
+```bash
+for i in {1..30}; do curl -sf http://localhost:8000/health && break || sleep 1; done
+# idle, no model yet:  {"status":"idle","version":"…"}
 ```
-Q1. How many cluster nodes?
-    1 — one Mac (single-Mac install)
-    2-5 — multi-Mac cluster
+Open the dashboard at `http://localhost:8000/` (or `http://<server-ip>:8000/`).
 
-Q2. For each node, the SSH target:
-    e.g. "admin@192.168.1.42", "sophie@studio-1.lan"
+### Step 2 — Install the Engine on each Mac Studio
 
-Q3. Are the nodes Thunderbolt-5-cabled in a full mesh?
-    yes  → JACCL backend (faster, requires per-peer interface map)
-    no   → ring backend (TCP, works on any LAN)
+For **every** Mac Studio node:
 
-Q4. Where does the orchestrator run?
-    one of the nodes / a separate Mac / a Linux box
-    (anything with Docker reachable from all nodes)
+1. Make sure **Remote Login** is on and the Serveur can SSH to it with a key
+   (no password prompt):
+   ```bash
+   ssh -o BatchMode=yes admin@<node-ip> hostname    # expect: <hostname>
+   ```
+   If it prompts for a password, copy a key first: `ssh-copy-id admin@<node-ip>`
+   (you type the node’s macOS password **once** — it is never stored).
+2. In the Configurator, pick profile **Engine**, enter the node’s SSH target and
+   (optionally) the **models directory** — the same path on every node. The
+   wizard runs `bootstrap-node.sh` over SSH: it provisions `~/mlx-cluster/` with
+   `runner.py`, the helpers/patches, and a pinned venv (`mlx`/`mlx-lm`), then
+   smoke-imports MLX. **Idempotent** — safe to re-run.
 
-Q5. Install Companion (chat client) alongside?
-    yes → same host as orchestrator? or different?
-    no  → user will hit the API directly or pair Companion later
+### Step 3 — Build the topology
 
-Q6. Cluster name — short, role-descriptive (e.g. "my-cluster", "lab-fast")
-    This becomes the cluster_id in /admin/clusters/<name>/* and the
-    YAML key in topology.yaml. Whatever the user picks IS the name —
-    the engine no longer reserves any reserved word.
+1. In the Configurator’s **Topology** step, enter each node as `rank = ssh-target`
+   (optionally `:id`), choose backend **`jaccl`**.
+2. Click **Build**. It probes the RDMA wiring via NDP (IPv6 neighbour discovery
+   on each TB5 link), generates the `rdma_to:` matrix, **validates mesh symmetry**
+   (every cable listed on both ends; `N·(N−1)` edges expected), and writes
+   **`~/.odysseus/topology.yaml`** — backing up the previous file to `.bak` and
+   **preserving any other clusters** already defined.
+3. If a cable is unplugged or a node is off, validation fails with a clear
+   “X cannot reach Y”. Fix the cabling and Build again.
 
-Q7. Models directory plan
-    - external SSD (recommended for serious clusters, 2-4 TB)
-    - internal SSD on each node (default ~/mlx-models)
-    - NFS-mounted shared volume
-
-Q8. First model to load?
-    Skip this for now — Stage 7 has a `suggest-models.py` that picks
-    candidates based on the cluster RAM you collect in Stage 2.
+Confirm the cluster registered:
+```bash
+curl -s http://localhost:8000/admin/clusters    # expect your cluster name
 ```
 
-Echo the plan back to the user as a summary before starting Stage 1.
-Don't proceed without confirmation.
+### Step 4 — First model + smoke test
 
-## Stage 1 — SSH bootstrap (one-time per node)
+See **§6** below.
 
-The orchestrator container will SSH into each node to spawn runners.
-You need key-based auth from the orchestrator host (or your laptop, if
-you're driving the install from there) to each node.
+---
 
-For each node target the user gave in Q2:
+## 5. Mode Solo — Serveur + 1 Telemak Mac
+
+### Step 1 — Install the Serveur
+
+Same as Cluster Step 1 (Mac mini, profile **Serveur**).
+
+### Step 2 — Install Telemak
+
+On the single Mac that will run the model, pick profile **Telemak**. The
+Configurator copies `Telemak.app` into `/Applications/` (locally or over SSH with
+`--node`). Launch Telemak and note the HTTP endpoint it listens on (e.g.
+`http://<telemak-ip>:8003`).
+
+### Step 3 — Wire Solo (http-proxy, no RDMA)
+
+In the Topology step, choose backend **`http-proxy`** and set the **upstream** to
+Telemak’s URL. The Configurator writes a Solo cluster into `~/.odysseus/topology.yaml`
+(no `rdma_to`, just `upstream:`) and validates it.
+
+### Step 4 — Smoke
+
+OdyssAI-X now proxies to Telemak. Run the completion smoke from §6 (Telemak owns
+its own model lifecycle — load the model in Telemak itself).
+
+---
+
+## 6. First model — download, load, smoke
+
+A model must physically exist under `models_dir` on every node before the
+orchestrator can load it.
 
 ```bash
-# 1. Generate a key on the orchestrator host (or your laptop) if there
-#    isn't one yet — skip if ~/.ssh/id_ed25519 already exists.
-[ -f ~/.ssh/id_ed25519 ] || ssh-keygen -t ed25519 -N "" -f ~/.ssh/id_ed25519
+# 6a. Download into the models_dir (two-level org/repo layout)
+huggingface-cli download \
+  mlx-community/Qwen3-7B-MLX-8bit \
+  --local-dir ~/mlx-models/mlx-community/Qwen3-7B-MLX-8bit
 
-# 2. Copy the key to the node. The user types their macOS account
-#    password ONCE per node — never store it, never read it back.
-ssh-copy-id <ssh-target>
-# e.g. ssh-copy-id admin@192.168.1.42
+# 6b. Multi-node: push it from one node to the others (or use the dashboard → Sync matrix)
+curl -X POST http://<server-ip>:8000/admin/sync/rsync \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"mlx-community/Qwen3-7B-MLX-8bit","source":"<node-a-id>","targets":["<node-b-id>"]}'
 
-# 3. Verify key-based auth works without password.
-ssh -o BatchMode=yes -o ConnectTimeout=5 <ssh-target> 'hostname; uname -m'
-# Expect: <hostname>\narm64
+# 7. Load on the cluster (<cluster> = the key you set in topology, e.g. `default`)
+curl -X POST http://<server-ip>:8000/admin/<cluster>/load \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"mlx-community/Qwen3-7B-MLX-8bit"}'
+# First load: 30 s – 5 min depending on disk + node count.
+
+# Smoke a completion (/v1/* is always public)
+curl -X POST http://<server-ip>:8000/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"<cluster>","messages":[{"role":"user","content":"Say hello in one short sentence."}]}'
 ```
+A streaming SSE response ending in `data: [DONE]` means **the stack is installed**.
 
-**Critical:** never put the password in the conversation, the script,
-or any file. The user pastes it directly into their `ssh-copy-id`
-prompt — Claude never sees or stores it.
+> The models directory is **editable per cluster** in the dashboard (cluster
+> screen → *Models directory* — a single shared path used by every node) and is
+> what the Models matrix reads. You can also download from the dashboard →
+> **Sync matrix → Download from Hugging Face**.
 
-**Pre-req on each node:**
-- macOS with Apple Silicon (the smoke command above confirms `arm64`)
-- **Remote Login** enabled (System Settings → General → Sharing →
-  Remote Login → ON). If `ssh-copy-id` fails with `Connection refused`,
-  this is why. Tell the user; don't try to fix it yourself.
+---
 
-If a node has SSH key auth set up already from a prior install (you can
-tell by `ssh -o BatchMode=yes ... hostname` working without
-`ssh-copy-id`), skip it for that node.
+## 7. Rebuild the topology (cable moved / node added)
 
-## Stage 2 — Bootstrap each cluster node
+When a TB5 cable changes or you add a node, open the Configurator → **Topology →
+Rebuild**. It re-probes the wiring, shows a **visual diff** of the cabling
+before/after, re-validates the mesh, and rewrites `~/.odysseus/topology.yaml`
+(old file kept as `.bak`). No need to hand-edit anything.
 
-Now install the MLX runtime on each node — Python venv with
-`mlx + mlx-lm`, plus the `runner.py` script the orchestrator will
-spawn. The `scripts/bootstrap-node.sh` shipped in this repo does
-exactly that.
+---
 
-For each node:
+## 8. Optional — cloud providers & Companion
 
+- **Cloud passthrough** is built into OdyssAI-X. Dashboard → **Settings → Cloud
+  providers → Add provider** (OpenRouter / Anthropic / OpenAI), paste the key —
+  aliases like `or:claude-haiku` appear in `/v1/models` immediately. Do **not**
+  install LiteLLM; it is only a legacy fallback rail.
+- **Companion** is already installed by the Serveur profile (`:3100`). To point
+  it at this engine: Companion → **Settings → Infrastructure → Engine** →
+  `http://<server-ip>:8000` → Test endpoint.
+
+---
+
+## 9. Admin auth (optional, opt-in)
+
+`/admin/*` is **open by default** — odyssai.eu is a trusted-LAN, single-operator
+install. Only if you expose the engine beyond your LAN (tunnel, port-forward),
+set a token. Any non-empty value flips `/admin/*` to require `Authorization:
+Bearer <token>`:
 ```bash
-# Run from the directory of this repo. Default models dir is
-# '$HOME/mlx-models' on the remote node — override with the path the
-# user chose in Q7 if it's an external SSD.
-scripts/bootstrap-node.sh <ssh-target>
-
-# OR with an explicit models dir on the node (quote the variable so
-# the dollar sign resolves on the REMOTE shell):
-scripts/bootstrap-node.sh <ssh-target> '$HOME/mlx-models'
-scripts/bootstrap-node.sh admin@studio-1.lan /Volumes/External/models
-```
-
-The script is idempotent — re-running it just re-syncs scripts and
-re-checks the venv. Smoke at the end verifies `mlx + mlx-lm` import.
-
-### Optional but recommended — `lean-node.sh`
-
-If the Mac will only serve as an MLX node (no human use), strip the
-background services that hold wired memory + churn CPU on idle :
-
-```bash
-ssh <ssh-target> 'bash -s' < scripts/lean-node.sh
-# or with an explicit models dir to disable Spotlight on:
-ssh <ssh-target> 'bash -s' < scripts/lean-node.sh -- --models-dir /Volumes/models
-```
-
-What it does, briefly :
-
-1. Hides ~25 unused Apple apps from Launchpad (Mail, Maps, FaceTime,
-   News, Stocks, Music, Photos, iWork suite, …) via `chflags hidden` —
-   reversible.
-2. Turns off Spotlight indexing on the models SSD (a multi-TB volume
-   gains nothing from being indexed).
-3. Disables Time Machine on the node.
-4. `launchctl disable`s iCloud / Photos / News / Music background
-   daemons — `photoanalysisd` alone can hold 1-2 GB of wired memory
-   on a freshly-installed Mac.
-5. `pmset -a sleep 0 disksleep 0 hibernatemode 0` — a node that sleeps
-   mid-load = killed pool, JACCL queue-pair errors.
-
-All actions are reversible and the script is idempotent. Add
-`--dry-run` to preview without applying. Ask the user first if the Mac
-is also a workstation — the hidden-apps step would be intrusive on a
-shared box.
-
-**Collect from each node** (you need it for Stage 3 + 7):
-
-```bash
-# RAM per node (we'll sum across nodes for the model-fit calc later)
-ssh <ssh-target> 'sysctl -n hw.memsize | awk "{print int(\$1/1024/1024/1024)}"'
-# → e.g. 96, 256, 512 (GB)
-
-# Models dir on the node
-ssh <ssh-target> 'echo $HOME/mlx-models'
-# OR the path the user set in Q7
-```
-
-Tally the total cluster RAM. Save the per-node values for the topology
-file in Stage 4.
-
-## Stage 3 — RDMA discovery (only if Q3 was "yes JACCL")
-
-JACCL needs to know, for each node, which RDMA HCA talks to which
-peer. macOS enumerates Thunderbolt ports differently per boot — so on
-one node the cable to peer rank 1 might be `rdma_en5`, and on another
-the cable to peer rank 1 might be `rdma_en3`. The mapping is
-hardware-specific and **physically opaque** — neither the operator
-nor the agent can tell which `rdma_en<N>` corresponds to which
-chassis port by looking at the box.
-
-Skip this stage entirely if Q3 was "ring". Continue to Stage 4.
-
-### Auto-discovery
-
-Use the bundled script. It SSHes into each node, lists the
-PORT_ACTIVE HCAs, then cross-references the peer MAC addresses
-visible via NDP (IPv6 neighbor discovery on each TB5 interface) to
-reconstruct who's connected to whom:
-
-```bash
-scripts/discover-rdma-wiring.py \
-  0=<ssh-of-rank0>[:<id>] \
-  1=<ssh-of-rank1>[:<id>] \
-  ...
-```
-
-Worked example for a 4-node cluster:
-
-```bash
-scripts/discover-rdma-wiring.py \
-  0=admin@10.0.0.1:host-a \
-  1=admin@10.0.0.2:host-b \
-  2=admin@10.0.0.3:host-c \
-  3=admin@10.0.0.4:host-d
-```
-
-Output is a per-node `rdma_to:` block, ready to paste under each node
-in `topology.yaml`:
-
-```
-# rank 0 — host-a (admin@10.0.0.1)
-rdma_to:
-  1: rdma_en5    # → host-b
-  2: rdma_en4    # → host-c
-  3: rdma_en3    # → host-d
-```
-
-The script exits non-zero (with warnings on stderr) if the cluster
-isn't a full mesh — typically a cable unplugged or a node off. Fix
-the cabling and re-run.
-
-### When auto-discovery fails
-
-If the script fails repeatedly (NDP table not populating, IPv6 disabled
-on the TB bridge, etc.) — fall back to `ring` backend in Stage 4. Ring
-is TCP-only, no wiring map needed, slightly slower on big MoEs.
-JACCL is an optimization; ring is a working install.
-
-## Stage 4 — Write `topology.yaml` + start the orchestrator
-
-On the orchestrator host (the one from Q4), do:
-
-```bash
-# 1. Clone Odysseus on the orchestrator host (if not done yet).
-git clone https://github.com/Odyssai-eu/Odysseus.git ~/Odysseus
-cd ~/Odysseus
-
-# 2. Write the topology config. ~/.odysseus is the canonical location
-#    the container reads (mounted into the container at runtime).
-mkdir -p ~/.odysseus
-```
-
-Build `~/.odysseus/topology.yaml` from Q1-Q7. Use the user's cluster
-name from Q6 as the YAML key (NOT "default" unless the user explicitly
-said "default"). Single-node example:
-
-```yaml
-clusters:
-  <cluster-name>:                # e.g. my-cluster
-    label: "<short description>" # e.g. "Mac Studio cluster"
-    backend: ring                # or jaccl if Q3 was yes
-    pools:
-      - size: 1
-        nodes:
-          - rank: 0
-            id: node-0
-            ssh: admin@192.168.1.42
-            models_dir: /Users/admin/mlx-models   # from Q7 / Stage 2
-```
-
-Multi-node ring (Q3 = no):
-
-```yaml
-clusters:
-  <cluster-name>:
-    label: "<description>"
-    backend: ring
-    pools:
-      - size: <N>          # number of nodes
-        nodes:
-          - rank: 0
-            id: node-0
-            ssh: <target-0>
-            models_dir: <models-dir-0>
-          - rank: 1
-            id: node-1
-            ssh: <target-1>
-            models_dir: <models-dir-1>
-          # … one per node
-```
-
-Multi-node JACCL (Q3 = yes): same as ring but add `backend: jaccl` and
-a `rdma_to:` block per node, populated from the Stage 3 matrix:
-
-```yaml
-- rank: 0
-  id: node-0
-  ssh: <target-0>
-  rdma_to:
-    1: rdma_en5      # interface on node-0 that reaches node-1
-    2: rdma_en4      # interface on node-0 that reaches node-2
-```
-
-Then start the orchestrator:
-
-```bash
+echo "ODYSSAI_X_ADMIN_TOKEN=$(python3 -c 'import secrets; print(secrets.token_urlsafe(32))')" >> .env
 docker compose up -d
-
-# Wait for /health to come up
-for i in {1..30}; do
-  curl -sf http://localhost:8000/health && break || sleep 1
-done
-# Expect: {"status":"idle","version":"…"}
-
-# Confirm the cluster is registered
-curl -s http://localhost:8000/admin/clusters | jq '.data[].id'
-# Expect: "<cluster-name>"  (and nothing else if you defined only one)
 ```
+> `ODYSSEUS_ADMIN_TOKEN` is still read as a legacy alias, but `ODYSSAI_X_ADMIN_TOKEN`
+> is the current name. `/v1/*` endpoints stay public regardless.
 
-If `/admin/clusters` returns an empty list or the wrong id, the
-container couldn't parse the topology — `docker logs odyssai-odysseus`
-will show the error. Fix the YAML, re-up, re-check.
+---
 
-**Admin auth note:** `/admin/*` is open by default for trusted-LAN
-installs (whoever can reach `:8000` is the operator). If the user is
-exposing the engine beyond their LAN, set `ODYSSEUS_ADMIN_TOKEN` in
-the env at this stage — see `AGENTS.md` step 5.
+## 10. Common failure modes
 
-## Stage 5 — Install Companion (only if Q5 was "yes")
+| Symptom | Fix |
+|---|---|
+| `docker compose up` exits immediately | `docker logs odyssai-odysseus` — usually an invalid `~/.odysseus/topology.yaml` or an unreachable SSH target. The boot log names the bad key. |
+| Engine up, `/v1/models` empty | No model loaded — run the load step (§6). |
+| Topology Build fails “X cannot reach Y” | A TB5 cable is unplugged or a node is off. Fix cabling, Build again. |
+| Load fails `Shape mismatch` at runner init | Sharding mismatch. Tensor parallel needs KV-heads divisible by `world_size`; big MoEs need pipeline (`"sharding":"pipeline"` in the load payload). |
+| `errno 16 / 96 / 2` after several sessions | JACCL queue-pair degradation (known upstream MLX/JACCL bug). Reboot the affected nodes — dashboard has a **Reboot all** button. |
+| Model paths mismatch between nodes | `models_dir` must be the same path on every node — use the dashboard **Sync matrix** to rsync, or a shared mount. |
 
-Companion is in a separate repo. On the host the user chose for
-Companion (often the same as the orchestrator host):
+---
+
+## 11. Security posture (LAN-first, self-hosted)
+
+odyssai.eu is **LAN-first, single-operator**. Defaults are usable with zero
+config; hardening is an opt-in, not a forced policy. Bind interface, mandatory
+API key, and WAN exposure are **your choice** (advice: Cloudflare Tunnel,
+IP/MAC allowlist, reverse-proxy auth — the stack doesn’t impose them). The
+documented default admin password is meant to be changed on first login. Full
+version in `docs/SECURITY-POSTURE.md`.
+
+---
+
+## Appendix — Advanced / headless install (no DMG)
+
+Use this when the Configurator GUI isn’t an option: a **Linux orchestrator**
+(no macOS `.app`), CI, or a fully headless setup. The Configurator is just a
+façade over these scripts — they remain the source of truth and still ship in
+the engine repo.
 
 ```bash
-git clone https://github.com/Odyssai-eu/Companion.git ~/Companion
-cd ~/Companion
+# 1. SSH bootstrap each node (one-time)
+ssh-copy-id admin@<node-ip>                       # key auth, password typed once
 
-cp .env.example .env
-# Defaults are sensible — host port binds to 127.0.0.1 only, session
-# secret auto-generates on first boot. Edit only if you need
-# customization (e.g. HOST_BIND=0.0.0.0 for LAN exposure).
+# 2. Provision each MLX node (idempotent) — from the engine repo
+./scripts/bootstrap-node.sh admin@<node-ip> ~/mlx-models
 
+# 3. Discover the RDMA wiring (Cluster mode only)
+python scripts/discover-rdma-wiring.py 0=admin@<node-a> 1=admin@<node-b> …
+#    → prints ready-to-paste topology.yaml blocks; non-zero exit if the mesh is incomplete
+
+# 4. Write the topology by COPYING the example (never from scratch)
+cp config/topology.example.yaml ~/.odysseus/topology.yaml
+#    edit nodes / rdma_to (jaccl) or upstream (http-proxy); validated by topology.py (TopologyConfig)
+
+# 5. Start the Serveur stack
 docker compose up -d
-
-# Wait for /api/health
-for i in {1..30}; do
-  curl -sf http://localhost:3000/api/health && break || sleep 1
-done
-# Expect: {"status":"ok","version":"0.1.0","engines":0}
 ```
+For an **agent-driven** equivalent of this appendix using the `odyssai-configure`
+CLI (`install`, `topology build/rebuild`, `validate`), see [`AGENTS.md`](AGENTS.md).
 
-Tell the user:
+---
 
-> Open http://localhost:3000/, click **Sign up**, enter email +
-> password + name (8-char minimum). The first signup on an empty DB
-> becomes the workspace admin automatically. After signup, go to
-> **Settings → Infrastructure → Engine** and click **Discover** —
-> Companion will find the Odysseus engine you started in Stage 4.
+## Where to learn more
 
-If the orchestrator and Companion are on different machines, the user
-will need to enter `http://<orchestrator-host>:8000` manually instead
-of using Discover (which only scans the local LAN).
-
-## Stage 6 — Confirm models directory + sync if multi-node
-
-Each cluster node needs the same model files at the same path on its
-local disk (or via a shared mount).
-
-```bash
-# Verify the models_dir exists on each node and is writable
-for target in <ssh-target-0> <ssh-target-1> …; do
-  ssh "$target" "mkdir -p '<models-dir>' && ls -ld '<models-dir>'"
-done
-```
-
-External SSD recommendation: if any node has an external SSD with
-≥500 GB free (`ls /Volumes/`), suggest moving models there before the
-disk fills. Big MoEs are 300-700 GB each.
-
-For multi-node: when you load a model in Stage 7, the orchestrator
-will need the file on EVERY node. Either:
-
-- **Download on one node, sync to the rest** via `/admin/sync/rsync`
-  (works from the dashboard or via curl). The orchestrator manages
-  the rsync over SSH.
-- **NFS-mount a shared models directory** — operators with a serious
-  storage setup often have this already.
-
-Don't try to be clever — just tell the user the options.
-
-## Stage 7 — First model: pick + download + load
-
-What gates model size is **cumulated RAM across the pool**, not node
-count. 4 × 32 GB Macs total 128 GB of usable memory — that doesn't
-unlock a 1.5 TB model just because there are 4 nodes. Sum the per-node
-unified-memory values you captured in Stage 2 (or re-collect them via
-`ssh admin@<ip> 'sysctl -n hw.memsize'` divided by 2³⁰).
-
-Then ask the helper which models fit, keeping 20% margin for KV cache:
-
-```bash
-# From the repo root
-scripts/suggest-models.py --ram-gb <total>
-```
-
-Example output for a 96 GB single-Mac install:
-
-```
-mlx-community/Qwen3.6-35B-A3B-8bit       38G  chat   Latest Qwen MoE...
-```
-
-Example for a 4-node pool of 256 GB Ultras (`--ram-gb 1024`):
-
-```
-mlx-community/Qwen3.6-35B-A3B-8bit                38G  chat
-mlx-community/Qwen3-Next-80B-A3B-Instruct-8bit    85G  chat
-mlx-community/Qwen3-Coder-Next-8bit               85G  code
-mlx-community/Qwen3.5-122B-A10B-8bit             131G  chat
-mlx-community/MiniMax-M2-8bit                    243G  chat
-mlx-community/Qwen3.5-397B-A17B-8bit             422G  reasoner
-mlx-community/Qwen3-Coder-480B-A35B-Instruct-8bit 540G code
-mlx-community/DeepSeek-V3.1-8bit                 713G  reasoner
-```
-
-Show the user the table. Let them pick. Don't impose.
-
-Then download + load. On a single-node install:
-
-```bash
-# Make sure huggingface-cli is on the orchestrator host (or wherever
-# the models_dir actually lives — usually the node itself).
-pip install --user --upgrade huggingface_hub
-
-# Download into the models_dir from Q7 / Stage 2
-huggingface-cli download <repo-id> \
-  --local-dir <models-dir>/<repo-id>
-# e.g. ~/mlx-models/mlx-community/Qwen3-7B-MLX-8bit
-```
-
-For multi-node, download on node 0, then sync to the others:
-
-```bash
-curl -X POST http://<docker-host>:8000/admin/sync/rsync \
-  -H 'Content-Type: application/json' \
-  -d '{
-    "model": "<repo-id>",
-    "source": "node-0",
-    "targets": ["node-1", "node-2"]
-  }'
-# Watch progress in dashboard → Sync matrix.
-```
-
-Then load the model on the cluster:
-
-```bash
-curl -X POST http://<docker-host>:8000/admin/clusters/<cluster-name>/load \
-  -H 'Content-Type: application/json' \
-  -d '{"model": "<repo-id>"}'
-# Streaming progress response. First load is 30 s–5 min depending on
-# disk speed and node count.
-```
-
-Smoke-test the completion:
-
-```bash
-curl -X POST http://<docker-host>:8000/v1/chat/completions \
-  -H 'Content-Type: application/json' \
-  -d '{
-    "model": "<cluster-name>",
-    "messages": [{"role":"user","content":"Say hello in one short sentence."}]
-  }'
-```
-
-You should get a streaming SSE response. If yes: **the cluster is
-fully operational**.
-
-If the user opted into Companion (Q5), tell them:
-
-> Open Companion → start a new chat → pick **<cluster-name>** in the
-> model picker → send a message. The reply comes through Odysseus,
-> through your `<cluster-name>` cluster, off the model you just loaded.
-
-## Stage 8 — Tell the user what they just built
-
-Hand the user a concise success summary:
-
-```
-✓ Odysseus cluster installed.
-
-  Cluster:       <cluster-name>
-  Backend:       <ring|jaccl>
-  Nodes:         <N>  (<total-RAM>GB total unified memory)
-                 - node-0 @ <target-0>  <ram-0>GB  models: <dir-0>
-                 - node-1 @ <target-1>  <ram-1>GB  models: <dir-1>
-                 …
-
-  Orchestrator:  <docker-host>:8000  (dashboard, API)
-  Companion:     <companion-host>:3000  (optional, only if installed)
-
-  Loaded model:  <repo-id>
-  Endpoints:
-    OpenAI:      http://<docker-host>:8000/v1/chat/completions
-    Anthropic:   http://<docker-host>:8000/v1/messages
-
-  Next moves:
-    - Browse the dashboard at http://<docker-host>:8000/
-    - Add more models via Sync matrix → Download from Hugging Face
-    - Add another cluster: edit ~/.odysseus/topology.yaml, restart container
-    - Expose beyond LAN: set ODYSSEUS_ADMIN_TOKEN, configure reverse proxy
-```
-
-## Failure modes — what to do when something breaks
-
-**SSH key auth still fails after `ssh-copy-id`**
-→ Remote Login isn't enabled on that node. User flips it on in
-System Settings. Don't fight the OS — tell them, wait, retry.
-
-**`bootstrap-node.sh` reports "Python 3.11+ required"**
-→ The node has only an older Python. Install via `brew install
-python@3.11` on the node, then re-run the bootstrap.
-
-**`docker logs odyssai-odysseus` shows "topology validation failed"**
-→ Your `~/.odysseus/topology.yaml` has a typo or wrong key. The log
-quotes the offending field. Fix the YAML, `docker compose up -d`
-again (no rebuild needed).
-
-**`/admin/clusters` is empty after Stage 4**
-→ Topology file isn't being read. Check the bind mount in
-`docker-compose.yml`: `${HOME}/.odysseus:/root/.odysseus:ro` should
-exist. If you're on a system where `${HOME}` resolves weirdly, replace
-with the absolute path.
-
-**Load fails with `Connection refused` to a node**
-→ The orchestrator's SSH key isn't trusted on that node. Re-run
-`ssh-copy-id` from inside the container:
-`docker exec odyssai-odysseus ssh-copy-id <ssh-target>`.
-
-**Load fails with `Shape mismatch` at runner init**
-→ The model needs pipeline parallel but the pool was started with
-tensor parallel (or vice versa). Add `"sharding": "pipeline"` to the
-load payload for big MoEs, or pick a smaller pool size.
-
-**JACCL pool fails with `Changing queue pair to RTR failed`**
-→ Known upstream MLX/JACCL bug — queue-pair degradation after many
-sessions. Reboot the affected nodes (dashboard → **Reboot all**).
-
-## What you should NOT do
-
-- **Do not collect or store passwords.** SSH key auth via
-  `ssh-copy-id` is the only authentication step where the user types
-  a password, and it goes directly into their terminal, not into the
-  conversation.
-- **Do not bootstrap the orchestrator-only host as a node.** Stage 2
-  only applies to machines listed in `topology.yaml` as cluster nodes.
-  A separate Mac mini orchestrating remote Mac Studios doesn't need
-  MLX installed locally.
-- **Do not invent the RDMA matrix.** If the user can't draw it,
-  fall back to `ring`. Wrong wiring data makes JACCL fail at
-  `init_distributed` with cryptic errors.
-- **Do not pick a model for the user.** Show what fits, let them
-  choose. Their hardware, their preferences.
-- **Do not pin model versions in this doc.** The `suggest-models.py`
-  catalog is curated; if the user asks for something not in it,
-  download it anyway as long as it's a published MLX model on HF.
-
-## Where to go from here
-
-- **`AGENTS.md`** — granular component install (the 6 patterns from
-  yesterday). Use when the user already has parts of the stack and
-  just needs to add one piece.
-- **`docs/GETTING-STARTED.md`** — long-form operator walkthrough,
-  more narrative than this runbook.
-- **https://odyssai.eu/docs/** — public docs site (Starlight), with
-  architecture deep-dives, API reference, and the Companion user
-  guide.
-- **Companion repo** — `https://github.com/Odyssai-eu/Companion`
-  with its own `AGENTS.md` for client-side workflow patterns
-  (semantic routing, MCP servers, agent tokens, etc.).
+- [`AGENTS.md`](AGENTS.md) — the same install, driven by an AI agent via the CLI.
+- `docs/DEPLOY.md` — production deployment patterns (hot-reload, rebuild, logs).
+- `https://odyssai.eu/docs/` — public docs site (architecture, full API reference).
+- Configurator repo: `https://github.com/Odyssai-eu/Odyssai-config` (`README.md` + `CLAUDE.md`).
