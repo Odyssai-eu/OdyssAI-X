@@ -48,3 +48,26 @@ pas de détails d'implémentation.
 - **Location "odyssai"** — la network location dédiée créée par la recette (équivalent
   Odyssai de la location "exo"). Sert aussi de mécanisme de rollback (`--revert`
   rebascule sur la location persistée d'origine).
+
+## Serving & vitesse (glossaire)
+
+Termes du domaine vitesse d'inférence (entrés via le grill Mistral #54, 2026-06-16).
+
+- **Decode bandwidth-bound** — pour un modèle DENSE, le decode est borné par la bande
+  passante mémoire : chaque token re-streame TOUS les poids. tok/s ≈ bande_passante ÷
+  taille_modèle. D'où un dense lent là où un MoE (ne streame que ses params actifs) vole.
+  Repère : M3 Ultra ~819 GB/s ; un 128B en Q8 ~128 GB → plafond ~6,4 tok/s.
+- **EAGLE draft** — petit modèle de tête (1 couche, ~1,5 B pour Mistral 3.5) qui PROPOSE
+  plusieurs tokens d'avance ; le target les VÉRIFIE en un forward. Spéculatif **lossless**
+  (la sortie reste exactement celle du target). Mistral le livre en format natif, pour
+  vLLM/SGLang.
+- **Speculative acceptance** — fraction des tokens proposés par le draft que le target
+  accepte ; détermine le speedup réel. Peut baisser si le target est quantifié alors que
+  le draft a été entraîné sur le full.
+- **MTPLX** — notre infra de décodage spéculatif (repo séparé `mtplx-odyssai`) : têtes
+  type MTP/EAGLE sur modèles **denses** (1,71× prouvé). C'est le véhicule pour porter EAGLE
+  chez nous — vLLM/SGLang étant CUDA-first, ils ne tournent pas sur Metal.
+- **Tensor-parallel (TP) vs pipeline** — TP shard les poids INTRA-couche (chaque node tient
+  une tranche de têtes ; KV-heads divisibles par world_size requis) → scale la bande passante
+  agrégée. Pipeline shard PAR couches : c'est le mode d'**Argo**. Un dense comme Mistral
+  (KV=8) peut faire du TP sur 2 ou 4 nodes ; M3 était pipeline-only.
