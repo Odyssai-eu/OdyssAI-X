@@ -8658,22 +8658,73 @@ async def admin_sync_bulk_delete(req: BulkDeleteRequest):
     return {"ok": True, "results": results, "deleted": sum(1 for r in results if r["ok"])}
 
 
+_SYNC_TERMINAL = {"done", "failed", "partial", "cancelled", "interrupted", "error"}
+
+
+@app.post("/admin/sync/jobs/clear")
+async def admin_sync_jobs_clear():
+    """Purge every terminal sync job (done/failed/partial/cancelled/…) from both
+    the in-memory list and the SQLite history. Running/queued jobs are kept.
+    This is the dashboard 'Clear' button (#57)."""
+    removed = [jid for jid, j in _sync_jobs.items() if j.get("status") in _SYNC_TERMINAL]
+    for jid in removed:
+        _sync_jobs.pop(jid, None)
+    past = _persist.clear_terminal_jobs()
+    return {"ok": True, "removed_active": len(removed), "removed_history": past}
+
+
 @app.delete("/admin/sync/jobs/{job_id}")
 async def admin_sync_job_cancel(job_id: str):
+    """A running job is cancelled (rsync terminated). A terminal job is removed
+    from the list — the dashboard '(x)' per job (#57)."""
     job = _sync_jobs.get(job_id)
+    if job and job["status"] == "running":
+        for proc in _sync_procs.get(job_id, []) or []:
+            try:
+                if proc.returncode is None:
+                    proc.terminate()
+            except Exception:
+                pass
+        job["status"] = "cancelled"
+        job["finished_at"] = time.time()
+        _persist.persist_job(job_id, job)
+        return {"ok": True, "cancelled": True}
+    # Terminal (or only in history): remove the entry entirely.
+    _sync_jobs.pop(job_id, None)
+    _persist.delete_job(job_id)
+    return {"ok": True, "removed": True}
+
+
+@app.post("/admin/sync/jobs/{job_id}/retry")
+async def admin_sync_job_retry(job_id: str):
+    """Re-run a failed/partial/cancelled job with the same model/source/targets.
+    Spawns a NEW job id (the old one stays as history) (#57)."""
+    job = _sync_jobs.get(job_id) or next(
+        (j for j in _persist.recent_jobs(limit=100) if j.get("id") == job_id), None
+    )
     if not job:
         raise HTTPException(404, "no such job")
-    if job["status"] != "running":
-        return {"ok": True, "already": job["status"]}
-    for proc in _sync_procs.get(job_id, []) or []:
-        try:
-            if proc.returncode is None:
-                proc.terminate()
-        except Exception:
-            pass
-    job["status"] = "cancelled"
-    job["finished_at"] = time.time()
-    return {"ok": True}
+    if job.get("status") == "running":
+        raise HTTPException(409, "job is still running")
+    model = job.get("model")
+    source = job.get("source")
+    targets = [t for t in (job.get("targets") or []) if _resolve_host(t) and t != source]
+    if not _resolve_host(source) or not targets:
+        raise HTTPException(400, "original source/targets no longer resolvable")
+    new_id = uuid.uuid4().hex[:8]
+    _sync_jobs[new_id] = {
+        "id": new_id, "model": model, "source": source, "targets": targets,
+        "status": "running", "started_at": time.time(), "finished_at": None,
+        "per_target": [
+            {"target": t, "status": "queued", "started_at": None, "finished_at": None,
+             "bytes_transferred": 0, "error": None}
+            for t in targets
+        ],
+        "bytes_total": None, "error": None, "retry_of": job_id,
+    }
+    _persist.persist_job(new_id, _sync_jobs[new_id])
+    asyncio.create_task(_drive_sync_job(new_id, model, source, targets))
+    return {"id": new_id, "retry_of": job_id}
 
 
 # ──────────────────────────────────────────────────────────────────────────────

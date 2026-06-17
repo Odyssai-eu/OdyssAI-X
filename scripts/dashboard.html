@@ -2888,6 +2888,7 @@ function renderActiveSyncJobs() {
       <div style="display:flex;align-items:baseline;gap:10px">
         <h3 style="font-family:var(--font-display);font-size:18px;font-weight:600;color:var(--ink);letter-spacing:-0.015em">Sync jobs</h3>
         <span style="font-size:12px;color:var(--ink-2)">${jobs.filter(j => j.status === "running").length} running · ${jobs.filter(j => j.status === "done").length} done · ${jobs.filter(j => j.status === "failed" || j.status === "partial").length} failed</span>
+        ${jobs.some(j => j.status !== "running" && j.status !== "queued") ? `<button class="btn btn-xs" data-act="sync-jobs-clear" style="margin-left:auto" title="Remove all finished/failed jobs from the list">${Icon.trash || Icon.x}<span>Clear</span></button>` : ""}
       </div>
       ${jobs.map(renderSyncJobRow).join("")}
     </div>
@@ -2930,7 +2931,9 @@ function renderSyncJobRow(j) {
           <span style="font-family:var(--font-mono);font-size:11px;color:var(--ink-2)">
             ${done} / ${total}${pct != null ? ` · ${pct}%` : ""} · ${elapsed}s${etaSec != null ? ` · ETA ${fmtDur(etaSec)}` : ""}${rate != null ? ` · ${fmtBytes(rate)}/s` : ""}
           </span>
-          ${running ? `<button class="btn btn-xs btn-destructive" data-act="sync-job-cancel" data-id="${escapeHtml(j.id)}">${Icon.x}<span>Cancel</span></button>` : ""}
+          ${running
+            ? `<button class="btn btn-xs btn-destructive" data-act="sync-job-cancel" data-id="${escapeHtml(j.id)}">${Icon.x}<span>Cancel</span></button>`
+            : `${(failed || partial || j.status === "cancelled" || j.status === "interrupted") ? `<button class="btn btn-xs" data-act="sync-job-retry" data-id="${escapeHtml(j.id)}" title="Re-run with the same source/targets">${Icon.refresh || ""}<span>Retry</span></button>` : ""}<button class="btn btn-xs btn-ghost" data-act="sync-job-remove" data-id="${escapeHtml(j.id)}" title="Remove from list">${Icon.x}</button>`}
         </div>
       </div>
       ${pct != null ? `
@@ -6655,6 +6658,23 @@ async function handleAct(e) {
     if (!confirm("Cancel this sync job?")) return;
     try { await delJson("/admin/sync/jobs/" + el.dataset.id); toast("sync job cancelled", "ok"); }
     catch (err) { toast("cancel failed: " + err.message, "err"); }
+    refreshAll(); return;
+  }
+  if (act === "sync-job-remove") {
+    // Terminal job → same DELETE endpoint, which removes (not cancels) a finished one.
+    try { await delJson("/admin/sync/jobs/" + el.dataset.id); }
+    catch (err) { toast("remove failed: " + err.message, "err"); }
+    refreshAll(); return;
+  }
+  if (act === "sync-job-retry") {
+    try { const r = await postJson(`/admin/sync/jobs/${el.dataset.id}/retry`, {}); toast("retry started → " + r.id, "ok"); }
+    catch (err) { toast("retry failed: " + err.message, "err"); }
+    refreshAll(); return;
+  }
+  if (act === "sync-jobs-clear") {
+    if (!confirm("Remove all finished/failed sync jobs from the list?")) return;
+    try { const r = await postJson("/admin/sync/jobs/clear", {}); toast(`cleared ${(r.removed_active||0)+(r.removed_history||0)} job(s)`, "ok"); }
+    catch (err) { toast("clear failed: " + err.message, "err"); }
     refreshAll(); return;
   }
 

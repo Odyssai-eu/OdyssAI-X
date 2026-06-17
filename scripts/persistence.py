@@ -235,6 +235,34 @@ def recent_jobs(limit: int = 50) -> list[dict]:
         return []
 
 
+def delete_job(jid: str) -> None:
+    """Remove a single sync job from history (used by the dashboard '(x)' on a
+    terminal job). No-op if it isn't persisted."""
+    if _conn is None:
+        return
+    try:
+        with _lock:
+            _conn.execute("DELETE FROM sync_jobs WHERE id = ?", (jid,))
+    except Exception as e:
+        _log(f"delete_job({jid}) failed: {e}")
+
+
+def clear_terminal_jobs() -> int:
+    """Purge every sync job in a terminal state from history (dashboard 'Clear').
+    Keeps anything still running/queued. Returns the number of rows removed."""
+    if _conn is None:
+        return 0
+    try:
+        with _lock:
+            cur = _conn.execute(
+                "DELETE FROM sync_jobs WHERE status NOT IN ('running', 'queued')"
+            )
+            return cur.rowcount or 0
+    except Exception as e:
+        _log(f"clear_terminal_jobs failed: {e}")
+        return 0
+
+
 def mark_orphans_interrupted() -> int:
     """On startup, any sync_job still 'running' AND any chat run still in
     a non-terminal status ('running', 'streaming', 'cancelling') is
