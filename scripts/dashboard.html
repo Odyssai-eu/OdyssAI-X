@@ -1544,6 +1544,7 @@ const SETTINGS_TABS = [
   { id: "general",    label: "General" },
   { id: "clusters",   label: "Clusters" },
   { id: "models",     label: "Models" },
+  { id: "huggingface", label: "Hugging Face" },
   { id: "providers",  label: "Cloud providers" },
   { id: "crew",       label: "Crew" },
   { id: "endpoints",  label: "Endpoints" },
@@ -1590,6 +1591,7 @@ function renderSettingsBody(tab) {
   if (tab === "general")   return renderSettingsGeneral();
   if (tab === "clusters")  return renderSettingsClusters();
   if (tab === "models")    return renderSettingsModels();
+  if (tab === "huggingface") return renderSettingsHuggingFace();
   if (tab === "providers") return renderSettingsProviders();
   if (tab === "crew")      return renderSettingsCrew();
   if (tab === "endpoints") return renderSettingsEndpoints();
@@ -2851,7 +2853,31 @@ function renderSettingsModels() {
       ${m ? renderMatrixCard(m, group) : (loading ? `<div class="empty-state">Probing 6 hosts via SSH… (~10 s)</div>` : `<div class="empty-state">Click <b>Refresh</b> to probe hosts.</div>`)}
       ${renderActiveSyncJobs()}
       ${state.sync_picker?.open ? renderSyncPicker() : ""}
-      ${renderSettingsHFDownload(group)}
+    </div>
+  `;
+}
+
+// HF download moved to its own "Hugging Face" tab (#58). Cluster picker +
+// the per-node download form + the live download activity all live here now,
+// instead of being buried under the Models matrix.
+function renderSettingsHuggingFace() {
+  const group = state.matrix_group && state.matrix_group !== "all" ? state.matrix_group : null;
+  const groups = matrixGroups().filter(g => g.id !== "all");
+  return `
+    <div class="matrix-toolbar">
+      <div class="stack">
+        <h2>Hugging Face</h2>
+        <div class="sub">Download models from Hugging Face onto a cluster's nodes, and watch progress.</div>
+      </div>
+    </div>
+    <div style="display:flex;align-items:center;gap:10px">
+      <span style="font-size:12px;color:var(--ink-2)">Cluster:</span>
+      <div class="seg-mode" style="padding:3px">
+        ${groups.map(g => `<button class="pill ${g.id===group?"selected":""}" data-act="matrix-group" data-v="${g.id}" style="padding:0 12px;height:30px;font-size:12px">${g.label}${g.hosts?" ("+g.hosts.length+")":""}</button>`).join("")}
+      </div>
+    </div>
+    <div style="margin-top:16px">
+      ${group ? renderHFDownload(group) : `<div class="empty-state">Pick a cluster above to download a Hugging Face model to its nodes.</div>`}
     </div>
   `;
 }
@@ -4956,7 +4982,11 @@ function clusterTargetNodes(cluster) {
 function renderDownloadRow(d) {
   const running = d.status === "running";
   const resumable = (d.status === "cancelled" || d.status === "error" || d.status === "partial");
-  const pct = (d.bytes && d.total_bytes) ? Math.round((d.bytes/d.total_bytes)*100) : (running ? 50 : (d.status==="done"?100:0));
+  const hasTotal = d.bytes && d.total_bytes;
+  const pct = hasTotal ? Math.round((d.bytes/d.total_bytes)*100) : (d.status === "done" ? 100 : 0);
+  // total_bytes is not reported by the runner today (#14), so while running we
+  // show a moving indeterminate bar + bytes transferred rather than a fake %.
+  const indeterminate = running && !hasTotal;
   const elapsed = ((d.finished_at || Date.now()/1000) - d.started_at).toFixed(0);
   const per = d.per_target || [];
   const targetsSummary = per.length
@@ -4992,8 +5022,10 @@ function renderDownloadRow(d) {
         </div>
       </div>
       <div class="progress">
-        <div class="bar"><div class="fill" style="width:${pct}%"></div></div>
-        <div class="pct">${pct}%</div>
+        <div class="bar">${indeterminate
+          ? `<div class="fill" style="width:30%;animation:syncIndeterminate 1.6s linear infinite"></div>`
+          : `<div class="fill" style="width:${pct}%"></div>`}</div>
+        <div class="pct">${indeterminate ? escapeHtml(d.size || "…") : pct + "%"}</div>
       </div>
       ${errLine}
     </div>
