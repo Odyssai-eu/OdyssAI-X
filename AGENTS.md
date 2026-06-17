@@ -21,9 +21,14 @@ runs inference** — it routes to MLX nodes **or** to a single-Mac Telemak runti
 
 | Component | What | Target | CLI install |
 |---|---|---|---|
-| **Engine** | MLX engine (`runner.py` + venv + `mlx`/`mlx-lm`) | Mac Studio (Apple Silicon) | `install engine --node <ssh>` |
-| **Serveur** | OdyssAI-X (`api.py`) + Companion (client + memory) | Mac mini (Apple Silicon) | `install server` |
+| **Engine** | MLX engine (`runner.py` + venv + `mlx`/`mlx-lm`) | Mac Studio (Apple Silicon) | `install engine --node <ssh>` (remote) or `node-setup base` (this Mac) |
+| **Orchestrator** | OdyssAI-X (`api.py`) — routing only, no inference | Mac mini (Apple Silicon) | `install orchestrator` |
+| **Server** | Companion (chat client + memory: app + db + memory compiler + company LightRAG + native nemo) | same Mac mini | `install server` |
 | **Telemak** | single-Mac runtime | any Mac | `install telemak` |
+
+> The Mac mini “Serveur” hosts **both** OdyssAI-X and Companion → run `install
+> orchestrator` **and** `install server` on it. (The GUI’s single “Serveur”
+> profile does both for a human; the CLI splits them.)
 
 Two modes: **Cluster** (Serveur + N Mac Studio, RDMA/TB5, backend `jaccl`) ·
 **Solo** (Serveur + 1 Telemak Mac, backend `http-proxy`). The single-Mac case is
@@ -47,11 +52,12 @@ Then check the local prerequisites (JSON output — parse it, don't eyeball):
 ```bash
 odyssai-configure check-deps      # ssh / python / docker / vendored scripts
 odyssai-configure setup-deps      # creates ~/.odyssai/venv (pydantic + pyyaml) if needed
+odyssai-configure versions        # installed component versions vs this bundle's payloads (JSON)
 ```
 
-Per-profile prerequisites the wizard/CLI expects:
-- **Engine node**: Apple Silicon, macOS 14+, Python 3.11+, **Remote Login on**, SSH key auth from wherever you run the CLI. Verify: `ssh -o BatchMode=yes admin@<node> hostname`.
-- **Serveur**: Docker (Desktop on macOS), ~500 MB for the image + a state volume.
+Per-profile prerequisites the CLI expects:
+- **Engine node**: Apple Silicon, macOS 14+, Python 3.11+. For a **remote** install (`install engine --node`): **Remote Login on** + SSH key auth from where you run the CLI — verify `ssh -o BatchMode=yes admin@<node> hostname`. To provision the **current** Mac instead, use `node-setup base` (embedded python + vendored wheels — no network, no brew) and `node-setup network` (RDMA recipe; root + local console).
+- **Orchestrator / Server**: Docker (Desktop on macOS), ~500 MB image + state volume. The Server profile also runs the native MLX `nemo` memory service → Apple Silicon.
 
 ---
 
@@ -61,23 +67,28 @@ Run each as needed for the target mode. All sub-commands are **idempotent** and
 return JSON; check `ok`/error fields rather than scraping stdout.
 
 ```bash
-# Serveur (Mac mini): OdyssAI-X + Companion Docker stack. --build because images are :local.
-odyssai-configure install server [--embed-model <hf-id>] [--build]
+# Mac mini — OdyssAI-X orchestrator (Docker, vendored build context, no clone).
+odyssai-configure install orchestrator [--rebuild]
 
-# Engine (each Mac Studio): runs bootstrap-node.sh over SSH, provisions ~/mlx-cluster/.
-odyssai-configure install engine --node admin@<node-ip> [--models-dir <path>]
+# Mac mini — Companion stack (app + db + memory compiler + company LightRAG, Docker;
+# + native MLX nemo memory service). Defaults: --bind 0.0.0.0, --port 3100.
+odyssai-configure install server [--app-home <dir>] [--bind <iface>] [--port <n>] [--skip-nemo]
 
-# Telemak (Solo mode): drops Telemak.app locally or over SSH.
-odyssai-configure install telemak [--node admin@<mac> | --node local] [--force]
+# Each Mac Studio — bootstrap an MLX engine over SSH (provisions ~/mlx-cluster/).
+odyssai-configure install engine --node admin@<node-ip> [--models-dir <path>]   # -m alias; default $HOME/mlx-models
+
+# Telemak (Solo mode) — drops Telemak.app locally (/Applications) or on a remote node.
+odyssai-configure install telemak [--node admin@<mac>] [--force]
 ```
 
-- **`--models-dir`** is one **shared path used by every node** of the cluster
-  (the dashboard also exposes it as the editable *Models directory* per cluster).
-- For the **Serveur**, after install the stack is up on `:8000` (OdyssAI-X) and
-  `:3100` (Companion). Confirm:
+- `--models-dir` (engine) is the path **on that node**; the cluster-level shared
+  path is set in the topology (`topology build --models-dir`) and is editable per
+  cluster in the dashboard.
+- After `install orchestrator`, OdyssAI-X is on `:8000`; after `install server`,
+  Companion is on `:3100`. Confirm the engine:
   ```bash
   for i in {1..30}; do curl -sf http://localhost:8000/health && break || sleep 1; done
-  # {"status":"idle","version":"…"}   → engine up, no model yet
+  # {"status":"idle","version":"…"}   → orchestrator up, no model yet
   ```
 
 ---
