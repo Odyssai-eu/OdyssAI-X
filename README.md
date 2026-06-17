@@ -1,10 +1,10 @@
-# Odysseus
+# OdyssAI-X
 
 > *Mobilis in Mobile*
 
 **Distributed MLX inference engine for Apple Silicon clusters.** Built directly on `mlx` and `mlx-lm` — no `exo`, no extra orchestrator. JACCL backend over Thunderbolt 5 RDMA for in-cluster traffic; OpenAI- and Anthropic-compatible HTTP for clients.
 
-Part of [**OdyssAI**](https://odyssai.eu) — the open-source local AI ecosystem. Odysseus is the **engine** layer (this repo). Its sibling client is [**Companion**](https://github.com/Odyssai-eu/Companion).
+OdyssAI-X is the **engine** layer of [**OdyssAI**](https://odyssai.eu) — the open-source local AI ecosystem. The orchestrator *routes*, it never runs inference itself: it dispatches to MLX cluster nodes **or** proxies to a single-Mac Telemak runtime, so a cheap Mac mini can drive expensive Mac Studios.
 
 ```
 ┌─────────────────────────────────────────────────────────┐
@@ -13,7 +13,7 @@ Part of [**OdyssAI**](https://odyssai.eu) — the open-source local AI ecosystem
 │         ↓  HTTP  ─  /v1/chat/completions                │
 │         ↓        ─  /v1/messages                        │
 ├─────────────────────────────────────────────────────────┤
-│  Odysseus  (control plane + dashboard, this repo)       │
+│  OdyssAI-X  (control plane + dashboard, this repo)      │
 │         ↓  SSH  ─  starts long-lived runners            │
 ├─────────────────────────────────────────────────────────┤
 │  Cluster  (Apple Silicon nodes, MLX + mlx-lm)           │
@@ -24,104 +24,57 @@ Part of [**OdyssAI**](https://odyssai.eu) — the open-source local AI ecosystem
 ## What's in the box
 
 - **OpenAI- and Anthropic-compatible HTTP API** — drop-in for any client that speaks `chat/completions` or `messages`.
-- **Multi-pool orchestration** — declare any number of clusters in `topology.yaml` with the IDs you want (`default`, `chat`, `coder`, whatever fits), assign different models to each, load/unload from the dashboard.
-- **Pipeline + tensor parallel** — use either depending on the model's KV-head divisibility. Pipeline-AP for big MoEs that JACCL's pipeline mode handles.
+- **Multi-pool orchestration** — declare any number of clusters in `topology.yaml` with the IDs you want (`default`, `chat`, `coder`, …), assign different models to each, load/unload from the dashboard.
+- **Pipeline + tensor parallel** — either, depending on the model's KV-head divisibility. Pipeline-AP for big MoEs that JACCL's pipeline mode handles.
 - **KV prefix cache** — `session_id`-based reuse across turns. Big TTFT wins on the same conversation.
 - **Live admin dashboard** — runs, models, pool wiring, sync from Hugging Face, logs.
 - **Capability contract** — `/.well-known/inference-engine.json` and per-model `x_odyssai` blocks so clients can introspect what's actually supported (vision, tools, stream, context length).
 
+## The OdyssAI family — where everything lives
+
+| Component | Repo | Role |
+|---|---|---|
+| **OdyssAI-X** (engine) | this repo | distributed MLX inference, OpenAI/Anthropic API, admin dashboard |
+| **Companion** (client) | [Odyssai-eu/Companion](https://github.com/Odyssai-eu/Companion) | React chat client + memory; consumes this engine |
+| **Telemak** (runtime) | [Odyssai-eu/telemak](https://github.com/Odyssai-eu/telemak) | native single-Mac Swift runtime (Solo-mode upstream) |
+| **OdyssAI Configurator** (installer) | [Odyssai-eu/Odyssai-config](https://github.com/Odyssai-eu/Odyssai-config) | macOS DMG that installs all three + builds the RDMA topology |
+
 ## Install
 
-**Easiest path.** Open Claude Code, Codex, Cursor, or any other coding
-agent in this folder and tell it what you have:
+**Use the [OdyssAI Configurator](https://github.com/Odyssai-eu/Odyssai-config)** — a
+native macOS app (DMG, drag-to-Applications, no terminal). A wizard installs each
+component on the right machine and builds the RDMA topology for you:
 
-- *"I have N Macs, install the full cluster end-to-end"* →
-  the agent reads [`INSTALL-CLUSTER.md`](INSTALL-CLUSTER.md), a 7-stage
-  runbook that walks SSH bootstrap, node setup, RDMA discovery,
-  orchestrator + Companion install, models dir, and first-model
-  download — all in one session.
-- *"Install Odysseus on this machine"* (single component) → the agent
-  reads [`AGENTS.md`](AGENTS.md), which covers the 6 granular install
-  patterns (orchestrator only / node only / single-Mac full stack /
-  etc.) for when you already have some pieces in place.
+- **Engine** → a Mac Studio (Apple Silicon)
+- **Serveur** → a Mac mini (Apple Silicon): OdyssAI-X + Companion
+- **Telemak** → any one Mac (Solo mode)
 
-Either way, the agent adapts to your OS, your topology, and your
-existing tools.
+in two modes — **Cluster** (Serveur + N Mac Studio over RDMA/TB5) or **Solo**
+(Serveur + 1 Telemak Mac). The Configurator isn't signed with an Apple Developer
+ID (open-source, outside the App Store): build it locally, or clear the
+quarantine bit on a downloaded DMG — see its README.
 
-**Manual path** (single-node — the same Mac plays both orchestrator and
-cluster-node roles; Apple Silicon required for the cluster role):
-
-> If your setup is **multi-node** (a separate orchestrator host + 1-N
-> Apple Silicon nodes), use [`AGENTS.md`](AGENTS.md) instead. The
-> orchestrator-only host does NOT need MLX — only the cluster nodes do.
-
-```bash
-git clone https://github.com/Odyssai-eu/Odysseus.git
-cd Odysseus
-
-# 1. Enable Remote Login on your Mac
-#    System Settings → General → Sharing → Remote Login → ON
-#    Then add your own SSH key for container-to-host auth:
-[ -f ~/.ssh/id_ed25519 ] || ssh-keygen -t ed25519 -N "" -f ~/.ssh/id_ed25519
-cat ~/.ssh/id_ed25519.pub >> ~/.ssh/authorized_keys
-chmod 600 ~/.ssh/authorized_keys
-
-# 2. Bootstrap this Mac as a cluster node — i.e. install mlx + mlx-lm
-#    + runner.py under ~/mlx-cluster/. Single-node only: the same Mac
-#    plays both roles, so we bootstrap it. Skip this step on a separate
-#    orchestrator host (multi-node deployments).
-scripts/bootstrap-node.sh "$USER@localhost"
-
-# 3. Configure topology — single-node example
-mkdir -p ~/.odysseus
-cp config/topology.example.yaml ~/.odysseus/topology.yaml
-# edit ~/.odysseus/topology.yaml — set ssh: $USER@host.docker.internal
-
-# 4. Start the engine + dashboard
-docker compose up -d
-open http://localhost:8000
-
-# 5. Download a model into the models_dir on your Mac
-pip install --user --upgrade huggingface_hub   # if not already installed
-huggingface-cli download \
-  mlx-community/Qwen3-7B-MLX-8bit \
-  --local-dir ~/mlx-models/mlx-community/Qwen3-7B-MLX-8bit
-
-# 6. Load + chat
-#    /admin/* is open by default (LAN install). To require Bearer auth
-#    on a publicly-reachable deployment, set ODYSSEUS_ADMIN_TOKEN in
-#    your env and add `-H "Authorization: Bearer $ODYSSEUS_ADMIN_TOKEN"`.
-curl -X POST http://localhost:8000/admin/default/load \
-  -H 'Content-Type: application/json' \
-  -d '{"model": "mlx-community/Qwen3-7B-MLX-8bit"}'
-
-curl -X POST http://localhost:8000/v1/chat/completions \
-  -H 'Content-Type: application/json' \
-  -d '{
-    "model": "default",
-    "messages": [{"role":"user","content":"Hello"}]
-  }'
-```
-
-For multi-node TCP and JACCL RDMA paths, see [`AGENTS.md`](AGENTS.md) or
-the full operator walkthrough in
-[`docs/GETTING-STARTED.md`](docs/GETTING-STARTED.md).
+Prefer the terminal, or installing with an AI agent? [`INSTALL-CLUSTER.md`](INSTALL-CLUSTER.md)
+covers the GUI wizard, the `odyssai-configure` CLI, and a headless/scripted path
+(Linux orchestrator / CI). For project orientation — what lives where —
+see [`AGENTS.md`](AGENTS.md).
 
 ## Documentation
 
-- [Companion](https://github.com/Odyssai-eu/Companion) — the recommended client
-- Full docs site: [docs.odyssai.eu](https://odyssai.eu/docs/).
+- [`AGENTS.md`](AGENTS.md) — project orientation (what OdyssAI-X is, where everything lives).
+- [`INSTALL-CLUSTER.md`](INSTALL-CLUSTER.md) — install (GUI / CLI / headless).
+- [`docs/`](docs/) — `ABOUT.md`, `API.md`, `DEPLOY.md`, `PRODUCTION.md`, `SECURITY-POSTURE.md`.
+- [Companion](https://github.com/Odyssai-eu/Companion) — the recommended client.
+- Full docs site: [odyssai.eu/docs](https://odyssai.eu/docs/).
 
 ## Status
 
-**Pre-release.** The engine is used internally in production but has rough edges around operator onboarding (cluster topology config, hardware discovery, first-time setup). The 0.x cycle stabilises those before a 1.0 cut.
-
-Apache 2.0 licensed. See [LICENSE](LICENSE).
+**Pre-release.** The engine runs internally in production; the 0.x cycle stabilises operator onboarding (topology config, hardware discovery, first-time setup) ahead of a 1.0 cut. Apache 2.0 licensed — see [LICENSE](LICENSE).
 
 ## Contributing
 
-We welcome pull requests — bug fixes, model support, capability blocks, performance work. See [CONTRIBUTING.md](CONTRIBUTING.md) for conventions and the development setup.
+Pull requests welcome — bug fixes, model support, capability blocks, performance work. See [CONTRIBUTING.md](CONTRIBUTING.md) for conventions and dev setup.
 
 ## Acknowledgments
 
-Built on Apple's [MLX](https://github.com/ml-explore/mlx) and the [`mlx-lm`](https://github.com/ml-explore/mlx-lm) library. JACCL is part of `mlx-distributed`. Pipeline auto-parallel patterns informed by [exo](https://github.com/exo-explore/exo)'s lifecycle work.
+Built on Apple's [MLX](https://github.com/ml-explore/mlx) and [`mlx-lm`](https://github.com/ml-explore/mlx-lm). JACCL is part of `mlx-distributed`. Pipeline auto-parallel patterns informed by [exo](https://github.com/exo-explore/exo)'s lifecycle work.

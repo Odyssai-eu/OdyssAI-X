@@ -5,10 +5,10 @@
 > Applications), and click through a wizard that installs each component on the
 > right machine and builds the RDMA topology for you.
 >
-> Installing with an **AI agent** instead? Use [`AGENTS.md`](AGENTS.md) — same
-> result, driven by the `odyssai-configure` CLI. Need the bare scripted path
+> Installing with an **AI agent** or a scripted macOS setup? Jump to **§12 —
+> Install via the CLI** (`odyssai-configure`). Need the bare scripted path
 > (Linux orchestrator, CI, no macOS GUI)? See the **Advanced / headless**
-> appendix at the end.
+> appendix at the end. For project orientation, see [`AGENTS.md`](AGENTS.md).
 
 ---
 
@@ -253,6 +253,50 @@ version in `docs/SECURITY-POSTURE.md`.
 
 ---
 
+## 12. Install via the CLI (agents / scripted macOS)
+
+The same install, driven by **`odyssai-configure`** — the idempotent CLI that the
+GUI calls under the hood (JSON output, ships in the app bundle, or
+`swift run odyssai-configure` from the [Configurator repo](https://github.com/Odyssai-eu/Odyssai-config)).
+This is the path for an AI agent or a scripted macOS setup. All flags below are
+verified against the binary.
+
+```bash
+# Prerequisites (JSON — parse, don't eyeball)
+odyssai-configure check-deps          # ssh / python / docker / vendored scripts
+odyssai-configure setup-deps          # ~/.odyssai/venv (pydantic + pyyaml) for topology validation
+odyssai-configure versions            # installed component versions vs the bundle's payloads
+
+# Mac mini (Serveur) — TWO installs: orchestrator THEN server
+odyssai-configure install orchestrator [--rebuild]                       # OdyssAI-X (Docker, :8000), vendored, no clone
+odyssai-configure install server [--app-home <dir>] [--bind <iface>] \
+                                 [--port <n>] [--skip-nemo]              # Companion stack (:3100) + native MLX nemo. Defaults: 0.0.0.0 / 3100
+
+# Each Mac Studio (Engine) — remote bootstrap over SSH
+odyssai-configure install engine --node admin@<node-ip> [-m <models-dir>]   # default models dir $HOME/mlx-models
+#   …or provision the CURRENT Mac locally (no remote SSH):
+odyssai-configure node-setup base        # MLX runtime: embedded python + vendored wheels (no network, no brew)
+odyssai-configure node-setup network     # RDMA recipe on this Mac (root + local console)
+odyssai-configure node-setup check       # read-only RDMA provisioning status
+
+# Telemak (Solo mode)
+odyssai-configure install telemak [--node admin@<mac>] [--force]            # omit --node for local /Applications/
+
+# Topology — probes RDMA, validates mesh, backs up to .bak, PRESERVES other clusters
+odyssai-configure topology build --cluster <name> --backend jaccl \
+  --node 0=admin@<node-a>[:id] --node 1=admin@<node-b>[:id] …               # Cluster (RDMA)
+odyssai-configure topology build --cluster <name> --backend http-proxy \
+  --upstream http://<telemak-ip>:8003                                       # Solo
+odyssai-configure topology rebuild [--cluster <name>] [--dry-run]           # re-probe + before/after diff
+odyssai-configure topology show          # current clusters as JSON
+odyssai-configure validate               # validate ~/.odysseus/topology.yaml against the schema
+```
+
+Then download/load a model and smoke-test as in §6. For project orientation
+(what lives where, conventions), see [`AGENTS.md`](AGENTS.md).
+
+---
+
 ## Appendix — Advanced / headless install (no DMG)
 
 Use this when the Configurator GUI isn’t an option: a **Linux orchestrator**
@@ -285,7 +329,7 @@ CLI (`install`, `topology build/rebuild`, `validate`), see [`AGENTS.md`](AGENTS.
 
 ## Where to learn more
 
-- [`AGENTS.md`](AGENTS.md) — the same install, driven by an AI agent via the CLI.
+- [`AGENTS.md`](AGENTS.md) — project orientation: what OdyssAI-X is, where everything lives, conventions.
 - `docs/DEPLOY.md` — production deployment patterns (hot-reload, rebuild, logs).
 - `https://odyssai.eu/docs/` — public docs site (architecture, full API reference).
 - Configurator repo: `https://github.com/Odyssai-eu/Odyssai-config` (`README.md` + `CLAUDE.md`).
