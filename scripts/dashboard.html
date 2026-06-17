@@ -2279,7 +2279,7 @@ function renderTelemakEditorBody(id, draft, cfg, poolLoaded) {
       </div>
       <div class="field">
         <div class="field-label">Models directory <span style="font-weight:400;color:var(--ink-3)">(where Telemak stores models on this Mac — used for inventory display and HF download destination)</span></div>
-        <input class="ce-input mono" data-act="cluster-edit-telemak-models-dir" data-cluster="${id}" value="${escapeHtml(draft.models_dir || "")}" placeholder="/Volumes/models/odysseus"/>
+        <input class="ce-input mono" data-act="cluster-edit-models-dir" data-cluster="${id}" value="${escapeHtml(draft.models_dir || "")}" placeholder="/Volumes/models/odysseus"/>
       </div>
       <div style="font-size:11px;color:var(--ink-2);background:var(--ink-soft,#f5f5f5);padding:10px 12px;border-radius:6px;margin-top:4px">
         Telemak runs as a native Swift binary on a single Mac. OdyssAI-X only proxies HTTP — no runner spawning, no pipeline/tensor parallel, no RDMA wiring.
@@ -2309,6 +2309,10 @@ function renderMlxClusterEditorBody(id, draft, cfg, poolLoaded, kindOpts, backen
           ${backendOpts.map(b => `<option value="${b.v}" ${b.v===draft.backend?"selected":""}>${b.label}</option>`).join("")}
         </select>
       </div>
+    </div>
+    <div class="field" style="margin-bottom:14px">
+      <div class="field-label">Models directory <span style="font-weight:400;color:var(--ink-3)">(shared path — every node in this cluster reads models from here)</span></div>
+      <input class="ce-input mono" data-act="cluster-edit-models-dir" data-cluster="${id}" value="${escapeHtml(draft.models_dir || "")}" placeholder="/Volumes/models/odysseus"/>
     </div>
     <div>
       <div style="display:flex;justify-content:space-between;align-items:center;padding-bottom:14px">
@@ -5365,11 +5369,14 @@ async function handleAct(e) {
     if (e.type === "change") render();
     return;
   }
-  if (act === "cluster-edit-telemak-models-dir") {
+  if (act === "cluster-edit-models-dir") {
     const cid = el.dataset.cluster;
     const d = ensureDraft(cid); if (!d) return;
-    // Cluster-level models_dir. Used by HF download destination and by
-    // the Telemak Models card to know where to look for inventory.
+    // Cluster-level models_dir — a SINGLE shared path for every node in the
+    // cluster (all Argo ranks read from the same path). Used by HF download
+    // destination, the Models matrix inventory lookup, and Telemak's card.
+    // Persisted via PUT /admin/clusters/{id} (body.models_dir, same backend
+    // handler as POST /admin/clusters/{id}/models-dir).
     d.models_dir = (el.value || "").trim();
     if (e.type === "change") render();
     return;
