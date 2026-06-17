@@ -5212,7 +5212,7 @@ def _cloud_entries_for_v1_models() -> list[dict]:
                 "id": alias,
                 "object": "model",
                 "created": _now(),
-                "owned_by": f"odysseus-cloud-{prov_id}",
+                "owned_by": f"odyssai-cloud-{prov_id}",
                 "x_odyssai": caps,
             })
     return out
@@ -5977,7 +5977,7 @@ async def list_models(include_unloaded: bool = False):
         alias_caps["ready"] = True
         data.append({
             "id": alias, "object": "model",
-            "created": _now(), "owned_by": f"odysseus-{pool_name}",
+            "created": _now(), "owned_by": f"odyssai-{pool_name}",
             "x_concrete": pool.model,
             "x_odyssai": alias_caps,
         })
@@ -6014,7 +6014,7 @@ async def list_models(include_unloaded: bool = False):
             short = _telemak_short_id(loaded[0])
             data.append({
                 "id": cid, "object": "model",
-                "created": _now(), "owned_by": "odysseus-telemak",
+                "created": _now(), "owned_by": "odyssai-telemak",
                 "x_concrete": loaded[0],
                 "x_odyssai": {
                     "ready": True,
@@ -6035,7 +6035,7 @@ async def list_models(include_unloaded: bool = False):
                 short = _telemak_short_id(upstream_model)
                 data.append({
                     "id": f"{cid}:{short}", "object": "model",
-                    "created": _now(), "owned_by": "odysseus-telemak",
+                    "created": _now(), "owned_by": "odyssai-telemak",
                     "x_concrete": upstream_model,
                     "x_odyssai": {
                         "ready": True,
@@ -6077,7 +6077,7 @@ async def list_models(include_unloaded: bool = False):
             caps = dict(caps); caps["ready"] = False
             data.append({
                 "id": short, "object": "model",
-                "created": _now(), "owned_by": f"odysseus-{cluster}",
+                "created": _now(), "owned_by": f"odyssai-{cluster}",
                 "x_odyssai": caps,
             })
 
