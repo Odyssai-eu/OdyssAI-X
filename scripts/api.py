@@ -3571,7 +3571,7 @@ def _initial_default_config() -> Optional[dict]:
 #   major (1.7.2 → 2.0.0) — breaking API or topology change
 #
 # Use `./scripts/bump-version.sh patch|minor|major` to bump + auto-commit.
-APP_VERSION = "1.7.33"
+APP_VERSION = "1.7.34"
 
 app = FastAPI(
     title="OdyssAI-X (odyssai.eu)",
@@ -7993,16 +7993,36 @@ async def _run_one_rsync(job_id: str, model: str, src: dict, dst: dict, slot: di
     # last component but not intermediate parents — make sure the org dir
     # exists on the destination before transferring.
     dst_parent = os.path.dirname(dst_path.rstrip("/")) or dst["models_dir"]
-    inner = (
-        f"mkdir -p {shlex.quote(dst_parent)} && "
-        f"rsync -a {shlex.quote(src_path)} {dst['ssh']}:{shlex.quote(dst_path)}"
-    )
+    # rsync only creates the LEAF dir, not intermediate parents (the `org/` part
+    # of an `org/model` path). Create the parent ON THE DESTINATION first. The
+    # previous code ran `mkdir -p` inside the SOURCE-side command, so it created
+    # the org dir on the source and the receiver still failed with "mkdir … No
+    # such file or directory" on any node that had never received a model under
+    # that org (e.g. ultra-256c for kernelpool/, 2026-06-18). The orchestrator
+    # can ssh every node directly. NB: the ultra nodes ship openrsync (Apple's),
+    # which lacks --mkpath, so an explicit mkdir on the target is the portable fix.
+    inner = f"rsync -a {shlex.quote(src_path)} {dst['ssh']}:{shlex.quote(dst_path)}"
     cmd = ["ssh", "-o", "ConnectTimeout=5", "-o", "BatchMode=yes", src["ssh"], inner]
     slot["status"] = "running"
     slot["started_at"] = time.time()
     slot["finished_at"] = None
     slot["error"] = None
     try:
+        mkproc = await asyncio.create_subprocess_exec(
+            "ssh", "-o", "ConnectTimeout=5", "-o", "BatchMode=yes",
+            dst["ssh"], f"mkdir -p {shlex.quote(dst_parent)}",
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+        )
+        _sync_procs.setdefault(job_id, []).append(mkproc)
+        mko, mke = await mkproc.communicate()
+        if mkproc.returncode != 0:
+            slot["status"] = "failed"
+            slot["error"] = (
+                "mkdir on target failed: "
+                + (mke.decode("utf-8", "ignore") or mko.decode("utf-8", "ignore"))
+            )[:400]
+            slot["finished_at"] = time.time()
+            return slot
         proc = await asyncio.create_subprocess_exec(
             *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
         )
