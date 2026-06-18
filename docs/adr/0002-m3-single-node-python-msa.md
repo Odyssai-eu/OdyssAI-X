@@ -7,7 +7,7 @@ Status: Accepted
 ## Context
 
 M3 (428B A23B, `minimax_m3`) tourne aujourd'hui sur Argo en **pipeline 2-node**
-(`.29`+`.30`). Mesures de la nuit : TTFT 12,3 s sur 427 tokens, decode 18,8 tok/s
+(a 2-node Argo pool). Mesures de la nuit : TTFT 12,3 s sur 427 tokens, decode 18,8 tok/s
 — et **deux crashs JACCL** dans la session (keepalive queue-pair dégradé +
 leak Metal wired). Le port MSA de la classe `minimax_m3` réalise la sélection de
 blocs via un **masque additif dense** : fonctionnellement correct mais
@@ -16,7 +16,7 @@ d'inférence à 128K de contexte (TTFT + decode), 1M plus tard.
 
 Trois faits ont tranché :
 
-1. **M3 tient single-node.** Q6 = 322,8 GB ; ultra-512 budget wired ~460 GB →
+1. **M3 tient single-node.** Q6 = 322,8 GB ; the 512GB node budget wired ~460 GB →
    `nodes=1` fits (355 GB requis). Vérifié via `/admin/clusters/.../load-options`.
 2. **Single-node est plus rapide pour le flux interactif.** Le pipeline 2-node
    sérialise les nœuds sur un seul flux (bubble + comms inter-nœuds) sans gain de

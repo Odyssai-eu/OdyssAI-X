@@ -8,7 +8,7 @@ Status: Accepted (supersedes the 2026-06-09 version)
 
 ## Context
 
-Adding the 5th Argo node (ultra-256d / `.33`) went badly: the node lost its
+Adding the 5th Argo node (a 256GB Mac Studio) went badly: the node lost its
 management IPv4 and its Wi-Fi during a from-scratch network-setup script run
 **over SSH**, and was recovered only by an OS reinstall. The original version of
 this ADR — written mid-incident — concluded that the onboarding step must never
@@ -16,12 +16,12 @@ touch `en0`, Wi-Fi, network locations, or preferences.
 
 **Superseded diagnosis.** The final root cause of the IPv4 loss was a **dead
 switch-uplink cable** (proven: an unrelated MacBook went APIPA at the same
-moment, and `.33` re-acquired `.33` the instant the uplink was fixed). The
+moment, and the node re-acquired its address the instant the uplink was fixed). The
 script's real faults were narrower: it did not recreate Wi-Fi in its new
 location (losing the out-of-band lifeline), it accepted an APIPA address as
 success, and it ran over SSH with no operator at the console.
 
-**The proven recipe.** The 4 production ultras (.29–.32) run exo's network
+**The proven recipe.** The 4 production ultra nodes run exo's network
 setup to this day (verified live 2026-06-10): a dedicated network **location
 "exo"** containing recreated services for every port (Ethernet, Wi-Fi, one DHCP
 service per Thunderbolt port), `bridge0` torn down and removed from the SC
