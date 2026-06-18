@@ -143,6 +143,11 @@ def main() -> int:
     ap.add_argument("dst", help="output dir (MLX quantized)")
     ap.add_argument("--bits", type=int, default=6)
     ap.add_argument("--group-size", type=int, default=64)
+    ap.add_argument("--head-bits", type=int, default=0,
+                    help="bits pour embed_tokens + lm_head (0 = comme --bits). "
+                         ">=16 = garder bf16 (head pleine précision, pas de .scales → "
+                         "le class_predicate mlx-lm ne le quantifie pas). "
+                         "Ex. --bits 6 --head-bits 16 = Q6 Hd16.")
     ap.add_argument("--fuse-adapter", default=None,
                     help="sous-dossier LoRA à fuser (ex. l0) — relatif à src, ou chemin absolu")
     ap.add_argument("--limit-layers", type=int, default=0,
@@ -150,6 +155,7 @@ def main() -> int:
     args = ap.parse_args()
 
     gs, bits = args.group_size, args.bits
+    head_bits = args.head_bits or bits
     src, dst = Path(args.src), Path(args.dst)
     cfg = json.loads((src / "config.json").read_text())
 
@@ -163,6 +169,10 @@ def main() -> int:
     N_LAYERS = cfg["num_hidden_layers"]          # nextn = couche N_LAYERS, droppée
     N_EXPERTS = cfg["n_routed_experts"]
     FIRST_DENSE = cfg["first_k_dense_replace"]
+    # GLM-5.2 (IndexCache) : indexer_types[layer] = 'full' (a des poids indexer) ou
+    # 'shared' (PAS de poids — réutilise l'indexer d'une 'full' au runtime). Champ absent
+    # (GLM-5.1/Macaron) → toutes 'full'. #fix sinon KeyError layers.N.self_attn.indexer.wq_b.
+    INDEXER_TYPES = cfg.get("indexer_types")
 
     rd = ShardReader(src)
     # Refus explicite du FP8 GLM (weight_scale_inv par blocs ≠ weight_scale par canal).
@@ -237,12 +247,15 @@ def main() -> int:
                 rd.read(f"{A}.{sub}.weight")
             ).astype(mx.bfloat16)
 
-        # — indexer DSA : bf16 passthrough, jamais quantifié —
-        for sub in ("wq_b.weight", "wk.weight", "weights_proj.weight",
-                    "k_norm.weight", "k_norm.bias"):
-            tensors[f"{A}.indexer.{sub}"] = mx.array(
-                rd.read(f"{A}.indexer.{sub}")
-            ).astype(mx.bfloat16)
+        # — indexer DSA : bf16 passthrough, jamais quantifié. SEULEMENT sur les couches
+        #   'full' — les 'shared' n'ont AUCUN poids indexer (schéma IndexCache GLM-5.2).
+        is_full = INDEXER_TYPES is None or INDEXER_TYPES[layer] == "full"
+        if is_full:
+            for sub in ("wq_b.weight", "wk.weight", "weights_proj.weight",
+                        "k_norm.weight", "k_norm.bias"):
+                tensors[f"{A}.indexer.{sub}"] = mx.array(
+                    rd.read(f"{A}.indexer.{sub}")
+                ).astype(mx.bfloat16)
 
         # — absorption kv_b -> embed_q / unembed_out (sanitize dsv32, verbatim) —
         kvb = read_fused(f"{A}.kv_b_proj").reshape(H, NOPE + VDIM, LORA)
@@ -306,12 +319,20 @@ def main() -> int:
         fuser.mark_prefix_done("lm_head")
     if not out.done("top"):
         tensors = {}
+        # embed_tokens + lm_head à head_bits. head_bits>=16 = bf16 (pas de .scales → le
+        # class_predicate mlx-lm ne quantifie pas) = head pleine précision (Hd16).
         w = rd.read("model.embed_tokens.weight")
-        deq, nm = qinto(tensors, "model.embed_tokens", w, gs, bits)
-        audit(nm, deq, w)
+        if head_bits >= 16:
+            tensors["model.embed_tokens.weight"] = mx.array(w).astype(mx.bfloat16)
+        else:
+            deq, nm = qinto(tensors, "model.embed_tokens", w, gs, head_bits)
+            audit(nm, deq, w)
         w = read_fused("lm_head")
-        deq, nm = qinto(tensors, "lm_head", w, gs, bits)
-        audit(nm, deq, w)
+        if head_bits >= 16:
+            tensors["lm_head.weight"] = mx.array(w).astype(mx.bfloat16)
+        else:
+            deq, nm = qinto(tensors, "lm_head", w, gs, head_bits)
+            audit(nm, deq, w)
         tensors["model.norm.weight"] = mx.array(
             rd.read("model.norm.weight")
         ).astype(mx.bfloat16)
@@ -354,8 +375,8 @@ def main() -> int:
         "fused_adapter": None if adapter_path is None else {
             "path": str(adapter_path), "scale": fuser.scale, **rep,
         },
-        "recipe": {"bits": bits, "group_size": gs,
-                   "indexer": "bf16 (non quantifié)",
+        "recipe": {"bits": bits, "group_size": gs, "head_bits": head_bits,
+                   "indexer": "bf16 (non quantifié, full only)",
                    "router_gate": "bf16 + e_score_correction_bias f32 (bruts)",
                    "mtp_dropped": True,
                    "absorption": "kv_b->embed_q/unembed_out (mlx-lm dsv32 verbatim)",
