@@ -2877,9 +2877,50 @@ function renderSettingsHuggingFace() {
       </div>
     </div>
     <div style="margin-top:16px">
+      <div class="field-label">Search Hugging Face</div>
+      <div style="display:flex;gap:8px;margin-top:4px">
+        <input class="ce-input mono" data-act="hf-search-input" value="${escapeHtml(state.hf_search_q || "")}"
+               placeholder="e.g. minimax mlx, qwen3 8bit…" style="flex:1"/>
+        <button class="btn btn-sm" data-act="hf-search-go">${Icon.search || ""}<span>Search</span></button>
+      </div>
+      ${renderHFSearchResults()}
+    </div>
+    <div style="margin-top:16px">
       ${group ? renderHFDownload(group) : `<div class="empty-state">Pick a cluster above to download a Hugging Face model to its nodes.</div>`}
     </div>
   `;
+}
+
+function renderHFSearchResults() {
+  if (state.hf_searching) return `<div class="empty-state" style="padding:14px">Searching…</div>`;
+  const res = state.hf_search_results;
+  if (!res) return "";
+  if (res.length === 0) return `<div style="margin-top:8px;font-size:12px;color:var(--ink-2)">No results.</div>`;
+  return `
+    <div style="margin-top:10px;display:flex;flex-direction:column;gap:4px;max-height:260px;overflow:auto">
+      ${res.map(m => `
+        <div style="display:flex;align-items:center;justify-content:space-between;gap:10px;padding:6px 10px;background:var(--surface);border:1px solid var(--line);border-radius:8px">
+          <div style="min-width:0">
+            <div style="font-family:var(--font-mono);font-size:12px;color:var(--ink);white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${escapeHtml(m.id)}</div>
+            <div style="font-size:11px;color:var(--ink-2)">↓ ${(m.downloads ?? 0).toLocaleString()} · ♥ ${m.likes ?? 0}${m.pipeline_tag ? " · " + escapeHtml(m.pipeline_tag) : ""}</div>
+          </div>
+          <button class="btn btn-xs" data-act="hf-search-pick" data-v="${escapeHtml(m.id)}">Use</button>
+        </div>`).join("")}
+    </div>`;
+}
+
+async function doHfSearch() {
+  const q = (state.hf_search_q || "").trim();
+  if (!q) { state.hf_search_results = null; render(); return; }
+  state.hf_searching = true; render();
+  try {
+    const r = await getJson(`/admin/hf/search?q=${encodeURIComponent(q)}&limit=25`);
+    state.hf_search_results = r.data || [];
+  } catch (err) {
+    toast("HF search failed: " + err.message, "err");
+    state.hf_search_results = [];
+  }
+  state.hf_searching = false; render();
 }
 
 // HF download UI — moved here from the Home dashboard (where it didn't belong).
@@ -4982,13 +5023,15 @@ function clusterTargetNodes(cluster) {
 function renderDownloadRow(d) {
   const running = d.status === "running";
   const resumable = (d.status === "cancelled" || d.status === "error" || d.status === "partial");
-  const hasTotal = d.bytes && d.total_bytes;
-  const pct = hasTotal ? Math.round((d.bytes/d.total_bytes)*100) : (d.status === "done" ? 100 : 0);
-  // total_bytes is not reported by the runner today (#14), so while running we
-  // show a moving indeterminate bar + bytes transferred rather than a fake %.
+  const per = d.per_target || [];
+  // Live aggregate across targets — per-target bytes update live; d.bytes only
+  // finalises at the end. total_bytes = repo_size × N targets (HF API, #14).
+  const liveBytes = per.reduce((s, p) => s + (p.bytes || 0), 0) || d.bytes || 0;
+  const hasTotal = d.total_bytes > 0;
+  const pct = hasTotal ? Math.min(100, Math.round((liveBytes / d.total_bytes) * 100)) : (d.status === "done" ? 100 : 0);
+  // Real % when the repo size is known; otherwise a moving indeterminate bar.
   const indeterminate = running && !hasTotal;
   const elapsed = ((d.finished_at || Date.now()/1000) - d.started_at).toFixed(0);
-  const per = d.per_target || [];
   const targetsSummary = per.length
     ? per.map(p => {
         const dot = p.status === "done" ? "🟢"
@@ -6363,6 +6406,14 @@ async function handleAct(e) {
     render();
   } return; }
   if (act === "form-hf-repo")   { f.hf_repo = el.value; return; }
+  if (act === "hf-search-input") { state.hf_search_q = el.value; return; }
+  if (act === "hf-search-go")   { await doHfSearch(); return; }
+  if (act === "hf-search-pick") {
+    if (!state.pending_form) state.pending_form = {};
+    state.pending_form.hf_repo = el.dataset.v;
+    toast("Repo set: " + el.dataset.v + " — pick a cluster + Download below", "ok");
+    render(); return;
+  }
   if (act === "form-hf-token")  {
     // Persist locally in localStorage so the operator doesn't have to
     // paste their HF token on every download. Token is never persisted

@@ -1062,6 +1062,27 @@ _downloads: dict[str, dict] = {}
 _dl_procs: dict[str, dict[str, asyncio.subprocess.Process]] = {}
 
 
+async def _hf_repo_total_bytes(repo: str, token: Optional[str]) -> Optional[int]:
+    """Best-effort total size of an HF repo = sum of file sizes, via the HF tree
+    API. Mechanism borrowed from the HF tools app (#14) to drive a real progress
+    bar. Returns None on any failure so the caller falls back to indeterminate."""
+    url = f"https://huggingface.co/api/models/{repo}/tree/main?recursive=true"
+    headers = {"Authorization": f"Bearer {token}"} if token else {}
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as c:
+            r = await c.get(url, headers=headers)
+            if r.status_code != 200:
+                return None
+            total = 0
+            for e in r.json():
+                if e.get("type") == "file":
+                    sz = e.get("size") or (e.get("lfs") or {}).get("size") or 0
+                    total += int(sz)
+            return total or None
+    except Exception:
+        return None
+
+
 async def _hf_dl_one(dl_id: str, host: dict, repo: str,
                      hf_token: Optional[str], slot: dict) -> dict:
     """One target download. Mutates `slot` in place so the parent job's
@@ -1162,6 +1183,13 @@ async def _hf_dl_run(dl_id: str, repo: str, hf_token: Optional[str],
                          for t in targets]
     # Map host_id → slot for the runner to mutate
     by_id = {p["host"]: p for p in job["per_target"]}
+    # Real progress bar (#14): each target pulls the FULL repo, so the aggregate
+    # target = repo_size × N targets. Best-effort via the HF API (HF tools idea);
+    # None → the UI keeps the indeterminate bar.
+    repo_bytes = await _hf_repo_total_bytes(repo, hf_token)
+    if repo_bytes:
+        job["repo_bytes"] = repo_bytes
+        job["total_bytes"] = repo_bytes * max(1, len(targets))
     coros = [_hf_dl_one(dl_id, t, repo, hf_token, by_id[t["id"]])
              for t in targets]
     results = await asyncio.gather(*coros, return_exceptions=True)
@@ -3571,7 +3599,7 @@ def _initial_default_config() -> Optional[dict]:
 #   major (1.7.2 → 2.0.0) — breaking API or topology change
 #
 # Use `./scripts/bump-version.sh patch|minor|major` to bump + auto-commit.
-APP_VERSION = "1.7.34"
+APP_VERSION = "1.7.35"
 
 app = FastAPI(
     title="OdyssAI-X (odyssai.eu)",
@@ -7326,6 +7354,40 @@ async def admin_downloads_create(req: HFDownloadRequest):
 @app.get("/admin/downloads")
 async def admin_downloads_list():
     return {"data": list(_downloads.values())}
+
+
+@app.get("/admin/hf/search")
+async def admin_hf_search(q: str, limit: int = 20):
+    """Proxy HF model search (borrowed from the HF tools app). Returns a trimmed
+    list the dashboard's Hugging Face tab renders into clickable download targets."""
+    q = (q or "").strip()
+    if not q:
+        return {"data": []}
+    params = {
+        "search": q,
+        "limit": max(1, min(limit, 50)),
+        "sort": "downloads",
+        "direction": -1,
+    }
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as c:
+            r = await c.get("https://huggingface.co/api/models", params=params)
+            if r.status_code != 200:
+                raise HTTPException(502, f"HF search failed: {r.status_code}")
+            out = [
+                {
+                    "id": m.get("id") or m.get("modelId"),
+                    "downloads": m.get("downloads"),
+                    "likes": m.get("likes"),
+                    "pipeline_tag": m.get("pipeline_tag"),
+                    "updated": m.get("lastModified"),
+                }
+                for m in r.json()
+                if (m.get("id") or m.get("modelId"))
+            ]
+            return {"data": out}
+    except httpx.HTTPError as e:
+        raise HTTPException(502, f"HF search error: {e}")
 
 
 @app.delete("/admin/downloads/{dl_id}")
