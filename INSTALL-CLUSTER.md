@@ -297,6 +297,41 @@ Then download/load a model and smoke-test as in §6. For project orientation
 
 ---
 
+## RDMA / Thunderbolt onboarding — a fresh node (the hard-won gotchas)
+
+**Symptom.** Topology *Build* fails “X cannot reach Y”, or the cluster silently
+falls back to `ring` (TCP) instead of `jaccl`, on a Mac that has never been
+provisioned. **Cause:** a fresh Mac runs the default *Thunderbolt Bridge*
+(`bridge0`), which gives the TB ports **no IPv6 link-local (`fe80`) address** —
+and `fe80` per port is exactly what JACCL GIDs and the NDP-based wiring
+discovery consume. No `fe80` → no RDMA mesh.
+
+**Fix — provision the node ONCE, at its console.** From the Configurator:
+**`node-setup → network`** (or `sudo scripts/rdma-onboard.sh --apply --console`).
+It applies the exo-derived recipe (`scripts/odyssai-network-setup.sh`): a
+dedicated network location **`odyssai`** with one failing-DHCP service per TB
+port (→ APIPA IPv4 + the `fe80` we need), the Thunderbolt Bridge service
+disabled, all re-asserted forever by the root LaunchDaemon
+**`eu.odyssai.networksetup`**.
+
+**Non-negotiable gotchas** (learned the hard way onboarding `.33` — it lost its
+management IP + Wi-Fi over SSH and needed an OS reinstall):
+
+- **Console only — NEVER over SSH.** The driver refuses when `SSH_CONNECTION` is
+  set. The recipe recreates the Ethernet + Wi-Fi services (your out-of-band
+  lifeline); a half-applied switch over SSH can strand the node.
+- **Exit codes are the contract** (don't parse prose): `0` ready · `10`
+  needs-reboot (proposed at most once — a second `10` becomes `1`) · `11`
+  needs-apply (not provisioned yet) · `1` blocked (a guard refused; nothing
+  half-done).
+- **APIPA on the management NIC (`en0`) is a FAILURE**, never success. The
+  driver asserts a non-APIPA lease + default route after the switch.
+- **Never two network daemons.** A Mac still running exo's `io.exo.networksetup`
+  must be migrated off first (that is issue #47).
+- Full rationale + the superseded mis-diagnosis: `docs/adr/0001-rdma-onboarding-thunderbolt-only.md`.
+
+---
+
 ## Appendix — Advanced / headless install (no DMG)
 
 Use this when the Configurator GUI isn’t an option: a **Linux orchestrator**
