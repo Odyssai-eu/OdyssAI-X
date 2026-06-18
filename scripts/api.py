@@ -8946,9 +8946,36 @@ async def admin_cluster_models(cluster_id: str, dir: Optional[str] = None):
     Each entry includes `size_bytes` (du -sk on the model dir) so the dashboard
     can show the user how big each model is BEFORE they attempt to load it.
     Sizes are gathered in one batched SSH call to avoid the per-model fanout.
+
+    For kind=telemak clusters, SSH discovery is replaced by a proxy call to
+    the upstream's /admin/models/available endpoint.
     """
     if not cluster_exists(cluster_id):
         raise HTTPException(404, f"unknown cluster {cluster_id}")
+    cd = get_cluster_def(cluster_id)
+    if cd.get("kind") == "telemak":
+        upstream = (cd.get("upstream") or "").rstrip("/")
+        if not upstream:
+            raise HTTPException(502, f"{cluster_id}: telemak cluster has no upstream URL")
+        import httpx
+        try:
+            async with httpx.AsyncClient(timeout=5.0) as client:
+                r = await client.get(f"{upstream}/admin/models/available")
+            if r.status_code != 200:
+                raise HTTPException(502, f"{cluster_id}: upstream /admin/models/available returned {r.status_code}")
+            payload = r.json()
+        except httpx.RequestError as exc:
+            raise HTTPException(502, f"{cluster_id}: upstream unreachable: {exc}")
+        loaded = await _telemak_loaded_models(cluster_id, cd)
+        loaded_set = set(loaded)
+        annotated = [{
+            "id": m["id"],
+            "kind": "telemak",
+            "size_bytes": int(m.get("size_gb", 0) * 1_073_741_824),
+            "family": m.get("family"),
+            "is_loaded": m["id"] in loaded_set,
+        } for m in payload.get("models", []) if m.get("id")]
+        return {"data": annotated, "models_dir": None, "upstream": upstream}
     rank0 = rank0_ssh_for_cluster(cluster_id, 1)
     target_dir = dir or models_dir_for(cluster_id)
     if dir:
