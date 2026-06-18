@@ -163,6 +163,10 @@ def main() -> int:
     N_LAYERS = cfg["num_hidden_layers"]          # nextn = couche N_LAYERS, droppée
     N_EXPERTS = cfg["n_routed_experts"]
     FIRST_DENSE = cfg["first_k_dense_replace"]
+    # GLM-5.2 (IndexCache) : indexer_types[layer] = 'full' (a des poids indexer)
+    # ou 'shared' (PAS de poids — réutilise l'indexer d'une 'full' au runtime).
+    # Older GLM/Macaron : champ absent → toutes les couches sont 'full'.
+    INDEXER_TYPES = cfg.get("indexer_types")
 
     rd = ShardReader(src)
     # Refus explicite du FP8 GLM (weight_scale_inv par blocs ≠ weight_scale par canal).
@@ -237,12 +241,17 @@ def main() -> int:
                 rd.read(f"{A}.{sub}.weight")
             ).astype(mx.bfloat16)
 
-        # — indexer DSA : bf16 passthrough, jamais quantifié —
-        for sub in ("wq_b.weight", "wk.weight", "weights_proj.weight",
-                    "k_norm.weight", "k_norm.bias"):
-            tensors[f"{A}.indexer.{sub}"] = mx.array(
-                rd.read(f"{A}.indexer.{sub}")
-            ).astype(mx.bfloat16)
+        # — indexer DSA : bf16 passthrough, jamais quantifié. SEULEMENT sur les
+        #   couches 'full' — les 'shared' n'ont pas de poids indexer (elles
+        #   réutilisent l'indexer d'une 'full' au runtime, schéma IndexCache).
+        #   #fix GLM-5.2 (sinon KeyError layers.3...indexer.wq_b).
+        is_full = INDEXER_TYPES is None or INDEXER_TYPES[layer] == "full"
+        if is_full:
+            for sub in ("wq_b.weight", "wk.weight", "weights_proj.weight",
+                        "k_norm.weight", "k_norm.bias"):
+                tensors[f"{A}.indexer.{sub}"] = mx.array(
+                    rd.read(f"{A}.indexer.{sub}")
+                ).astype(mx.bfloat16)
 
         # — absorption kv_b -> embed_q / unembed_out (sanitize dsv32, verbatim) —
         kvb = read_fused(f"{A}.kv_b_proj").reshape(H, NOPE + VDIM, LORA)
