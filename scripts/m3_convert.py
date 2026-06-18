@@ -37,6 +37,7 @@ from __future__ import annotations
 import argparse
 import json
 import shutil
+import socket
 import struct
 import time
 from pathlib import Path
@@ -380,7 +381,7 @@ def main() -> int:
     manifest = {
         "tool": "m3_convert.py v1 (famille 3 odyssai-convert, Odysseus#48)",
         "date": time.strftime("%Y-%m-%d %H:%M:%S"),
-        "machine": "ultra-512",
+        "machine": socket.gethostname(),
         "source": str(src),
         "source_format": "BF16 safetensors (minimax_m3_vl)",
         "model_type": "minimax_m3",

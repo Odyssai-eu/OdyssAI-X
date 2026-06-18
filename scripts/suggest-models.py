@@ -99,13 +99,13 @@ CATALOG: list[ModelSuggestion] = [
         repo="mlx-community/Qwen3-Coder-480B-A35B-Instruct-8bit",
         size_gb=540.0,
         role="code",
-        note="Frontier code model. 2× ultra-512 or 3× ultra-256 pool.",
+        note="Frontier code model. 2× 512GB nodes or 3× 256GB nodes.",
     ),
     ModelSuggestion(
         repo="mlx-community/DeepSeek-V3.1-8bit",
         size_gb=713.0,
         role="reasoner",
-        note="DeepSeek V3.1. 2× ultra-512 or 3× ultra-256 pool.",
+        note="DeepSeek V3.1. 2× 512GB nodes or 3× 256GB nodes.",
     ),
     ModelSuggestion(
         repo="mlx-community/GLM-5-8bit-MXFP8",

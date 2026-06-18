@@ -7998,7 +7998,7 @@ async def _run_one_rsync(job_id: str, model: str, src: dict, dst: dict, slot: di
     # previous code ran `mkdir -p` inside the SOURCE-side command, so it created
     # the org dir on the source and the receiver still failed with "mkdir … No
     # such file or directory" on any node that had never received a model under
-    # that org (e.g. ultra-256c for kernelpool/, 2026-06-18). The orchestrator
+    # that org (e.g. a node new to that org, 2026-06-18). The orchestrator
     # can ssh every node directly. NB: the ultra nodes ship openrsync (Apple's),
     # which lacks --mkpath, so an explicit mkdir on the target is the portable fix.
     inner = f"rsync -a {shlex.quote(src_path)} {dst['ssh']}:{shlex.quote(dst_path)}"
