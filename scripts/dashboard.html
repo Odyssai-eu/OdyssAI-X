@@ -680,6 +680,27 @@ h1, h2, h3 { margin: 0; }
 .toast.show { opacity: 1; transform: translateX(-50%) translateY(0); pointer-events: auto; }
 .toast.err { background: var(--rust); }
 .toast.ok  { background: var(--green); }
+/* Persistent error toast (#60-style errors are multi-line + need copying):
+   errors don't auto-dismiss, they show a readable, copyable card with
+   Copy + Close. The ephemeral pill is kept for ok/info toasts. */
+.toast.persistent {
+  display: flex; flex-direction: column; align-items: stretch; gap: 8px;
+  border-radius: 10px; max-width: min(720px, 92vw); padding: 10px 12px;
+  text-align: left; pointer-events: auto;
+}
+.toast.persistent .toast-bar { display: flex; justify-content: flex-end; gap: 6px; }
+.toast.persistent .toast-btn {
+  background: rgba(255,255,255,0.18); border: none; color: white;
+  padding: 3px 11px; border-radius: 6px; font-size: 12px; font-weight: 600;
+  cursor: pointer; line-height: 1.5;
+}
+.toast.persistent .toast-btn:hover { background: rgba(255,255,255,0.32); }
+.toast.persistent .toast-msg {
+  font-family: var(--font-mono); font-size: 12px; line-height: 1.5;
+  white-space: pre-wrap; word-break: break-word;
+  max-height: 52vh; overflow: auto;
+  user-select: text; -webkit-user-select: text;
+}
 
 /* Empty state */
 .empty-state { padding: 40px 36px; text-align: center; color: var(--ink-2); font-size: 13px; }
@@ -1343,12 +1364,50 @@ function fmtBytes(b) {
   return (b/(1024*1024*1024)).toFixed(1) + " GB";
 }
 
+let _toastTimer = null;
 function toast(msg, kind) {
   const t = $("toast");
   if (!t) return;
-  t.textContent = msg;
-  t.className = "toast show" + (kind ? " " + kind : "");
-  setTimeout(() => { t.className = "toast"; }, 2400);
+  if (_toastTimer) { clearTimeout(_toastTimer); _toastTimer = null; }
+  // Errors are PERSISTENT + copyable. A 2.4s auto-dismiss made load failures
+  // (often multi-line tracebacks, e.g. a pool load) impossible to read or
+  // copy. Build a readable card with Copy + Close; ok/info keep the pill.
+  if (kind === "err") {
+    t.innerHTML = "";
+    const bar = document.createElement("div");
+    bar.className = "toast-bar";
+    const copyBtn = document.createElement("button");
+    copyBtn.className = "toast-btn"; copyBtn.type = "button"; copyBtn.textContent = "Copy";
+    copyBtn.onclick = () => _toastCopy(msg, copyBtn);
+    const closeBtn = document.createElement("button");
+    closeBtn.className = "toast-btn"; closeBtn.type = "button";
+    closeBtn.setAttribute("aria-label", "Close"); closeBtn.textContent = "Close";
+    closeBtn.onclick = () => { t.className = "toast"; t.innerHTML = ""; };
+    bar.appendChild(copyBtn); bar.appendChild(closeBtn);
+    const body = document.createElement("div");
+    body.className = "toast-msg"; body.textContent = msg;
+    t.appendChild(bar); t.appendChild(body);
+    t.className = "toast show err persistent";
+  } else {
+    t.textContent = msg;
+    t.className = "toast show" + (kind ? " " + kind : "");
+    _toastTimer = setTimeout(() => { t.className = "toast"; }, 2400);
+  }
+}
+// Self-contained copy for the error card — does NOT call toast() (that would
+// replace the very error the user is trying to copy). Feedback goes in the
+// button label. Uses the hidden-textarea path that works over plain HTTP LAN.
+function _toastCopy(text, btn) {
+  let ok = false;
+  try {
+    const ta = document.createElement("textarea");
+    ta.value = text; ta.setAttribute("readonly", "");
+    ta.style.position = "fixed"; ta.style.top = "-1000px"; ta.style.opacity = "0";
+    document.body.appendChild(ta); ta.select(); ta.setSelectionRange(0, ta.value.length);
+    ok = document.execCommand("copy");
+    document.body.removeChild(ta);
+  } catch (e) { ok = false; }
+  if (btn) { btn.textContent = ok ? "Copied" : "Copy failed"; setTimeout(() => { btn.textContent = "Copy"; }, 1300); }
 }
 
 // Clipboard with a fallback. `navigator.clipboard` only exists in a
