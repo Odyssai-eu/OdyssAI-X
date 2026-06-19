@@ -2620,7 +2620,11 @@ def _seed_in_think(model_id: Optional[str], enable_thinking) -> bool:
 #    content field. Do not modify the content field."
 # i.e. their stance is "don't disable thinking" — we route around them
 # by treating the auto-opened block as reasoning and stripping the close.
-_MODELS_AUTO_OPEN_THINK = ("minimax", "qwen3.5", "qwen3.6", "step-3.7", "step3p7")
+# GLM-5.2 (glm_moe_dsa): template auto-opens <think> ; HONORS enable_thinking
+# (off -> empty <think></think> baked in the prompt, no output block), like
+# Qwen3.5/3.6 -> goes HERE only, NOT in _MODELS_IGNORE_ENABLE_THINKING_FLAG.
+# Substring "glm-5.2" matches the concrete HF path (kernelpool/GLM-5.2-*, all quants).
+_MODELS_AUTO_OPEN_THINK = ("minimax", "qwen3.5", "qwen3.6", "step-3.7", "step3p7", "glm-5.2")
 # Subset of _MODELS_AUTO_OPEN_THINK that IGNORES the `enable_thinking`
 # kwarg and always wraps reasoning in <think>...</think>. Per MiniMax M2
 # docs (2026-05-20 update): "The model's reasoning is wrapped in <think>
