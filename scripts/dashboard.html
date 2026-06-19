@@ -6838,6 +6838,20 @@ function _isEditing() {
   // A cluster draft has unsaved changes (cluster_draft is keyed by cluster id)
   const cd = state.cluster_draft || {};
   if (Object.values(cd).some(v => v && Object.keys(v).length > 0)) return true;
+  // A native <select> (the model picker) or a text <input> is focused right
+  // now — the user has the dropdown OPEN and is browsing/picking. The 8s
+  // window below only starts on a `change` event (i.e. AFTER a pick), so it
+  // never covered the open-but-not-yet-picked moment: a 5s poll landing then
+  // re-renders via `$("root").innerHTML = ...`, collapsing the dropdown and
+  // swallowing the click (#60 — single click never selects, list refreshes
+  // mid-pick; the "add a second instance" picker has the same native select).
+  // Defer for the WHOLE time a form control holds focus; the next blur lets
+  // polling resume within one tick. (A model load disables the picker, so a
+  // focused-but-disabled select can't stall load-progress refresh.)
+  const _ae = document.activeElement;
+  if (_ae && (_ae.tagName === "SELECT" || _ae.tagName === "INPUT")) {
+    return true;
+  }
   // Recent form interaction (model picker, node pills, mode toggle, KV checkbox).
   // Defer the polled re-render long enough that picking a model doesn't get
   // overwritten by a 5s poll landing mid-click. 8s is short enough that fresh
