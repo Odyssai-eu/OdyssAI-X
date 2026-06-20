@@ -41,6 +41,12 @@ OUT = "/Volumes/models/odysseus/odyssai/Hy3-preview-MTP-head"
 
 PFX = f"model.layers.{LAYER}."
 
+# The head is a DRAFTER — its precision only affects acceptance (speed), never
+# output quality (the trunk verifies every proposed token). So we quantize it
+# aggressively. Q4 (4-bit) g32 by default; fallback ladder Q4->Q6->Q8 via HEAD_BITS.
+QUANT_BITS = int(os.environ.get("HEAD_BITS", "4"))
+QUANT_GROUP = int(os.environ.get("HEAD_GROUP", "32"))
+
 
 def log(*a):
     print(*a, flush=True)
@@ -131,6 +137,35 @@ def transform(w):
     return out
 
 
+def quantize_head(out):
+    """Quantize the 2-D/3-D weights (Linear + SwitchGLU experts) to QUANT_BITS @
+    group QUANT_GROUP, affine. Keep 1-D tensors full precision (RMSNorm weights +
+    router.expert_bias). mlx-swift's loadWeights builds QuantizedLinear/
+    QuantizedSwitchLinear from the config's quantization block and binds the
+    .weight(packed)/.scales/.biases we emit here."""
+    q = {}
+    nq = 0
+    for k, w in out.items():
+        if k.endswith(".weight") and w.ndim >= 2:
+            indim = int(w.shape[-1])
+            if indim % QUANT_GROUP != 0:
+                sys.exit(f"{k}: in-dim {indim} not divisible by group_size {QUANT_GROUP}")
+            try:
+                wq, sc, bi = mx.quantize(w, group_size=QUANT_GROUP, bits=QUANT_BITS, mode="affine")
+            except TypeError:
+                wq, sc, bi = mx.quantize(w, group_size=QUANT_GROUP, bits=QUANT_BITS)
+            base = k[: -len(".weight")]
+            q[k] = wq
+            q[base + ".scales"] = sc
+            q[base + ".biases"] = bi
+            nq += 1
+        else:
+            q[k] = w
+    log(f"[quant] {nq} matrices -> {QUANT_BITS}-bit g{QUANT_GROUP} affine; "
+        f"kept {len(out) - nq} full (norms + expert_bias)")
+    return q
+
+
 def write_outputs(out):
     os.makedirs(OUT, exist_ok=True)
     mtp_path = os.path.join(OUT, "mtp.safetensors")
@@ -159,7 +194,10 @@ def write_outputs(out):
         "rope_parameters": trunk_cfg.get("rope_parameters"),
         "tie_word_embeddings": trunk_cfg.get("tie_word_embeddings", False),
         "num_mtp_layers": 1,
-        # head ships bf16; no `quantization` block -> mlx-swift loads plain Linear/SwitchGLU.
+        # head quantized to QUANT_BITS @ group QUANT_GROUP -> mlx-swift builds
+        # QuantizedLinear/QuantizedSwitchLinear from this block (fast gatherQuantizedMM).
+        "quantization": {"bits": QUANT_BITS, "group_size": QUANT_GROUP, "mode": "affine"},
+        "quantization_config": {"bits": QUANT_BITS, "group_size": QUANT_GROUP, "mode": "affine"},
         "mlx_lm_extra_tensors": {"mtp_file": "mtp.safetensors"},
         "_trunk": "inferencerlabs/Hy3-preview-MLX-9bit",
         "_note": "embed_tokens + lm_head are SHARED from the trunk at load (not in this file).",
@@ -196,6 +234,7 @@ if __name__ == "__main__":
     download()
     w = load_layer80()
     out = transform(w)
-    verify(out)
+    verify(out)                 # bf16 shapes, pre-quant
+    out = quantize_head(out)    # -> Q4 (or HEAD_BITS) packed weight + scales + biases
     write_outputs(out)
     log("DONE — sidecar at " + OUT)
