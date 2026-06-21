@@ -3793,7 +3793,7 @@ async def odyrag():
 async def odyrag_proxy(shard_id: str, path: str, request: Request):
     """Proxy requests to LightRAG shard instances — avoids browser CORS restrictions."""
     _SHARD_PORTS: dict[str, int] = {
-        "company": 8766,
+        "company": 8767,
         "shard1": 8768, "shard2": 8769, "shard3": 8770, "shard4": 8771,
     }
     port = _SHARD_PORTS.get(shard_id)
