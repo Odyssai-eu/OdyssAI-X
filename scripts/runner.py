@@ -2241,7 +2241,7 @@ def _run_legacy_main(model, tokenizer, repo: str, kv_q8_default: bool,
 
         # Prefix-cache hit accounting. When `cached_cache` was found and
         # `suffix_tokens` < `prompt_tokens_full`, the difference is the count
-        # served from cache (no prefill cost). Mirrors oMLX's `cached_tokens`
+        # served from cache (no prefill cost). Mirrors an OpenAI-style `cached_tokens`
         # so the API layer can publish OpenAI-compat
         # `prompt_tokens_details.cached_tokens` and Companion's StatsRow
         # surfaces the win for local pools too, not just the cloud proxy path.
