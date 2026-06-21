@@ -8968,6 +8968,10 @@ async def admin_cluster_models(cluster_id: str, dir: Optional[str] = None):
         upstream = (cd.get("upstream") or "").rstrip("/")
         if not upstream:
             raise HTTPException(502, f"{cluster_id}: telemak cluster has no upstream URL")
+        # Master push: ensure the Telemak server scans the dir this cluster is
+        # configured for (auto-heals a freshly-deployed node whose config.json
+        # isn't set yet). Idempotent — no-op when already in sync.
+        await _telemak_reconcile_models_dir(cluster_id, cd)
         import httpx
         try:
             async with httpx.AsyncClient(timeout=5.0) as client:
@@ -9121,6 +9125,7 @@ async def admin_cluster_load(cluster_id: str, req: ArgoLoadRequest):
     # selection. We just POST {model} upstream and return its response.
     cd = get_cluster_def(cluster_id)
     if cd.get("kind") == "telemak":
+        await _telemak_reconcile_models_dir(cluster_id, cd)
         return await _telemak_proxy_load(cluster_id, cd, req)
     # Block reload if the cluster is currently flagged degraded — a JACCL
     # queue-pair stuck in TIME_WAIT or a wired-memory leak makes the next
@@ -9324,6 +9329,33 @@ def _telemak_split_alias(model: Optional[str]) -> tuple[Optional[str], Optional[
         return (model, None)
     cluster, short = model.split(":", 1)
     return (cluster, short or None)
+
+
+async def _telemak_reconcile_models_dir(cluster_id: str, cd: dict) -> None:
+    """OdyssAI-X (master) asserts the cluster's configured models_dir onto the
+    Telemak server (slave). Idempotent: GET the server's effective dir and POST
+    only when it differs from cd['models_dir'] (no re-scan churn on polls).
+    No-op when the cluster has no models_dir. Best-effort — a transient failure
+    is swallowed; the proxy call that follows surfaces real outages. We do NOT
+    auto-create a missing dir (a non-existent configured dir is a config error to
+    surface, not to silently create empty)."""
+    upstream = (cd.get("upstream") or "").rstrip("/")
+    want = (cd.get("models_dir") or "").strip()
+    if not upstream or not want:
+        return
+    import httpx
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            r = await client.get(f"{upstream}/admin/models-dir")
+            cur = (r.json().get("dir") or "") if r.status_code == 200 else ""
+            if cur.rstrip("/") == want.rstrip("/"):
+                return  # already in sync
+            await client.post(
+                f"{upstream}/admin/models-dir",
+                json={"dir": want, "managed": True},
+            )
+    except httpx.RequestError:
+        return
 
 
 async def _telemak_loaded_models(cluster_id: str, cd: dict, force: bool = False) -> list[str]:
