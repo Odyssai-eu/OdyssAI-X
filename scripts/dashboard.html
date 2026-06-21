@@ -3894,11 +3894,21 @@ function renderArgoPoolsList(a) {
     const conc = (p.model || "").split("/").pop();
     const tps = p.recent_avg_tps != null ? `${p.recent_avg_tps} tok/s` : "—";
     const aliasIsDefault = p.alias === "default";
+    // #61 — per-pool activity. The aggregate Activity hero only showed the
+    // cluster total; here each pool gets its own live indicator from the
+    // in-flight runs routed to its alias (runs carry {cluster, alias}).
+    const poolInflight = (state.runs || []).filter(
+      (r) => r.cluster === state.selected_cluster && r.alias === p.alias
+    ).length;
+    const actPill = poolInflight > 0
+      ? `<span style="background:#fff8e6;border:1px solid var(--amber);color:var(--amber-deep);padding:2px 8px;border-radius:5px;font-size:10px;font-weight:600;letter-spacing:0.04em;text-transform:uppercase"><span style="display:inline-block;width:5px;height:5px;border-radius:50%;background:var(--amber);margin-right:5px;animation:pulse 1s infinite;vertical-align:middle"></span>${poolInflight} in flight</span>`
+      : `<span style="color:var(--ink-3);font-size:10px;letter-spacing:0.04em;text-transform:uppercase">idle</span>`;
     return `
       <div style="display:flex;align-items:center;gap:12px;padding:8px 12px;background:var(--surface);border:1px solid var(--line);border-radius:6px;font-family:var(--font-mono);font-size:12px">
-        <span style="font-weight:600;color:var(--ink);min-width:80px">${escapeHtml(p.alias)}</span>
+        <span style="font-weight:600;color:var(--ink);min-width:80px">${escapeHtml(p.alias)}${aliasIsDefault && conc ? ' &rarr;' : ''}</span>
         <span style="color:var(--ink-2);flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${escapeHtml(conc)}</span>
         <span style="color:var(--ink-3);font-size:11px">${p.nodes_count || p.nodes || 0} node · ${escapeHtml(hostNames)}</span>
+        ${actPill}
         <span style="color:var(--ink-3);font-size:11px">${tps}</span>
         <button class="btn btn-xs btn-destructive" data-act="default-unload-alias" data-alias="${escapeHtml(p.alias)}" ${aliasIsDefault ? 'title="Default alias — also stoppable via the main Stop button"' : ''}>${Icon.x}<span>Stop</span></button>
       </div>
