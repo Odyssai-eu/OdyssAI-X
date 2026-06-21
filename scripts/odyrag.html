@@ -356,6 +356,31 @@ label:first-child { margin-top: 0; }
 }
 @keyframes spin { to { transform: rotate(360deg); } }
 
+/* ── Graph ── */
+.graph-controls {
+  display: flex; gap: 14px; align-items: flex-end; margin-bottom: 16px; flex-wrap: wrap;
+}
+.graph-controls > div { flex-shrink: 0; }
+.graph-controls input[type="number"] { width: 80px; }
+.graph-legend { display: flex; flex-wrap: wrap; gap: 10px; margin-bottom: 14px; }
+#graph-container {
+  border: 1px solid var(--border); border-radius: 12px; overflow: hidden;
+  position: relative; background: #000008;
+}
+#graph-3d { width: 100%; height: 580px; display: block; }
+#graph-overlay {
+  position: absolute; inset: 0;
+  display: flex; align-items: center; justify-content: center;
+  color: var(--muted); font-size: 14px;
+  background: rgba(0,0,8,0.9); z-index: 10;
+  flex-direction: column; gap: 8px; text-align: center;
+}
+.gtooltip {
+  background: #080818; border: 1px solid rgba(124,58,237,.4);
+  padding: 8px 12px; border-radius: 7px; max-width: 260px;
+  font-size: 12px; line-height: 1.5; pointer-events: none;
+}
+
 footer {
   margin-top: 48px; padding: 20px 28px;
   border-top: 1px solid var(--border);
@@ -393,6 +418,7 @@ footer a:hover { color: var(--accent3); }
   <div class="tab" onclick="showTab('inject')">Inject</div>
   <div class="tab" onclick="showTab('documents')">Documents</div>
   <div class="tab" onclick="showTab('query')">Query</div>
+  <div class="tab" onclick="showTab('graph')">&#x2606; Galaxy</div>
 </div>
 
 <!-- ══════════ OVERVIEW ══════════ -->
@@ -532,6 +558,33 @@ footer a:hover { color: var(--accent3); }
   </div>
 </div>
 
+<!-- ══════════ GRAPH ══════════ -->
+<div id="pane-graph" class="pane">
+  <div class="graph-controls">
+    <div>
+      <label>Shard</label>
+      <select id="graph-shard"></select>
+    </div>
+    <div>
+      <label>Top labels (N)</label>
+      <input type="number" id="graph-nodes" value="12" min="5" max="60">
+    </div>
+    <button class="btn btn-primary" style="width:auto;padding:8px 22px;margin-top:0;flex-shrink:0" onclick="loadGraph()">
+      &#x2606; Load galaxy
+    </button>
+    <span id="graph-status" style="font-size:11px;color:var(--muted);align-self:center"></span>
+  </div>
+  <div class="graph-legend" id="graph-legend"></div>
+  <div id="graph-container">
+    <div id="graph-3d"></div>
+    <div id="graph-overlay">
+      <div style="font-size:32px;margin-bottom:8px">&#x1F30C;</div>
+      <div>Select a shard and click <b style="color:var(--accent3)">Load galaxy</b></div>
+      <div style="font-size:11px;margin-top:4px">Drag to orbit · scroll to zoom · click node to focus</div>
+    </div>
+  </div>
+</div>
+
 <!-- ══════════ FOOTER ══════════ -->
 <footer>
   <strong>OdyRAG</strong> — knowledge graph layer for the odyssai.eu stack<br>
@@ -592,21 +645,21 @@ async function safeFetch(url, opts = {}) {
 // ── Shard Overview ────────────────────────────────────────────────────────────
 async function refreshShard(shard) {
   const base = shardUrl(shard.port);
-  const [health, counts, pipeline] = await Promise.all([
+  const [health, pipeline, counts] = await Promise.all([
     safeFetch(`${base}/health`),
-    safeFetch(`${base}/documents/status_counts`),
     safeFetch(`${base}/documents/pipeline_status`),
+    safeFetch(`${base}/documents/status_counts`),
   ]);
 
-  shardState[shard.id] = { health, counts, pipeline };
-  renderShardCard(shard, health, counts, pipeline);
+  shardState[shard.id] = { health, pipeline, counts };
+  renderShardCard(shard, health, pipeline, counts);
 }
 
-function renderShardCard(shard, health, counts, pipeline) {
+function renderShardCard(shard, health, pipeline, counts) {
   const el = document.getElementById(`card-${shard.id}`);
   if (!el) return;
 
-  if (!health) {
+  if (!health || health.status !== 'healthy') {
     el.querySelector('.badge').textContent = 'offline';
     el.querySelector('.badge').className = 'badge badge-offline';
     el.querySelector('.shard-model').textContent = '—';
@@ -617,7 +670,7 @@ function renderShardCard(shard, health, counts, pipeline) {
     return;
   }
 
-  const busy = health.pipeline_busy;
+  const busy = pipeline?.busy || false;
   el.classList.toggle('busy', busy);
 
   const badge = el.querySelector('.badge');
@@ -627,15 +680,18 @@ function renderShardCard(shard, health, counts, pipeline) {
   const model = health.configuration?.llm_model || shard.model;
   el.querySelector('.shard-model').textContent = model;
 
-  const c = counts || {};
-  const total    = (c.PROCESSED || 0) + (c.FAILED || 0) + (c.PENDING || 0) + (c.PROCESSING || 0) + (c.PREPROCESSED || 0);
-  const done     = c.PROCESSED || 0;
-  const pct      = total > 0 ? Math.round(done / total * 100) : 0;
+  const sc = (counts && counts.status_counts) || {};
+  const pending    = (sc.pending || 0) + (sc.preprocessed || 0);
+  const processing = sc.processing || 0;
+  const processed  = sc.processed  || 0;
+  const failed     = sc.failed     || 0;
+  const total      = sc.all || (pending + processing + processed + failed);
+  const pct        = total > 0 ? Math.round(processed / total * 100) : 0;
 
-  el.querySelector('.c-pending .count-val').textContent    = (c.PENDING || 0) + (c.PREPROCESSED || 0);
-  el.querySelector('.c-processing .count-val').textContent = c.PROCESSING || 0;
-  el.querySelector('.c-processed .count-val').textContent  = c.PROCESSED  || 0;
-  el.querySelector('.c-failed .count-val').textContent     = c.FAILED     || 0;
+  el.querySelector('.c-pending .count-val').textContent    = pending;
+  el.querySelector('.c-processing .count-val').textContent = processing;
+  el.querySelector('.c-processed .count-val').textContent  = processed;
+  el.querySelector('.c-failed .count-val').textContent     = failed;
   el.querySelector('.progress-fill').style.width           = `${pct}%`;
 
   const msgs = pipeline?.history_messages;
@@ -708,7 +764,7 @@ function showTabByName(name) {
   document.querySelectorAll('.pane').forEach(p => p.classList.remove('active'));
   document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
   document.getElementById(`pane-${name}`).classList.add('active');
-  document.querySelectorAll('.tab')[['overview','inject','documents','query'].indexOf(name)]?.classList.add('active');
+  document.querySelectorAll('.tab')[['overview','inject','documents','query','graph'].indexOf(name)]?.classList.add('active');
 }
 
 // ── Global refresh ────────────────────────────────────────────────────────────
@@ -931,12 +987,12 @@ function populateSelects() {
   const opts = SHARDS.map((s, i) =>
     `<option value="${i}">${s.label} (:${s.port})</option>`
   ).join('');
-  ['inject-shard', 'upload-shard', 'docs-shard', 'query-shard'].forEach(id => {
+  ['inject-shard', 'upload-shard', 'docs-shard', 'query-shard', 'graph-shard'].forEach(id => {
     const el = document.getElementById(id);
     if (el) el.innerHTML = opts;
   });
-  // query defaults to company
   document.getElementById('query-shard').selectedIndex = 0;
+  document.getElementById('graph-shard').selectedIndex = 1; // default shard1 (ingesting)
 }
 
 // ── Init ──────────────────────────────────────────────────────────────────────
@@ -948,6 +1004,151 @@ refreshInterval = setInterval(refreshAll, 5000);
 
 // Cleanup on unload
 window.addEventListener('beforeunload', () => clearInterval(refreshInterval));
+
+// ── Galaxy graph (3D force-directed) ─────────────────────────────────────────
+let fg3d = null;
+let fgLibLoaded = false;
+
+function ensureFgLib() {
+  return new Promise(resolve => {
+    if (fgLibLoaded) return resolve();
+    const s = document.createElement('script');
+    s.src = 'https://unpkg.com/3d-force-graph';
+    s.onload = () => { fgLibLoaded = true; resolve(); };
+    s.onerror = () => { toast('Failed to load 3d-force-graph from unpkg', 'err'); };
+    document.head.appendChild(s);
+  });
+}
+
+const ENTITY_COLORS = {
+  concept:      '#01c8ff',
+  person:       '#f59e0b',
+  organization: '#a855f7',
+  event:        '#10b981',
+  geo:          '#ef4444',
+  product:      '#f97316',
+  technology:   '#3b82f6',
+  unknown:      '#6b6b8a',
+};
+
+function entityColor(type) {
+  const t = (type || 'unknown').toLowerCase();
+  return ENTITY_COLORS[t] || ENTITY_COLORS.unknown;
+}
+
+async function loadGraph() {
+  await ensureFgLib();
+
+  const idx    = document.getElementById('graph-shard').selectedIndex;
+  const shard  = SHARDS[idx];
+  const N      = Math.min(60, Math.max(5, parseInt(document.getElementById('graph-nodes').value) || 12));
+  const status = document.getElementById('graph-status');
+  const overlay = document.getElementById('graph-overlay');
+
+  overlay.innerHTML = '<div style="font-size:24px">&#x231B;</div><div>Fetching top entities…</div>';
+  overlay.style.display = 'flex';
+  status.textContent = '';
+
+  const base   = shardUrl(shard.port);
+  const labels = await safeFetch(`${base}/graph/label/popular`);
+  if (!labels || !labels.length) {
+    overlay.innerHTML = '<div style="font-size:24px">&#x1F300;</div><div>No entities yet — keep ingesting!</div>';
+    return;
+  }
+
+  const top = labels.slice(0, N);
+  overlay.innerHTML = `<div style="font-size:24px">&#x231B;</div><div>Loading ${top.length} subgraphs…</div>`;
+
+  const graphs = await Promise.all(
+    top.map(label => safeFetch(`${base}/graphs?label=${encodeURIComponent(label)}`))
+  );
+
+  const nodeMap = new Map();
+  const linkSet = new Map();
+
+  for (const g of graphs) {
+    if (!g || !g.nodes) continue;
+    for (const n of g.nodes) {
+      if (!nodeMap.has(n.id)) {
+        nodeMap.set(n.id, {
+          id:   n.id,
+          type: (n.properties?.entity_type || 'unknown').toLowerCase(),
+          desc: n.properties?.description || '',
+          val:  1,
+        });
+      } else {
+        nodeMap.get(n.id).val += 0.5;
+      }
+    }
+    for (const e of (g.edges || [])) {
+      const key = `${e.source}|||${e.target}`;
+      if (!linkSet.has(key)) linkSet.set(key, { source: e.source, target: e.target });
+    }
+  }
+
+  const nodes = Array.from(nodeMap.values());
+  const links = Array.from(linkSet.values())
+    .filter(l => nodeMap.has(l.source) && nodeMap.has(l.target));
+
+  overlay.style.display = 'none';
+  status.textContent = `${nodes.length} entities · ${links.length} relations · ${shard.label}`;
+
+  renderGalaxy(nodes, links);
+  renderGalaxyLegend();
+}
+
+function renderGalaxy(nodes, links) {
+  const container = document.getElementById('graph-3d');
+  container.innerHTML = '';
+  if (fg3d) { try { fg3d._destructor?.(); } catch {} fg3d = null; }
+
+  fg3d = ForceGraph3D()(container)
+    .backgroundColor('#000008')
+    .width(container.clientWidth  || 900)
+    .height(580)
+    .graphData({ nodes, links })
+    .nodeId('id')
+    .nodeLabel(n => {
+      const c = entityColor(n.type);
+      return `<div class="gtooltip">` +
+        `<b style="color:${c}">${n.id}</b>` +
+        `<div style="color:#888;font-size:10px;margin-top:2px">${n.type}</div>` +
+        (n.desc ? `<div style="color:#ccc;font-size:10px;margin-top:4px;line-height:1.4">${n.desc.slice(0, 150)}</div>` : '') +
+        `</div>`;
+    })
+    .nodeColor(n => entityColor(n.type))
+    .nodeOpacity(0.92)
+    .nodeRelSize(5)
+    .nodeVal(n => n.val || 1)
+    .linkColor(() => 'rgba(1,200,255,0.1)')
+    .linkWidth(0.4)
+    .linkDirectionalParticles(2)
+    .linkDirectionalParticleWidth(1)
+    .linkDirectionalParticleColor(() => '#01c8ff')
+    .linkDirectionalParticleSpeed(0.005)
+    .onNodeClick(n => {
+      const d = 80;
+      const r = 1 + d / Math.hypot(n.x || 1, n.y || 1, n.z || 1);
+      fg3d.cameraPosition({ x: n.x * r, y: n.y * r, z: n.z * r }, n, 1200);
+    });
+
+  setTimeout(() => {
+    fg3d.d3Force('charge')?.strength(-120);
+    fg3d.d3Force('link')?.distance(60);
+    fg3d.d3ReheatSimulation();
+    const ctrl = fg3d.controls();
+    if (ctrl) { ctrl.autoRotate = true; ctrl.autoRotateSpeed = 0.4; }
+  }, 300);
+}
+
+function renderGalaxyLegend() {
+  const legend = document.getElementById('graph-legend');
+  legend.innerHTML = Object.entries(ENTITY_COLORS).map(([t, c]) =>
+    `<span style="display:inline-flex;align-items:center;gap:5px;font-size:11px;color:var(--muted)">` +
+    `<span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:${c}"></span>${t}` +
+    `</span>`
+  ).join('');
+}
 </script>
 </body>
 </html>

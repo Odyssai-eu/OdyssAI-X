@@ -3789,6 +3789,41 @@ async def odyrag():
     return HTMLResponse(ODYRAG_FILE.read_text())
 
 
+@app.api_route("/odyrag/api/{shard_id}/{path:path}", methods=["GET", "POST", "DELETE"])
+async def odyrag_proxy(shard_id: str, path: str, request: Request):
+    """Proxy requests to LightRAG shard instances — avoids browser CORS restrictions."""
+    _SHARD_PORTS: dict[str, int] = {
+        "company": 8766,
+        "shard1": 8768, "shard2": 8769, "shard3": 8770, "shard4": 8771,
+    }
+    port = _SHARD_PORTS.get(shard_id)
+    if port is None:
+        raise HTTPException(status_code=404, detail=f"Unknown shard: {shard_id!r}")
+    qs = str(request.query_params)
+    target = f"http://192.168.86.39:{port}/{path}"
+    if qs:
+        target = f"{target}?{qs}"
+    body = await request.body()
+    fwd_headers: dict[str, str] = {}
+    if body:
+        ct = request.headers.get("content-type", "")
+        if ct:
+            fwd_headers["content-type"] = ct
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            resp = await client.request(
+                request.method, target,
+                content=body or None,
+                headers=fwd_headers,
+            )
+        try:
+            return JSONResponse(resp.json(), status_code=resp.status_code)
+        except Exception:
+            return PlainTextResponse(resp.text, status_code=resp.status_code)
+    except Exception as exc:
+        return JSONResponse({"error": str(exc)}, status_code=503)
+
+
 @app.get("/wall")
 async def status_wall():
     """Standalone status wall — portrait black display for ops monitoring.
