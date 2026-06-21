@@ -1,0 +1,955 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>OdyRAG</title>
+<style>
+:root {
+  --bg:       #080810;
+  --surface:  #0e0e1a;
+  --card:     #12121f;
+  --border:   #1e1e33;
+  --border2:  #2a2a44;
+  --accent:   #7c3aed;
+  --accent2:  #a855f7;
+  --accent3:  #c084fc;
+  --text:     #e2e2f0;
+  --muted:    #6b6b8a;
+  --dim:      #3a3a55;
+  --green:    #10b981;
+  --yellow:   #f59e0b;
+  --red:      #ef4444;
+  --blue:     #3b82f6;
+  --cyan:     #06b6d4;
+  --font:     -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+  --mono:     'SF Mono', 'Fira Code', 'Cascadia Code', monospace;
+}
+
+* { box-sizing: border-box; margin: 0; padding: 0; }
+
+body {
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--font);
+  font-size: 13px;
+  line-height: 1.5;
+  min-height: 100vh;
+}
+
+/* ── Header ── */
+header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0 28px;
+  height: 56px;
+  background: linear-gradient(180deg, #0e0e1f 0%, var(--bg) 100%);
+  border-bottom: 1px solid var(--border);
+  position: sticky; top: 0; z-index: 100;
+}
+
+.logo {
+  display: flex; align-items: center; gap: 10px;
+  font-size: 17px; font-weight: 700; letter-spacing: -0.3px;
+}
+.logo-icon {
+  width: 28px; height: 28px;
+  background: linear-gradient(135deg, var(--accent) 0%, var(--accent3) 100%);
+  border-radius: 7px;
+  display: flex; align-items: center; justify-content: center;
+  font-size: 14px; font-weight: 800; color: #fff;
+}
+.logo span { color: var(--accent3); }
+.logo-tag {
+  font-size: 10px; font-weight: 400; color: var(--muted);
+  background: var(--surface); border: 1px solid var(--border);
+  padding: 2px 7px; border-radius: 99px; letter-spacing: 0.5px;
+}
+
+.header-right {
+  display: flex; align-items: center; gap: 16px;
+}
+.refresh-btn {
+  display: flex; align-items: center; gap: 6px;
+  background: var(--surface); border: 1px solid var(--border);
+  color: var(--muted); padding: 5px 12px; border-radius: 6px;
+  cursor: pointer; font-size: 12px; transition: all .15s;
+}
+.refresh-btn:hover { border-color: var(--accent); color: var(--accent3); }
+.pulse { width: 7px; height: 7px; border-radius: 50%; background: var(--green); }
+.pulse.live { animation: pulse 2s infinite; }
+@keyframes pulse {
+  0%,100% { opacity: 1; box-shadow: 0 0 0 0 rgba(16,185,129,.4); }
+  50%      { opacity: .8; box-shadow: 0 0 0 5px rgba(16,185,129,0); }
+}
+
+/* ── Tabs ── */
+.tabs {
+  display: flex; gap: 2px;
+  padding: 12px 28px 0;
+  border-bottom: 1px solid var(--border);
+}
+.tab {
+  padding: 8px 18px 10px;
+  cursor: pointer; font-size: 13px; font-weight: 500;
+  color: var(--muted); border-bottom: 2px solid transparent;
+  transition: all .15s; margin-bottom: -1px;
+}
+.tab:hover { color: var(--text); }
+.tab.active { color: var(--accent3); border-bottom-color: var(--accent); }
+
+/* ── Layout ── */
+.pane { display: none; padding: 24px 28px; }
+.pane.active { display: block; }
+
+/* ── Grid ── */
+.shard-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
+  gap: 14px;
+  margin-bottom: 20px;
+}
+
+/* ── Shard Card ── */
+.shard-card {
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  overflow: hidden;
+  transition: border-color .2s;
+}
+.shard-card:hover { border-color: var(--border2); }
+.shard-card.busy { border-color: rgba(124,58,237,.35); }
+
+.shard-head {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 12px 14px 10px;
+  border-bottom: 1px solid var(--border);
+}
+.shard-name {
+  font-weight: 600; font-size: 13px; display: flex; align-items: center; gap: 8px;
+}
+.shard-port {
+  font-family: var(--mono); font-size: 11px; color: var(--muted);
+  background: var(--surface); padding: 2px 7px; border-radius: 4px;
+}
+.badge {
+  font-size: 10px; font-weight: 600; padding: 2px 8px; border-radius: 99px;
+  letter-spacing: .4px; text-transform: uppercase;
+}
+.badge-busy   { background: rgba(124,58,237,.2);  color: var(--accent3); }
+.badge-idle   { background: rgba(16,185,129,.12); color: var(--green); }
+.badge-offline{ background: rgba(239,68,68,.12);  color: var(--red); }
+
+.shard-body { padding: 12px 14px; }
+
+.shard-model {
+  font-family: var(--mono); font-size: 11px; color: var(--cyan);
+  margin-bottom: 10px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+
+.counts {
+  display: grid; grid-template-columns: repeat(4, 1fr); gap: 6px;
+  margin-bottom: 10px;
+}
+.count-item { text-align: center; }
+.count-val {
+  font-size: 18px; font-weight: 700; line-height: 1.1;
+  font-family: var(--mono);
+}
+.count-label { font-size: 10px; color: var(--muted); margin-top: 1px; }
+.c-pending    { color: var(--yellow); }
+.c-processing { color: var(--blue); }
+.c-processed  { color: var(--green); }
+.c-failed     { color: var(--red); }
+
+.progress-bar {
+  height: 3px; background: var(--border); border-radius: 99px; overflow: hidden;
+  margin-bottom: 10px;
+}
+.progress-fill {
+  height: 100%; border-radius: 99px; transition: width .5s ease;
+  background: linear-gradient(90deg, var(--accent) 0%, var(--accent3) 100%);
+}
+
+.latest-msg {
+  font-family: var(--mono); font-size: 10px; color: var(--muted);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  min-height: 14px;
+}
+
+.shard-foot {
+  display: flex; gap: 6px;
+  padding: 8px 14px;
+  border-top: 1px solid var(--border);
+}
+.btn-shard {
+  flex: 1; padding: 5px; border-radius: 6px; border: 1px solid var(--border);
+  background: var(--surface); color: var(--muted);
+  cursor: pointer; font-size: 11px; font-weight: 500; transition: all .15s;
+}
+.btn-shard:hover { border-color: var(--accent); color: var(--accent3); }
+.btn-shard.danger:hover { border-color: var(--red); color: var(--red); }
+.btn-shard.primary {
+  background: rgba(124,58,237,.15); border-color: var(--accent);
+  color: var(--accent3);
+}
+.btn-shard.primary:hover { background: rgba(124,58,237,.3); }
+
+/* ── Section title ── */
+.section-title {
+  font-size: 11px; font-weight: 600; color: var(--muted);
+  text-transform: uppercase; letter-spacing: .8px;
+  margin-bottom: 14px; display: flex; align-items: center; gap: 8px;
+}
+.section-title::after {
+  content: ''; flex: 1; height: 1px; background: var(--border);
+}
+
+/* ── Inject Panel ── */
+.inject-layout {
+  display: grid; grid-template-columns: 1fr 320px; gap: 20px;
+  align-items: start;
+}
+@media (max-width: 900px) { .inject-layout { grid-template-columns: 1fr; } }
+
+.panel {
+  background: var(--card); border: 1px solid var(--border);
+  border-radius: 10px; overflow: hidden;
+}
+.panel-head {
+  padding: 12px 16px; border-bottom: 1px solid var(--border);
+  font-weight: 600; font-size: 13px; color: var(--text);
+}
+.panel-body { padding: 16px; }
+
+textarea, input, select {
+  width: 100%; background: var(--surface); border: 1px solid var(--border);
+  color: var(--text); border-radius: 7px; padding: 10px 12px;
+  font-family: var(--font); font-size: 13px; outline: none;
+  transition: border-color .15s; resize: vertical;
+}
+textarea:focus, input:focus, select:focus { border-color: var(--accent); }
+textarea { font-family: var(--mono); font-size: 12px; min-height: 200px; }
+select option { background: var(--surface); }
+
+label {
+  display: block; font-size: 11px; font-weight: 500; color: var(--muted);
+  margin-bottom: 5px; margin-top: 12px; text-transform: uppercase;
+  letter-spacing: .5px;
+}
+label:first-child { margin-top: 0; }
+
+.btn {
+  display: inline-flex; align-items: center; justify-content: center; gap: 7px;
+  padding: 9px 18px; border-radius: 7px; font-size: 13px; font-weight: 600;
+  cursor: pointer; border: none; transition: all .15s; width: 100%; margin-top: 14px;
+}
+.btn-primary {
+  background: linear-gradient(135deg, var(--accent) 0%, #9333ea 100%);
+  color: #fff; box-shadow: 0 2px 12px rgba(124,58,237,.35);
+}
+.btn-primary:hover { box-shadow: 0 4px 20px rgba(124,58,237,.5); filter: brightness(1.1); }
+.btn-primary:disabled { opacity: .4; cursor: not-allowed; filter: none; box-shadow: none; }
+.btn-secondary {
+  background: var(--surface); border: 1px solid var(--border); color: var(--text);
+}
+.btn-secondary:hover { border-color: var(--accent); color: var(--accent3); }
+.btn-danger {
+  background: rgba(239,68,68,.1); border: 1px solid rgba(239,68,68,.3); color: var(--red);
+}
+.btn-danger:hover { background: rgba(239,68,68,.2); }
+
+.upload-zone {
+  border: 2px dashed var(--border); border-radius: 8px; padding: 24px;
+  text-align: center; color: var(--muted); cursor: pointer;
+  transition: all .2s; margin-bottom: 0;
+}
+.upload-zone:hover, .upload-zone.drag { border-color: var(--accent); color: var(--accent3); }
+.upload-zone input { display: none; }
+
+/* ── Toast ── */
+.toast-container {
+  position: fixed; bottom: 24px; right: 24px; z-index: 9999;
+  display: flex; flex-direction: column; gap: 8px; align-items: flex-end;
+}
+.toast {
+  padding: 10px 16px; border-radius: 8px; font-size: 12px; font-weight: 500;
+  max-width: 320px; animation: slideIn .2s ease;
+  box-shadow: 0 4px 20px rgba(0,0,0,.4);
+}
+@keyframes slideIn {
+  from { opacity: 0; transform: translateY(10px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+.toast-ok  { background: rgba(16,185,129,.15); border: 1px solid rgba(16,185,129,.3); color: var(--green); }
+.toast-err { background: rgba(239,68,68,.15);  border: 1px solid rgba(239,68,68,.3);  color: var(--red); }
+.toast-inf { background: rgba(124,58,237,.15); border: 1px solid rgba(124,58,237,.3); color: var(--accent3); }
+
+/* ── Documents ── */
+.docs-toolbar {
+  display: flex; gap: 10px; align-items: center; margin-bottom: 16px; flex-wrap: wrap;
+}
+.docs-toolbar select { width: auto; flex: 1; min-width: 160px; }
+.filter-btns { display: flex; gap: 6px; }
+.filter-btn {
+  padding: 5px 12px; border-radius: 6px; border: 1px solid var(--border);
+  background: var(--surface); color: var(--muted); cursor: pointer;
+  font-size: 11px; font-weight: 600; transition: all .15s; white-space: nowrap;
+}
+.filter-btn.active { border-color: var(--accent); color: var(--accent3); background: rgba(124,58,237,.1); }
+.filter-btn:hover { border-color: var(--border2); color: var(--text); }
+
+.doc-table { width: 100%; border-collapse: collapse; }
+.doc-table th {
+  text-align: left; font-size: 10px; font-weight: 600; color: var(--muted);
+  text-transform: uppercase; letter-spacing: .5px;
+  padding: 8px 10px; border-bottom: 1px solid var(--border);
+}
+.doc-table td {
+  padding: 8px 10px; border-bottom: 1px solid var(--border);
+  font-size: 12px; font-family: var(--mono);
+}
+.doc-table tr:last-child td { border-bottom: none; }
+.doc-table tr:hover td { background: rgba(255,255,255,.02); }
+.status-pill {
+  display: inline-block; padding: 1px 7px; border-radius: 99px;
+  font-size: 10px; font-weight: 600; letter-spacing: .3px;
+}
+.s-pending    { background: rgba(245,158,11,.15);  color: var(--yellow); }
+.s-processing { background: rgba(59,130,246,.15);  color: var(--blue); }
+.s-processed  { background: rgba(16,185,129,.15);  color: var(--green); }
+.s-failed     { background: rgba(239,68,68,.15);   color: var(--red); }
+.s-preprocessed { background: rgba(6,182,212,.15); color: var(--cyan); }
+
+.empty-state {
+  text-align: center; padding: 48px; color: var(--muted); font-size: 13px;
+}
+
+/* ── Query ── */
+.query-layout { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; align-items: start; }
+@media (max-width: 900px) { .query-layout { grid-template-columns: 1fr; } }
+
+.query-response {
+  background: var(--surface); border: 1px solid var(--border); border-radius: 7px;
+  padding: 14px; font-family: var(--mono); font-size: 12px; line-height: 1.7;
+  min-height: 200px; white-space: pre-wrap; overflow-wrap: break-word;
+  color: var(--text);
+}
+
+/* ── Pipeline Log ── */
+.log-box {
+  background: var(--surface); border: 1px solid var(--border); border-radius: 7px;
+  padding: 12px 14px; height: 160px; overflow-y: auto;
+  font-family: var(--mono); font-size: 11px; line-height: 1.6;
+}
+.log-line { color: var(--muted); }
+.log-line.recent { color: var(--text); }
+
+/* ── Misc ── */
+.row { display: flex; gap: 10px; }
+.row > * { flex: 1; }
+
+.spinner {
+  display: inline-block; width: 12px; height: 12px;
+  border: 2px solid rgba(255,255,255,.2); border-top-color: #fff;
+  border-radius: 50%; animation: spin .6s linear infinite;
+}
+@keyframes spin { to { transform: rotate(360deg); } }
+
+footer {
+  margin-top: 48px; padding: 20px 28px;
+  border-top: 1px solid var(--border);
+  font-size: 11px; color: var(--dim); text-align: center;
+  line-height: 1.8;
+}
+footer a { color: var(--muted); text-decoration: none; }
+footer a:hover { color: var(--accent3); }
+
+.global-actions {
+  display: flex; gap: 10px; margin-bottom: 20px; flex-wrap: wrap;
+}
+.global-actions .btn {
+  width: auto; flex: none; padding: 7px 16px; font-size: 12px;
+}
+</style>
+</head>
+<body>
+
+<header>
+  <div class="logo">
+    <div class="logo-icon">O</div>
+    <span>Ody<span>RAG</span></span>
+    <span class="logo-tag">knowledge graph</span>
+  </div>
+  <div class="header-right">
+    <span id="refresh-status" style="font-size:11px;color:var(--muted)">refreshing…</span>
+    <div class="pulse live" id="live-dot"></div>
+    <button class="refresh-btn" onclick="refreshAll()">&#8635; Refresh now</button>
+  </div>
+</header>
+
+<div class="tabs">
+  <div class="tab active" onclick="showTab('overview')">Overview</div>
+  <div class="tab" onclick="showTab('inject')">Inject</div>
+  <div class="tab" onclick="showTab('documents')">Documents</div>
+  <div class="tab" onclick="showTab('query')">Query</div>
+</div>
+
+<!-- ══════════ OVERVIEW ══════════ -->
+<div id="pane-overview" class="pane active">
+  <div class="global-actions">
+    <button class="btn btn-secondary" style="width:auto" onclick="retryAllFailed()">&#8635; Retry all failed</button>
+    <button class="btn btn-danger" style="width:auto" onclick="cancelAllPipelines()">&#x25A0; Cancel all pipelines</button>
+  </div>
+  <div class="section-title">Shard instances</div>
+  <div class="shard-grid" id="shard-grid">
+    <!-- populated by JS -->
+  </div>
+</div>
+
+<!-- ══════════ INJECT ══════════ -->
+<div id="pane-inject" class="pane">
+  <div class="inject-layout">
+    <div class="panel">
+      <div class="panel-head">Inject text</div>
+      <div class="panel-body">
+        <label>Content</label>
+        <textarea id="inject-text" placeholder="Paste text, code, documentation…"></textarea>
+        <label>Target shard</label>
+        <select id="inject-shard"></select>
+        <button class="btn btn-primary" onclick="doInjectText()">
+          <span>&#x2BAD;</span> Inject text
+        </button>
+      </div>
+    </div>
+    <div style="display:flex;flex-direction:column;gap:14px">
+      <div class="panel">
+        <div class="panel-head">Upload file</div>
+        <div class="panel-body">
+          <label>Target shard</label>
+          <select id="upload-shard"></select>
+          <div class="upload-zone" id="upload-zone" onclick="document.getElementById('file-input').click()" ondrop="dropFile(event)" ondragover="event.preventDefault();this.classList.add('drag')" ondragleave="this.classList.remove('drag')">
+            <input type="file" id="file-input" onchange="uploadFile(this.files[0])">
+            <div style="font-size:24px;margin-bottom:8px">&#x1F4C4;</div>
+            <div>Drop file or click to browse</div>
+            <div style="font-size:11px;margin-top:4px">PDF · TXT · MD · DOCX</div>
+          </div>
+          <button class="btn btn-secondary" style="margin-top:10px" onclick="doScan()">&#x1F50D; Scan input dir</button>
+        </div>
+      </div>
+      <div class="panel">
+        <div class="panel-head">Batch inject from Qdrant</div>
+        <div class="panel-body">
+          <div style="font-size:12px;color:var(--muted);line-height:1.6">
+            Alpha-centauri ingestion running via <code style="color:var(--cyan)">run_parallel.sh</code>.<br>
+            Monitor progress in the Overview tab.
+          </div>
+          <button class="btn btn-secondary" style="margin-top:12px" onclick="openShardLogs()">&#x1F4CB; View ingest logs</button>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ══════════ DOCUMENTS ══════════ -->
+<div id="pane-documents" class="pane">
+  <div class="docs-toolbar">
+    <select id="docs-shard" onchange="loadDocs()"></select>
+    <div class="filter-btns">
+      <button class="filter-btn active" data-status="ALL"     onclick="setFilter(this,'ALL')">All</button>
+      <button class="filter-btn" data-status="PENDING"    onclick="setFilter(this,'PENDING')">Pending</button>
+      <button class="filter-btn" data-status="PROCESSING" onclick="setFilter(this,'PROCESSING')">Processing</button>
+      <button class="filter-btn" data-status="PROCESSED"  onclick="setFilter(this,'PROCESSED')">Processed</button>
+      <button class="filter-btn" data-status="FAILED"     onclick="setFilter(this,'FAILED')">Failed</button>
+    </div>
+    <button class="btn btn-secondary" style="width:auto;padding:5px 14px;font-size:12px;margin-top:0" onclick="loadDocs()">&#8635;</button>
+    <button class="btn btn-danger"    style="width:auto;padding:5px 14px;font-size:12px;margin-top:0" onclick="retryFailed()">Retry failed</button>
+  </div>
+  <div class="panel" style="overflow:auto">
+    <table class="doc-table">
+      <thead>
+        <tr>
+          <th>Doc ID</th>
+          <th>Status</th>
+          <th>Created</th>
+          <th>Content (preview)</th>
+        </tr>
+      </thead>
+      <tbody id="docs-tbody">
+        <tr><td colspan="4" class="empty-state">Select a shard above</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <div style="margin-top:10px;display:flex;gap:10px;align-items:center">
+    <span id="docs-count" style="font-size:11px;color:var(--muted)"></span>
+    <button class="btn btn-secondary" style="width:auto;padding:5px 14px;font-size:12px;margin-top:0" id="prev-page" onclick="changePage(-1)">&#8249; Prev</button>
+    <span id="page-info" style="font-size:11px;color:var(--muted);min-width:60px;text-align:center"></span>
+    <button class="btn btn-secondary" style="width:auto;padding:5px 14px;font-size:12px;margin-top:0" id="next-page" onclick="changePage(1)">Next &#8250;</button>
+  </div>
+</div>
+
+<!-- ══════════ QUERY ══════════ -->
+<div id="pane-query" class="pane">
+  <div class="query-layout">
+    <div class="panel">
+      <div class="panel-head">Query knowledge graph</div>
+      <div class="panel-body">
+        <label>Question</label>
+        <textarea id="query-text" rows="5" placeholder="Ask anything about the indexed knowledge…"></textarea>
+        <div class="row" style="margin-top:12px">
+          <div>
+            <label>Shard</label>
+            <select id="query-shard"></select>
+          </div>
+          <div>
+            <label>Mode</label>
+            <select id="query-mode">
+              <option value="hybrid">Hybrid (recommended)</option>
+              <option value="local">Local</option>
+              <option value="global">Global</option>
+              <option value="naive">Naive (vector only)</option>
+            </select>
+          </div>
+        </div>
+        <button class="btn btn-primary" onclick="doQuery()" id="query-btn">
+          <span>&#x2728;</span> Query
+        </button>
+      </div>
+    </div>
+    <div style="display:flex;flex-direction:column;gap:14px">
+      <div class="panel">
+        <div class="panel-head" style="display:flex;justify-content:space-between;align-items:center">
+          <span>Response</span>
+          <span id="query-elapsed" style="font-size:11px;color:var(--muted)"></span>
+        </div>
+        <div class="panel-body">
+          <div class="query-response" id="query-response">
+            Response will appear here…
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ══════════ FOOTER ══════════ -->
+<footer>
+  <strong>OdyRAG</strong> — knowledge graph layer for the odyssai.eu stack<br>
+  Powered by <a href="https://github.com/HKUDS/LightRAG" target="_blank">LightRAG</a>
+  (HKUDS, MIT License) &mdash; UI &copy; 2026 odyssai.eu
+</footer>
+
+<div class="toast-container" id="toast-container"></div>
+
+<script>
+// ── Config ──────────────────────────────────────────────────────────────────
+const HOST = window.location.hostname;
+
+const SHARDS = [
+  { id: 'company', label: 'Company',  port: 8766, model: 'default',                    primary: true },
+  { id: 'shard1',  label: 'Shard 1',  port: 8768, model: 'telerag1 · qwen3-coder-30b' },
+  { id: 'shard2',  label: 'Shard 2',  port: 8769, model: 'telerag2 · qwen3-coder-30b' },
+  { id: 'shard3',  label: 'Shard 3',  port: 8770, model: 'telerag3 · qwen3-coder-30b' },
+  { id: 'shard4',  label: 'Shard 4',  port: 8771, model: 'tele-fast · qwen3-coder-30b' },
+];
+
+const ODYSSAI_URL = `http://${HOST}:8000`;
+
+// ── State ────────────────────────────────────────────────────────────────────
+let shardState = {};
+let docsPage = 1;
+let docsFilter = 'ALL';
+let refreshInterval = null;
+
+// ── Tab switching ────────────────────────────────────────────────────────────
+function showTab(name) {
+  document.querySelectorAll('.pane').forEach(p => p.classList.remove('active'));
+  document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+  document.getElementById(`pane-${name}`).classList.add('active');
+  event.currentTarget.classList.add('active');
+}
+
+// ── Toasts ───────────────────────────────────────────────────────────────────
+function toast(msg, type = 'inf') {
+  const el = document.createElement('div');
+  el.className = `toast toast-${type}`;
+  el.textContent = msg;
+  document.getElementById('toast-container').appendChild(el);
+  setTimeout(() => el.remove(), 4000);
+}
+
+// ── API helpers ──────────────────────────────────────────────────────────────
+function shardUrl(port) { return `http://${HOST}:${port}`; }
+
+async function safeFetch(url, opts = {}) {
+  try {
+    const r = await fetch(url, { ...opts, signal: AbortSignal.timeout(5000) });
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    return await r.json();
+  } catch { return null; }
+}
+
+// ── Shard Overview ────────────────────────────────────────────────────────────
+async function refreshShard(shard) {
+  const base = shardUrl(shard.port);
+  const [health, counts, pipeline] = await Promise.all([
+    safeFetch(`${base}/health`),
+    safeFetch(`${base}/documents/status_counts`),
+    safeFetch(`${base}/documents/pipeline_status`),
+  ]);
+
+  shardState[shard.id] = { health, counts, pipeline };
+  renderShardCard(shard, health, counts, pipeline);
+}
+
+function renderShardCard(shard, health, counts, pipeline) {
+  const el = document.getElementById(`card-${shard.id}`);
+  if (!el) return;
+
+  if (!health) {
+    el.querySelector('.badge').textContent = 'offline';
+    el.querySelector('.badge').className = 'badge badge-offline';
+    el.querySelector('.shard-model').textContent = '—';
+    el.querySelectorAll('.count-val').forEach(v => v.textContent = '—');
+    el.querySelector('.latest-msg').textContent = 'unreachable';
+    el.querySelector('.progress-fill').style.width = '0%';
+    el.classList.remove('busy');
+    return;
+  }
+
+  const busy = health.pipeline_busy;
+  el.classList.toggle('busy', busy);
+
+  const badge = el.querySelector('.badge');
+  badge.textContent = busy ? 'busy' : 'idle';
+  badge.className = `badge badge-${busy ? 'busy' : 'idle'}`;
+
+  const model = health.configuration?.llm_model || shard.model;
+  el.querySelector('.shard-model').textContent = model;
+
+  const c = counts || {};
+  const total    = (c.PROCESSED || 0) + (c.FAILED || 0) + (c.PENDING || 0) + (c.PROCESSING || 0) + (c.PREPROCESSED || 0);
+  const done     = c.PROCESSED || 0;
+  const pct      = total > 0 ? Math.round(done / total * 100) : 0;
+
+  el.querySelector('.c-pending .count-val').textContent    = (c.PENDING || 0) + (c.PREPROCESSED || 0);
+  el.querySelector('.c-processing .count-val').textContent = c.PROCESSING || 0;
+  el.querySelector('.c-processed .count-val').textContent  = c.PROCESSED  || 0;
+  el.querySelector('.c-failed .count-val').textContent     = c.FAILED     || 0;
+  el.querySelector('.progress-fill').style.width           = `${pct}%`;
+
+  const msgs = pipeline?.history_messages;
+  const latest = msgs && msgs.length ? msgs[msgs.length - 1] : (pipeline?.latest_message || '');
+  el.querySelector('.latest-msg').textContent = latest || 'idle';
+}
+
+function buildShardGrid() {
+  const grid = document.getElementById('shard-grid');
+  grid.innerHTML = SHARDS.map(s => `
+    <div class="shard-card" id="card-${s.id}">
+      <div class="shard-head">
+        <div class="shard-name">
+          ${s.primary ? '<span style="color:var(--accent3)">&#x2605;</span> ' : ''}${s.label}
+          <span class="shard-port">:${s.port}</span>
+        </div>
+        <span class="badge badge-idle">idle</span>
+      </div>
+      <div class="shard-body">
+        <div class="shard-model">${s.model}</div>
+        <div class="counts">
+          <div class="count-item c-pending">
+            <div class="count-val">—</div>
+            <div class="count-label">pending</div>
+          </div>
+          <div class="count-item c-processing">
+            <div class="count-val">—</div>
+            <div class="count-label">running</div>
+          </div>
+          <div class="count-item c-processed">
+            <div class="count-val">—</div>
+            <div class="count-label">done</div>
+          </div>
+          <div class="count-item c-failed">
+            <div class="count-val">—</div>
+            <div class="count-label">failed</div>
+          </div>
+        </div>
+        <div class="progress-bar"><div class="progress-fill" style="width:0%"></div></div>
+        <div class="latest-msg">connecting…</div>
+      </div>
+      <div class="shard-foot">
+        <button class="btn-shard" onclick="injectToShard('${s.id}')">&#x2BAD; Inject</button>
+        <button class="btn-shard" onclick="queryOnShard('${s.id}')">&#x2728; Query</button>
+        <button class="btn-shard danger" onclick="cancelPipeline(${s.port})">&#x25A0; Stop</button>
+        <button class="btn-shard" onclick="retryFailedOnShard(${s.port})">&#8635; Retry</button>
+      </div>
+    </div>
+  `).join('');
+}
+
+function injectToShard(id) {
+  const idx = SHARDS.findIndex(s => s.id === id);
+  if (idx >= 0) {
+    document.getElementById('inject-shard').selectedIndex = idx;
+    document.getElementById('upload-shard').selectedIndex = idx;
+  }
+  showTabByName('inject');
+  document.getElementById('inject-text').focus();
+}
+
+function queryOnShard(id) {
+  const idx = SHARDS.findIndex(s => s.id === id);
+  if (idx >= 0) document.getElementById('query-shard').selectedIndex = idx;
+  showTabByName('query');
+  document.getElementById('query-text').focus();
+}
+
+function showTabByName(name) {
+  document.querySelectorAll('.pane').forEach(p => p.classList.remove('active'));
+  document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+  document.getElementById(`pane-${name}`).classList.add('active');
+  document.querySelectorAll('.tab')[['overview','inject','documents','query'].indexOf(name)]?.classList.add('active');
+}
+
+// ── Global refresh ────────────────────────────────────────────────────────────
+async function refreshAll() {
+  document.getElementById('refresh-status').textContent = 'refreshing…';
+  await Promise.all(SHARDS.map(s => refreshShard(s)));
+  const now = new Date();
+  document.getElementById('refresh-status').textContent =
+    `updated ${now.getHours().toString().padStart(2,'0')}:${now.getMinutes().toString().padStart(2,'0')}:${now.getSeconds().toString().padStart(2,'0')}`;
+}
+
+// ── Inject ────────────────────────────────────────────────────────────────────
+async function doInjectText() {
+  const text = document.getElementById('inject-text').value.trim();
+  if (!text) return toast('Text is empty', 'err');
+  const idx = document.getElementById('inject-shard').selectedIndex;
+  const shard = SHARDS[idx];
+  const base = shardUrl(shard.port);
+  const r = await safeFetch(`${base}/documents/text`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ text }),
+  });
+  if (r) {
+    toast(`Queued on ${shard.label} — track: ${r.id || 'ok'}`, 'ok');
+    document.getElementById('inject-text').value = '';
+    refreshShard(shard);
+  } else {
+    toast(`Inject failed on ${shard.label}`, 'err');
+  }
+}
+
+async function uploadFile(file) {
+  if (!file) return;
+  document.getElementById('upload-zone').classList.remove('drag');
+  const idx = document.getElementById('upload-shard').selectedIndex;
+  const shard = SHARDS[idx];
+  const base = shardUrl(shard.port);
+  const fd = new FormData();
+  fd.append('file', file);
+  toast(`Uploading ${file.name} to ${shard.label}…`, 'inf');
+  const r = await safeFetch(`${base}/documents/upload`, { method: 'POST', body: fd });
+  if (r) {
+    toast(`${file.name} → ${r.status} (${shard.label})`, r.status === 'success' ? 'ok' : 'inf');
+    refreshShard(shard);
+  } else {
+    toast(`Upload failed`, 'err');
+  }
+}
+
+function dropFile(e) {
+  e.preventDefault();
+  document.getElementById('upload-zone').classList.remove('drag');
+  const file = e.dataTransfer.files[0];
+  if (file) uploadFile(file);
+}
+
+async function doScan() {
+  const idx = document.getElementById('upload-shard').selectedIndex;
+  const shard = SHARDS[idx];
+  const r = await safeFetch(`${shardUrl(shard.port)}/documents/scan`, { method: 'POST' });
+  if (r) toast(`Scan triggered on ${shard.label}`, 'ok');
+  else toast('Scan failed', 'err');
+}
+
+function openShardLogs() {
+  toast('SSH: tail -f ~/lightrag-alpha-ingest/logs/ingest-shard*.log', 'inf');
+}
+
+// ── Documents ─────────────────────────────────────────────────────────────────
+function setFilter(btn, status) {
+  docsFilter = status;
+  docsPage = 1;
+  document.querySelectorAll('.filter-btn').forEach(b => b.classList.remove('active'));
+  btn.classList.add('active');
+  loadDocs();
+}
+
+async function loadDocs() {
+  const idx = document.getElementById('docs-shard').selectedIndex;
+  const shard = SHARDS[idx];
+  const base = shardUrl(shard.port);
+
+  const body = {
+    page: docsPage,
+    page_size: 20,
+  };
+  if (docsFilter !== 'ALL') body.status_filter = docsFilter;
+
+  const r = await safeFetch(`${base}/documents/paginated`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+
+  const tbody = document.getElementById('docs-tbody');
+  if (!r) {
+    tbody.innerHTML = `<tr><td colspan="4" class="empty-state" style="color:var(--red)">Failed to load docs</td></tr>`;
+    return;
+  }
+
+  const docs = r.documents || [];
+  const pagination = r.pagination || {};
+  const total = pagination.total_count || docs.length;
+
+  if (!docs.length) {
+    tbody.innerHTML = `<tr><td colspan="4" class="empty-state">No documents</td></tr>`;
+    document.getElementById('docs-count').textContent = '';
+    document.getElementById('page-info').textContent = '';
+    return;
+  }
+
+  tbody.innerHTML = docs.map(d => {
+    const status = d.status || 'UNKNOWN';
+    const sc = status.toLowerCase().replace('preprocessed','preprocessed');
+    const preview = (d.content || d.metadata?.source || d.doc_id || '—').slice(0, 80);
+    const created = d.created_at ? new Date(d.created_at).toLocaleString() : '—';
+    return `<tr>
+      <td style="color:var(--muted);max-width:140px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${d.doc_id}">${(d.doc_id||'').slice(0,16)}…</td>
+      <td><span class="status-pill s-${sc}">${status}</span></td>
+      <td style="color:var(--muted);white-space:nowrap">${created}</td>
+      <td style="color:var(--text)">${preview}</td>
+    </tr>`;
+  }).join('');
+
+  const totalPages = Math.ceil(total / 20) || 1;
+  document.getElementById('docs-count').textContent = `${total} documents`;
+  document.getElementById('page-info').textContent = `${docsPage} / ${totalPages}`;
+  document.getElementById('prev-page').disabled = docsPage <= 1;
+  document.getElementById('next-page').disabled = docsPage >= totalPages;
+}
+
+function changePage(delta) {
+  docsPage = Math.max(1, docsPage + delta);
+  loadDocs();
+}
+
+async function retryFailed() {
+  const idx = document.getElementById('docs-shard').selectedIndex;
+  const shard = SHARDS[idx];
+  const r = await safeFetch(`${shardUrl(shard.port)}/documents/reprocess_failed`, { method: 'POST' });
+  if (r) { toast(`Reprocess triggered on ${shard.label}`, 'ok'); loadDocs(); }
+  else toast('Retry failed', 'err');
+}
+
+async function retryAllFailed() {
+  let ok = 0;
+  for (const s of SHARDS) {
+    const r = await safeFetch(`${shardUrl(s.port)}/documents/reprocess_failed`, { method: 'POST' });
+    if (r) ok++;
+  }
+  toast(`Retry triggered on ${ok}/${SHARDS.length} shards`, ok > 0 ? 'ok' : 'err');
+  refreshAll();
+}
+
+async function cancelPipeline(port) {
+  const shard = SHARDS.find(s => s.port === port);
+  const r = await safeFetch(`${shardUrl(port)}/documents/cancel_pipeline`, { method: 'POST' });
+  if (r) toast(`Pipeline cancelled on ${shard?.label || port}`, 'ok');
+  else toast('Cancel failed', 'err');
+  setTimeout(refreshAll, 500);
+}
+
+async function cancelAllPipelines() {
+  let ok = 0;
+  for (const s of SHARDS) {
+    const r = await safeFetch(`${shardUrl(s.port)}/documents/cancel_pipeline`, { method: 'POST' });
+    if (r) ok++;
+  }
+  toast(`Pipelines cancelled on ${ok}/${SHARDS.length} shards`, ok > 0 ? 'ok' : 'err');
+  setTimeout(refreshAll, 500);
+}
+
+async function retryFailedOnShard(port) {
+  const shard = SHARDS.find(s => s.port === port);
+  const r = await safeFetch(`${shardUrl(port)}/documents/reprocess_failed`, { method: 'POST' });
+  if (r) { toast(`Retry triggered on ${shard?.label}`, 'ok'); refreshShard(shard); }
+  else toast('Retry failed', 'err');
+}
+
+// ── Query ─────────────────────────────────────────────────────────────────────
+async function doQuery() {
+  const q = document.getElementById('query-text').value.trim();
+  if (!q) return toast('Query is empty', 'err');
+  const idx = document.getElementById('query-shard').selectedIndex;
+  const shard = SHARDS[idx];
+  const mode = document.getElementById('query-mode').value;
+  const btn = document.getElementById('query-btn');
+  const resp = document.getElementById('query-response');
+
+  btn.innerHTML = '<div class="spinner"></div> Querying…';
+  btn.disabled = true;
+  resp.textContent = '…';
+  document.getElementById('query-elapsed').textContent = '';
+
+  const t0 = Date.now();
+  const r = await safeFetch(`${shardUrl(shard.port)}/query`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ query: q, mode, only_need_context: false }),
+  });
+
+  const elapsed = ((Date.now() - t0) / 1000).toFixed(1);
+  document.getElementById('query-elapsed').textContent = `${elapsed}s`;
+
+  btn.innerHTML = '<span>&#x2728;</span> Query';
+  btn.disabled = false;
+
+  if (r) {
+    resp.textContent = r.response || r.answer || JSON.stringify(r, null, 2);
+  } else {
+    resp.style.color = 'var(--red)';
+    resp.textContent = 'Query failed — is the shard running and the graph built?';
+    setTimeout(() => { resp.style.color = ''; }, 3000);
+  }
+}
+
+// ── Selects population ───────────────────────────────────────────────────────
+function populateSelects() {
+  const opts = SHARDS.map((s, i) =>
+    `<option value="${i}">${s.label} (:${s.port})</option>`
+  ).join('');
+  ['inject-shard', 'upload-shard', 'docs-shard', 'query-shard'].forEach(id => {
+    const el = document.getElementById(id);
+    if (el) el.innerHTML = opts;
+  });
+  // query defaults to company
+  document.getElementById('query-shard').selectedIndex = 0;
+}
+
+// ── Init ──────────────────────────────────────────────────────────────────────
+buildShardGrid();
+populateSelects();
+refreshAll();
+
+refreshInterval = setInterval(refreshAll, 5000);
+
+// Cleanup on unload
+window.addEventListener('beforeunload', () => clearInterval(refreshInterval));
+</script>
+</body>
+</html>

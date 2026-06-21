@@ -275,6 +275,7 @@ def set_enable_thinking_default(value: bool) -> None:
         settings["enable_thinking_default"] = bool(value)
         cfg["settings"] = settings
 DASHBOARD_FILE = Path(os.environ.get("DASHBOARD_FILE", _HERE / "dashboard.html"))
+ODYRAG_FILE    = Path(os.environ.get("ODYRAG_FILE",    _HERE / "odyrag.html"))
 ICON_FILE = Path(os.environ.get("ICON_FILE", _HERE / "odysseus.png"))
 # User Guide Markdown source. Tries env override first, then a list of
 # plausible defaults so dev (repo `docs/user-guide/`) and container
@@ -3777,6 +3778,15 @@ async def dashboard():
 
 
 WALL_FILE = Path(os.environ.get("WALL_FILE", _HERE / "wall.html"))
+
+
+@app.get("/odyrag")
+async def odyrag():
+    """OdyRAG — knowledge graph management dashboard (LightRAG-based).
+    Served fresh per request so docker cp deploys without restart."""
+    if not ODYRAG_FILE.exists():
+        return HTMLResponse("<h1>odyrag.html missing</h1>", status_code=500)
+    return HTMLResponse(ODYRAG_FILE.read_text())
 
 
 @app.get("/wall")
