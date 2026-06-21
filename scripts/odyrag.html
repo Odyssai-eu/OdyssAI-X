@@ -1082,7 +1082,11 @@ async function loadGraph() {
     }
     for (const e of (g.edges || [])) {
       const key = `${e.source}|||${e.target}`;
-      if (!linkSet.has(key)) linkSet.set(key, { source: e.source, target: e.target });
+      if (!linkSet.has(key)) linkSet.set(key, {
+        source: e.source,
+        target: e.target,
+        desc:   e.properties?.description || '',
+      });
     }
   }
 
@@ -1102,6 +1106,14 @@ function renderGalaxy(nodes, links) {
   container.innerHTML = '';
   if (fg3d) { try { fg3d._destructor?.(); } catch {} fg3d = null; }
 
+  // Resolve a link's source node (string id before sim, object after) → its color,
+  // so edges glow in the colour of the entity they emanate from (galaxy filaments).
+  const byId = new Map(nodes.map(n => [n.id, n]));
+  const linkColorOf = l => {
+    const s = (l.source && typeof l.source === 'object') ? l.source : byId.get(l.source);
+    return entityColor(s?.type);
+  };
+
   fg3d = ForceGraph3D()(container)
     .backgroundColor('#000008')
     .width(container.clientWidth  || 900)
@@ -1120,12 +1132,19 @@ function renderGalaxy(nodes, links) {
     .nodeOpacity(0.92)
     .nodeRelSize(5)
     .nodeVal(n => n.val || 1)
-    .linkColor(() => 'rgba(1,200,255,0.1)')
-    .linkWidth(0.4)
+    .linkColor(linkColorOf)
+    .linkOpacity(0.5)
+    .linkWidth(0.9)
     .linkDirectionalParticles(2)
-    .linkDirectionalParticleWidth(1)
-    .linkDirectionalParticleColor(() => '#01c8ff')
-    .linkDirectionalParticleSpeed(0.005)
+    .linkDirectionalParticleWidth(1.6)
+    .linkDirectionalParticleColor(linkColorOf)
+    .linkDirectionalParticleSpeed(0.006)
+    .linkLabel(l => {
+      const s = (l.source && typeof l.source === 'object') ? l.source.id : l.source;
+      const t = (l.target && typeof l.target === 'object') ? l.target.id : l.target;
+      const d = l.desc ? `<div style="color:#ccc;font-size:10px;margin-top:3px;line-height:1.4">${l.desc.slice(0,140)}</div>` : '';
+      return `<div class="gtooltip"><b style="color:#01c8ff">${s}</b> &#8594; <b style="color:#01c8ff">${t}</b>${d}</div>`;
+    })
     .onNodeClick(n => {
       const d = 80;
       const r = 1 + d / Math.hypot(n.x || 1, n.y || 1, n.z || 1);
