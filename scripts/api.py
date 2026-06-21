@@ -6010,6 +6010,11 @@ async def list_models(include_unloaded: bool = False):
         data.append({
             "id": alias, "object": "model",
             "created": _now(), "owned_by": f"odyssai-{pool_name}",
+            # OpenAI-standard `root` = the concrete model the alias resolves to,
+            # so standard clients (and the dashboard) can show what `default`
+            # actually serves without reading our x_ extensions (#62). `id`
+            # stays the alias — routing on model="default" is unchanged.
+            "root": pool.model,
             "x_concrete": pool.model,
             "x_odyssai": alias_caps,
         })
@@ -6047,6 +6052,7 @@ async def list_models(include_unloaded: bool = False):
             data.append({
                 "id": cid, "object": "model",
                 "created": _now(), "owned_by": "odyssai-telemak",
+                "root": loaded[0],
                 "x_concrete": loaded[0],
                 "x_odyssai": {
                     "ready": True,
@@ -6068,6 +6074,7 @@ async def list_models(include_unloaded: bool = False):
                 data.append({
                     "id": f"{cid}:{short}", "object": "model",
                     "created": _now(), "owned_by": "odyssai-telemak",
+                    "root": upstream_model,
                     "x_concrete": upstream_model,
                     "x_odyssai": {
                         "ready": True,
@@ -6611,7 +6618,7 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
 #
 # Translates Anthropic Messages API to our OpenAI-style runner protocol so
 # Claude Code, Aider in Anthropic mode, and other Anthropic SDK clients can hit
-# the cluster directly. Borrowed/inspired by jundot/omlx.
+# the cluster directly.
 #
 # Coverage:
 #   - Body: model, max_tokens, system (str|blocks), messages, tools, stream
