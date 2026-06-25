@@ -6629,7 +6629,7 @@ async def coeos_resolve(req, request) -> str:
 
     k = (chosen, category or "?", fallback)
     _coeos_decisions[k] = _coeos_decisions.get(k, 0) + 1
-    return chosen
+    return chosen, (category or "")
 
 
 _TOOL_BLOCK_RE = [
@@ -6654,8 +6654,11 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
     # Coeos router (RFC #63): a virtual model id that picks a concrete candidate
     # and rewrites req.model, so the normal chain below (Telemak/cloud/local)
     # serves the chosen model. Resolved FIRST so no other branch short-circuits.
+    coeos_routed: Optional[str] = None     # clean id CoeOS routed to (for the response label)
+    coeos_category: Optional[str] = None
     if req.model and req.model.strip().lower() == COEOS_MODEL_ID:
-        req.model = await coeos_resolve(req, request)
+        coeos_routed, coeos_category = await coeos_resolve(req, request)
+        req.model = coeos_routed
     # 0. Telemak passthrough? If the model id matches a kind=telemak cluster,
     # proxy the request to that cluster's upstream Swift binary. Supports
     # both `cluster_id` (1-model back-compat) and `cluster_id:short_id`
@@ -6857,6 +6860,11 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
         }
         if session_meta:
             body["x_mlx_cluster"]["session"] = session_meta
+        if coeos_routed:
+            body["x_odyssai_routed"] = {"router": COEOS_DISPLAY_ID,
+                                        "routed_to": coeos_routed,
+                                        "category": coeos_category,
+                                        "concrete": model_id}
         return JSONResponse(body)
 
     async def stream() -> AsyncIterator[bytes]:
@@ -6875,6 +6883,11 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
             first = {"id": completion_id, "object": "chat.completion.chunk",
                      "created": created, "model": model_id,
                      "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}]}
+            if coeos_routed:
+                first["x_odyssai_routed"] = {"router": COEOS_DISPLAY_ID,
+                                             "routed_to": coeos_routed,
+                                             "category": coeos_category,
+                                             "concrete": model_id}
             yield f"data: {json.dumps(first)}\n\n".encode()
             # Per-stream <think>…</think> wire filter. Decision is shared
             # with the Telemak proxy via _should_filter_think so a model
