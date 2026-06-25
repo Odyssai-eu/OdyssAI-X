@@ -2176,7 +2176,9 @@ function renderSettingsCoeos() {
   // Use the SAME servable list as the Endpoints tab (live /v1/models): all
   // published models — local pools (Argo …), Telemak clusters, and cloud —
   // with friendly "ClusterLabel — family" labels and the real routing id.
-  const entries = (state.endpoint_models || []).map(m => ({ id: m.id, label: endpointModelLabel(m) }));
+  const entries = (state.endpoint_models || [])
+    .filter(m => m.id !== COEOS_PUBLIC_ID)  // don't let CoeOS route to itself
+    .map(m => ({ id: m.id, label: endpointModelLabel(m) }));
   // Keep a bound model visible even if it unloaded since (id not in live list).
   Object.values(cm).filter(Boolean).forEach(v => {
     if (!entries.some(e => e.id === v)) entries.push({ id: v, label: v + " (not loaded)" });
