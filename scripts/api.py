@@ -5493,6 +5493,60 @@ async def admin_settings_update(req: ServerSettingsUpdate):
     return await admin_settings_get()
 
 
+# ── Coeos router config (RFC #63) ─────────────────────────────────────────────
+
+class CoeosConfig(BaseModel):
+    enabled: Optional[bool] = None
+    candidate_models: Optional[list[str]] = None  # 3-4 model ids
+    routing_instruction: Optional[str] = None      # JSON string, edited like a system prompt
+    cold_boot_autoload: Optional[bool] = None
+
+
+@app.get("/admin/coeos")
+async def admin_coeos_get():
+    return get_coeos_config()
+
+
+@app.get("/admin/coeos/available-models")
+async def admin_coeos_available_models():
+    return {"data": list_routable_model_ids()}
+
+
+@app.get("/admin/coeos/decisions")
+async def admin_coeos_decisions():
+    """Routing decision counts (model × phase × fallback) for operator visibility."""
+    return {"decisions": [
+        {"model": k[0], "phase": k[1], "fallback": k[2], "count": v}
+        for k, v in sorted(_coeos_decisions.items(), key=lambda kv: -kv[1])]}
+
+
+@app.put("/admin/coeos")
+async def admin_coeos_update(req: CoeosConfig):
+    if req.candidate_models is not None:
+        if any(m and m.strip().lower() == COEOS_MODEL_ID for m in req.candidate_models):
+            raise HTTPException(400, detail={"error": "reserved_id",
+                "message": "'coeos' is the router's own id and can't be a candidate."})
+    if req.routing_instruction is not None and req.routing_instruction.strip():
+        try:
+            json.loads(req.routing_instruction)
+        except Exception as e:
+            raise HTTPException(400, detail={"error": "bad_json",
+                "message": f"routing_instruction is not valid JSON: {e}"})
+    with _cluster_config_txn() as cfg:
+        c = cfg.get("coeos_config") or {}
+        if req.enabled is not None:
+            c["enabled"] = bool(req.enabled)
+        if req.candidate_models is not None:
+            c["candidate_models"] = req.candidate_models
+        if req.routing_instruction is not None:
+            c["routing_instruction"] = req.routing_instruction
+        if req.cold_boot_autoload is not None:
+            c["cold_boot_autoload"] = bool(req.cold_boot_autoload)
+        cfg["coeos_config"] = c
+    _coeos_instr_cache.clear()  # force re-parse on next request
+    return get_coeos_config()
+
+
 # Provider templates — preset configs for common upstreams. The dashboard
 # "Add provider" form offers these as a dropdown so a user can pick e.g.
 # "Anthropic direct" and get api_base + protocol + api_key_env pre-filled.
@@ -6069,6 +6123,18 @@ async def list_models(include_unloaded: bool = False):
     for cid, alias, pool in list_all_pools():
         await _push_loaded(pool, cid, alias)
 
+    # Coeos router: advertise the virtual `coeos` id when enabled (agents target
+    # it). It's not a pool — it resolves to a candidate at request time (#63).
+    _coeos_cfg = get_coeos_config()
+    if _coeos_cfg.get("enabled") and _coeos_cfg.get("candidate_models"):
+        data.append({
+            "id": COEOS_MODEL_ID, "object": "model",
+            "created": _now(), "owned_by": "odyssai-coeos",
+            "root": COEOS_MODEL_ID, "x_concrete": COEOS_MODEL_ID,
+            "x_odyssai": {"ready": True, "kind": "router",
+                          "candidates": _coeos_cfg.get("candidate_models")},
+        })
+
     # kind=telemak clusters: query the upstream's /v1/models. Multi-model
     # routing (V1):
     #   - 1 model loaded → emit `cluster_id` (back-compat).
@@ -6297,6 +6363,205 @@ def _route_pool(model: Optional[str]) -> Optional[RunnerPool]:
     return None
 
 
+# ──────────────────────────────────────────────────────────────────────────────
+# Coeos — smart LLM-router (RFC OdyssAI-X#63). A virtual model id `coeos` that
+# reads the request, picks the best candidate via a JSON routing instruction
+# (deterministic rules first, a light LLM only when ambiguous AND already hot),
+# rewrites req.model, and lets the normal routing chain serve it. For AGENTS
+# (Omnigent/Cline/Aider/Hermes), routing PER PHASE. Config lives in
+# cluster-config.json["coeos_config"]. Plan reviewed (grill + MiniMax, 2 rounds).
+# ──────────────────────────────────────────────────────────────────────────────
+import re as _coeos_re
+
+COEOS_MODEL_ID = "coeos"
+
+# Tool names signalling an "act/code" phase across known agent frameworks.
+_COEOS_ACT_TOOL_RE = _coeos_re.compile(
+    r"\b(write|edit|str_replace|apply|replace_in_file|search_replace|create_file|"
+    r"insert_edit|apply_patch|run_command|execute_command|write_to_file)\b",
+    _coeos_re.IGNORECASE)
+_COEOS_PLAN_HINT_RE = _coeos_re.compile(
+    r"\b(architect|plan|planner|design|reason|think step)\b", _coeos_re.IGNORECASE)
+
+# Per-(model, phase, fallback) decision counter — operator visibility.
+_coeos_decisions: dict[tuple, int] = {}
+# Parsed-instruction memo keyed by the raw JSON string (rides the config TTL).
+_coeos_instr_cache: dict[str, dict] = {}
+
+
+def get_coeos_config() -> dict:
+    cfg = _load_cluster_config()
+    return cfg.get("coeos_config") or {}
+
+
+def _coeos_parse_instruction(raw: str) -> dict:
+    """Parse + memoize the routing_instruction JSON (keyed by raw string)."""
+    if not raw:
+        return {}
+    cached = _coeos_instr_cache.get(raw)
+    if cached is not None:
+        return cached
+    try:
+        parsed = json.loads(raw)
+        if not isinstance(parsed, dict):
+            parsed = {}
+    except Exception:
+        parsed = {}
+    if len(_coeos_instr_cache) > 16:
+        _coeos_instr_cache.clear()
+    _coeos_instr_cache[raw] = parsed
+    return parsed
+
+
+def _coeos_hot_model_ids() -> set:
+    """Ids servable RIGHT NOW: loaded local pools + always-ready cloud aliases.
+    Read-only — no pool instantiation."""
+    hot: set = set()
+    for cid, alias, _p in list_all_pools():
+        hot.add(alias if alias != DEFAULT_ALIAS else cid)
+    if _pool is not None:
+        hot.add("nautilus")
+    try:
+        for e in _cloud_entries_for_v1_models():
+            hot.add(e["id"])
+    except Exception:
+        pass
+    return hot
+
+
+def list_routable_model_ids() -> list:
+    """Ids a client can pick as Coeos candidates (hot local + cloud)."""
+    return sorted(_coeos_hot_model_ids())
+
+
+def _coeos_infer_phase(req, request) -> str:
+    """Phase for routing. Explicit `x-coeos-phase` header wins (Omnigent); else
+    infer from the request SHAPE (tools / system prompt / code fence) — not just
+    the last message. Returns plan | act | code | chat."""
+    hdr = (request.headers.get("x-coeos-phase") or "").strip().lower()
+    if hdr in ("plan", "act", "code", "chat"):
+        return hdr
+    if req.tools:
+        for t in req.tools:
+            name = ((t.get("function") or {}).get("name") or t.get("name") or "")
+            if _COEOS_ACT_TOOL_RE.search(str(name)):
+                return "code"
+    sys_txt = " ".join(
+        (m.content if isinstance(m.content, str) else "")
+        for m in (req.messages or []) if m.role == "system")
+    if _COEOS_PLAN_HINT_RE.search(sys_txt):
+        return "plan"
+    last = next((m for m in reversed(req.messages or []) if m.role == "user"), None)
+    if last and isinstance(last.content, str) and "```" in last.content:
+        return "code"
+    return "chat"
+
+
+def _coeos_signals(req, phase: str) -> dict:
+    last = next((m for m in reversed(req.messages or []) if m.role == "user"), None)
+    txt = last.content if (last and isinstance(last.content, str)) else ""
+    fr = bool(_coeos_re.search(
+        r"[àâçéèêëîïôûùüÿœ]| le | la | les | une | des | qui | pour ", txt.lower()))
+    mt = req.max_tokens or 512
+    length = "long" if mt >= 2000 else ("medium" if mt >= 700 else "short")
+    return {"phase": phase, "lang": "fr" if fr else "en", "length": length,
+            "tools_present": bool(req.tools)}
+
+
+def _coeos_match_rules(instr: dict, signals: dict):
+    """First rule whose `when` is a subset of signals wins."""
+    for rule in (instr.get("rules") or []):
+        when = rule.get("when") or {}
+        if when and all(signals.get(k) == v for k, v in when.items()):
+            return rule.get("model")
+    return None
+
+
+async def _coeos_llm_decide(decider_pool, instr, candidates, signals, messages):
+    """Ask the (already-hot) decider model to pick a candidate. Bounded, cheap."""
+    last_content = ""
+    if messages:
+        c = messages[-1].get("content")
+        if isinstance(c, str):
+            last_content = c[:600]
+    prompt = (
+        f"{instr.get('llm_instruction', 'Pick the single best model for this request.')}\n\n"
+        f"Candidates: {candidates}\n"
+        f"Signals: {json.dumps(signals)}\n"
+        f"Latest user message (truncated): {last_content}\n\n"
+        f"Reply with ONLY one model id from Candidates, nothing else.")
+    buf = ""
+    try:
+        async for ev in decider_pool.submit(None, 24, False,
+                                             messages=[{"role": "user", "content": prompt}]):
+            if ev.get("event") == "token":
+                buf += ev.get("text", "")
+            elif ev.get("event") == "done":
+                break
+    except Exception as e:
+        sys.stderr.write(f"[coeos] decider LLM error: {e}\n")
+        return None
+    pick = buf.strip().split()[0].strip('"\'`,.') if buf.strip() else ""
+    return pick or None
+
+
+async def coeos_resolve(req, request) -> str:
+    """Resolve `coeos` → a concrete model id. Hybrid decider: rules first, a
+    light LLM only when ambiguous AND the decider is already hot. Falls back to
+    a hot candidate (never routes to a cold model); 503 if nothing is hot
+    (unless cold_boot_autoload)."""
+    cfg = get_coeos_config()
+    if not cfg.get("enabled"):
+        raise HTTPException(status_code=400, detail={
+            "error": "coeos_disabled",
+            "message": "Coeos router is disabled. Enable it in Settings → Coeos."})
+    instr = _coeos_parse_instruction(cfg.get("routing_instruction") or "{}")
+    candidates = [c for c in (cfg.get("candidate_models") or [])
+                  if c and c.lower() != COEOS_MODEL_ID]
+    default_model = instr.get("default_model") or (candidates[0] if candidates else None)
+    hot = _coeos_hot_model_ids()
+    phase = _coeos_infer_phase(req, request)
+    signals = _coeos_signals(req, phase)
+
+    # 1. Deterministic rules.
+    chosen = _coeos_match_rules(instr, signals)
+    # 2. LLM fallback — only if ambiguous AND the configured decider is hot.
+    if not chosen and instr.get("llm_fallback"):
+        decider_id = instr.get("decider_model") or default_model
+        decider_pool = _route_pool(decider_id) if decider_id else None
+        if decider_pool is not None and decider_pool.alive_count() > 0:
+            messages = [m.model_dump(exclude_none=True) for m in req.messages]
+            chosen = await _coeos_llm_decide(decider_pool, instr, candidates, signals, messages)
+    # 3. Validate ∈ candidates; else default.
+    if chosen not in candidates:
+        chosen = default_model
+
+    def _is_hot(mid) -> bool:
+        return bool(mid) and (mid in hot or find_cloud_alias(mid) is not None)
+
+    fallback = False
+    # 4. Never route to a cold model — fall back to a hot candidate + log.
+    if not _is_hot(chosen):
+        hot_candidates = [c for c in candidates if _is_hot(c)]
+        if hot_candidates:
+            sub = hot_candidates[0]
+            sys.stderr.write(f"[coeos] {chosen!r} cold → fallback to hot {sub!r} (phase={phase})\n")
+            chosen, fallback = sub, True
+        elif cfg.get("cold_boot_autoload") and default_model:
+            sys.stderr.write(f"[coeos] cold boot — routing to {default_model!r} (autoload on)\n")
+            chosen, fallback = default_model, True
+        else:
+            raise HTTPException(status_code=503, detail={
+                "error": "coeos_no_warm_candidate",
+                "message": "Coeos has no warm candidate to route to. Load one of "
+                           "the candidates, or enable cold_boot_autoload.",
+                "candidates": candidates})
+
+    k = (chosen, phase, fallback)
+    _coeos_decisions[k] = _coeos_decisions.get(k, 0) + 1
+    return chosen
+
+
 _TOOL_BLOCK_RE = [
     __import__("re").compile(r"<tool_call>.*?</tool_call>", __import__("re").DOTALL),
     __import__("re").compile(r"<tool_calls>.*?</tool_calls>", __import__("re").DOTALL),
@@ -6316,6 +6581,11 @@ def _strip_tool_calls_from_text(text: str) -> str:
 
 @app.post("/v1/chat/completions")
 async def chat_completions(req: ChatCompletionRequest, request: Request):
+    # Coeos router (RFC #63): a virtual model id that picks a concrete candidate
+    # and rewrites req.model, so the normal chain below (Telemak/cloud/local)
+    # serves the chosen model. Resolved FIRST so no other branch short-circuits.
+    if req.model and req.model.strip().lower() == COEOS_MODEL_ID:
+        req.model = await coeos_resolve(req, request)
     # 0. Telemak passthrough? If the model id matches a kind=telemak cluster,
     # proxy the request to that cluster's upstream Swift binary. Supports
     # both `cluster_id` (1-model back-compat) and `cluster_id:short_id`

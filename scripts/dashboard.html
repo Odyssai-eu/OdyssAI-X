@@ -1199,7 +1199,8 @@ async function refreshAll() {
 
     // Global (non-cluster-scoped) endpoints — fetched in parallel too.
     const [metrics, sessions, telemetry, runs, syncJobs, inventory,
-           providers, crew, discoveryState, serverSettings, versionInfo, providerTemplates] = await Promise.all([
+           providers, crew, discoveryState, serverSettings, versionInfo, providerTemplates,
+           coeosConfig, coeosModels] = await Promise.all([
       getJson("/admin/metrics").catch(() => ({ data: [] })),
       getJson("/admin/sessions").catch(() => ({ data: [], count: 0 })),
       getJson("/admin/nodes/telemetry").catch(() => null),
@@ -1212,8 +1213,12 @@ async function refreshAll() {
       getJson("/admin/settings").catch(() => null),
       getJson("/admin/version").catch(() => null),
       getJson("/admin/providers/templates").catch(() => ({ data: [] })),
+      getJson("/admin/coeos").catch(() => ({})),
+      getJson("/admin/coeos/available-models").catch(() => ({ data: [] })),
     ]);
     if (serverSettings) state.server_settings = serverSettings;
+    state.coeos = coeosConfig || {};
+    state.coeos_available = coeosModels?.data || [];
     if (versionInfo) state.version_info = versionInfo;
     if (providerTemplates?.data) state.provider_templates = providerTemplates.data;
     state.cloud_providers = providers?.data || [];
@@ -1605,6 +1610,7 @@ const SETTINGS_TABS = [
   { id: "models",     label: "Models" },
   { id: "huggingface", label: "Hugging Face" },
   { id: "providers",  label: "Cloud providers" },
+  { id: "coeos",      label: "Coeos" },
   { id: "crew",       label: "Crew" },
   { id: "endpoints",  label: "Endpoints" },
   { id: "userguide",  label: "User Guide" },
@@ -1652,6 +1658,7 @@ function renderSettingsBody(tab) {
   if (tab === "models")    return renderSettingsModels();
   if (tab === "huggingface") return renderSettingsHuggingFace();
   if (tab === "providers") return renderSettingsProviders();
+  if (tab === "coeos")     return renderSettingsCoeos();
   if (tab === "crew")      return renderSettingsCrew();
   if (tab === "endpoints") return renderSettingsEndpoints();
   if (tab === "userguide") return renderSettingsUserGuide();
@@ -2144,6 +2151,92 @@ function renderSettingsGeneral() {
         <div style="display:flex;gap:10px">
           <button class="btn btn-sm" style="color:var(--rust);border-color:var(--line)" data-act="server-restart">${Icon.refresh}<span>Restart server</span></button>
           <div style="font-size:11px;color:var(--ink-3);align-self:center">Reloads cluster-config.json, re-runs startup. Active streams drop.</div>
+        </div>
+      </div>
+    </div>
+  `;
+}
+
+// ─── Settings: Coeos (smart LLM-router, RFC #63) ───────────────────
+function renderSettingsCoeos() {
+  const c = state.coeos || {};
+  const enabled = c.enabled === true;
+  const autoload = c.cold_boot_autoload === true;
+  const candidates = c.candidate_models || [];
+  const available = state.coeos_available || [];
+  const instr = c.routing_instruction || "";
+  // Union of available + any candidate already configured but not currently hot.
+  const pickable = Array.from(new Set([...available, ...candidates])).sort();
+  const SAMPLE = JSON.stringify({
+    decider_model: candidates[0] || "<id>",
+    default_model: candidates[0] || "<id>",
+    llm_fallback: true,
+    llm_instruction: "Pick the single best model for this request. Reply with ONLY the model id.",
+    rules: [
+      { when: { phase: "code" }, model: candidates[0] || "<coder>" },
+      { when: { phase: "plan" }, model: candidates[1] || "<reasoner>" },
+      { when: { lang: "fr", length: "long" }, model: candidates[2] || "<GLM>" },
+    ],
+  }, null, 2);
+  return `
+    <div style="display:flex;flex-direction:column;gap:20px">
+      <div style="background:var(--surface);border:1px solid var(--line);border-radius:12px;padding:18px;display:flex;flex-direction:column;gap:14px">
+        <div>
+          <div class="field-label">Coeos · smart LLM-router</div>
+          <div style="font-size:12px;color:var(--ink-2);margin-top:2px">Exposes a virtual <span class="mono">coeos</span> model. Agents (Omnigent / Cline / Aider / Hermes) call it; it picks the best candidate per phase via the routing instruction below, then relays. Not for chat — Companion keeps its own router.</div>
+        </div>
+        <div style="display:flex;align-items:center;justify-content:space-between;gap:14px;padding:10px 12px;background:var(--surface-2);border-radius:8px">
+          <div>
+            <div style="font-size:13px;font-weight:600">Enabled</div>
+            <div style="font-size:11px;color:var(--ink-3);margin-top:2px">When on, <span class="mono">coeos</span> appears in <span class="mono">/v1/models</span> and routes requests.</div>
+          </div>
+          <label style="display:inline-flex;align-items:center;gap:8px;cursor:pointer">
+            <input type="checkbox" data-act="coeos-toggle-enabled" ${enabled?"checked":""}/>
+            <span style="font-family:var(--font-mono);font-size:12px;color:${enabled?'var(--blue-deep)':'var(--ink-3)'}">${enabled?'ON':'OFF'}</span>
+          </label>
+        </div>
+        <div style="display:flex;align-items:center;justify-content:space-between;gap:14px;padding:10px 12px;background:var(--surface-2);border-radius:8px">
+          <div>
+            <div style="font-size:13px;font-weight:600">Cold-boot autoload</div>
+            <div style="font-size:11px;color:var(--ink-3);margin-top:2px">If no candidate is warm, route to <span class="mono">default_model</span> anyway (triggers a load) instead of returning 503. Off = strict (503 until a candidate is loaded).</div>
+          </div>
+          <label style="display:inline-flex;align-items:center;gap:8px;cursor:pointer">
+            <input type="checkbox" data-act="coeos-toggle-autoload" ${autoload?"checked":""}/>
+            <span style="font-family:var(--font-mono);font-size:12px;color:${autoload?'var(--blue-deep)':'var(--ink-3)'}">${autoload?'ON':'OFF'}</span>
+          </label>
+        </div>
+      </div>
+
+      <div style="background:var(--surface);border:1px solid var(--line);border-radius:12px;padding:18px;display:flex;flex-direction:column;gap:14px">
+        <div>
+          <div class="field-label">Candidate models (3–4)</div>
+          <div style="font-size:12px;color:var(--ink-2);margin-top:2px">The models Coeos can route to. Listed = currently routable (hot local pools + cloud aliases). Load a model first if it's missing.</div>
+        </div>
+        <div style="display:flex;flex-direction:column;gap:6px">
+          ${pickable.length ? pickable.map(m => `
+            <label style="display:flex;align-items:center;gap:10px;padding:8px 12px;background:var(--surface-2);border-radius:8px;cursor:pointer">
+              <input type="checkbox" data-act="coeos-toggle-candidate" data-v="${escapeHtml(m)}" ${candidates.includes(m)?"checked":""}/>
+              <span class="mono" style="font-size:12px">${escapeHtml(m)}</span>
+              ${available.includes(m) ? "" : `<span style="font-size:10px;color:var(--rust)">(not hot)</span>`}
+            </label>`).join("")
+          : `<div style="font-size:12px;color:var(--ink-3)">No routable models — load a pool or publish a cloud provider first.</div>`}
+        </div>
+      </div>
+
+      <div style="background:var(--surface);border:1px solid var(--line);border-radius:12px;padding:18px;display:flex;flex-direction:column;gap:14px">
+        <div>
+          <div class="field-label">Routing instruction · JSON</div>
+          <div style="font-size:12px;color:var(--ink-2);margin-top:2px">
+            Decision table edited like a system prompt. <span class="mono">rules</span> match first (each <span class="mono">when</span> is a subset of the request signals: <span class="mono">phase</span> plan/act/code/chat, <span class="mono">lang</span> fr/en, <span class="mono">length</span> short/medium/long, <span class="mono">tools_present</span>). If none match and <span class="mono">llm_fallback</span>, the (already-hot) <span class="mono">decider_model</span> picks. Invalid → <span class="mono">default_model</span>.
+          </div>
+        </div>
+        <textarea class="ce-input mono" rows="14" placeholder='${escapeHtml(SAMPLE)}' data-act="coeos-set-instruction" style="width:100%;resize:vertical;font-size:11px;line-height:1.4;white-space:pre">${escapeHtml(instr)}</textarea>
+        <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">
+          <button class="btn btn-sm" data-act="coeos-import">${Icon.upload || ""}<span>Import JSON…</span></button>
+          <button class="btn btn-sm" data-act="coeos-export">${Icon.download || ""}<span>Export JSON</span></button>
+          <button class="btn btn-sm" data-act="coeos-insert-sample"><span>Insert sample</span></button>
+          <button class="btn btn-sm" style="background:var(--blue);color:white;border-color:var(--blue)" data-act="coeos-save"><span>Save</span></button>
+          <input type="file" accept="application/json,.json" data-act="coeos-import-file" style="display:none"/>
         </div>
       </div>
     </div>
@@ -6054,6 +6147,101 @@ async function handleAct(e) {
     } catch (e) {
       toast(`Prewarm failed: ${e.message}`, "err");
     }
+    return;
+  }
+  // ── Coeos router (RFC #63) ──────────────────────────────────────
+  if (act === "coeos-toggle-enabled" || act === "coeos-toggle-autoload") {
+    const field = act === "coeos-toggle-enabled" ? "enabled" : "cold_boot_autoload";
+    try {
+      const r = await fetch("/admin/coeos", { method: "PUT",
+        headers: { "content-type": "application/json", ...authHeaders() },
+        body: JSON.stringify({ [field]: el.checked }) });
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      state.coeos = await r.json();
+      toast(`Coeos ${field} = ${el.checked ? "on" : "off"}`, "ok");
+    } catch (e) { toast(`Save failed: ${e.message}`, "err"); }
+    render();
+    return;
+  }
+  if (act === "coeos-toggle-candidate") {
+    const cur = new Set((state.coeos && state.coeos.candidate_models) || []);
+    if (el.checked) cur.add(v); else cur.delete(v);
+    const list = Array.from(cur);
+    try {
+      const r = await fetch("/admin/coeos", { method: "PUT",
+        headers: { "content-type": "application/json", ...authHeaders() },
+        body: JSON.stringify({ candidate_models: list }) });
+      if (!r.ok) { const t = await r.text(); throw new Error(t.slice(0, 200)); }
+      state.coeos = await r.json();
+      toast(`Candidates: ${list.length}`, "ok");
+    } catch (e) { toast(`Save failed: ${e.message}`, "err"); }
+    render();
+    return;
+  }
+  if (act === "coeos-set-instruction") {
+    // Stash locally on every keystroke; explicit Save validates + persists.
+    state.coeos = { ...(state.coeos || {}), routing_instruction: el.value || "" };
+    return;
+  }
+  if (act === "coeos-insert-sample") {
+    const cands = (state.coeos && state.coeos.candidate_models) || [];
+    const sample = JSON.stringify({
+      decider_model: cands[0] || "",
+      default_model: cands[0] || "",
+      llm_fallback: true,
+      llm_instruction: "Pick the single best model for this request. Reply with ONLY the model id.",
+      rules: [
+        { when: { phase: "code" }, model: cands[0] || "" },
+        { when: { phase: "plan" }, model: cands[1] || cands[0] || "" },
+        { when: { lang: "fr", length: "long" }, model: cands[2] || cands[0] || "" },
+      ],
+    }, null, 2);
+    state.coeos = { ...(state.coeos || {}), routing_instruction: sample };
+    render();
+    return;
+  }
+  if (act === "coeos-save") {
+    const txt = (state.coeos && state.coeos.routing_instruction) || "";
+    if (txt.trim()) {
+      try { JSON.parse(txt); }
+      catch (e) { toast(`Invalid JSON: ${e.message}`, "err"); return; }
+    }
+    try {
+      const r = await fetch("/admin/coeos", { method: "PUT",
+        headers: { "content-type": "application/json", ...authHeaders() },
+        body: JSON.stringify({ routing_instruction: txt }) });
+      if (!r.ok) { const t = await r.text(); throw new Error(t.slice(0, 200)); }
+      state.coeos = await r.json();
+      toast("Routing instruction saved", "ok");
+    } catch (e) { toast(`Save failed: ${e.message}`, "err"); }
+    return;
+  }
+  if (act === "coeos-export") {
+    const txt = (state.coeos && state.coeos.routing_instruction) || "{}";
+    const blob = new Blob([txt], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url; a.download = "coeos-routing.json";
+    document.body.appendChild(a); a.click();
+    document.body.removeChild(a); URL.revokeObjectURL(url);
+    return;
+  }
+  if (act === "coeos-import") {
+    const inp = document.querySelector('[data-act="coeos-import-file"]');
+    if (inp) inp.click();
+    return;
+  }
+  if (act === "coeos-import-file") {
+    const file = el.files && el.files[0];
+    if (!file) return;
+    try {
+      const text = await file.text();
+      JSON.parse(text);  // validate before accepting
+      state.coeos = { ...(state.coeos || {}), routing_instruction: text };
+      render();
+      toast("Imported — review then Save", "ok");
+    } catch (e) { toast(`Import failed: ${e.message}`, "err"); }
+    el.value = "";  // allow re-importing the same file
     return;
   }
   if (act === "server-restart") {
