@@ -5497,14 +5497,16 @@ async def admin_settings_update(req: ServerSettingsUpdate):
 
 class CoeosConfig(BaseModel):
     enabled: Optional[bool] = None
-    candidate_models: Optional[list[str]] = None  # 3-4 model ids
+    category_models: Optional[dict] = None         # {category: model_id} for the 5 categories
     routing_instruction: Optional[str] = None      # JSON string, edited like a system prompt
     cold_boot_autoload: Optional[bool] = None
 
 
 @app.get("/admin/coeos")
 async def admin_coeos_get():
-    return get_coeos_config()
+    cfg = get_coeos_config()
+    cfg["_categories"] = COEOS_CATEGORIES  # so the dashboard renders the picker rows
+    return cfg
 
 
 @app.get("/admin/coeos/available-models")
@@ -5514,18 +5516,24 @@ async def admin_coeos_available_models():
 
 @app.get("/admin/coeos/decisions")
 async def admin_coeos_decisions():
-    """Routing decision counts (model × phase × fallback) for operator visibility."""
+    """Routing decision counts (model × category × fallback) for operator visibility."""
     return {"decisions": [
-        {"model": k[0], "phase": k[1], "fallback": k[2], "count": v}
+        {"model": k[0], "category": k[1], "fallback": k[2], "count": v}
         for k, v in sorted(_coeos_decisions.items(), key=lambda kv: -kv[1])]}
 
 
 @app.put("/admin/coeos")
 async def admin_coeos_update(req: CoeosConfig):
-    if req.candidate_models is not None:
-        if any(m and m.strip().lower() == COEOS_MODEL_ID for m in req.candidate_models):
+    if req.category_models is not None:
+        bad_keys = [k for k in req.category_models if k not in COEOS_CATEGORIES]
+        if bad_keys:
+            raise HTTPException(400, detail={"error": "bad_category",
+                "message": f"unknown categor{'ies' if len(bad_keys)>1 else 'y'}: {bad_keys}. "
+                           f"Allowed: {COEOS_CATEGORIES}"})
+        if any(v and str(v).strip().lower() == COEOS_MODEL_ID
+               for v in req.category_models.values()):
             raise HTTPException(400, detail={"error": "reserved_id",
-                "message": "'coeos' is the router's own id and can't be a candidate."})
+                "message": "'coeos' is the router's own id and can't be bound to a category."})
     if req.routing_instruction is not None and req.routing_instruction.strip():
         try:
             json.loads(req.routing_instruction)
@@ -5536,8 +5544,10 @@ async def admin_coeos_update(req: CoeosConfig):
         c = cfg.get("coeos_config") or {}
         if req.enabled is not None:
             c["enabled"] = bool(req.enabled)
-        if req.candidate_models is not None:
-            c["candidate_models"] = req.candidate_models
+        if req.category_models is not None:
+            # Keep only non-empty bindings for the known categories.
+            c["category_models"] = {k: v for k, v in req.category_models.items()
+                                    if k in COEOS_CATEGORIES and v}
         if req.routing_instruction is not None:
             c["routing_instruction"] = req.routing_instruction
         if req.cold_boot_autoload is not None:
@@ -6123,16 +6133,18 @@ async def list_models(include_unloaded: bool = False):
     for cid, alias, pool in list_all_pools():
         await _push_loaded(pool, cid, alias)
 
-    # Coeos router: advertise the virtual `coeos` id when enabled (agents target
-    # it). It's not a pool — it resolves to a candidate at request time (#63).
+    # CoeOS router: advertise the virtual `CoeOS` id when enabled (agents target
+    # it, and clients like Companion show it as an endpoint alongside Argo /
+    # Telemak). It's not a pool — it resolves to a category's model per request.
     _coeos_cfg = get_coeos_config()
-    if _coeos_cfg.get("enabled") and _coeos_cfg.get("candidate_models"):
+    _coeos_cat_models = _coeos_category_models(_coeos_cfg)
+    if _coeos_cfg.get("enabled") and _coeos_cat_models:
         data.append({
-            "id": COEOS_MODEL_ID, "object": "model",
+            "id": COEOS_DISPLAY_ID, "object": "model",
             "created": _now(), "owned_by": "odyssai-coeos",
-            "root": COEOS_MODEL_ID, "x_concrete": COEOS_MODEL_ID,
+            "root": COEOS_DISPLAY_ID, "x_concrete": COEOS_DISPLAY_ID,
             "x_odyssai": {"ready": True, "kind": "router",
-                          "candidates": _coeos_cfg.get("candidate_models")},
+                          "categories": _coeos_cat_models},
         })
 
     # kind=telemak clusters: query the upstream's /v1/models. Multi-model
@@ -6373,7 +6385,15 @@ def _route_pool(model: Optional[str]) -> Optional[RunnerPool]:
 # ──────────────────────────────────────────────────────────────────────────────
 import re as _coeos_re
 
-COEOS_MODEL_ID = "coeos"
+COEOS_MODEL_ID = "coeos"          # canonical id used for case-insensitive matching
+COEOS_DISPLAY_ID = "CoeOS"        # public id emitted in /v1/models (Sophie's spelling)
+
+# The 5 routing categories (Sophie). One published model is bound to each in the
+# dashboard; the decider classifies a request into one category, then resolves it.
+COEOS_CATEGORIES = ["writing", "planning", "coding", "fast_tools", "deep_analysis"]
+# Legacy x-coeos-phase header → category (so older agents still route).
+_COEOS_PHASE_TO_CATEGORY = {
+    "plan": "planning", "code": "coding", "act": "fast_tools", "chat": "writing"}
 
 # Tool names signalling an "act/code" phase across known agent frameworks.
 _COEOS_ACT_TOOL_RE = _coeos_re.compile(
@@ -6382,8 +6402,12 @@ _COEOS_ACT_TOOL_RE = _coeos_re.compile(
     _coeos_re.IGNORECASE)
 _COEOS_PLAN_HINT_RE = _coeos_re.compile(
     r"\b(architect|plan|planner|design|reason|think step)\b", _coeos_re.IGNORECASE)
+# Deep-analysis hints in the user text.
+_COEOS_DEEP_RE = _coeos_re.compile(
+    r"\b(analyse|analyze|debug|root cause|why does|prove|investigate|"
+    r"trade-?off|reason through|step by step|deep dive)\b", _coeos_re.IGNORECASE)
 
-# Per-(model, phase, fallback) decision counter — operator visibility.
+# Per-(model, category, fallback) decision counter — operator visibility.
 _coeos_decisions: dict[tuple, int] = {}
 # Parsed-instruction memo keyed by the raw JSON string (rides the config TTL).
 _coeos_instr_cache: dict[str, dict] = {}
@@ -6430,17 +6454,21 @@ def _coeos_hot_model_ids() -> set:
 
 
 def list_routable_model_ids() -> list:
-    """Ids a client can pick as Coeos candidates (hot local + cloud)."""
+    """Published model ids a client can bind to a Coeos category (hot local +
+    cloud) — the same set /v1/models advertises as servable."""
     return sorted(_coeos_hot_model_ids())
 
 
+def _coeos_category_models(cfg: dict) -> dict:
+    """category → model id, dropping empties and the reserved `coeos` id."""
+    cm = cfg.get("category_models") or {}
+    return {k: v for k, v in cm.items()
+            if k in COEOS_CATEGORIES and v and str(v).lower() != COEOS_MODEL_ID}
+
+
 def _coeos_infer_phase(req, request) -> str:
-    """Phase for routing. Explicit `x-coeos-phase` header wins (Omnigent); else
-    infer from the request SHAPE (tools / system prompt / code fence) — not just
-    the last message. Returns plan | act | code | chat."""
-    hdr = (request.headers.get("x-coeos-phase") or "").strip().lower()
-    if hdr in ("plan", "act", "code", "chat"):
-        return hdr
+    """Coarse phase signal from the request SHAPE (tools / system prompt / code
+    fence) — feeds the rule matcher. Returns plan | act | code | chat."""
     if req.tools:
         for t in req.tools:
             name = ((t.get("function") or {}).get("name") or t.get("name") or "")
@@ -6460,39 +6488,57 @@ def _coeos_infer_phase(req, request) -> str:
 def _coeos_signals(req, phase: str) -> dict:
     last = next((m for m in reversed(req.messages or []) if m.role == "user"), None)
     txt = last.content if (last and isinstance(last.content, str)) else ""
+    low = txt.lower()
     fr = bool(_coeos_re.search(
-        r"[àâçéèêëîïôûùüÿœ]| le | la | les | une | des | qui | pour ", txt.lower()))
+        r"[àâçéèêëîïôûùüÿœ]| le | la | les | une | des | qui | pour ", low))
     mt = req.max_tokens or 512
     length = "long" if mt >= 2000 else ("medium" if mt >= 700 else "short")
     return {"phase": phase, "lang": "fr" if fr else "en", "length": length,
-            "tools_present": bool(req.tools)}
+            "tools_present": bool(req.tools),
+            "has_code": "```" in txt,
+            "deep": bool(_COEOS_DEEP_RE.search(low))}
 
 
-def _coeos_match_rules(instr: dict, signals: dict):
-    """First rule whose `when` is a subset of signals wins."""
+def _coeos_header_category(request) -> Optional[str]:
+    """Explicit category from the agent. `x-coeos-category` wins (Omnigent);
+    legacy `x-coeos-phase` is mapped to a category for older agents."""
+    cat = (request.headers.get("x-coeos-category") or "").strip().lower()
+    if cat in COEOS_CATEGORIES:
+        return cat
+    phase = (request.headers.get("x-coeos-phase") or "").strip().lower()
+    return _COEOS_PHASE_TO_CATEGORY.get(phase)
+
+
+def _coeos_match_category(instr: dict, signals: dict) -> Optional[str]:
+    """First rule whose `when` is a subset of signals wins; returns its category
+    (back-compat: a rule may still carry `model`, handled by the caller)."""
     for rule in (instr.get("rules") or []):
         when = rule.get("when") or {}
         if when and all(signals.get(k) == v for k, v in when.items()):
-            return rule.get("model")
+            cat = rule.get("category")
+            if cat in COEOS_CATEGORIES:
+                return cat
     return None
 
 
-async def _coeos_llm_decide(decider_pool, instr, candidates, signals, messages):
-    """Ask the (already-hot) decider model to pick a candidate. Bounded, cheap."""
+async def _coeos_llm_classify(decider_pool, instr, signals, messages) -> Optional[str]:
+    """Ask the (already-hot) decider to classify into one category. Bounded."""
     last_content = ""
     if messages:
         c = messages[-1].get("content")
         if isinstance(c, str):
             last_content = c[:600]
+    default_instr = ("Classify the request into exactly one category and reply "
+                     "with ONLY the category id: " + " | ".join(COEOS_CATEGORIES) + ".")
     prompt = (
-        f"{instr.get('llm_instruction', 'Pick the single best model for this request.')}\n\n"
-        f"Candidates: {candidates}\n"
+        f"{instr.get('llm_instruction', default_instr)}\n\n"
+        f"Categories: {COEOS_CATEGORIES}\n"
         f"Signals: {json.dumps(signals)}\n"
         f"Latest user message (truncated): {last_content}\n\n"
-        f"Reply with ONLY one model id from Candidates, nothing else.")
+        f"Reply with ONLY one category id, nothing else.")
     buf = ""
     try:
-        async for ev in decider_pool.submit(None, 24, False,
+        async for ev in decider_pool.submit(None, 12, False,
                                              messages=[{"role": "user", "content": prompt}]):
             if ev.get("event") == "token":
                 buf += ev.get("text", "")
@@ -6501,51 +6547,57 @@ async def _coeos_llm_decide(decider_pool, instr, candidates, signals, messages):
     except Exception as e:
         sys.stderr.write(f"[coeos] decider LLM error: {e}\n")
         return None
-    pick = buf.strip().split()[0].strip('"\'`,.') if buf.strip() else ""
-    return pick or None
+    pick = buf.strip().split()[0].strip('"\'`,.').lower() if buf.strip() else ""
+    return pick if pick in COEOS_CATEGORIES else None
 
 
 async def coeos_resolve(req, request) -> str:
-    """Resolve `coeos` → a concrete model id. Hybrid decider: rules first, a
-    light LLM only when ambiguous AND the decider is already hot. Falls back to
-    a hot candidate (never routes to a cold model); 503 if nothing is hot
-    (unless cold_boot_autoload)."""
+    """Resolve `coeos` → a concrete model id. Classify the request into one of
+    the 5 categories (header → rules → light LLM if ambiguous AND decider hot →
+    default), then resolve category → model. Falls back to any hot category
+    model (never routes to a cold model); 503 if none is hot (unless
+    cold_boot_autoload)."""
     cfg = get_coeos_config()
     if not cfg.get("enabled"):
         raise HTTPException(status_code=400, detail={
             "error": "coeos_disabled",
-            "message": "Coeos router is disabled. Enable it in Settings → Coeos."})
+            "message": "CoeOS router is disabled. Enable it in Settings → CoeOS."})
     instr = _coeos_parse_instruction(cfg.get("routing_instruction") or "{}")
-    candidates = [c for c in (cfg.get("candidate_models") or [])
-                  if c and c.lower() != COEOS_MODEL_ID]
-    default_model = instr.get("default_model") or (candidates[0] if candidates else None)
+    cat_models = _coeos_category_models(cfg)
+    default_cat = instr.get("default_category")
+    if default_cat not in COEOS_CATEGORIES:
+        default_cat = "fast_tools" if "fast_tools" in cat_models else (
+            next(iter(cat_models), None))
     hot = _coeos_hot_model_ids()
     phase = _coeos_infer_phase(req, request)
     signals = _coeos_signals(req, phase)
 
-    # 1. Deterministic rules.
-    chosen = _coeos_match_rules(instr, signals)
-    # 2. LLM fallback — only if ambiguous AND the configured decider is hot.
-    if not chosen and instr.get("llm_fallback"):
-        decider_id = instr.get("decider_model") or default_model
+    # 1. Explicit category header (Omnigent) → 2. rules → 3. LLM if ambiguous
+    #    AND decider hot → 4. default category.
+    category = _coeos_header_category(request)
+    if not category:
+        category = _coeos_match_category(instr, signals)
+    if not category and instr.get("llm_fallback"):
+        decider_id = instr.get("decider_model") or cat_models.get(default_cat or "")
         decider_pool = _route_pool(decider_id) if decider_id else None
         if decider_pool is not None and decider_pool.alive_count() > 0:
             messages = [m.model_dump(exclude_none=True) for m in req.messages]
-            chosen = await _coeos_llm_decide(decider_pool, instr, candidates, signals, messages)
-    # 3. Validate ∈ candidates; else default.
-    if chosen not in candidates:
-        chosen = default_model
+            category = await _coeos_llm_classify(decider_pool, instr, signals, messages)
+    if category not in COEOS_CATEGORIES:
+        category = default_cat
+    chosen = cat_models.get(category) if category else None
 
     def _is_hot(mid) -> bool:
         return bool(mid) and (mid in hot or find_cloud_alias(mid) is not None)
 
     fallback = False
-    # 4. Never route to a cold model — fall back to a hot candidate + log.
+    # Never route to a cold model — fall back to any hot category model + log.
     if not _is_hot(chosen):
-        hot_candidates = [c for c in candidates if _is_hot(c)]
-        if hot_candidates:
-            sub = hot_candidates[0]
-            sys.stderr.write(f"[coeos] {chosen!r} cold → fallback to hot {sub!r} (phase={phase})\n")
+        hot_models = [m for m in cat_models.values() if _is_hot(m)]
+        default_model = cat_models.get(default_cat or "")
+        if hot_models:
+            sub = hot_models[0]
+            sys.stderr.write(f"[coeos] {chosen!r} (cat={category}) cold → hot {sub!r}\n")
             chosen, fallback = sub, True
         elif cfg.get("cold_boot_autoload") and default_model:
             sys.stderr.write(f"[coeos] cold boot — routing to {default_model!r} (autoload on)\n")
@@ -6553,11 +6605,11 @@ async def coeos_resolve(req, request) -> str:
         else:
             raise HTTPException(status_code=503, detail={
                 "error": "coeos_no_warm_candidate",
-                "message": "Coeos has no warm candidate to route to. Load one of "
-                           "the candidates, or enable cold_boot_autoload.",
-                "candidates": candidates})
+                "message": "CoeOS has no warm model bound to a category. Load one "
+                           "of the bound models, or enable cold_boot_autoload.",
+                "category_models": cat_models})
 
-    k = (chosen, phase, fallback)
+    k = (chosen, category or "?", fallback)
     _coeos_decisions[k] = _coeos_decisions.get(k, 0) + 1
     return chosen
 
