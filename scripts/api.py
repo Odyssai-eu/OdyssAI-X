@@ -6438,11 +6438,14 @@ def _coeos_parse_instruction(raw: str) -> dict:
 
 
 def _coeos_hot_model_ids() -> set:
-    """Ids servable RIGHT NOW: loaded local pools + always-ready cloud aliases.
-    Read-only — no pool instantiation."""
+    """Ids servable RIGHT NOW, in the SAME id-space /v1/models publishes:
+    loaded local pool aliases (and their cluster ids), always-ready cloud
+    aliases, and nautilus. Telemak cluster ids are checked separately in
+    `_coeos_is_servable` (they're proxies, not pools). Read-only."""
     hot: set = set()
     for cid, alias, _p in list_all_pools():
-        hot.add(alias if alias != DEFAULT_ALIAS else cid)
+        hot.add(alias)   # the id /v1/models emits
+        hot.add(cid)     # tolerate the cluster-id form too
     if _pool is not None:
         hot.add("nautilus")
     try:
@@ -6453,9 +6456,24 @@ def _coeos_hot_model_ids() -> set:
     return hot
 
 
+def _coeos_is_servable(mid, hot: set) -> bool:
+    """True if `mid` can be served right now — covers loaded local pools,
+    cloud aliases, and ACTIVE Telemak clusters (id `cid` or `cid:short`),
+    matching what /v1/models advertises. No async upstream calls."""
+    if not mid:
+        return False
+    if mid in hot or find_cloud_alias(mid) is not None:
+        return True
+    base = str(mid).split(":")[0]
+    cd = get_cluster_def(base)
+    if cd and cd.get("kind") == "telemak" and base in set(active_cluster_ids()):
+        return True
+    return False
+
+
 def list_routable_model_ids() -> list:
-    """Published model ids a client can bind to a Coeos category (hot local +
-    cloud) — the same set /v1/models advertises as servable."""
+    """Published local + cloud ids (excludes Telemak proxies — the dashboard
+    picker reads the full /v1/models list directly for those)."""
     return sorted(_coeos_hot_model_ids())
 
 
@@ -6588,7 +6606,7 @@ async def coeos_resolve(req, request) -> str:
     chosen = cat_models.get(category) if category else None
 
     def _is_hot(mid) -> bool:
-        return bool(mid) and (mid in hot or find_cloud_alias(mid) is not None)
+        return _coeos_is_servable(mid, hot)
 
     fallback = False
     # Never route to a cold model — fall back to any hot category model + log.

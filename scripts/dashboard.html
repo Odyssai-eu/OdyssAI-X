@@ -2172,13 +2172,19 @@ function renderSettingsCoeos() {
   const enabled = c.enabled === true;
   const autoload = c.cold_boot_autoload === true;
   const cm = c.category_models || {};
-  const available = state.coeos_available || [];
   const instr = c.routing_instruction || "";
-  // Bound models that aren't currently hot still need to show as the selected
-  // option, so the picker doesn't silently drop them.
-  const optionSet = Array.from(new Set([...available, ...Object.values(cm).filter(Boolean)])).sort();
-  const opts = (sel) => `<option value="">— none —</option>` + optionSet.map(m =>
-    `<option value="${escapeHtml(m)}" ${m === sel ? "selected" : ""}>${escapeHtml(m)}${available.includes(m) ? "" : " (not hot)"}</option>`).join("");
+  // Use the SAME servable list as the Endpoints tab (live /v1/models): all
+  // published models — local pools (Argo …), Telemak clusters, and cloud —
+  // with friendly "ClusterLabel — family" labels and the real routing id.
+  const entries = (state.endpoint_models || []).map(m => ({ id: m.id, label: endpointModelLabel(m) }));
+  // Keep a bound model visible even if it unloaded since (id not in live list).
+  Object.values(cm).filter(Boolean).forEach(v => {
+    if (!entries.some(e => e.id === v)) entries.push({ id: v, label: v + " (not loaded)" });
+  });
+  entries.sort((a, b) => a.label.localeCompare(b.label));
+  const opts = (sel) => `<option value="">— none —</option>` + entries.map(e =>
+    `<option value="${escapeHtml(e.id)}" ${e.id === sel ? "selected" : ""}>${escapeHtml(e.label)}</option>`).join("");
+  const optionSet = entries;  // reused below for the empty-state check
 
   const baseUrl = endpointBaseUrl();
   const curl =
@@ -2248,7 +2254,7 @@ curl "${baseUrl}/chat/completions" \\
             </div>
             <select class="ce-input mono" data-act="coeos-set-category" data-cat="${cat.id}" style="width:280px;font-size:12px">${opts(cm[cat.id] || "")}</select>
           </div>`).join("")}
-        ${optionSet.length ? "" : `<div style="font-size:12px;color:var(--ink-3)">No published models — load a pool or publish a cloud provider first.</div>`}
+        ${optionSet.length ? "" : `<div style="font-size:12px;color:var(--ink-3)">${state.endpoint_models_loaded ? "No published models — load a pool or publish a cloud provider first." : "Loading published models…"}</div>`}
       </div>
 
       <div style="background:var(--surface);border:1px solid var(--line);border-radius:12px;padding:18px;display:flex;flex-direction:column;gap:14px">
@@ -6085,6 +6091,7 @@ async function handleAct(e) {
     if (v === "models" && !state.matrix && !state.matrix_loading) fetchMatrix(false);
     if (v === "userguide" && !state.userguide_topics_loaded) loadUserGuideTopics();
     if (v === "endpoints" && !state.endpoint_models_loaded) loadEndpointModels();
+    if (v === "coeos" && !state.endpoint_models_loaded) loadEndpointModels();
     render(); return;
   }
   if (act === "userguide-pick") {
