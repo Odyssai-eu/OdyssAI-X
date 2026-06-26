@@ -5505,7 +5505,8 @@ class CoeosConfig(BaseModel):
     note: Optional[str] = None
     decider_model: Optional[str] = None          # the model that CLASSIFIES the request
     default_axis: Optional[str] = None
-    axes: Optional[list] = None                  # [{key, label, model, bench?, verified?}, …]
+    axes: Optional[list] = None                  # [{key, label, model(=logical), description?}, …]
+    models: Optional[dict] = None                # logical name → {name, endpoint} registry
     cold_boot_autoload: Optional[bool] = None
 
 
@@ -5552,7 +5553,7 @@ async def admin_coeos_update(req: CoeosConfig):
     with _cluster_config_txn() as cfg:
         c = cfg.get("coeos_config") or {}
         for field in ("enabled", "name", "regime", "updated", "note", "decider_model",
-                      "default_axis", "axes", "cold_boot_autoload"):
+                      "default_axis", "axes", "models", "cold_boot_autoload"):
             val = getattr(req, field)
             if val is not None:
                 c[field] = bool(val) if field in ("enabled", "cold_boot_autoload") else val
@@ -6414,13 +6415,37 @@ def _coeos_axes(cfg: dict) -> list:
 
 
 def _coeos_axis_models(cfg: dict) -> dict:
-    """axis key → bound model id (non-empty, not the reserved coeos id)."""
+    """axis key → bound model (a LOGICAL name resolved via the registry, or a
+    literal endpoint in legacy configs). Non-empty, not the reserved coeos id."""
     out = {}
     for ax in _coeos_axes(cfg):
         k, m = ax.get("key"), ax.get("model")
         if k and m and str(m).lower() != COEOS_MODEL_ID:
             out[k] = m
     return out
+
+
+def _coeos_model_registry(cfg: dict) -> dict:
+    """Logical model name → {name: <public display>, endpoint: <operator's id>}.
+    The registry is the ONLY operator-specific join: axes bind portable logical
+    names, the registry maps each to the local endpoint. Empty endpoint = not
+    mapped yet. Absent registry = legacy alias-based config (see resolve)."""
+    reg = cfg.get("models")
+    return reg if isinstance(reg, dict) else {}
+
+
+def _coeos_resolve_endpoint(cfg: dict, logical) -> tuple:
+    """Logical model name → (endpoint_id, public_display_name).
+    If a registry entry exists, use its endpoint + name. If there's no registry
+    entry for this name, treat the binding itself as the endpoint (back-compat
+    with legacy alias-based TMB Settings)."""
+    if not logical:
+        return "", ""
+    entry = _coeos_model_registry(cfg).get(logical)
+    if isinstance(entry, dict):
+        return (entry.get("endpoint") or ""), (entry.get("name") or logical)
+    # No registry entry → the binding IS the endpoint (legacy config).
+    return logical, logical
 
 
 def _coeos_hot_model_ids() -> set:
@@ -6609,29 +6634,32 @@ async def coeos_resolve(req, request) -> tuple:
             axis = await _coeos_llm_classify(decider_id, axes, messages)
     if axis not in keys:
         axis = default_axis
-    chosen = axis_models.get(axis) if axis else None
+    # Resolve the axis binding through the model registry: axes bind a LOGICAL
+    # model name (portable, e.g. "minimax-m3"); the registry maps it to the
+    # operator's endpoint + a public display name. Legacy configs without a
+    # registry treat the binding as a literal endpoint (back-compat).
+    logical = axis_models.get(axis) if axis else None
+    endpoint, display = _coeos_resolve_endpoint(cfg, logical)
 
-    def _is_hot(mid) -> bool:
-        return _coeos_is_servable(mid, hot)
-
+    # No silent fallback to a different model. If the recommended model isn't
+    # mapped or isn't loaded, surface it ("<name> — not loaded") so the operator
+    # loads it or maps an endpoint. cold_boot_autoload may opt to load it instead
+    # of erroring.
     fallback = False
-    # Never route to a cold model — fall back to any hot bound model + log.
-    if not _is_hot(chosen):
-        hot_models = [m for m in axis_models.values() if _is_hot(m)]
-        default_model = axis_models.get(default_axis or "")
-        if hot_models:
-            sub = hot_models[0]
-            sys.stderr.write(f"[coeos] {chosen!r} (axis={axis}) cold → hot {sub!r}\n")
-            chosen, fallback = sub, True
-        elif cfg.get("cold_boot_autoload") and default_model:
-            sys.stderr.write(f"[coeos] cold boot — routing to {default_model!r} (autoload on)\n")
-            chosen, fallback = default_model, True
-        else:
-            raise HTTPException(status_code=503, detail={
-                "error": "coeos_no_warm_candidate",
-                "message": "CoeOS has no warm model bound to an axis. Load one of "
-                           "the bound models, or enable cold_boot_autoload.",
-                "axis_models": axis_models})
+    if endpoint and _coeos_is_servable(endpoint, hot):
+        chosen = endpoint
+    elif endpoint and cfg.get("cold_boot_autoload"):
+        sys.stderr.write(f"[coeos] cold boot — loading {endpoint!r} for axis {axis} (autoload on)\n")
+        chosen, fallback = endpoint, True
+    else:
+        raise HTTPException(status_code=503, detail={
+            "error": "coeos_model_not_loaded",
+            "axis": axis,
+            "recommended": display or logical or "?",
+            "endpoint": endpoint or None,
+            "message": f"{display or logical or 'recommended model'} — not loaded. "
+                       "Map an endpoint for this model in Settings → CoeOS, or load "
+                       "it. CoeOS does not silently route to a different model."})
 
     k = (chosen, axis or "?", fallback)
     _coeos_decisions[k] = _coeos_decisions.get(k, 0) + 1
