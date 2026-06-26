@@ -6473,37 +6473,107 @@ def _coeos_header_axis(request, keys: list) -> Optional[str]:
     return None
 
 
-async def _coeos_llm_classify(decider_pool, axes, messages) -> Optional[str]:
-    """Ask the (already-hot) decider to classify the request into ONE configured
-    axis. The taxonomy (keys + labels) is passed from config — nothing about the
-    skills or the winning models is hard-coded here. Bounded + cheap."""
+def _coeos_parse_axis(text: str, keys: list) -> Optional[str]:
+    """Extract the chosen axis key from the decider's (possibly multi-token,
+    reasoned) reply. Priority: an explicit final `AXIS: <key>` line → a bare reply
+    whose first token is a key (legacy tag-style) → the LAST word-bounded key
+    mentioned anywhere. Returns None if no configured key is found."""
+    import re
+    if not text or not text.strip():
+        return None
+    low = text.lower()
+    keyset = {k.lower() for k in keys}
+    # 1. explicit `AXIS: <key>` (or `AXIS = key`, `AXIS:"key"`) — last one wins.
+    for m in reversed(list(re.finditer(r"axis\s*[:=]\s*[`\"']?([a-z0-9_]+)", low))):
+        if m.group(1) in keyset:
+            return m.group(1)
+    # 2. legacy: the whole reply is just the key.
+    first = low.strip().split()[0].strip('`"\',.') if low.strip() else ""
+    if first in keyset:
+        return first
+    # 3. last word-bounded key mention anywhere in the reasoning.
+    best, best_pos = None, -1
+    for k in keys:
+        for m in re.finditer(r"\b" + re.escape(k.lower()) + r"\b", low):
+            if m.start() > best_pos:
+                best, best_pos = k, m.start()
+    return best
+
+
+async def _coeos_llm_classify(decider_id, axes, messages) -> Optional[str]:
+    """Ask the (already-hot) decider to UNDERSTAND the request and classify it into
+    ONE configured axis. The taxonomy (keys + labels + per-axis descriptions) is
+    passed from config — nothing about the skills or the winning models is
+    hard-coded here. The decider is treated as a reasoning router, not a tag
+    matcher: it receives the full last message + each axis's frontier description
+    and room to think, then emits the key on a final `AXIS:` line.
+
+    Dispatch mirrors the chat endpoint so a Telemak-proxy decider (e.g. a Qwen3.5
+    122B served by a Telemak Swift binary) is reachable — `_route_pool` only
+    resolves LOCAL pools and returns None for proxies, which is why the old
+    pool-only path silently skipped proxy deciders and every request fell to
+    `default_axis`. Order: Telemak upstream → local pool. `enable_thinking=False`
+    so a reasoning-first decider answers directly instead of burning its budget on
+    a `<think>` block that never reaches the key."""
     last_content = ""
     if messages:
         c = messages[-1].get("content")
         if isinstance(c, str):
-            last_content = c[:800]
-    menu = "\n".join(f"- {ax['key']}: {ax.get('label', ax['key'])}"
-                     for ax in axes if ax.get("key"))
+            last_content = c[:8000]
+        elif isinstance(c, list):  # multimodal — keep the text parts
+            last_content = " ".join(
+                p.get("text", "") for p in c
+                if isinstance(p, dict) and p.get("type") == "text")[:8000]
+
+    def _axis_line(ax):
+        line = f"- {ax['key']}: {ax.get('label', ax['key'])}"
+        desc = ax.get("description") or ax.get("hint")
+        if desc:
+            line += f" — {desc}"
+        return line
+
+    menu = "\n".join(_axis_line(ax) for ax in axes if ax.get("key"))
     keys = [ax["key"] for ax in axes if ax.get("key")]
     prompt = (
-        "You are a routing classifier. Read the request and pick the single "
-        "best-matching skill axis from the menu. Reply with ONLY the axis key.\n\n"
+        "You are CoeOS's routing classifier. UNDERSTAND the request — its true "
+        "intent and the nature of the deliverable (target language, domain) — then "
+        "pick the SINGLE best-matching skill axis from the menu. Prefer the MOST "
+        "SPECIFIC axis that applies; choose a generic bucket (e.g. code_general) "
+        "ONLY when no specific axis fits. Honour each axis's frontier notes "
+        "(the '— …' clause, including its 'not here if …' guidance).\n\n"
         f"Axes:\n{menu}\n\n"
-        f"Request (truncated):\n{last_content}\n\n"
-        f"Reply with ONLY one of: {', '.join(keys)}")
+        f"Request:\n{last_content}\n\n"
+        "Reason in at most two short sentences, then end your reply with a final "
+        f"line exactly: `AXIS: <key>` where <key> is one of: {', '.join(keys)}")
+    dmsg = [{"role": "user", "content": prompt}]
     buf = ""
     try:
-        async for ev in decider_pool.submit(None, 12, False,
-                                             messages=[{"role": "user", "content": prompt}]):
-            if ev.get("event") == "token":
-                buf += ev.get("text", "")
-            elif ev.get("event") == "done":
-                break
+        # 1. Telemak proxy decider — forward to its upstream, same as the chat
+        #    passthrough. `_route_pool` can't see proxies, so we resolve the
+        #    cluster directly and reuse the proven proxy helper.
+        tele_cluster, tele_short = _telemak_split_alias(decider_id)
+        if tele_cluster and cluster_exists(tele_cluster) \
+                and get_cluster_def(tele_cluster).get("kind") == "telemak":
+            body = {"model": decider_id, "messages": dmsg, "max_tokens": 160,
+                    "enable_thinking": False, "stream": False}
+            out = await _telemak_proxy_chat_completion(
+                tele_cluster, get_cluster_def(tele_cluster), body, False,
+                requested_short_id=tele_short)
+            buf = ((out.get("choices") or [{}])[0].get("message", {}) or {}).get("content") or ""
+        else:
+            # 2. Local pool decider (back-compat, e.g. a small local classifier).
+            pool = _route_pool(decider_id)
+            if pool is None:
+                return None
+            async for ev in pool.submit(None, 160, False, messages=dmsg):
+                if ev.get("event") == "token":
+                    buf += ev.get("text", "")
+                elif ev.get("event") == "done":
+                    break
     except Exception as e:
         sys.stderr.write(f"[coeos] decider error: {e}\n")
         return None
-    pick = buf.strip().split()[0].strip('"\'`,.').lower() if buf.strip() else ""
-    return pick if pick in keys else None
+    return _coeos_parse_axis(buf, keys)
 
 
 async def coeos_resolve(req, request) -> tuple:
@@ -6530,10 +6600,13 @@ async def coeos_resolve(req, request) -> tuple:
     axis = _coeos_header_axis(request, keys)
     if not axis:
         decider_id = cfg.get("decider_model")
-        decider_pool = _route_pool(decider_id) if decider_id else None
-        if decider_pool is not None and decider_pool.alive_count() > 0:
+        # Servability gate (Telemak-aware): only invoke an already-hot decider —
+        # never cold-boot one just to classify. `_coeos_is_servable` recognises
+        # loaded local pools, cloud aliases AND active Telemak proxies, unlike the
+        # old `_route_pool(...).alive_count() > 0` which was None/0 for proxies.
+        if decider_id and _coeos_is_servable(decider_id, hot):
             messages = [m.model_dump(exclude_none=True) for m in req.messages]
-            axis = await _coeos_llm_classify(decider_pool, axes, messages)
+            axis = await _coeos_llm_classify(decider_id, axes, messages)
     if axis not in keys:
         axis = default_axis
     chosen = axis_models.get(axis) if axis else None
