@@ -2178,6 +2178,17 @@ function renderSettingsCoeos() {
   const opts = (sel) => `<option value="">— none —</option>` + entries.map(e =>
     `<option value="${escapeHtml(e.id)}" ${e.id === sel ? "selected" : ""}>${escapeHtml(e.label)}</option>`).join("");
 
+  // Portable model registry: axes bind a LOGICAL name; the registry maps each to
+  // the operator's endpoint. Legacy alias-based configs have no registry — their
+  // per-axis alias picker is kept untouched (hasRegistry=false).
+  const models = (c.models && typeof c.models === "object") ? c.models : {};
+  const hasRegistry = Object.keys(models).length > 0;
+  const isServable = (id) => !!id && entries.some(e => e.id === id);
+  const endpointOf = (logical) => (models[logical] || {}).endpoint || "";
+  const isLoaded = (logical) => isServable(endpointOf(logical));
+  const logicalOpts = (sel) => `<option value="">— none —</option>` + Object.keys(models).map(k =>
+    `<option value="${escapeHtml(k)}" ${k === sel ? "selected" : ""}>${escapeHtml((models[k] || {}).name || k)}</option>`).join("");
+
   const baseUrl = endpointBaseUrl();
   const curl =
 `export OPENAI_BASE_URL="${baseUrl}"
@@ -2242,16 +2253,35 @@ curl "${baseUrl}/chat/completions" \\
         </div>
       </div>
 
+      ${hasRegistry ? `<div style="background:var(--surface);border:1px solid var(--line);border-radius:12px;padding:18px;display:flex;flex-direction:column;gap:14px">
+        <div>
+          <div class="field-label">Models — map to your endpoints</div>
+          <div style="font-size:12px;color:var(--ink-2);margin-top:2px">Each axis binds a portable <b>logical model name</b>. Map it once to a model served in your <span class="mono">/v1/models</span>. If empty or not loaded, CoeOS answers “<i>&lt;name&gt; — not loaded</i>” instead of routing to a different model.</div>
+        </div>
+        <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:10px">
+          ${Object.keys(models).map(k => `
+            <div style="background:var(--surface-2);border-radius:8px;padding:10px;display:flex;flex-direction:column;gap:6px">
+              <div style="display:flex;align-items:center;justify-content:space-between;gap:6px">
+                <div style="font-size:12px;font-weight:600">${escapeHtml((models[k]||{}).name || k)}</div>
+                ${isLoaded(k) ? `<span style="font-size:10px;color:var(--blue-deep)">● loaded</span>` : `<span style="font-size:10px;color:var(--ink-3)">○ not loaded</span>`}
+              </div>
+              <div class="mono" style="font-size:10px;color:var(--ink-3)">${escapeHtml(k)}</div>
+              <select class="ce-input mono" data-act="coeos-set-endpoint" data-model="${escapeHtml(k)}" style="width:100%;font-size:11px">${opts(endpointOf(k))}</select>
+            </div>`).join("")}
+        </div>
+      </div>` : ``}
+
       <div style="background:var(--surface);border:1px solid var(--line);border-radius:12px;padding:18px;display:flex;flex-direction:column;gap:14px">
         <div>
           <div class="field-label">Skill axes — bench-derived bindings</div>
-          <div style="font-size:12px;color:var(--ink-2);margin-top:2px">One published model per axis (the one our TMB benchmarks proved best). A model may cover several axes. Empty = falls back to another bound axis. Edit a cell to override; the binding saves immediately.</div>
+          <div style="font-size:12px;color:var(--ink-2);margin-top:2px">${hasRegistry ? "Each axis binds a logical model (mapped above). " : "One published model per axis (the one our TMB benchmarks proved best). "}A model may cover several axes. The binding saves immediately.</div>
         </div>
         ${axes.length ? `<div style="display:grid;grid-template-columns:repeat(3,1fr);gap:10px">
           ${axes.map(a => `
             <div style="background:var(--surface-2);border-radius:8px;padding:10px;display:flex;flex-direction:column;gap:6px">
               <div style="font-size:12px;font-weight:600">${escapeHtml(a.label||a.key)}</div>
-              <select class="ce-input mono" data-act="coeos-set-axis" data-key="${escapeHtml(a.key)}" style="width:100%;font-size:11px">${opts(a.model||"")}</select>
+              <select class="ce-input mono" data-act="coeos-set-axis" data-key="${escapeHtml(a.key)}" style="width:100%;font-size:11px">${hasRegistry ? logicalOpts(a.model||"") : opts(a.model||"")}</select>
+              ${hasRegistry && a.model && !isLoaded(a.model) ? `<div style="font-size:10px;color:#b45309">⚠ ${escapeHtml((models[a.model]||{}).name || a.model)} — not loaded</div>` : ``}
             </div>`).join("")}
         </div>` : `<div style="font-size:12px;color:var(--ink-3)">${state.endpoint_models_loaded ? "No axes yet — import a TMB Settings file below." : "Loading…"}</div>`}
       </div>
@@ -6226,6 +6256,23 @@ async function handleAct(e) {
     render();
     return;
   }
+  if (act === "coeos-set-endpoint") {
+    // Map a logical model name → the operator's served endpoint. PUT the whole
+    // registry with this one entry updated.
+    const mk = el.dataset.model;
+    const models = { ...((state.coeos && state.coeos.models) || {}) };
+    models[mk] = { ...(models[mk] || {}), endpoint: el.value || "" };
+    try {
+      const r = await fetch("/admin/coeos", { method: "PUT",
+        headers: { "content-type": "application/json", ...authHeaders() },
+        body: JSON.stringify({ models }) });
+      if (!r.ok) { const t = await r.text(); throw new Error(t.slice(0, 200)); }
+      state.coeos = await r.json();
+      toast(`${(models[mk] || {}).name || mk} → ${el.value || "—"}`, "ok");
+    } catch (e) { toast(`Save failed: ${e.message}`, "err"); }
+    render();
+    return;
+  }
   if (act === "coeos-set-decider" || act === "coeos-set-default-axis") {
     const field = act === "coeos-set-decider" ? "decider_model" : "default_axis";
     try {
@@ -6263,7 +6310,7 @@ async function handleAct(e) {
       const parsed = JSON.parse(await file.text());
       // Send the whole settings file as the config (taxonomy + bindings + decider).
       const body = {};
-      ["name", "regime", "updated", "note", "decider_model", "default_axis", "axes", "cold_boot_autoload"]
+      ["name", "regime", "updated", "note", "decider_model", "default_axis", "axes", "models", "cold_boot_autoload"]
         .forEach(k => { if (parsed[k] !== undefined) body[k] = parsed[k]; });
       const r = await fetch("/admin/coeos", { method: "PUT",
         headers: { "content-type": "application/json", ...authHeaders() },
