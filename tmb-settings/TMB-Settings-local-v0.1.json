@@ -1,0 +1,25 @@
+{
+  "name": "TMB Settings — Souverain (local) · v0.1",
+  "regime": "local",
+  "updated": "2026-06-26",
+  "note": "Régime local souverain : contraint par les slots RAM. Aujourd'hui M3-centré (champion EFFICIENCY + #1-2 sur la plupart des axes). Un modèle couvre plusieurs axes. Remapper les ids vers les modèles réellement chargés sur le cluster.",
+  "decider_model": "telomnis:nex-n2-mini-6bit",
+  "default_axis": "code_general",
+  "axes": [
+    { "key": "creative",      "label": "Créatif / rédaction longue", "model": "or:hy3-preview", "bench": "T01 452.5 (Hy3 Q9 / GLM-Q8, Exceptionnel) ; M3 435", "verified": true },
+    { "key": "legal_rgpd",    "label": "RGPD / conformité",          "model": "qwen-3.5-397b",  "bench": "T02 50/50 (Exo×4)",                       "verified": true },
+    { "key": "legal_complex", "label": "Conformité multi-jur.",      "model": "default",        "bench": "T05 49/50 (M3 Q6 co-#1)",                 "verified": true },
+    { "key": "reasoning",     "label": "Raisonnement / logique",     "model": "default",        "bench": "T06 47/50 (M3)",                          "verified": true },
+    { "key": "calc",          "label": "Calcul / structuré",         "model": "glm-5.2-q6",     "bench": "T07 50/50 (GLM Q6) ; M3 48.5",            "verified": true },
+    { "key": "python",        "label": "Python / scripts",           "model": "default",        "bench": "T03 48.5 / T04 48.5 (M3) ; M2.7-8bit 50",  "verified": true },
+    { "key": "code_general",  "label": "Code général",               "model": "default",        "bench": "C01-C08 97.3% (M3 Q6 #1 local)",          "verified": true },
+    { "key": "debug",         "label": "Debug",                      "model": "default",        "bench": "M3 top local (C02)",                      "verified": true },
+    { "key": "react",         "label": "React / front",              "model": "default",        "bench": "à confirmer local (C04)",                 "verified": false },
+    { "key": "swift",         "label": "Swift",                      "model": "",               "bench": "TROU — aucun modèle fort benché (à trouver)", "verified": false },
+    { "key": "refactoring",   "label": "Refactoring",                "model": "default",        "bench": "à confirmer local (C06)",                 "verified": false },
+    { "key": "plan_decompo",  "label": "Planning — décomposition",   "model": "kimi-k2.7-code", "bench": "P01 44/50 (Kimi #1 local)",                "verified": true },
+    { "key": "plan_spec",     "label": "Planning — handoff / spec",  "model": "default",        "bench": "P04 50/50 (M3 local #1)",                 "verified": true },
+    { "key": "plan_judgment", "label": "Planning — jugement / pièges","model": "or:hy3-preview","bench": "P02 46 (Hy3 #1) / P03 48 (M3)",           "verified": true },
+    { "key": "fast_tools",    "label": "Tools & fast coding",        "model": "tele-fast",      "bench": "axe latence — teleFast (Qwen3-coder)",     "verified": false }
+  ]
+}

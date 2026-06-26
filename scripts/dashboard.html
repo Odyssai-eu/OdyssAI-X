@@ -2159,34 +2159,24 @@ function renderSettingsGeneral() {
 
 // ─── Settings: Coeos (smart LLM-router, RFC #63) ───────────────────
 const COEOS_PUBLIC_ID = "CoeOS";  // public model id (matches the server's COEOS_DISPLAY_ID)
-const COEOS_CATS = [
-  { id: "writing",       label: "Writing",             hint: "Prose, docs, long-form natural-language text" },
-  { id: "planning",      label: "Planning",            hint: "Architecture, task breakdown, design, reasoning about a plan" },
-  { id: "coding",        label: "Coding",              hint: "Writing & editing real code" },
-  { id: "fast_tools",    label: "Tools & fast coding", hint: "Tool calls, quick edits, autocomplete-grade speed" },
-  { id: "deep_analysis", label: "Deep analysis",       hint: "Hard reasoning, debugging, root-cause, trade-offs" },
-];
-
 function renderSettingsCoeos() {
   const c = state.coeos || {};
   const enabled = c.enabled === true;
   const autoload = c.cold_boot_autoload === true;
-  const cm = c.category_models || {};
-  const instr = c.routing_instruction || "";
-  // Use the SAME servable list as the Endpoints tab (live /v1/models): all
-  // published models — local pools (Argo …), Telemak clusters, and cloud —
-  // with friendly "ClusterLabel — family" labels and the real routing id.
+  const axes = Array.isArray(c.axes) ? c.axes : [];
+  const decider = c.decider_model || "";
+  const defaultAxis = c.default_axis || "";
+
+  // Model options = the live /v1/models list (same source as Endpoints): local
+  // pools (Argo…), Telemak clusters, and cloud — real routing id + friendly label.
   const entries = (state.endpoint_models || [])
-    .filter(m => m.id !== COEOS_PUBLIC_ID)  // don't let CoeOS route to itself
+    .filter(m => m.id !== COEOS_PUBLIC_ID)  // CoeOS can't route to itself
     .map(m => ({ id: m.id, label: endpointModelLabel(m) }));
-  // Keep a bound model visible even if it unloaded since (id not in live list).
-  Object.values(cm).filter(Boolean).forEach(v => {
-    if (!entries.some(e => e.id === v)) entries.push({ id: v, label: v + " (not loaded)" });
-  });
+  const bound = axes.map(a => a.model).filter(Boolean).concat(decider ? [decider] : []);
+  bound.forEach(v => { if (!entries.some(e => e.id === v)) entries.push({ id: v, label: v + " (not loaded)" }); });
   entries.sort((a, b) => a.label.localeCompare(b.label));
   const opts = (sel) => `<option value="">— none —</option>` + entries.map(e =>
     `<option value="${escapeHtml(e.id)}" ${e.id === sel ? "selected" : ""}>${escapeHtml(e.label)}</option>`).join("");
-  const optionSet = entries;  // reused below for the empty-state check
 
   const baseUrl = endpointBaseUrl();
   const curl =
@@ -2195,31 +2185,20 @@ export OPENAI_API_KEY="dummy"
 
 curl "${baseUrl}/chat/completions" \\
   -H "Content-Type: application/json" \\
-  -H "x-coeos-category: coding" \\
+  -H "x-coeos-axis: coding" \\
   -d '{"model":"${COEOS_PUBLIC_ID}","messages":[{"role":"user","content":"Hello"}]}'`;
 
-  const SAMPLE = JSON.stringify({
-    default_category: "fast_tools",
-    llm_fallback: true,
-    decider_model: cm.fast_tools || "",
-    llm_instruction: "Classify the request into exactly one category and reply with ONLY the category id: writing | planning | coding | fast_tools | deep_analysis.",
-    rules: [
-      { when: { phase: "plan" }, category: "planning" },
-      { when: { phase: "code" }, category: "coding" },
-      { when: { has_code: true }, category: "coding" },
-      { when: { deep: true }, category: "deep_analysis" },
-      { when: { tools_present: true }, category: "fast_tools" },
-      { when: { phase: "chat", length: "long" }, category: "writing" },
-      { when: { phase: "chat" }, category: "writing" },
-    ],
-  }, null, 2);
+  const loadedLine = c.name
+    ? `Loaded: <b>${escapeHtml(c.name)}</b>${c.regime ? ` · <span class="mono">${escapeHtml(c.regime)}</span>` : ""}${c.updated ? ` · ${escapeHtml(c.updated)}` : ""}`
+    : `No TMB Settings loaded — import a file below, or bind axes by hand.`;
 
   return `
     <div style="display:flex;flex-direction:column;gap:20px">
       <div style="background:var(--surface);border:1px solid var(--line);border-radius:12px;padding:18px;display:flex;flex-direction:column;gap:14px">
         <div>
-          <div class="field-label">CoeOS · smart LLM-router</div>
-          <div style="font-size:12px;color:var(--ink-2);margin-top:2px">Exposes a virtual <span class="mono">${COEOS_PUBLIC_ID}</span> model. Agents (Omnigent / Cline / Aider / Hermes) call it; it classifies each request into one of 5 categories and routes to the model you bind below, then relays. Not for chat — Companion keeps its own router.</div>
+          <div class="field-label">CoeOS · benchmark-composed virtual model</div>
+          <div style="font-size:12px;color:var(--ink-2);margin-top:2px">A virtual <span class="mono">${COEOS_PUBLIC_ID}</span> model. The decider classifies each agent request into one skill axis, then serves the model our TMB benchmarks proved best on it. Taxonomy + bindings = data (the TMB Settings). For agents — Companion keeps its own router.</div>
+          <div style="font-size:11px;color:var(--ink-3);margin-top:6px">${loadedLine}</div>
         </div>
         <div style="display:flex;align-items:center;justify-content:space-between;gap:14px;padding:10px 12px;background:var(--surface-2);border-radius:8px">
           <div>
@@ -2234,7 +2213,7 @@ curl "${baseUrl}/chat/completions" \\
         <div style="display:flex;align-items:center;justify-content:space-between;gap:14px;padding:10px 12px;background:var(--surface-2);border-radius:8px">
           <div>
             <div style="font-size:13px;font-weight:600">Cold-boot autoload</div>
-            <div style="font-size:11px;color:var(--ink-3);margin-top:2px">If no bound model is warm, route to the default category's model anyway (triggers a load) instead of returning 503. Off = strict.</div>
+            <div style="font-size:11px;color:var(--ink-3);margin-top:2px">If no bound model is warm, route to the default axis's model anyway (triggers a load) instead of returning 503. Off = strict.</div>
           </div>
           <label style="display:inline-flex;align-items:center;gap:8px;cursor:pointer">
             <input type="checkbox" data-act="coeos-toggle-autoload" ${autoload?"checked":""}/>
@@ -2245,33 +2224,47 @@ curl "${baseUrl}/chat/completions" \\
 
       <div style="background:var(--surface);border:1px solid var(--line);border-radius:12px;padding:18px;display:flex;flex-direction:column;gap:14px">
         <div>
-          <div class="field-label">Category models</div>
-          <div style="font-size:12px;color:var(--ink-2);margin-top:2px">Bind one published model (local or cloud) per category. The router classifies each request into a category, then serves its model. Leave a row at <span class="mono">none</span> to fall back to another bound category.</div>
+          <div class="field-label">Decider &amp; default</div>
+          <div style="font-size:12px;color:var(--ink-2);margin-top:2px">The <b>decider</b> classifies each request into one axis — it must stay <b>hot</b> (small &amp; fast, e.g. nex-n2-mini). If it's cold or unsure, requests fall to the <b>default axis</b>.</div>
         </div>
-        ${COEOS_CATS.map(cat => `
-          <div style="display:flex;align-items:center;justify-content:space-between;gap:14px;padding:10px 12px;background:var(--surface-2);border-radius:8px">
-            <div style="flex:1;min-width:0">
-              <div style="font-size:13px;font-weight:600">${cat.label}</div>
-              <div style="font-size:11px;color:var(--ink-3);margin-top:2px">${cat.hint}</div>
-            </div>
-            <select class="ce-input mono" data-act="coeos-set-category" data-cat="${cat.id}" style="width:280px;font-size:12px">${opts(cm[cat.id] || "")}</select>
-          </div>`).join("")}
-        ${optionSet.length ? "" : `<div style="font-size:12px;color:var(--ink-3)">${state.endpoint_models_loaded ? "No published models — load a pool or publish a cloud provider first." : "Loading published models…"}</div>`}
+        <div style="display:flex;gap:12px;flex-wrap:wrap">
+          <div style="flex:1;min-width:240px;display:flex;flex-direction:column;gap:4px">
+            <span style="font-size:11px;color:var(--ink-3)">Decider model</span>
+            <select class="ce-input mono" data-act="coeos-set-decider" style="width:100%;font-size:12px">${opts(decider)}</select>
+          </div>
+          <div style="flex:1;min-width:240px;display:flex;flex-direction:column;gap:4px">
+            <span style="font-size:11px;color:var(--ink-3)">Default axis</span>
+            <select class="ce-input mono" data-act="coeos-set-default-axis" style="width:100%;font-size:12px">
+              <option value="">— first bound —</option>
+              ${axes.map(a => `<option value="${escapeHtml(a.key)}" ${a.key===defaultAxis?"selected":""}>${escapeHtml(a.label||a.key)}</option>`).join("")}
+            </select>
+          </div>
+        </div>
       </div>
 
       <div style="background:var(--surface);border:1px solid var(--line);border-radius:12px;padding:18px;display:flex;flex-direction:column;gap:14px">
         <div>
-          <div class="field-label">Routing instruction · JSON</div>
-          <div style="font-size:12px;color:var(--ink-2);margin-top:2px">
-            Maps request signals → <b>category</b> (the model comes from the bindings above). <span class="mono">rules</span> match first (each <span class="mono">when</span> ⊆ signals: <span class="mono">phase</span> plan/act/code/chat, <span class="mono">lang</span> fr/en, <span class="mono">length</span> short/medium/long, <span class="mono">tools_present</span>, <span class="mono">has_code</span>, <span class="mono">deep</span>). Agents may force a category via header <span class="mono">x-coeos-category</span>. If nothing matches and <span class="mono">llm_fallback</span>, the (already-hot) <span class="mono">decider_model</span> classifies. Else → <span class="mono">default_category</span>.
-          </div>
+          <div class="field-label">Skill axes — bench-derived bindings</div>
+          <div style="font-size:12px;color:var(--ink-2);margin-top:2px">One published model per axis (the one our TMB benchmarks proved best). A model may cover several axes. Empty = falls back to another bound axis. Edit a cell to override; the binding saves immediately.</div>
         </div>
-        <textarea class="ce-input mono" rows="16" placeholder='${escapeHtml(SAMPLE)}' data-act="coeos-set-instruction" style="width:100%;resize:vertical;font-size:11px;line-height:1.4;white-space:pre">${escapeHtml(instr)}</textarea>
+        ${axes.length ? `<div style="display:grid;grid-template-columns:repeat(3,1fr);gap:10px">
+          ${axes.map(a => `
+            <div style="background:var(--surface-2);border-radius:8px;padding:10px;display:flex;flex-direction:column;gap:6px">
+              <div style="font-size:12px;font-weight:600">${escapeHtml(a.label||a.key)}${a.verified===false?` <span style="color:var(--rust);font-weight:400">· est.</span>`:""}</div>
+              <select class="ce-input mono" data-act="coeos-set-axis" data-key="${escapeHtml(a.key)}" style="width:100%;font-size:11px">${opts(a.model||"")}</select>
+              ${a.bench?`<div style="font-size:10px;color:var(--ink-3);line-height:1.3">${escapeHtml(a.bench)}</div>`:""}
+            </div>`).join("")}
+        </div>` : `<div style="font-size:12px;color:var(--ink-3)">${state.endpoint_models_loaded ? "No axes yet — import a TMB Settings file below." : "Loading…"}</div>`}
+      </div>
+
+      <div style="background:var(--surface);border:1px solid var(--line);border-radius:12px;padding:18px;display:flex;flex-direction:column;gap:14px">
+        <div>
+          <div class="field-label">TMB Settings file</div>
+          <div style="font-size:12px;color:var(--ink-2);margin-top:2px">Import a curated settings file to configure everything at once (taxonomy + bindings + decider) — then edit any cell above. Export to share or version. We ship a <span class="mono">local</span> (sovereign) and a <span class="mono">cloud</span> (best-of-all) variant, refreshed monthly.</div>
+        </div>
         <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">
-          <button class="btn btn-sm" data-act="coeos-import">${Icon.upload || ""}<span>Import JSON…</span></button>
-          <button class="btn btn-sm" data-act="coeos-export">${Icon.download || ""}<span>Export JSON</span></button>
-          <button class="btn btn-sm" data-act="coeos-insert-sample"><span>Insert sample</span></button>
-          <button class="btn btn-sm" style="background:var(--blue);color:white;border-color:var(--blue)" data-act="coeos-save"><span>Save</span></button>
+          <button class="btn btn-sm" style="background:var(--blue);color:white;border-color:var(--blue)" data-act="coeos-import">${Icon.upload || ""}<span>Import TMB Settings…</span></button>
+          <button class="btn btn-sm" data-act="coeos-export">${Icon.download || ""}<span>Export current</span></button>
           <input type="file" accept="application/json,.json" data-act="coeos-import-file" style="display:none"/>
         </div>
       </div>
@@ -2279,7 +2272,7 @@ curl "${baseUrl}/chat/completions" \\
       <div style="background:var(--surface);border:1px solid var(--line);border-radius:12px;padding:18px;display:flex;flex-direction:column;gap:14px">
         <div>
           <div class="field-label">OpenAI-compatible endpoint</div>
-          <div style="font-size:12px;color:var(--ink-2);margin-top:2px">Point any agent here — model <span class="mono">${COEOS_PUBLIC_ID}</span>. Agents that know their phase can force a category with the optional <span class="mono">x-coeos-category</span> header (<span class="mono">${COEOS_CATS.map(x=>x.id).join(" · ")}</span>); otherwise CoeOS infers it.</div>
+          <div style="font-size:12px;color:var(--ink-2);margin-top:2px">Point any agent here — model <span class="mono">${COEOS_PUBLIC_ID}</span>. An agent that knows its skill can force an axis with the optional <span class="mono">x-coeos-axis</span> header${axes.length?` (<span class="mono">${axes.map(a=>escapeHtml(a.key)).join(" · ")}</span>)`:""}; otherwise the decider classifies it.</div>
         </div>
         <div style="display:flex;gap:10px;align-items:center">
           <span style="font-size:12px;color:var(--ink-3);width:70px">Base URL</span>
@@ -6217,69 +6210,44 @@ async function handleAct(e) {
     render();
     return;
   }
-  if (act === "coeos-set-category") {
-    const cat = el.dataset.cat;
-    const cm = { ...((state.coeos && state.coeos.category_models) || {}) };
-    if (el.value) cm[cat] = el.value; else delete cm[cat];
+  if (act === "coeos-set-axis") {
+    // Bindings save immediately. PUT replaces the whole axes array, so send the
+    // full list with this one cell updated.
+    const key = el.dataset.key;
+    const axes = (state.coeos && Array.isArray(state.coeos.axes) ? state.coeos.axes : [])
+      .map(a => a.key === key ? { ...a, model: el.value || "" } : a);
     try {
       const r = await fetch("/admin/coeos", { method: "PUT",
         headers: { "content-type": "application/json", ...authHeaders() },
-        body: JSON.stringify({ category_models: cm }) });
+        body: JSON.stringify({ axes }) });
       if (!r.ok) { const t = await r.text(); throw new Error(t.slice(0, 200)); }
       state.coeos = await r.json();
-      toast(`${cat} → ${el.value || "none"}`, "ok");
+      toast(`${key} → ${el.value || "none"}`, "ok");
     } catch (e) { toast(`Save failed: ${e.message}`, "err"); }
     render();
     return;
   }
-  if (act === "coeos-set-instruction") {
-    // Stash locally on every keystroke; explicit Save validates + persists.
-    state.coeos = { ...(state.coeos || {}), routing_instruction: el.value || "" };
-    return;
-  }
-  if (act === "coeos-insert-sample") {
-    const cm = (state.coeos && state.coeos.category_models) || {};
-    const sample = JSON.stringify({
-      default_category: "fast_tools",
-      llm_fallback: true,
-      decider_model: cm.fast_tools || "",
-      llm_instruction: "Classify the request into exactly one category and reply with ONLY the category id: writing | planning | coding | fast_tools | deep_analysis.",
-      rules: [
-        { when: { phase: "plan" }, category: "planning" },
-        { when: { phase: "code" }, category: "coding" },
-        { when: { has_code: true }, category: "coding" },
-        { when: { deep: true }, category: "deep_analysis" },
-        { when: { tools_present: true }, category: "fast_tools" },
-        { when: { phase: "chat", length: "long" }, category: "writing" },
-        { when: { phase: "chat" }, category: "writing" },
-      ],
-    }, null, 2);
-    state.coeos = { ...(state.coeos || {}), routing_instruction: sample };
-    render();
-    return;
-  }
-  if (act === "coeos-save") {
-    const txt = (state.coeos && state.coeos.routing_instruction) || "";
-    if (txt.trim()) {
-      try { JSON.parse(txt); }
-      catch (e) { toast(`Invalid JSON: ${e.message}`, "err"); return; }
-    }
+  if (act === "coeos-set-decider" || act === "coeos-set-default-axis") {
+    const field = act === "coeos-set-decider" ? "decider_model" : "default_axis";
     try {
       const r = await fetch("/admin/coeos", { method: "PUT",
         headers: { "content-type": "application/json", ...authHeaders() },
-        body: JSON.stringify({ routing_instruction: txt }) });
+        body: JSON.stringify({ [field]: el.value || "" }) });
       if (!r.ok) { const t = await r.text(); throw new Error(t.slice(0, 200)); }
       state.coeos = await r.json();
-      toast("Routing instruction saved", "ok");
+      toast(`${field} = ${el.value || "—"}`, "ok");
     } catch (e) { toast(`Save failed: ${e.message}`, "err"); }
+    render();
     return;
   }
   if (act === "coeos-export") {
-    const txt = (state.coeos && state.coeos.routing_instruction) || "{}";
-    const blob = new Blob([txt], { type: "application/json" });
+    // Export the live config as a TMB Settings file (taxonomy + bindings + decider).
+    const cfg = { ...(state.coeos || {}) };
+    const blob = new Blob([JSON.stringify(cfg, null, 2)], { type: "application/json" });
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
-    a.href = url; a.download = "coeos-routing.json";
+    a.href = url;
+    a.download = (cfg.name ? cfg.name.replace(/[^a-z0-9._-]+/gi, "-") : "TMB-Settings") + ".json";
     document.body.appendChild(a); a.click();
     document.body.removeChild(a); URL.revokeObjectURL(url);
     return;
@@ -6293,11 +6261,18 @@ async function handleAct(e) {
     const file = el.files && el.files[0];
     if (!file) return;
     try {
-      const text = await file.text();
-      JSON.parse(text);  // validate before accepting
-      state.coeos = { ...(state.coeos || {}), routing_instruction: text };
+      const parsed = JSON.parse(await file.text());
+      // Send the whole settings file as the config (taxonomy + bindings + decider).
+      const body = {};
+      ["name", "regime", "updated", "note", "decider_model", "default_axis", "axes", "cold_boot_autoload"]
+        .forEach(k => { if (parsed[k] !== undefined) body[k] = parsed[k]; });
+      const r = await fetch("/admin/coeos", { method: "PUT",
+        headers: { "content-type": "application/json", ...authHeaders() },
+        body: JSON.stringify(body) });
+      if (!r.ok) { const t = await r.text(); throw new Error(t.slice(0, 200)); }
+      state.coeos = await r.json();
       render();
-      toast("Imported — review then Save", "ok");
+      toast(`Imported: ${parsed.name || "TMB Settings"} (${(parsed.axes || []).length} axes)`, "ok");
     } catch (e) { toast(`Import failed: ${e.message}`, "err"); }
     el.value = "";  // allow re-importing the same file
     return;

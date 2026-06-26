@@ -5496,17 +5496,22 @@ async def admin_settings_update(req: ServerSettingsUpdate):
 # ── Coeos router config (RFC #63) ─────────────────────────────────────────────
 
 class CoeosConfig(BaseModel):
+    # CoeOS config = the "TMB Settings" the operator imports. Everything is data:
+    # the taxonomy (axes) AND the per-axis model bindings AND the decider.
     enabled: Optional[bool] = None
-    category_models: Optional[dict] = None         # {category: model_id} for the 5 categories
-    routing_instruction: Optional[str] = None      # JSON string, edited like a system prompt
+    name: Optional[str] = None                   # e.g. "TMB Settings — Best of all (cloud) v0.1"
+    regime: Optional[str] = None                 # "local" | "cloud" (informational)
+    updated: Optional[str] = None                # settings vintage (monthly refresh)
+    note: Optional[str] = None
+    decider_model: Optional[str] = None          # the model that CLASSIFIES the request
+    default_axis: Optional[str] = None
+    axes: Optional[list] = None                  # [{key, label, model, bench?, verified?}, …]
     cold_boot_autoload: Optional[bool] = None
 
 
 @app.get("/admin/coeos")
 async def admin_coeos_get():
-    cfg = get_coeos_config()
-    cfg["_categories"] = COEOS_CATEGORIES  # so the dashboard renders the picker rows
-    return cfg
+    return get_coeos_config()
 
 
 @app.get("/admin/coeos/available-models")
@@ -5516,44 +5521,42 @@ async def admin_coeos_available_models():
 
 @app.get("/admin/coeos/decisions")
 async def admin_coeos_decisions():
-    """Routing decision counts (model × category × fallback) for operator visibility."""
+    """Routing decision counts (model × axis × fallback) for operator visibility."""
     return {"decisions": [
-        {"model": k[0], "category": k[1], "fallback": k[2], "count": v}
+        {"model": k[0], "axis": k[1], "fallback": k[2], "count": v}
         for k, v in sorted(_coeos_decisions.items(), key=lambda kv: -kv[1])]}
 
 
 @app.put("/admin/coeos")
 async def admin_coeos_update(req: CoeosConfig):
-    if req.category_models is not None:
-        bad_keys = [k for k in req.category_models if k not in COEOS_CATEGORIES]
-        if bad_keys:
-            raise HTTPException(400, detail={"error": "bad_category",
-                "message": f"unknown categor{'ies' if len(bad_keys)>1 else 'y'}: {bad_keys}. "
-                           f"Allowed: {COEOS_CATEGORIES}"})
-        if any(v and str(v).strip().lower() == COEOS_MODEL_ID
-               for v in req.category_models.values()):
-            raise HTTPException(400, detail={"error": "reserved_id",
-                "message": "'coeos' is the router's own id and can't be bound to a category."})
-    if req.routing_instruction is not None and req.routing_instruction.strip():
-        try:
-            json.loads(req.routing_instruction)
-        except Exception as e:
-            raise HTTPException(400, detail={"error": "bad_json",
-                "message": f"routing_instruction is not valid JSON: {e}"})
+    # Importing a TMB Settings file = a PUT with {name, decider_model,
+    # default_axis, axes, …}. Validate the axes shape + reserved id.
+    if req.axes is not None:
+        if not isinstance(req.axes, list):
+            raise HTTPException(400, detail={"error": "bad_axes",
+                "message": "axes must be a list of {key, label, model} objects."})
+        seen = set()
+        for ax in req.axes:
+            if not isinstance(ax, dict) or not ax.get("key"):
+                raise HTTPException(400, detail={"error": "bad_axis",
+                    "message": "each axis needs a non-empty 'key'."})
+            k = str(ax["key"]).strip().lower()
+            if k in seen:
+                raise HTTPException(400, detail={"error": "dup_axis",
+                    "message": f"duplicate axis key: {k!r}."})
+            seen.add(k)
+            m = ax.get("model")
+            if m and str(m).strip().lower() == COEOS_MODEL_ID:
+                raise HTTPException(400, detail={"error": "reserved_id",
+                    "message": "'coeos' is the router's own id and can't be bound to an axis."})
     with _cluster_config_txn() as cfg:
         c = cfg.get("coeos_config") or {}
-        if req.enabled is not None:
-            c["enabled"] = bool(req.enabled)
-        if req.category_models is not None:
-            # Keep only non-empty bindings for the known categories.
-            c["category_models"] = {k: v for k, v in req.category_models.items()
-                                    if k in COEOS_CATEGORIES and v}
-        if req.routing_instruction is not None:
-            c["routing_instruction"] = req.routing_instruction
-        if req.cold_boot_autoload is not None:
-            c["cold_boot_autoload"] = bool(req.cold_boot_autoload)
+        for field in ("enabled", "name", "regime", "updated", "note", "decider_model",
+                      "default_axis", "axes", "cold_boot_autoload"):
+            val = getattr(req, field)
+            if val is not None:
+                c[field] = bool(val) if field in ("enabled", "cold_boot_autoload") else val
         cfg["coeos_config"] = c
-    _coeos_instr_cache.clear()  # force re-parse on next request
     return get_coeos_config()
 
 
@@ -6135,16 +6138,16 @@ async def list_models(include_unloaded: bool = False):
 
     # CoeOS router: advertise the virtual `CoeOS` id when enabled (agents target
     # it, and clients like Companion show it as an endpoint alongside Argo /
-    # Telemak). It's not a pool — it resolves to a category's model per request.
+    # Telemak). It's not a pool — it resolves to an axis's model per request.
     _coeos_cfg = get_coeos_config()
-    _coeos_cat_models = _coeos_category_models(_coeos_cfg)
-    if _coeos_cfg.get("enabled") and _coeos_cat_models:
+    _coeos_ax_models = _coeos_axis_models(_coeos_cfg)
+    if _coeos_cfg.get("enabled") and _coeos_ax_models:
         data.append({
             "id": COEOS_DISPLAY_ID, "object": "model",
             "created": _now(), "owned_by": "odyssai-coeos",
             "root": COEOS_DISPLAY_ID, "x_concrete": COEOS_DISPLAY_ID,
             "x_odyssai": {"ready": True, "kind": "router",
-                          "categories": _coeos_cat_models},
+                          "axes": _coeos_ax_models},
         })
 
     # kind=telemak clusters: query the upstream's /v1/models. Multi-model
@@ -6380,37 +6383,22 @@ def _route_pool(model: Optional[str]) -> Optional[RunnerPool]:
 # reads the request, picks the best candidate via a JSON routing instruction
 # (deterministic rules first, a light LLM only when ambiguous AND already hot),
 # rewrites req.model, and lets the normal routing chain serve it. For AGENTS
-# (Omnigent/Cline/Aider/Hermes), routing PER PHASE. Config lives in
-# cluster-config.json["coeos_config"]. Plan reviewed (grill + MiniMax, 2 rounds).
+# (Omnigent/Cline/Aider/Hermes), routing PER SKILL AXIS. The taxonomy + bindings
+# are DATA (the "TMB Settings" file the operator imports), never hard-coded.
+# Config lives in cluster-config.json["coeos_config"].
 # ──────────────────────────────────────────────────────────────────────────────
-import re as _coeos_re
 
 COEOS_MODEL_ID = "coeos"          # canonical id used for case-insensitive matching
 COEOS_DISPLAY_ID = "CoeOS"        # public id emitted in /v1/models (Sophie's spelling)
 
-# The 5 routing categories (Sophie). One published model is bound to each in the
-# dashboard; the decider classifies a request into one category, then resolves it.
-COEOS_CATEGORIES = ["writing", "planning", "coding", "fast_tools", "deep_analysis"]
-# Legacy x-coeos-phase header → category (so older agents still route).
-_COEOS_PHASE_TO_CATEGORY = {
-    "plan": "planning", "code": "coding", "act": "fast_tools", "chat": "writing"}
+# CoeOS is a benchmark-composed virtual model: the routing TAXONOMY (skill axes)
+# and the per-axis model bindings live ENTIRELY in the config ("TMB Settings"
+# file the operator imports) — NO hard-coded categories/rules in code. The
+# decider model classifies each request into one configured axis, then we serve
+# that axis's bound model. Adding an axis (e.g. Swift) = editing the file.
 
-# Tool names signalling an "act/code" phase across known agent frameworks.
-_COEOS_ACT_TOOL_RE = _coeos_re.compile(
-    r"\b(write|edit|str_replace|apply|replace_in_file|search_replace|create_file|"
-    r"insert_edit|apply_patch|run_command|execute_command|write_to_file)\b",
-    _coeos_re.IGNORECASE)
-_COEOS_PLAN_HINT_RE = _coeos_re.compile(
-    r"\b(architect|plan|planner|design|reason|think step)\b", _coeos_re.IGNORECASE)
-# Deep-analysis hints in the user text.
-_COEOS_DEEP_RE = _coeos_re.compile(
-    r"\b(analyse|analyze|debug|root cause|why does|prove|investigate|"
-    r"trade-?off|reason through|step by step|deep dive)\b", _coeos_re.IGNORECASE)
-
-# Per-(model, category, fallback) decision counter — operator visibility.
+# Per-(model, axis, fallback) decision counter — operator visibility.
 _coeos_decisions: dict[tuple, int] = {}
-# Parsed-instruction memo keyed by the raw JSON string (rides the config TTL).
-_coeos_instr_cache: dict[str, dict] = {}
 
 
 def get_coeos_config() -> dict:
@@ -6418,23 +6406,21 @@ def get_coeos_config() -> dict:
     return cfg.get("coeos_config") or {}
 
 
-def _coeos_parse_instruction(raw: str) -> dict:
-    """Parse + memoize the routing_instruction JSON (keyed by raw string)."""
-    if not raw:
-        return {}
-    cached = _coeos_instr_cache.get(raw)
-    if cached is not None:
-        return cached
-    try:
-        parsed = json.loads(raw)
-        if not isinstance(parsed, dict):
-            parsed = {}
-    except Exception:
-        parsed = {}
-    if len(_coeos_instr_cache) > 16:
-        _coeos_instr_cache.clear()
-    _coeos_instr_cache[raw] = parsed
-    return parsed
+def _coeos_axes(cfg: dict) -> list:
+    """The configured skill axes (data-driven taxonomy). Each = {key, label,
+    model, ...}. Comes from the imported TMB Settings — never hard-coded."""
+    axes = cfg.get("axes")
+    return [a for a in axes if isinstance(a, dict) and a.get("key")] if isinstance(axes, list) else []
+
+
+def _coeos_axis_models(cfg: dict) -> dict:
+    """axis key → bound model id (non-empty, not the reserved coeos id)."""
+    out = {}
+    for ax in _coeos_axes(cfg):
+        k, m = ax.get("key"), ax.get("model")
+        if k and m and str(m).lower() != COEOS_MODEL_ID:
+            out[k] = m
+    return out
 
 
 def _coeos_hot_model_ids() -> set:
@@ -6477,83 +6463,34 @@ def list_routable_model_ids() -> list:
     return sorted(_coeos_hot_model_ids())
 
 
-def _coeos_category_models(cfg: dict) -> dict:
-    """category → model id, dropping empties and the reserved `coeos` id."""
-    cm = cfg.get("category_models") or {}
-    return {k: v for k, v in cm.items()
-            if k in COEOS_CATEGORIES and v and str(v).lower() != COEOS_MODEL_ID}
-
-
-def _coeos_infer_phase(req, request) -> str:
-    """Coarse phase signal from the request SHAPE (tools / system prompt / code
-    fence) — feeds the rule matcher. Returns plan | act | code | chat."""
-    if req.tools:
-        for t in req.tools:
-            name = ((t.get("function") or {}).get("name") or t.get("name") or "")
-            if _COEOS_ACT_TOOL_RE.search(str(name)):
-                return "code"
-    sys_txt = " ".join(
-        (m.content if isinstance(m.content, str) else "")
-        for m in (req.messages or []) if m.role == "system")
-    if _COEOS_PLAN_HINT_RE.search(sys_txt):
-        return "plan"
-    last = next((m for m in reversed(req.messages or []) if m.role == "user"), None)
-    if last and isinstance(last.content, str) and "```" in last.content:
-        return "code"
-    return "chat"
-
-
-def _coeos_signals(req, phase: str) -> dict:
-    last = next((m for m in reversed(req.messages or []) if m.role == "user"), None)
-    txt = last.content if (last and isinstance(last.content, str)) else ""
-    low = txt.lower()
-    fr = bool(_coeos_re.search(
-        r"[àâçéèêëîïôûùüÿœ]| le | la | les | une | des | qui | pour ", low))
-    mt = req.max_tokens or 512
-    length = "long" if mt >= 2000 else ("medium" if mt >= 700 else "short")
-    return {"phase": phase, "lang": "fr" if fr else "en", "length": length,
-            "tools_present": bool(req.tools),
-            "has_code": "```" in txt,
-            "deep": bool(_COEOS_DEEP_RE.search(low))}
-
-
-def _coeos_header_category(request) -> Optional[str]:
-    """Explicit category from the agent. `x-coeos-category` wins (Omnigent);
-    legacy `x-coeos-phase` is mapped to a category for older agents."""
-    cat = (request.headers.get("x-coeos-category") or "").strip().lower()
-    if cat in COEOS_CATEGORIES:
-        return cat
-    phase = (request.headers.get("x-coeos-phase") or "").strip().lower()
-    return _COEOS_PHASE_TO_CATEGORY.get(phase)
-
-
-def _coeos_match_category(instr: dict, signals: dict) -> Optional[str]:
-    """First rule whose `when` is a subset of signals wins; returns its category
-    (back-compat: a rule may still carry `model`, handled by the caller)."""
-    for rule in (instr.get("rules") or []):
-        when = rule.get("when") or {}
-        if when and all(signals.get(k) == v for k, v in when.items()):
-            cat = rule.get("category")
-            if cat in COEOS_CATEGORIES:
-                return cat
+def _coeos_header_axis(request, keys: list) -> Optional[str]:
+    """Explicit axis from the agent. `x-coeos-axis` wins; `x-coeos-category` is a
+    back-compat alias. Returned only if it's a CONFIGURED axis key."""
+    for h in ("x-coeos-axis", "x-coeos-category"):
+        v = (request.headers.get(h) or "").strip().lower()
+        if v in keys:
+            return v
     return None
 
 
-async def _coeos_llm_classify(decider_pool, instr, signals, messages) -> Optional[str]:
-    """Ask the (already-hot) decider to classify into one category. Bounded."""
+async def _coeos_llm_classify(decider_pool, axes, messages) -> Optional[str]:
+    """Ask the (already-hot) decider to classify the request into ONE configured
+    axis. The taxonomy (keys + labels) is passed from config — nothing about the
+    skills or the winning models is hard-coded here. Bounded + cheap."""
     last_content = ""
     if messages:
         c = messages[-1].get("content")
         if isinstance(c, str):
-            last_content = c[:600]
-    default_instr = ("Classify the request into exactly one category and reply "
-                     "with ONLY the category id: " + " | ".join(COEOS_CATEGORIES) + ".")
+            last_content = c[:800]
+    menu = "\n".join(f"- {ax['key']}: {ax.get('label', ax['key'])}"
+                     for ax in axes if ax.get("key"))
+    keys = [ax["key"] for ax in axes if ax.get("key")]
     prompt = (
-        f"{instr.get('llm_instruction', default_instr)}\n\n"
-        f"Categories: {COEOS_CATEGORIES}\n"
-        f"Signals: {json.dumps(signals)}\n"
-        f"Latest user message (truncated): {last_content}\n\n"
-        f"Reply with ONLY one category id, nothing else.")
+        "You are a routing classifier. Read the request and pick the single "
+        "best-matching skill axis from the menu. Reply with ONLY the axis key.\n\n"
+        f"Axes:\n{menu}\n\n"
+        f"Request (truncated):\n{last_content}\n\n"
+        f"Reply with ONLY one of: {', '.join(keys)}")
     buf = ""
     try:
         async for ev in decider_pool.submit(None, 12, False,
@@ -6563,59 +6500,55 @@ async def _coeos_llm_classify(decider_pool, instr, signals, messages) -> Optiona
             elif ev.get("event") == "done":
                 break
     except Exception as e:
-        sys.stderr.write(f"[coeos] decider LLM error: {e}\n")
+        sys.stderr.write(f"[coeos] decider error: {e}\n")
         return None
     pick = buf.strip().split()[0].strip('"\'`,.').lower() if buf.strip() else ""
-    return pick if pick in COEOS_CATEGORIES else None
+    return pick if pick in keys else None
 
 
-async def coeos_resolve(req, request) -> str:
-    """Resolve `coeos` → a concrete model id. Classify the request into one of
-    the 5 categories (header → rules → light LLM if ambiguous AND decider hot →
-    default), then resolve category → model. Falls back to any hot category
-    model (never routes to a cold model); 503 if none is hot (unless
-    cold_boot_autoload)."""
+async def coeos_resolve(req, request) -> tuple:
+    """Resolve `coeos` → (concrete model id, axis). Classify the request into one
+    CONFIGURED axis (explicit `x-coeos-axis` header → decider LLM if it's hot →
+    `default_axis`), then serve that axis's bound model. Falls back to any hot
+    bound model (never routes to a cold model); 503 if none is hot (unless
+    cold_boot_autoload). Taxonomy + bindings are data — see the TMB Settings."""
     cfg = get_coeos_config()
     if not cfg.get("enabled"):
         raise HTTPException(status_code=400, detail={
             "error": "coeos_disabled",
             "message": "CoeOS router is disabled. Enable it in Settings → CoeOS."})
-    instr = _coeos_parse_instruction(cfg.get("routing_instruction") or "{}")
-    cat_models = _coeos_category_models(cfg)
-    default_cat = instr.get("default_category")
-    if default_cat not in COEOS_CATEGORIES:
-        default_cat = "fast_tools" if "fast_tools" in cat_models else (
-            next(iter(cat_models), None))
+    axes = _coeos_axes(cfg)
+    axis_models = _coeos_axis_models(cfg)
+    keys = [ax.get("key") for ax in axes if ax.get("key")]
+    default_axis = cfg.get("default_axis")
+    if default_axis not in keys:
+        default_axis = next((k for k in keys if k in axis_models),
+                            (keys[0] if keys else None))
     hot = _coeos_hot_model_ids()
-    phase = _coeos_infer_phase(req, request)
-    signals = _coeos_signals(req, phase)
 
-    # 1. Explicit category header (Omnigent) → 2. rules → 3. LLM if ambiguous
-    #    AND decider hot → 4. default category.
-    category = _coeos_header_category(request)
-    if not category:
-        category = _coeos_match_category(instr, signals)
-    if not category and instr.get("llm_fallback"):
-        decider_id = instr.get("decider_model") or cat_models.get(default_cat or "")
+    # Classify: explicit header → decider LLM (only if already hot) → default.
+    axis = _coeos_header_axis(request, keys)
+    if not axis:
+        decider_id = cfg.get("decider_model")
         decider_pool = _route_pool(decider_id) if decider_id else None
         if decider_pool is not None and decider_pool.alive_count() > 0:
             messages = [m.model_dump(exclude_none=True) for m in req.messages]
-            category = await _coeos_llm_classify(decider_pool, instr, signals, messages)
-    if category not in COEOS_CATEGORIES:
-        category = default_cat
-    chosen = cat_models.get(category) if category else None
+            axis = await _coeos_llm_classify(decider_pool, axes, messages)
+    if axis not in keys:
+        axis = default_axis
+    chosen = axis_models.get(axis) if axis else None
 
     def _is_hot(mid) -> bool:
         return _coeos_is_servable(mid, hot)
 
     fallback = False
-    # Never route to a cold model — fall back to any hot category model + log.
+    # Never route to a cold model — fall back to any hot bound model + log.
     if not _is_hot(chosen):
-        hot_models = [m for m in cat_models.values() if _is_hot(m)]
-        default_model = cat_models.get(default_cat or "")
+        hot_models = [m for m in axis_models.values() if _is_hot(m)]
+        default_model = axis_models.get(default_axis or "")
         if hot_models:
             sub = hot_models[0]
-            sys.stderr.write(f"[coeos] {chosen!r} (cat={category}) cold → hot {sub!r}\n")
+            sys.stderr.write(f"[coeos] {chosen!r} (axis={axis}) cold → hot {sub!r}\n")
             chosen, fallback = sub, True
         elif cfg.get("cold_boot_autoload") and default_model:
             sys.stderr.write(f"[coeos] cold boot — routing to {default_model!r} (autoload on)\n")
@@ -6623,13 +6556,13 @@ async def coeos_resolve(req, request) -> str:
         else:
             raise HTTPException(status_code=503, detail={
                 "error": "coeos_no_warm_candidate",
-                "message": "CoeOS has no warm model bound to a category. Load one "
-                           "of the bound models, or enable cold_boot_autoload.",
-                "category_models": cat_models})
+                "message": "CoeOS has no warm model bound to an axis. Load one of "
+                           "the bound models, or enable cold_boot_autoload.",
+                "axis_models": axis_models})
 
-    k = (chosen, category or "?", fallback)
+    k = (chosen, axis or "?", fallback)
     _coeos_decisions[k] = _coeos_decisions.get(k, 0) + 1
-    return chosen, (category or "")
+    return chosen, (axis or "")
 
 
 _TOOL_BLOCK_RE = [
@@ -6655,9 +6588,9 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
     # and rewrites req.model, so the normal chain below (Telemak/cloud/local)
     # serves the chosen model. Resolved FIRST so no other branch short-circuits.
     coeos_routed: Optional[str] = None     # clean id CoeOS routed to (for the response label)
-    coeos_category: Optional[str] = None
+    coeos_axis: Optional[str] = None
     if req.model and req.model.strip().lower() == COEOS_MODEL_ID:
-        coeos_routed, coeos_category = await coeos_resolve(req, request)
+        coeos_routed, coeos_axis = await coeos_resolve(req, request)
         req.model = coeos_routed
     # 0. Telemak passthrough? If the model id matches a kind=telemak cluster,
     # proxy the request to that cluster's upstream Swift binary. Supports
@@ -6863,7 +6796,7 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
         if coeos_routed:
             body["x_odyssai_routed"] = {"router": COEOS_DISPLAY_ID,
                                         "routed_to": coeos_routed,
-                                        "category": coeos_category,
+                                        "axis": coeos_axis,
                                         "concrete": model_id}
         return JSONResponse(body)
 
@@ -6886,7 +6819,7 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
             if coeos_routed:
                 first["x_odyssai_routed"] = {"router": COEOS_DISPLAY_ID,
                                              "routed_to": coeos_routed,
-                                             "category": coeos_category,
+                                             "axis": coeos_axis,
                                              "concrete": model_id}
             yield f"data: {json.dumps(first)}\n\n".encode()
             # Per-stream <think>…</think> wire filter. Decision is shared

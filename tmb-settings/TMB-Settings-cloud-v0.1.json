@@ -1,0 +1,25 @@
+{
+  "name": "TMB Settings — Best of all (cloud) · v0.1",
+  "regime": "cloud",
+  "updated": "2026-06-26",
+  "note": "Modèle virtuel composé : chaque axe route vers le modèle que les benchmarks TMB ont prouvé meilleur dessus. Régime cloud = best-of-all sans contrainte de slots. Mensuel : régénéré depuis les scoreboards.",
+  "decider_model": "telomnis:nex-n2-mini-6bit",
+  "default_axis": "code_general",
+  "axes": [
+    { "key": "creative",      "label": "Créatif / rédaction longue", "model": "or:glm-5.2",       "bench": "T01 480/500 (record absolu, > Opus 475)", "verified": true },
+    { "key": "legal_rgpd",    "label": "RGPD / conformité",          "model": "or:glm-5.1",       "bench": "T02 48/50",                               "verified": true },
+    { "key": "legal_complex", "label": "Conformité multi-jur.",      "model": "or:qwen-3-6",      "bench": "T05 49/50 (co-#1)",                       "verified": true },
+    { "key": "reasoning",     "label": "Raisonnement / logique",     "model": "or:glm-5.2",       "bench": "T06 46/50",                               "verified": true },
+    { "key": "calc",          "label": "Calcul / structuré",         "model": "or:glm-5.2",       "bench": "T07 49/50",                               "verified": true },
+    { "key": "python",        "label": "Python / scripts",           "model": "anthropic/claude-opus", "bench": "T03 46.5/50 (cloud)",                "verified": true },
+    { "key": "code_general",  "label": "Code général",               "model": "or:glm-5.2",       "bench": "C01-C08 89.1% (cloud)",                   "verified": true },
+    { "key": "debug",         "label": "Debug",                      "model": "or:glm-5.2",       "bench": "C02 49/50 (record panel)",                "verified": true },
+    { "key": "react",         "label": "React / front",              "model": "or:glm-5.2",       "bench": "C04 49/50",                               "verified": true },
+    { "key": "swift",         "label": "Swift",                      "model": "",                 "bench": "TROU — aucun modèle fort benché (à trouver)", "verified": false },
+    { "key": "refactoring",   "label": "Refactoring",                "model": "or:glm-5.2",       "bench": "C06 49/50",                               "verified": true },
+    { "key": "plan_decompo",  "label": "Planning — décomposition",   "model": "or:minimax-m3",    "bench": "P01 39/50 (cloud ; local Kimi 44)",       "verified": true },
+    { "key": "plan_spec",     "label": "Planning — handoff / spec",  "model": "or:minimax-m3",    "bench": "P04 47/50",                               "verified": true },
+    { "key": "plan_judgment", "label": "Planning — jugement / pièges","model": "or:minimax-m3",   "bench": "P02 37 / P03 47",                         "verified": true },
+    { "key": "fast_tools",    "label": "Tools & fast coding",        "model": "or:claude-haiku",  "bench": "axe latence — pas de score qualité dédié", "verified": false }
+  ]
+}
