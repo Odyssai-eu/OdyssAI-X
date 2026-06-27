@@ -7046,6 +7046,294 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# OpenAI-compatible /v1/responses  (shim → /v1/chat/completions)
+#
+# The Responses API (openai.responses.*) is what Omnigent speaks. We don't store
+# state: this is a thin, STATELESS adapter that translates the Responses request
+# into a ChatCompletionRequest, reuses `chat_completions` (so CoeOS routing,
+# Telemak/cloud passthrough, tool quirks and EOS handling all come for free),
+# then translates the chat result back into Responses shape — a Response object
+# (non-stream) or the typed `response.*` SSE event sequence (stream), including
+# function_call items.
+#
+# Mapped: input (str | items: message / function_call / function_call_output),
+#   instructions→system, tools (flat→nested), tool_choice, max_output_tokens,
+#   reasoning.effort. Ignored (stateless): previous_response_id, store, metadata.
+# Not yet: built-in tools (web_search/file_search), input audio.
+# ──────────────────────────────────────────────────────────────────────────────
+class ResponsesRequest(BaseModel):
+    model: Optional[str] = None
+    input: Optional[Any] = None            # str OR list of input items
+    instructions: Optional[str] = None     # system prompt
+    stream: Optional[bool] = False
+    tools: Optional[list[dict]] = None
+    tool_choice: Optional[Any] = None
+    max_output_tokens: Optional[int] = None
+    reasoning: Optional[dict] = None        # {"effort": "low|medium|high"}
+    model_config = {"extra": "allow"}       # tolerate previous_response_id, store, …
+
+
+def _responses_flatten_content(content: Any):
+    """Responses content (str | list of parts) → chat content (str, or the
+    OpenAI parts list when images are present)."""
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        texts: list[str] = []
+        parts: list[dict] = []
+        has_img = False
+        for p in content:
+            if isinstance(p, str):
+                texts.append(p)
+                parts.append({"type": "text", "text": p})
+                continue
+            if not isinstance(p, dict):
+                continue
+            pt = p.get("type")
+            if pt in ("input_text", "output_text", "text", "summary_text"):
+                tx = p.get("text") or ""
+                texts.append(tx)
+                parts.append({"type": "text", "text": tx})
+            elif pt in ("input_image", "image_url", "image"):
+                url = p.get("image_url")
+                if isinstance(url, dict):
+                    url = url.get("url")
+                url = url or p.get("url")
+                if url:
+                    has_img = True
+                    parts.append({"type": "image_url", "image_url": {"url": url}})
+        return parts if has_img else "\n".join(t for t in texts if t)
+    return ""
+
+
+def _responses_build_messages(instructions: Optional[str], inp: Any) -> list[dict]:
+    """Responses (instructions + input) → chat messages list."""
+    msgs: list[dict] = []
+    if instructions:
+        msgs.append({"role": "system", "content": instructions})
+    if inp is None:
+        return msgs
+    if isinstance(inp, str):
+        msgs.append({"role": "user", "content": inp})
+        return msgs
+    if isinstance(inp, list):
+        for item in inp:
+            if isinstance(item, str):
+                msgs.append({"role": "user", "content": item})
+                continue
+            if not isinstance(item, dict):
+                continue
+            t = item.get("type")
+            if t in (None, "message"):
+                msgs.append({"role": item.get("role", "user"),
+                             "content": _responses_flatten_content(item.get("content"))})
+            elif t == "function_call":
+                msgs.append({"role": "assistant", "content": None,
+                             "tool_calls": [{
+                                 "id": item.get("call_id") or item.get("id"),
+                                 "type": "function",
+                                 "function": {"name": item.get("name"),
+                                              "arguments": item.get("arguments") or "{}"}}]})
+            elif t == "function_call_output":
+                out = item.get("output")
+                if not isinstance(out, str):
+                    out = json.dumps(out)
+                msgs.append({"role": "tool",
+                             "tool_call_id": item.get("call_id") or item.get("id"),
+                             "content": out})
+            # unknown item types (reasoning, …) are ignored
+    return msgs
+
+
+def _responses_tools_to_chat(tools: Optional[list]) -> Optional[list]:
+    """Responses tools (flat {type:function, name, …}) → chat ({type:function,
+    function:{…}}). Tolerates already-nested. Skips built-in tools."""
+    out: list[dict] = []
+    for t in tools or []:
+        if not isinstance(t, dict) or t.get("type") != "function":
+            continue
+        if isinstance(t.get("function"), dict):
+            out.append(t)
+            continue
+        fn = {"name": t.get("name"), "description": t.get("description"),
+              "parameters": t.get("parameters") or {"type": "object", "properties": {}}}
+        if "strict" in t:
+            fn["strict"] = t["strict"]
+        out.append({"type": "function",
+                    "function": {k: v for k, v in fn.items() if v is not None}})
+    return out or None
+
+
+def _responses_tool_choice(tc: Any) -> Any:
+    """Responses tool_choice → chat tool_choice."""
+    if tc is None:
+        return None
+    if isinstance(tc, str):           # "auto" | "none" | "required"
+        return tc
+    if isinstance(tc, dict):
+        if tc.get("type") == "function":
+            name = tc.get("name") or (tc.get("function") or {}).get("name")
+            if name:
+                return {"type": "function", "function": {"name": name}}
+        return tc.get("type") or "auto"
+    return None
+
+
+def _chat_to_responses_obj(chat_body: dict, model_label: str) -> dict:
+    """Chat completion JSON → Responses Response object."""
+    choice = (chat_body.get("choices") or [{}])[0]
+    msg = choice.get("message") or {}
+    text = msg.get("content") or ""
+    if isinstance(text, list):
+        text = "".join(p.get("text", "") for p in text if isinstance(p, dict))
+    output: list[dict] = []
+    if text:
+        output.append({"type": "message", "id": "msg_" + uuid.uuid4().hex[:24],
+                       "status": "completed", "role": "assistant",
+                       "content": [{"type": "output_text", "text": text, "annotations": []}]})
+    for tc in (msg.get("tool_calls") or []):
+        fn = tc.get("function") or {}
+        output.append({"type": "function_call", "id": "fc_" + uuid.uuid4().hex[:24],
+                       "call_id": tc.get("id") or ("call_" + uuid.uuid4().hex[:12]),
+                       "name": fn.get("name"), "arguments": fn.get("arguments") or "{}",
+                       "status": "completed"})
+    usage = chat_body.get("usage") or {}
+    resp = {"id": "resp_" + uuid.uuid4().hex[:24], "object": "response",
+            "created_at": chat_body.get("created") or _now(), "status": "completed",
+            "model": chat_body.get("model") or model_label, "output": output,
+            "output_text": text,
+            "usage": {"input_tokens": usage.get("prompt_tokens", 0),
+                      "output_tokens": usage.get("completion_tokens", 0),
+                      "total_tokens": usage.get("total_tokens", 0)}}
+    if chat_body.get("x_odyssai_routed"):
+        resp["x_odyssai_routed"] = chat_body["x_odyssai_routed"]
+    return resp
+
+
+async def _responses_stream(chat_iter, model_label: str):
+    """Wrap the chat-completions SSE byte stream → typed Responses SSE events."""
+    seq = 0
+
+    def ev(typ: str, payload: dict) -> bytes:
+        nonlocal seq
+        out = {"type": typ, "sequence_number": seq, **payload}
+        seq += 1
+        return f"event: {typ}\ndata: {json.dumps(out)}\n\n".encode()
+
+    rid = "resp_" + uuid.uuid4().hex[:24]
+    msg_id = "msg_" + uuid.uuid4().hex[:24]
+    base = {"id": rid, "object": "response", "created_at": _now(),
+            "model": model_label, "status": "in_progress", "output": []}
+    yield ev("response.created", {"response": base})
+    yield ev("response.in_progress", {"response": base})
+
+    text_started = False
+    full_text = ""
+    tool_calls: list[dict] = []
+    routed = None
+    buf = b""
+    async for raw in chat_iter:
+        buf += raw if isinstance(raw, (bytes, bytearray)) else str(raw).encode()
+        while b"\n\n" in buf:
+            block, buf = buf.split(b"\n\n", 1)
+            line = block.strip()
+            if not line.startswith(b"data:"):
+                continue
+            data = line[5:].strip()
+            if data == b"[DONE]":
+                continue
+            try:
+                chunk = json.loads(data)
+            except Exception:
+                continue
+            if chunk.get("x_odyssai_routed"):
+                routed = chunk["x_odyssai_routed"]
+            delta = ((chunk.get("choices") or [{}])[0]).get("delta") or {}
+            piece = delta.get("content") or ""
+            if piece:
+                if not text_started:
+                    text_started = True
+                    yield ev("response.output_item.added", {"output_index": 0,
+                             "item": {"type": "message", "id": msg_id, "status": "in_progress",
+                                      "role": "assistant", "content": []}})
+                    yield ev("response.content_part.added", {"item_id": msg_id, "output_index": 0,
+                             "content_index": 0, "part": {"type": "output_text", "text": "", "annotations": []}})
+                full_text += piece
+                yield ev("response.output_text.delta", {"item_id": msg_id, "output_index": 0,
+                         "content_index": 0, "delta": piece})
+            if delta.get("tool_calls"):
+                tool_calls = delta["tool_calls"]
+
+    output_items: list[dict] = []
+    out_index = 0
+    if text_started:
+        yield ev("response.output_text.done", {"item_id": msg_id, "output_index": 0,
+                 "content_index": 0, "text": full_text})
+        yield ev("response.content_part.done", {"item_id": msg_id, "output_index": 0,
+                 "content_index": 0, "part": {"type": "output_text", "text": full_text, "annotations": []}})
+        msg_item = {"type": "message", "id": msg_id, "status": "completed", "role": "assistant",
+                    "content": [{"type": "output_text", "text": full_text, "annotations": []}]}
+        yield ev("response.output_item.done", {"output_index": 0, "item": msg_item})
+        output_items.append(msg_item)
+        out_index = 1
+
+    for tc in tool_calls:
+        fn = tc.get("function") or {}
+        fc_id = "fc_" + uuid.uuid4().hex[:24]
+        call_id = tc.get("id") or ("call_" + uuid.uuid4().hex[:12])
+        args = fn.get("arguments") or "{}"
+        if not isinstance(args, str):
+            args = json.dumps(args)
+        added = {"type": "function_call", "id": fc_id, "call_id": call_id,
+                 "name": fn.get("name"), "arguments": "", "status": "in_progress"}
+        yield ev("response.output_item.added", {"output_index": out_index, "item": added})
+        yield ev("response.function_call_arguments.delta", {"item_id": fc_id,
+                 "output_index": out_index, "delta": args})
+        yield ev("response.function_call_arguments.done", {"item_id": fc_id,
+                 "output_index": out_index, "arguments": args})
+        done = {**added, "arguments": args, "status": "completed"}
+        yield ev("response.output_item.done", {"output_index": out_index, "item": done})
+        output_items.append(done)
+        out_index += 1
+
+    final = {**base, "status": "completed", "output": output_items, "output_text": full_text}
+    if routed:
+        final["x_odyssai_routed"] = routed
+    yield ev("response.completed", {"response": final})
+
+
+@app.post("/v1/responses")
+async def responses(req: ResponsesRequest, request: Request):
+    messages = _responses_build_messages(req.instructions, req.input)
+    if not messages:
+        raise HTTPException(status_code=400, detail={
+            "error": "invalid_request",
+            "message": "`input` is required (string or list of input items)."})
+    kwargs: dict = {"model": req.model, "messages": messages, "stream": bool(req.stream)}
+    if req.max_output_tokens:
+        kwargs["max_tokens"] = req.max_output_tokens
+    tools = _responses_tools_to_chat(req.tools)
+    if tools:
+        kwargs["tools"] = tools
+    tc = _responses_tool_choice(req.tool_choice)
+    if tc is not None:
+        kwargs["tool_choice"] = tc
+    if isinstance(req.reasoning, dict) and req.reasoning.get("effort"):
+        kwargs["reasoning_effort"] = req.reasoning["effort"]
+    chat_req = ChatCompletionRequest(**kwargs)
+    model_label = req.model or "odyssai"
+
+    result = await chat_completions(chat_req, request)   # reuse the whole routing chain
+    if bool(req.stream):
+        return StreamingResponse(_responses_stream(result.body_iterator, model_label),
+                                 media_type="text/event-stream")
+    chat_body = json.loads(result.body)
+    return JSONResponse(_chat_to_responses_obj(chat_body, model_label))
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # Anthropic-compatible /v1/messages
 #
 # Translates Anthropic Messages API to our OpenAI-style runner protocol so
