@@ -7185,7 +7185,11 @@ def _chat_to_responses_obj(chat_body: dict, model_label: str) -> dict:
     """Chat completion JSON → Responses Response object."""
     choice = (chat_body.get("choices") or [{}])[0]
     msg = choice.get("message") or {}
-    text = msg.get("content") or ""
+    # Reasoning models (MiniMax-M3 local) put the answer in `reasoning_content`
+    # and leave `content` null. The chat endpoint keeps them separate on purpose
+    # (Companion's thinking UI) — but an agent (Omnigent) needs one text, so the
+    # shim falls back to reasoning_content when content is empty.
+    text = msg.get("content") or msg.get("reasoning_content") or ""
     if isinstance(text, list):
         text = "".join(p.get("text", "") for p in text if isinstance(p, dict))
     output: list[dict] = []
@@ -7251,7 +7255,9 @@ async def _responses_stream(chat_iter, model_label: str):
             if chunk.get("x_odyssai_routed"):
                 routed = chunk["x_odyssai_routed"]
             delta = ((chunk.get("choices") or [{}])[0]).get("delta") or {}
-            piece = delta.get("content") or ""
+            # content first; fall back to reasoning_content (MiniMax-M3 streams the
+            # answer there with content empty) so agent streaming isn't blank.
+            piece = delta.get("content") or delta.get("reasoning_content") or ""
             if piece:
                 if not text_started:
                     text_started = True
