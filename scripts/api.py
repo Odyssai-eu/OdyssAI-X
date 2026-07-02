@@ -10247,6 +10247,14 @@ async def _telemak_proxy_chat_completion(
         if _re_default:
             forward_body["reasoning_effort"] = _re_default
     forward_body["model"] = upstream_model
+    if stream:
+        # Ask the upstream for a trailing usage chunk (mlx_vlm.server and
+        # Telemak both honor stream_options.include_usage) so the client can
+        # compute tok/s. The cloud proxy already does this; the telemak path
+        # did not, so VLM rows showed "Chunks" instead of a speed metric.
+        _so = dict(forward_body.get("stream_options") or {})
+        _so.setdefault("include_usage", True)
+        forward_body["stream_options"] = _so
     import httpx
     if not stream:
         _t0 = time.time()
@@ -10373,6 +10381,25 @@ async def _telemak_proxy_chat_completion(
                                 cluster=cluster_id,
                             )
                             break
+                        # Usage-only chunk (stream_options.include_usage):
+                        # choices:[] + usage:{...}, no content delta. The think
+                        # filter would drop it, so the client never gets tok/s.
+                        # Pass it through verbatim (its delta is empty) and
+                        # capture completion_tokens for our own metrics.
+                        _st = line.strip()
+                        if _st.startswith(b"data: ") and _st != b"data: [DONE]":
+                            try:
+                                _uo = json.loads(line[6:])
+                            except Exception:
+                                _uo = None
+                            if isinstance(_uo, dict) and _uo.get("usage"):
+                                _u = _uo.get("usage") or {}
+                                if _u.get("completion_tokens"):
+                                    _ntoks = _u["completion_tokens"]
+                                if not _ttft:
+                                    _ttft.append(time.time() - _t0)
+                                yield line + b"\n"
+                                continue
                         out_line = _telemak_filter_sse_line(line, state, cluster_id)
                         if out_line is not None:
                             if not _ttft:
