@@ -418,7 +418,7 @@ def get_cluster_def(cluster_id: str) -> dict:
     default = DEFAULT_CLUSTER_DEFS.get(cluster_id, {})
     overlay = cfg.get(cluster_id, {})
     merged = json.loads(json.dumps(default))  # deep copy
-    for k in ("name", "kind", "backend", "max_nodes", "models_dir", "enabled", "upstream", "supports_vision"):
+    for k in ("name", "kind", "backend", "max_nodes", "models_dir", "enabled", "upstream", "supports_vision", "_vlm_managed", "_vlm_port", "_vlm_model_path", "_vlm_pid"):
         if k in overlay:
             merged[k] = overlay[k]
     if "nodes" in overlay and overlay["nodes"]:
@@ -11226,6 +11226,427 @@ async def admin_connection_test(nodes: int = 1, cluster: str = "default"):
             for n, r in zip(topo, ssh_results)
         ],
     }
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Engine-managed single-node VLM serving
+#
+# mlx-vlm is single-node only (no distributed serving path), so a VLM = exactly
+# one node. Today the routing layer already works: a telemak-kind cluster with
+# backend=http-proxy proxies chat/messages to an mlx_vlm.server, handling vision
+# passthrough, <think> split, usage chunk and supports_vision. The ONLY thing
+# missing was the operator having to (a) create a python3.12 venv, (b) launch
+# mlx_vlm.server by hand, and (c) PUT a telemak cluster def. These endpoints
+# fold (b) + (c) into the engine so `POST /admin/vlm/load` does the whole thing;
+# (a) is provisioned once per node by scripts/install-mlx-vlm.sh.
+#
+# This is ADDITIVE: it reuses validate_cluster_def / save_cluster_def /
+# get_cluster_def and the same telemak cluster shape the http-proxy router
+# already consumes. It does NOT touch _telemak_proxy_chat_completion, the
+# generation path, or any existing routing.
+#
+# Lifecycle:
+#   load   → ssh nohup launch mlx_vlm.server → poll /v1/models until data
+#            non-empty → upsert a telemak cluster def marked `_vlm_managed`
+#   unload → ssh two-phase kill (SIGTERM → grace → SIGKILL) matching the port
+#            AND the checkpoint (so an unrelated VLM on the node survives) →
+#            tombstone the cluster def (same {_removed: true} mechanism as
+#            DELETE /admin/clusters/{id})
+# ──────────────────────────────────────────────────────────────────────────────
+VLM_DEFAULT_VENV = env_get("VLM_VENV", "/Users/admin/.venvs/mlx-vlm")
+VLM_DEFAULT_PORT = int(env_get("VLM_PORT", "8080") or "8080")
+VLM_READY_TIMEOUT_S = float(env_get("VLM_READY_TIMEOUT_S", "180") or "180")
+# Marker key stamped on cluster-config entries the engine launched, so
+# /admin/vlm/status and unload can distinguish engine-managed VLMs from
+# hand-added telemak clusters.
+VLM_MANAGED_KEY = "_vlm_managed"
+
+
+def _vlm_ip_from_ssh(ssh_target: str) -> str:
+    """Derive the upstream host (IP or hostname) from a `user@host[:port]` ssh
+    target. This is the SSH host, NOT hardcoded — it comes from the request.
+
+    `admin@192.168.86.30`      → `192.168.86.30`
+    `admin@node-a.lan:2222`    → `node-a.lan`  (ssh port is not the http port)
+    """
+    host = ssh_target.split("@", 1)[-1]
+    # Strip an ssh port suffix if present (`host:port`); the VLM http port is
+    # a separate parameter. Guard against IPv6 (no bare colon form supported).
+    if host.count(":") == 1:
+        host = host.split(":", 1)[0]
+    return host
+
+
+def _vlm_log_path(vlm_id: str) -> str:
+    """Remote log path for a managed VLM. Kept under $HOME so the launch env
+    (HOME=/Users/admin) resolves it; validated slug means no shell metachars."""
+    return f"~/mlx-vlm-{vlm_id}.log"
+
+
+def _vlm_launch_cmd(vlm_id: str, venv: str, model_path: str, port: int) -> str:
+    """Build the proven nohup launch command with a full exported env block.
+
+    Mirrors the manual launch that ran on .29 tonight: export a clean env
+    (HOME/USER/TMPDIR/PATH) so mlx_vlm.server finds its venv + HF cache the
+    same way an interactive login shell would, then nohup the server detached
+    with stdout+stderr to the per-id log. Echoes the launched PID on stdout.
+    """
+    venv_bin = f"{venv.rstrip('/')}/bin"
+    server_bin = f"{venv_bin}/mlx_vlm.server"
+    log = _vlm_log_path(vlm_id)
+    # HOME/USER fixed to the admin account the nodes run under (matches the
+    # ssh target `admin@...`); PATH puts the venv first. All interpolated
+    # values are shlex.quote'd — model_path may contain '/', slug is validated.
+    return (
+        f"export HOME=/Users/admin USER=admin TMPDIR=/tmp "
+        f"PATH={shlex.quote(venv_bin)}:/usr/bin:/bin:/usr/sbin:/sbin && "
+        f"nohup {shlex.quote(server_bin)} "
+        f"--model {shlex.quote(model_path)} "
+        f"--host 0.0.0.0 --port {int(port)} "
+        f"--trust-remote-code "
+        f"> {log} 2>&1 & "
+        f"echo VLM_PID=$!"
+    )
+
+
+def _vlm_kill_cmd(port: int, model_path: str) -> str:
+    """Two-phase SIGTERM → grace → SIGKILL of the mlx_vlm.server for THIS port
+    (and, defensively, matching the checkpoint) — mirrors _remote_pkill /
+    _sweep_orphan_runners so Metal wired pages get a chance to free cleanly.
+
+    Matching on `--port <port>` AND the model path avoids killing an unrelated
+    mlx_vlm.server the operator may have on the same node. The pgrep pattern is
+    an extended regex over the full command line.
+    """
+    # Escape regex metacharacters in the model path so it matches literally in
+    # pgrep -f (which treats its pattern as a regex). Then shell-quote the whole
+    # pattern for the remote shell.
+    model_rx = re.escape(model_path)
+    # Require both the server module and the exact port token; include the model
+    # path as a further guard. `--port <port> ` ensures 8080 doesn't match 80801.
+    pattern = shlex.quote(
+        f"mlx_vlm.server.*--port {int(port)}( .*{model_rx})?"
+    )
+    return (
+        f"if pgrep -f {pattern} >/dev/null 2>&1; then "
+        f"  pkill -TERM -f {pattern} 2>/dev/null; "
+        f"  for i in $(seq 1 24); do "
+        f"    pgrep -f {pattern} >/dev/null 2>&1 || break; "
+        f"    sleep 0.5; "
+        f"  done; "
+        f"  if pgrep -f {pattern} >/dev/null 2>&1; then "
+        f"    pkill -9 -f {pattern}; echo 'killed (SIGKILL)'; "
+        f"  else echo 'cleaned (SIGTERM)'; fi; "
+        f"else echo 'no process'; fi"
+    )
+
+
+async def _vlm_probe_ready(ip: str, port: int, timeout: float = 5.0) -> Optional[bool]:
+    """Health probe: GET http://<ip>:<port>/v1/models and check the `data`
+    array is NON-EMPTY. mlx_vlm.server's own /health is unreliable (a zombie
+    holds the port with data:[]), so the model list is the real readiness gate.
+
+    Returns True (ready), False (reachable but empty → still loading / zombie),
+    or None (unreachable → not up yet).
+    """
+    import httpx
+    url = f"http://{ip}:{int(port)}/v1/models"
+    try:
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            r = await client.get(url)
+    except Exception:
+        return None
+    if r.status_code >= 400:
+        return False
+    try:
+        body = r.json()
+    except Exception:
+        return False
+    data = body.get("data") if isinstance(body, dict) else None
+    return bool(data)
+
+
+async def _vlm_log_tail(ssh_target: str, vlm_id: str, lines: int = 40) -> str:
+    """SSH-read the tail of a managed VLM's log — surfaced in the 503 body on
+    ready-timeout so the operator sees WHY (OOM, bad checkpoint, import error)
+    the same way RunnerProc.stderr_tail does for distributed runners."""
+    log = _vlm_log_path(vlm_id)
+    cmd = f"tail -n {int(lines)} {log} 2>/dev/null || true"
+    try:
+        rc, out, err = await asyncio.to_thread(_ssh_exec, ssh_target, cmd, 12)
+        return (out or err or "").strip()[-4000:]
+    except Exception as e:
+        return f"(could not read log tail: {e})"
+
+
+def _vlm_managed_cluster_ids() -> list[str]:
+    """cluster-config ids the engine launched as VLMs (marked VLM_MANAGED_KEY),
+    excluding tombstoned ones."""
+    out: list[str] = []
+    for cid, entry in _load_cluster_config().items():
+        if not isinstance(entry, dict):
+            continue
+        if entry.get("_removed"):
+            continue
+        if entry.get(VLM_MANAGED_KEY):
+            out.append(cid)
+    return out
+
+
+def _vlm_capacity_warning(host_id: str, ssh_target: str, exclude_id: str) -> Optional[str]:
+    """Co-residence warning (advisory, v1 does NOT block): is the target node
+    already a member of an active mlx-distributed pool, or already hosting
+    another engine-managed VLM? Co-residence can OOM (e.g. M3-VL 353GB + a text
+    pool > 512GB)."""
+    reasons: list[str] = []
+    # 1. Member of a loaded mlx-distributed pool?
+    for cid, _alias, pool in list_all_pools():
+        if not getattr(pool, "loaded", False):
+            continue
+        if host_id in _cluster_host_ids(cid):
+            reasons.append(f"node {host_id} is in loaded pool '{cid}'")
+    # 2. Already hosting another managed VLM (same ssh target / host)?
+    for cid in _vlm_managed_cluster_ids():
+        if cid == exclude_id:
+            continue
+        cd = get_cluster_def(cid)
+        for n in cd.get("nodes") or []:
+            if n.get("ssh") == ssh_target or n.get("host") == host_id:
+                reasons.append(f"node {host_id} already hosts VLM '{cid}'")
+                break
+    if not reasons:
+        return None
+    return (
+        "co-residence detected — this can OOM the node: "
+        + "; ".join(reasons)
+    )
+
+
+class VLMLoadRequest(BaseModel):
+    id: str                      # cluster slug [a-z0-9-]
+    host: str                    # ssh target, e.g. "admin@192.168.86.30"
+    model: str                   # path rel to models_dir OR absolute
+    name: Optional[str] = None   # display name (defaults to id)
+    port: Optional[int] = None   # default VLM_DEFAULT_PORT (8080)
+    venv: Optional[str] = None   # default VLM_DEFAULT_VENV
+    models_dir: Optional[str] = None   # override; else DEFAULT_MODELS_DIR
+    ready_timeout_s: Optional[float] = None
+
+
+class VLMUnloadRequest(BaseModel):
+    id: str
+
+
+def _vlm_resolve_model_path(model: str, models_dir: Optional[str]) -> str:
+    """Absolute path passed to mlx_vlm.server --model.
+
+    Absolute input (starts with '/') is used verbatim. A relative id is joined
+    onto models_dir (default DEFAULT_MODELS_DIR) so `odyssai/MiniMax-M3-VL-...`
+    resolves the same way the distributed loader resolves relative model ids.
+    """
+    m = model.strip()
+    if m.startswith("/"):
+        return m
+    base = (models_dir or DEFAULT_MODELS_DIR).rstrip("/")
+    return f"{base}/{m}"
+
+
+@app.post("/admin/vlm/load")
+async def admin_vlm_load(req: VLMLoadRequest):
+    """Launch mlx_vlm.server on a chosen node and route to it via a telemak
+    http-proxy cluster the engine creates.
+
+    Steps:
+      a. validate the slug + resolve ssh target and upstream host/IP
+      b. ssh-launch mlx_vlm.server (nohup + full env), log to ~/mlx-vlm-<id>.log
+      c. poll GET /v1/models until data non-empty (up to ready_timeout_s);
+         on timeout, ssh-read the log tail and return 503 with it
+      d. on ready, upsert a telemak cluster def {kind:telemak,
+         backend:http-proxy, upstream, supports_vision:true, _vlm_managed:true}
+      e. return {status:"loaded", id, upstream, model}
+    """
+    vlm_id = (req.id or "").strip().lower()
+    if not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,40}", vlm_id):
+        raise HTTPException(400, f"id {req.id!r} must match [a-z0-9][a-z0-9-]{{0,40}} (URL-safe slug)")
+    ssh_target = (req.host or "").strip()
+    try:
+        _safe_ssh_target(ssh_target)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    if not (req.model or "").strip():
+        raise HTTPException(400, "model is required")
+
+    port = int(req.port or VLM_DEFAULT_PORT)
+    venv = (req.venv or VLM_DEFAULT_VENV).strip()
+    ready_timeout = float(req.ready_timeout_s or VLM_READY_TIMEOUT_S)
+    model_path = _vlm_resolve_model_path(req.model, req.models_dir)
+    ip = _vlm_ip_from_ssh(ssh_target)
+    host_id = _host_id_from_ssh(ssh_target)
+    upstream = f"http://{ip}:{port}"
+
+    # Advisory capacity check (never blocks in v1).
+    warning = _vlm_capacity_warning(host_id, ssh_target, exclude_id=vlm_id)
+
+    # If already reachable on this port with a model loaded, treat as an early
+    # zombie/duplicate — surface it rather than launching a second server that
+    # fights for the port. The operator can /admin/vlm/unload first.
+    already = await _vlm_probe_ready(ip, port)
+    if already is True:
+        raise HTTPException(
+            409,
+            f"{ip}:{port} already serving a model — unload it first "
+            f"(POST /admin/vlm/unload) or pick another port",
+        )
+
+    # (b) launch
+    launch = _vlm_launch_cmd(vlm_id, venv, model_path, port)
+    launched_pid: Optional[str] = None
+    try:
+        rc, out, err = await asyncio.to_thread(_ssh_exec, ssh_target, launch, 20)
+    except subprocess.TimeoutExpired:
+        raise HTTPException(504, f"ssh launch on {ssh_target} timed out")
+    except Exception as e:
+        raise HTTPException(502, f"ssh to {ssh_target} failed: {e}")
+    if rc != 0:
+        raise HTTPException(
+            502,
+            f"launch failed on {ssh_target} (rc={rc}): "
+            f"{(err or out or '').strip()[:300]}",
+        )
+    for line in (out or "").splitlines():
+        if line.startswith("VLM_PID="):
+            launched_pid = line.split("=", 1)[1].strip()
+
+    # (c) poll for readiness — data non-empty on /v1/models.
+    deadline = time.time() + ready_timeout
+    ready = False
+    while time.time() < deadline:
+        state = await _vlm_probe_ready(ip, port)
+        if state is True:
+            ready = True
+            break
+        await asyncio.sleep(3.0)
+    if not ready:
+        tail = await _vlm_log_tail(ssh_target, vlm_id)
+        raise HTTPException(
+            503,
+            "mlx_vlm.server did not become ready within "
+            f"{int(ready_timeout)}s on {upstream}. Log tail:\n{tail}",
+        )
+
+    # (d) upsert the telemak cluster def routing to the launched server.
+    candidate = {
+        "name": (req.name or vlm_id),
+        "kind": "telemak",
+        "backend": "http-proxy",
+        "upstream": upstream,
+        "supports_vision": True,
+        "nodes": [{"host": host_id, "ssh": ssh_target, "master": True}],
+    }
+    verr = validate_cluster_def(vlm_id, candidate)
+    if verr:
+        # Server is up but the def is bad — kill what we launched so we don't
+        # leave an unreachable-from-the-dashboard server holding the node.
+        try:
+            await asyncio.to_thread(_ssh_exec, ssh_target, _vlm_kill_cmd(port, model_path), 20)
+        except Exception:
+            pass
+        raise HTTPException(400, f"cluster def invalid: {verr}")
+    # Persist the def + engine-managed bookkeeping. save_cluster_def overlays
+    # onto (and lifts any tombstone on) the cluster-config entry.
+    save_cluster_def(vlm_id, {
+        **candidate,
+        VLM_MANAGED_KEY: True,
+        "_vlm_port": port,
+        "_vlm_model_path": model_path,
+        "_vlm_pid": launched_pid,
+        "_telemak_loaded_model": model_path,
+    })
+    _telemak_cache_invalidate(vlm_id)
+
+    return {
+        "status": "loaded",
+        "id": vlm_id,
+        "upstream": upstream,
+        "model": model_path,
+        "pid": launched_pid,
+        "warning": warning,
+    }
+
+
+@app.post("/admin/vlm/unload")
+async def admin_vlm_unload(req: VLMUnloadRequest):
+    """Kill the mlx_vlm.server for a managed VLM and tombstone its cluster def.
+
+    Two-phase SIGTERM → grace → SIGKILL matching the port + checkpoint (reused
+    from the orphan-sweep pattern) so an unrelated VLM on the same node is left
+    alone; then tombstone the cluster def with {_removed: true}, the same
+    mechanism DELETE /admin/clusters/{id} uses.
+    """
+    vlm_id = (req.id or "").strip().lower()
+    cd = get_cluster_def(vlm_id)
+    if not cd or cd.get("kind") != "telemak":
+        raise HTTPException(404, f"unknown VLM cluster {vlm_id}")
+    nodes = cd.get("nodes") or []
+    ssh_target = (nodes[0] or {}).get("ssh") if nodes else None
+    if not ssh_target:
+        raise HTTPException(400, f"{vlm_id}: no ssh target on cluster node")
+    port = int(cd.get("_vlm_port") or VLM_DEFAULT_PORT)
+    model_path = cd.get("_vlm_model_path") or cd.get("_telemak_loaded_model") or ""
+
+    kill = _vlm_kill_cmd(port, model_path)
+    kill_result = ""
+    try:
+        rc, out, err = await asyncio.to_thread(_ssh_exec, ssh_target, kill, 20)
+        lines = (out or err or "").strip().splitlines()
+        kill_result = lines[-1] if lines else "(no output)"
+    except subprocess.TimeoutExpired:
+        kill_result = "ssh kill timed out"
+    except Exception as e:
+        kill_result = f"ssh kill error: {e}"
+
+    # Tombstone the cluster def — same {_removed: true} mechanism as
+    # DELETE /admin/clusters/{id}. active_cluster_ids() / cluster_exists()
+    # then filter it out.
+    with _cluster_config_txn() as cfg:
+        cfg[vlm_id] = {"_removed": True}
+    _telemak_cache_invalidate(vlm_id)
+
+    return {
+        "status": "unloaded",
+        "id": vlm_id,
+        "ssh": ssh_target,
+        "port": port,
+        "kill_result": kill_result,
+    }
+
+
+@app.get("/admin/vlm/status")
+async def admin_vlm_status():
+    """List engine-managed VLM clusters + their /v1/models reachability."""
+    out: list[dict] = []
+    for cid in _vlm_managed_cluster_ids():
+        cd = get_cluster_def(cid)
+        upstream = (cd.get("upstream") or "").rstrip("/")
+        nodes = cd.get("nodes") or []
+        ssh_target = (nodes[0] or {}).get("ssh") if nodes else None
+        host_id = (nodes[0] or {}).get("host") if nodes else None
+        port = int(cd.get("_vlm_port") or VLM_DEFAULT_PORT)
+        ip = _vlm_ip_from_ssh(ssh_target) if ssh_target else None
+        reachable = await _vlm_probe_ready(ip, port) if ip else None
+        out.append({
+            "id": cid,
+            "name": cd.get("name") or cid,
+            "host": host_id,
+            "ssh": ssh_target,
+            "upstream": upstream,
+            "port": port,
+            "model": cd.get("_vlm_model_path") or cd.get("_telemak_loaded_model"),
+            "pid": cd.get("_vlm_pid"),
+            # True = serving, False = up but empty (loading/zombie), None = down
+            "ready": reachable,
+        })
+    return {"vlms": out}
 
 
 # ──────────────────────────────────────────────────────────────────────────────
