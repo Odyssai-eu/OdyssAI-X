@@ -757,7 +757,8 @@ async def get_model_arch_meta(ssh: str, abspath: str) -> dict:
     Used to decide mode validity (tensor vs pipeline) WITHOUT loading the model.
     Cascades into text_config/language_model like runner.py does for the
     multimodal nests."""
-    miss = {"model_type": None, "num_hidden_layers": None, "num_key_value_heads": None}
+    miss = {"model_type": None, "num_hidden_layers": None,
+            "num_key_value_heads": None, "is_vision": False}
     cmd = f"cat {shlex.quote(abspath.rstrip('/') + '/config.json')} 2>/dev/null"
     try:
         out = await asyncio.to_thread(
@@ -778,10 +779,20 @@ async def get_model_arch_meta(ssh: str, abspath: str) -> dict:
             or cfg.get("language_model", {}).get(key)
             or (cfg.get("text_config", {}).get("language_model", {}) or {}).get(key)
         )
+    # Vision detection — same rule as _model_capabilities: model_type carries a
+    # "_vl"/"vision" marker OR a vision_config nest is present. Lets the loader
+    # route VL models to the single-node mlx_vlm.server flow instead of the
+    # distributed text runner (which can't run them).
+    _mt = (cfg.get("model_type") or cfg.get("text_config", {}).get("model_type") or "").lower()
+    is_vision = bool(
+        "_vl" in _mt or "_vision" in _mt or "vision" in _mt
+        or "vision_config" in cfg or "vision_tower_config" in cfg
+    )
     return {
         "model_type": cfg.get("model_type"),
         "num_hidden_layers": _nested("num_hidden_layers"),
         "num_key_value_heads": _nested("num_key_value_heads"),
+        "is_vision": is_vision,
     }
 
 
@@ -3608,7 +3619,7 @@ def _initial_default_config() -> Optional[dict]:
 #   major (1.7.2 → 2.0.0) — breaking API or topology change
 #
 # Use `./scripts/bump-version.sh patch|minor|major` to bump + auto-commit.
-APP_VERSION = "1.8.1"
+APP_VERSION = "1.9.0"
 
 app = FastAPI(
     title="OdyssAI-X (odyssai.eu)",
@@ -6186,6 +6197,14 @@ async def list_models(include_unloaded: bool = False):
                 return True
             n = (name or "").lower()
             return any(t in n for t in ("-vl", "vl-", "_vl", "vision"))
+        # Distinct `kind` marker the dashboard reads to draw a VLM badge. The
+        # transport stays http-proxy (backend below), but engine-managed VLMs
+        # (VLM_MANAGED_KEY) — or any telemak cluster serving a vision model —
+        # report kind="vlm" so the VL model is attributable + badged as such.
+        def _telemak_kind(name: str) -> str:
+            if cd.get(VLM_MANAGED_KEY) or _telemak_vision(name):
+                return "vlm"
+            return "telemak"
         # cluster_label + family + quantization let the Companion picker
         # render telemak rows with the same depth as local pool rows:
         # title = cluster_label (e.g. "TeleCoder"), subtitle = family · quant.
@@ -6201,7 +6220,7 @@ async def list_models(include_unloaded: bool = False):
                     "ready": True,
                     "loaded": True,
                     "alias_for": loaded[0],
-                    "kind": "telemak",
+                    "kind": _telemak_kind(loaded[0]),
                     "cluster_label": cluster_label,
                     "family": short,
                     "quantization": _quant_from_name(loaded[0]),
@@ -6224,7 +6243,7 @@ async def list_models(include_unloaded: bool = False):
                         "ready": True,
                         "loaded": True,
                         "alias_for": upstream_model,
-                        "kind": "telemak",
+                        "kind": _telemak_kind(upstream_model),
                         "cluster_label": cluster_label,
                         "family": short,
                         "quantization": _quant_from_name(upstream_model),
@@ -9011,6 +9030,22 @@ def _cluster_host_ids(cluster_id: str) -> list[str]:
     return [n.get("host") for n in (cd.get("nodes") or []) if n.get("host")]
 
 
+def _vlm_occupied_hosts() -> dict[str, str]:
+    """Map host_id -> vlm_cluster_id for every node currently hosting an
+    engine-managed VLM. A VLM cluster def is only persisted AFTER its
+    mlx_vlm.server became ready (see /admin/vlm/load step d), so an existing
+    (non-tombstoned) VLM_MANAGED_KEY cluster means that host is occupied.
+    Used to hard-block text pools from claiming a VLM-occupied node."""
+    occupied: dict[str, str] = {}
+    for cid in _vlm_managed_cluster_ids():
+        cd = get_cluster_def(cid)
+        for n in cd.get("nodes") or []:
+            h = n.get("host")
+            if h:
+                occupied[h] = cid
+    return occupied
+
+
 async def _reboot_one(host: dict) -> dict:
     out = {"host": host["id"], "ssh": host["ssh"], "rc": None, "error": None, "method": None}
     # Try sudo -n shutdown first (works with NOPASSWD config), fall back to
@@ -9180,10 +9215,17 @@ async def admin_clusters_list():
         master = next((n for n in nodes if n.get("master")), nodes[0] if nodes else {})
         cluster_max = len(nodes) or 1
         saved_max = get_cluster_max_nodes(cid, default=cluster_max)
+        # Engine-managed VLM marker — `kind` stays as-is (telemak) so the
+        # http-proxy renderers keep working, but the dashboard reads `is_vlm`
+        # (+ supports_vision) to draw a distinct "VLM" badge and attribute the
+        # VL model to its host.
+        is_vlm = bool(cd.get(VLM_MANAGED_KEY) or cd.get("supports_vision"))
         out.append({
             "id": cid,
             "name": cd.get("name", cid),
             "kind": cd.get("kind"),
+            "is_vlm": is_vlm,
+            "supports_vision": bool(cd.get("supports_vision")),
             "backend": cd.get("backend"),
             "upstream": cd.get("upstream") or None,
             "enabled": _cluster_enabled(cid),
@@ -9961,6 +10003,27 @@ async def admin_cluster_load(cluster_id: str, req: ArgoLoadRequest):
         )
 
     topo = build_topology_from_indices(cluster_id, node_indices)
+
+    # Hard capacity enforcement (mirror of /admin/vlm/load): refuse to build a
+    # text pool that would claim a node currently hosting an engine-managed
+    # VLM. Co-residence can OOM (e.g. a text pool + M3-VL 327GB > node RAM).
+    # Overridable with force=true (same flag that overrides degraded/mode/RAM
+    # checks) or the VLM_ALLOW_CORESIDENCE env.
+    vlm_hosts = _vlm_occupied_hosts()
+    if vlm_hosts and not (getattr(req, "force", False) or VLM_ALLOW_CORESIDENCE):
+        clashes = [
+            f"node {n.get('host')} hosts VLM '{vlm_hosts[n.get('host')]}'"
+            for n in topo if n.get("host") in vlm_hosts
+        ]
+        if clashes:
+            raise HTTPException(
+                409,
+                f"{cluster_id}: refusing to load — " + "; ".join(clashes)
+                + ". Unload the VLM (POST /admin/vlm/unload) first, pick nodes "
+                "that are free, or override with force=true "
+                "(or set VLM_ALLOW_CORESIDENCE).",
+            )
+
     rank0_ssh = topo[0]["ssh"]
     # Resolve to an absolute path before sizing/reading config — a relative
     # model id would run du/cat in the SSH home dir and silently return nothing,
@@ -9973,6 +10036,42 @@ async def admin_cluster_load(cluster_id: str, req: ArgoLoadRequest):
     # pipeline with more nodes than layers) BEFORE spawning runners that would
     # just die at the barrier. Independent of the RAM check below.
     arch = await get_model_arch_meta(rank0_ssh, model_abspath)
+
+    # Unified load auto-detect. The distributed text runner can't run a vision
+    # model — VL models serve single-node via mlx_vlm.server. When the requested
+    # model's config.json is a vision model, transparently DISPATCH to the
+    # engine-managed VLM launch flow (admin_vlm_load) targeting this pool's
+    # rank-0 node, so "load model X on cluster/node N" just works for both.
+    #
+    # Seam: this creates a SEPARATE engine-managed telemak/http-proxy cluster
+    # (id "<cluster_id>-vlm", routing to mlx_vlm.server on rank-0) rather than a
+    # pool inside this mlx-distributed cluster — the two runtimes are distinct.
+    # The VLM then appears in the dashboard with the "vlm" badge attributed to
+    # rank-0's host. Set force=true to bypass detection and attempt a (doomed)
+    # text load anyway. Multi-node VL requests collapse to single-node (rank-0).
+    if arch.get("is_vision") and not getattr(req, "force", False):
+        vlm_id = f"{cluster_id}-vlm"
+        vlm_host = topo[0].get("host") or _host_id_from_ssh(rank0_ssh)
+        vlm_req = VLMLoadRequest(
+            id=re.sub(r"[^a-z0-9-]", "-", vlm_id.lower())[:41].strip("-") or "vlm",
+            host=rank0_ssh,
+            model=req.model,
+            name=f"{cd.get('name', cluster_id)} VLM",
+            models_dir=base_dir,
+        )
+        result = await admin_vlm_load(vlm_req)
+        return {
+            **result,
+            "dispatched": "vlm",
+            "note": (
+                f"{req.model} is a vision model — the distributed text runner "
+                f"can't serve it. Launched an engine-managed VLM "
+                f"(mlx_vlm.server) on {vlm_host} instead; it appears as cluster "
+                f"'{result.get('id')}' with the VLM badge. Pass force=true to "
+                "attempt a text load anyway."
+            ),
+        }
+
     mode_ok, mode_reason = _validate_load_mode(
         arch.get("model_type"), arch.get("num_hidden_layers"),
         arch.get("num_key_value_heads"), nodes_count, req.mode,
@@ -10716,6 +10815,18 @@ async def _telemak_status(cluster_id: str, cd: dict) -> dict:
                         ]
         except Exception:
             reachable = False
+    # VLM attribution. A plain mlx_vlm.server does NOT emit x_telemak.kind, so
+    # every loaded model above defaulted to kind="llm" — the dashboard would
+    # then badge an engine-managed VLM as "chat". The engine IS the capability
+    # truth here (it launched the server as a VLM), so when this telemak cluster
+    # is engine-managed as a VLM (VLM_MANAGED_KEY) or explicitly flags vision,
+    # stamp kind="vlm" onto every loaded model. Only takes effect while a model
+    # is actually loaded (models_details is empty otherwise) — the badge shows
+    # the VLM "in action", not on an idle/empty cluster.
+    is_vlm_cluster = bool(cd.get(VLM_MANAGED_KEY) or cd.get("supports_vision"))
+    if is_vlm_cluster:
+        for det in models_details.values():
+            det["kind"] = "vlm"
     # Derive mtp_enabled per model : engine reports an MTP mode AND model
     # is an LLM (embedders / VLMs don't benefit from MTP today).
     has_mtp_mode = any("mtp" in (m or "").lower() for m in spec_modes)
@@ -10774,6 +10885,14 @@ async def _telemak_status(cluster_id: str, cd: dict) -> dict:
         "models_dir": cd.get("models_dir"),
         "degraded": None,
         "kind": "telemak",
+        # Engine-managed VLM marker. Distinct from `kind` (which stays "telemak"
+        # so the http-proxy renderers keep working); the dashboard reads
+        # `is_vlm` + `supports_vision` to draw the VLM badge and attribute the
+        # VL model to its host. Only "in action" when a model is loaded.
+        "is_vlm": is_vlm_cluster,
+        "supports_vision": bool(cd.get("supports_vision")),
+        "vlm_ready": bool(is_vlm_cluster and models_loaded and reachable),
+        "host": (nodes[0] or {}).get("host") if nodes else None,
         "upstream": upstream,
         "upstream_reachable": reachable,
     }
@@ -11263,6 +11382,11 @@ VLM_READY_TIMEOUT_S = float(env_get("VLM_READY_TIMEOUT_S", "600") or "600")
 # /admin/vlm/status and unload can distinguish engine-managed VLMs from
 # hand-added telemak clusters.
 VLM_MANAGED_KEY = "_vlm_managed"
+# Hard co-residence enforcement. A VLM co-resident with a loaded text pool (or
+# another VLM) on the same node can OOM (e.g. M3-VL 327GB + a text pool > 512GB).
+# By default /admin/vlm/load REFUSES such a placement; set this env (or pass
+# force=true on the request) to override and allow co-residence deliberately.
+VLM_ALLOW_CORESIDENCE = (env_get("VLM_ALLOW_CORESIDENCE", "") or "").lower() in ("1", "true", "yes", "on")
 
 
 def _vlm_ip_from_ssh(ssh_target: str) -> str:
@@ -11396,11 +11520,12 @@ def _vlm_managed_cluster_ids() -> list[str]:
     return out
 
 
-def _vlm_capacity_warning(host_id: str, ssh_target: str, exclude_id: str) -> Optional[str]:
-    """Co-residence warning (advisory, v1 does NOT block): is the target node
-    already a member of an active mlx-distributed pool, or already hosting
-    another engine-managed VLM? Co-residence can OOM (e.g. M3-VL 353GB + a text
-    pool > 512GB)."""
+def _vlm_capacity_reasons(host_id: str, ssh_target: str, exclude_id: str) -> list[str]:
+    """Co-residence reasons: is the target node already a member of a LOADED
+    mlx-distributed pool, or already hosting another engine-managed VLM?
+    Co-residence can OOM (e.g. M3-VL 327GB + a text pool > 512GB). Returns the
+    list of concrete reasons (empty when the node is free). The caller decides
+    whether to hard-block (default) or warn (override)."""
     reasons: list[str] = []
     # 1. Member of a loaded mlx-distributed pool?
     for cid, _alias, pool in list_all_pools():
@@ -11417,12 +11542,11 @@ def _vlm_capacity_warning(host_id: str, ssh_target: str, exclude_id: str) -> Opt
             if n.get("ssh") == ssh_target or n.get("host") == host_id:
                 reasons.append(f"node {host_id} already hosts VLM '{cid}'")
                 break
-    if not reasons:
-        return None
-    return (
-        "co-residence detected — this can OOM the node: "
-        + "; ".join(reasons)
-    )
+    return reasons
+
+
+def _vlm_capacity_message(reasons: list[str]) -> str:
+    return "co-residence detected — this can OOM the node: " + "; ".join(reasons)
 
 
 class VLMLoadRequest(BaseModel):
@@ -11434,6 +11558,10 @@ class VLMLoadRequest(BaseModel):
     venv: Optional[str] = None   # default VLM_DEFAULT_VENV
     models_dir: Optional[str] = None   # override; else DEFAULT_MODELS_DIR
     ready_timeout_s: Optional[float] = None
+    # Override the hard co-residence check (default False). Also overridable
+    # cluster-wide via VLM_ALLOW_CORESIDENCE env. When set, co-residence is
+    # allowed and only surfaced as a `warning` in the response.
+    force: bool = False
 
 
 class VLMUnloadRequest(BaseModel):
@@ -11487,8 +11615,23 @@ async def admin_vlm_load(req: VLMLoadRequest):
     host_id = _host_id_from_ssh(ssh_target)
     upstream = f"http://{ip}:{port}"
 
-    # Advisory capacity check (never blocks in v1).
-    warning = _vlm_capacity_warning(host_id, ssh_target, exclude_id=vlm_id)
+    # Hard capacity enforcement. A VLM co-resident with a loaded text pool (or
+    # another loaded VLM) on the same node can OOM. REFUSE by default (409);
+    # allow only when explicitly overridden (per-request force or the
+    # VLM_ALLOW_CORESIDENCE env), in which case it degrades to a warning.
+    reasons = _vlm_capacity_reasons(host_id, ssh_target, exclude_id=vlm_id)
+    warning = None
+    if reasons:
+        override = bool(req.force) or VLM_ALLOW_CORESIDENCE
+        msg = _vlm_capacity_message(reasons)
+        if not override:
+            raise HTTPException(
+                409,
+                f"{msg}. Refusing to load — unload the co-resident pool/VLM "
+                f"first, pick a free node, or override with force=true "
+                f"(or set VLM_ALLOW_CORESIDENCE).",
+            )
+        warning = msg + " (overridden)"
 
     # If already reachable on this port with a model loaded, treat as an early
     # zombie/duplicate — surface it rather than launching a second server that
