@@ -785,6 +785,11 @@ h1, h2, h3 { margin: 0; }
 .cluster-item .kind-pill.telemak { color: var(--amber-deep); background: var(--amber-soft); }
 .cluster-item .kind-pill.http-proxy { color: var(--amber-deep); background: var(--amber-soft); }
 .cluster-item .kind-pill.default { color: var(--blue-deep); background: var(--blue-soft); }
+/* VLM badge — distinct violet, shown only when an engine-managed VLM is loaded
+   & serving ("in action"). Renders alongside the telemak kind-pill. */
+.cluster-item .dot.vlm { background: var(--violet); }
+.cluster-item .kind-pill.vlm { color: var(--violet); background: var(--violet-soft); }
+.kind-pill.vlm { font-size: 10px; font-weight: 700; padding: 2px 6px; border-radius: 4px; letter-spacing: 0.04em; text-transform: uppercase; color: var(--violet); background: var(--violet-soft); }
 .cluster-item .meta { font-family: var(--font-mono); font-size: 11px; color: var(--ink-2); }
 .add-cluster-btn {
   display: flex; flex-direction: row; align-items: center; gap: 10px;
@@ -1153,6 +1158,11 @@ async function refreshAll() {
       id: c.id,
       name: c.name || c.id,
       kind: c.kind || "mlx-distributed",
+      // Engine-managed VLM marker (from /admin/clusters). Drives the distinct
+      // "VLM" badge in the ribbon + settings list. `kind` stays telemak so the
+      // http-proxy renderers keep working.
+      is_vlm: !!c.is_vlm,
+      supports_vision: !!c.supports_vision,
       color: "blue",
       enabled: c.enabled !== false,
     }));
@@ -1457,6 +1467,23 @@ let CLUSTERS = [];
 
 function clusterState(id) {
   return (state.cluster_status || {})[id] || null;
+}
+
+// Distinct "VLM" badge, shown ONLY when an engine-managed VLM is actually
+// loaded + reachable ("in action") — not on an idle/empty VLM cluster. Reads
+// the live status (`vlm_ready`) so it toggles with the model, falling back to
+// the config-level is_vlm marker + models_loaded when the status is older.
+function isVlmInAction(id) {
+  const st = clusterState(id);
+  if (!st) return false;
+  if (typeof st.vlm_ready === "boolean") return st.vlm_ready;
+  const isVlm = st.is_vlm || CLUSTERS.find(c => c.id === id)?.is_vlm;
+  const loaded = Array.isArray(st.models_loaded) ? st.models_loaded.length > 0 : !!st.loaded;
+  return !!isVlm && loaded && st.upstream_reachable !== false;
+}
+function vlmPill(id) {
+  if (!isVlmInAction(id)) return "";
+  return `<span class="kind-pill vlm" title="Engine-managed VLM — loaded &amp; serving">VLM</span>`;
 }
 
 function pickCluster(id) {
@@ -2342,6 +2369,7 @@ function renderSettingsClusters() {
               <div class="name-row">
                 <div class="name">${c.name}</div>
                 <div class="kind-pill ${escapeHtml(c.kind)}">${c.kind}</div>
+                ${vlmPill(c.id)}
               </div>
               <div class="meta">${escapeHtml(summary(c.id))}</div>
             </div>
@@ -3618,11 +3646,17 @@ function renderRibbon() {
       badge = "Idle";
     }
     const active = sel === c.id ? "active" : "";
+    // Show the VLM model name + badge in the ribbon when a VLM is in action —
+    // telemak status carries models_loaded, not the mlx-distributed `model`.
+    if (model === "—" && Array.isArray(p?.models_loaded) && p.models_loaded.length) {
+      model = (p.models_loaded[0] || "").split('/').pop() || "—";
+    }
     return `
       <button class="tab ${active}" data-cluster="${c.id}" data-act="pick-cluster">
         <div class="row1">
           <div class="pip"></div>
           <span class="name">${escapeHtml(c.name)}</span>
+          ${vlmPill(c.id)}
           <span class="meta">${escapeHtml(badge.toUpperCase())}</span>
         </div>
         <div class="sub">${escapeHtml(truncatePath(model, 60))}</div>
@@ -3770,10 +3804,12 @@ function renderTelemakHomeCard(a, cid, label) {
   const details = a.models_details || {};
   const kindBadge = (kind) => {
     const k = (kind || "llm").toLowerCase();
+    // VLM gets a DISTINCT violet badge (not the amber telemak/embedder tones)
+    // so a loaded vision model reads at a glance as "VLM in action".
     const palette = k === "embedder" ? ["green-soft", "green-deep", "embed"]
-                  : k === "vlm"      ? ["amber-soft", "amber-deep", "vlm"]
+                  : k === "vlm"      ? ["violet-soft", "violet", "VLM"]
                   : k === "embedding"? ["green-soft", "green-deep", "embed"]
-                  : k === "vision"   ? ["amber-soft", "amber-deep", "vlm"]
+                  : k === "vision"   ? ["violet-soft", "violet", "VLM"]
                   :                    ["blue-soft", "blue-deep", "chat"];
     return `<span style="padding:2px 7px;background:var(--${palette[0]});color:var(--${palette[1]});border-radius:4px;font-size:10px;font-weight:700;letter-spacing:0.04em;text-transform:uppercase;white-space:nowrap">${palette[2]}</span>`;
   };
@@ -3852,6 +3888,7 @@ function renderTelemakHomeCard(a, cid, label) {
           <div class="h1-cluster">
             <div class="row">
               <h1>${escapeHtml(label)}</h1>
+              ${vlmPill(cid)}
               ${statusPill}
               ${phasePill}
               ${busyPill}
@@ -3862,7 +3899,7 @@ function renderTelemakHomeCard(a, cid, label) {
               ${tpsPill}
             </div>
             <div class="topo">
-              <span class="text">telemak · native swift · single-node</span>
+              <span class="text">${isVlmInAction(cid) ? "vlm · mlx_vlm.server · single-node" : "telemak · native swift · single-node"}</span>
               <span class="dot">·</span>
               <span class="mono">${escapeHtml(upstream || "—")}</span>
             </div>
