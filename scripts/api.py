@@ -218,6 +218,15 @@ REMOTE_CLUSTER_DIR = env_get("REMOTE_CLUSTER_DIR", "$HOME/mlx-cluster").rstrip("
 RUNNER_REMOTE = env_get("RUNNER_REMOTE", f"{REMOTE_CLUSTER_DIR}/runner.py")
 PYTHON_REMOTE = env_get("PYTHON_REMOTE", f"{REMOTE_CLUSTER_DIR}/.venv/bin/python")
 RUNNER_MATCH_PATTERN = env_get("RUNNER_MATCH_PATTERN", "mlx-cluster/runner.py")
+# Distributed VLM runner (vlm_runner.py, ring/TCP tensor-parallel mlx-vlm).
+# Own venv (mlx-vlm + torch, py3.12 — NOT the text cluster venv) and own
+# pkill pattern, disjoint from both runner.py and the untouchable prod
+# mlx_vlm.server processes. Feature-flagged: the multi-node VL load path
+# only activates with VLM_DISTRIBUTED_ENABLED=1 (default off = prod-safe).
+VLM_RUNNER_REMOTE = env_get("VLM_RUNNER_REMOTE", f"{REMOTE_CLUSTER_DIR}/vlm_runner.py")
+VLM_PYTHON_REMOTE = env_get("VLM_PYTHON_REMOTE", "/Users/admin/.venvs/mlx-vlm/bin/python")
+VLM_RUNNER_MATCH_PATTERN = env_get("VLM_RUNNER_MATCH_PATTERN", "mlx-cluster/vlm_runner.py")
+VLM_DISTRIBUTED_ENABLED = env_get("VLM_DISTRIBUTED_ENABLED", "0") == "1"
 
 _HERE = Path(__file__).resolve().parent
 CLUSTER_CONFIG_FILE = Path(os.environ.get("CLUSTER_CONFIG_FILE", _HERE / "cluster-config.json"))
@@ -1334,6 +1343,37 @@ def remote_cmd(node: dict, nodes: list[dict], model: str, mode: str, port: int,
     return f"{write_devices} && {cd_prefix}{env_str} {PYTHON_REMOTE} {RUNNER_REMOTE}"
 
 
+def remote_vlm_cmd(node: dict, nodes: list[dict], model: str, port: int,
+                   emit_batch: int = 10) -> str:
+    """Per-node command for the distributed VLM runner (ring/TCP).
+
+    Mirrors remote_cmd's echo-prefix pattern but writes an MLX ring hostfile
+    ([["ip:port"], ...] in rank order — the format Gate-0 validated cross-node
+    on 2026-07-02) instead of the jaccl devices json, and launches
+    vlm_runner.py with the mlx-vlm venv python. Hosts/ports derive from the
+    topology + the caller's ephemeral port — nothing hardcoded."""
+    ordered = sorted(nodes, key=lambda x: x["rank"])
+    hosts = [[f"{n['ssh'].split('@')[1]}:{port}"] for n in ordered]
+    hostfile_json = json.dumps(hosts)
+    hostfile_path = f"/tmp/mlx_ring_hostfile_{port}.json"
+    env = {
+        "MLX_RANK": str(node["rank"]),
+        "MLX_WORLD_SIZE": str(len(nodes)),
+        "MLX_HOSTFILE": hostfile_path,
+        "MLX_METAL_FAST_SYNCH": "1",
+        "RUNNER_MODEL": model,
+        "RUNNER_BACKEND": "ring",
+        "RUNNER_EMIT_BATCH": str(emit_batch),
+    }
+    env_str = " ".join(f"{k}={shlex.quote(v)}" for k, v in env.items())
+    write_hosts = f"echo {shlex.quote(hostfile_json)} > {hostfile_path}"
+    cd_prefix = ""
+    if not model.startswith("/"):
+        node_models_dir = node.get("models_dir") or DEFAULT_MODELS_DIR
+        cd_prefix = f"cd {shlex.quote(node_models_dir)} && "
+    return f"{write_hosts} && {cd_prefix}{env_str} {VLM_PYTHON_REMOTE} {VLM_RUNNER_REMOTE}"
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Runner pool
 # ──────────────────────────────────────────────────────────────────────────────
@@ -1369,9 +1409,14 @@ _WATCHDOG_RECOVERY_BY_CLUSTER: dict = {}
 
 
 class RunnerProc:
-    def __init__(self, node: dict, cmd: str, on_event, cluster: str = "nautilus"):
+    def __init__(self, node: dict, cmd: str, on_event, cluster: str = "nautilus",
+                 match_pattern: Optional[str] = None):
         self.node = node
         self.cluster = cluster
+        # pkill pattern for the REMOTE process this proc spawned. Text pools
+        # keep the runner.py default; the distributed VLM pool passes its own
+        # so a graceful_stop never touches runner.py (or vice versa).
+        self._match_pattern = match_pattern or RUNNER_MATCH_PATTERN
         # Only rank 0 produces events we parse; ranks > 0 would otherwise fill
         # their stdout pipe buffer (no reader) and block the remote process on
         # write(), stalling the distributed barrier -> deadlock. Send their
@@ -1543,7 +1588,7 @@ class RunnerProc:
             # → SIGKILL only if still alive. Returns 0 if any process was
             # signalled (TERM phase), 1 if no match. We don't care about
             # the exact rc here, just that we tried both phases.
-            pattern = shlex.quote(RUNNER_MATCH_PATTERN)
+            pattern = shlex.quote(self._match_pattern)
             # 24×0.5s = 12s grace so the runner's SIGTERM-driven Metal
             # cleanup (free_metal) finishes on big models before SIGKILL.
             cmd = (
@@ -1595,6 +1640,7 @@ def _sweep_orphan_runners(cluster_id: str,
     if not nodes:
         return {"cluster": cluster_id, "swept": [], "note": "no nodes defined"}
     pattern = shlex.quote(RUNNER_MATCH_PATTERN)
+    pattern_vlm = shlex.quote(VLM_RUNNER_MATCH_PATTERN)
     # The sweep does three things in one SSH round-trip per node:
     #   1. kill any runner.py (two-phase SIGTERM → grace → SIGKILL)
     #   2. probe wired memory AFTER the kill — surfaces the Metal-leak
@@ -1620,6 +1666,19 @@ def _sweep_orphan_runners(cluster_id: str,
         f"    pkill -9 -f {pattern}; echo 'killed (SIGKILL)'; "
         f"  else echo 'cleaned (SIGTERM)'; fi; "
         f"else echo 'no orphan'; fi; "
+        # Same two-phase kill for orphaned DISTRIBUTED VLM runners
+        # (vlm_runner.py) — a pattern disjoint from both runner.py and the
+        # prod mlx_vlm.server processes, which this sweep must never touch.
+        f"if pgrep -f {pattern_vlm} >/dev/null 2>&1; then "
+        f"  pkill -TERM -f {pattern_vlm} 2>/dev/null; "
+        f"  for i in $(seq 1 24); do "
+        f"    pgrep -f {pattern_vlm} >/dev/null 2>&1 || break; "
+        f"    sleep 0.5; "
+        f"  done; "
+        f"  if pgrep -f {pattern_vlm} >/dev/null 2>&1; then "
+        f"    pkill -9 -f {pattern_vlm}; echo 'vlm killed (SIGKILL)'; "
+        f"  else echo 'vlm cleaned (SIGTERM)'; fi; "
+        f"else echo 'no vlm orphan'; fi; "
         # ── phase 2: wired memory probe ──────────────────────────────
         # vm_stat reports in pages; multiply by page size for bytes.
         f"PS=$(vm_stat | head -1 | awk '{{print $8}}' | tr -d '.'); "
@@ -2315,6 +2374,126 @@ class RunnerPool:
             self._listeners.pop(req_id, None)
 
 
+class VLMDistPool(RunnerPool):
+    """Distributed (tensor-parallel) VLM pool: N vlm_runner.py ranks over
+    ring/TCP, driven through the inherited RunnerPool machinery (stdin-JSONL
+    fan-out submit, cancel broadcast, graceful_stop, alive_count, keepalive).
+
+    is_vlm=True publishes the badge + supports_vision; vlm_proxy=False keeps
+    chat routing on the normal pool.submit() path (the http-proxy branch is
+    for the single-node mlx_vlm.server VLMPool only)."""
+
+    is_vlm = True
+    is_vlm_dist = True
+    vlm_proxy = False
+
+    def __init__(self, model: str, cluster: str, alias: str,
+                 node_indices: list[int]):
+        super().__init__(model=model, mode="tensor", use_ap=False,
+                         nodes_count=len(node_indices), cluster=cluster,
+                         kv_q8=False, draft_model=None, alias=alias,
+                         node_indices=list(node_indices))
+        self.backend = "ring"
+
+    async def start(self):
+        """Mirror of RunnerPool.start() for the VLM runner: same model-layout
+        preflight and the same wait-ready-while-scanning-deaths loop, minus
+        the text-only extras (AP, draft, capacity-aware pipeline split) and
+        with the ring hostfile command instead of the jaccl devices json.
+        Deliberately a contained copy — the text start() stays untouched."""
+        self._loop = asyncio.get_running_loop()
+        async def _probe_node(n):
+            ssh_t = (
+                n.get("ssh")
+                or (f"{n.get('user','admin')}@{n['ip']}" if n.get("ip") else None)
+            )
+            if not ssh_t:
+                return None
+            try:
+                ok, err = await _validate_model_layout(
+                    ssh_t, self.model, models_dir=n.get("models_dir")
+                )
+            except Exception as e:
+                sys.stderr.write(
+                    f"[api] vlm layout probe skipped on {n.get('host', ssh_t)} ({e})\n"
+                )
+                return None
+            return None if ok else f"{n.get('host', ssh_t)} → {err}"
+        problems = [
+            r for r in await asyncio.gather(*[_probe_node(n) for n in self.nodes])
+            if isinstance(r, str)
+        ]
+        if problems:
+            raise RuntimeError(
+                "model not present/complete on all target nodes — "
+                + "; ".join(problems)
+                + ". Rsync the model to every node before loading."
+            )
+        port = random_ephemeral_port()
+        sys.stderr.write(
+            f"[api] starting {self.nodes_count} VLM runners "
+            f"(model={self.model}, backend=ring, port={port})\n"
+        )
+        t0 = time.time()
+        for node in self.nodes:
+            cmd = remote_vlm_cmd(node, self.nodes, self.model, port,
+                                 emit_batch=self.emit_batch)
+            self.runners.append(RunnerProc(
+                node, cmd, self._on_event, cluster=self.cluster,
+                match_pattern=VLM_RUNNER_MATCH_PATTERN,
+            ))
+        rank0 = next(r for r in self.runners if r.node["rank"] == 0)
+        load_timeout_s = 900.0   # 327GB Q6 loads in ~75-90s warm; cold FS
+        no_progress_grace_s = 60.0
+        deaths: list[tuple[int, int, str]] = []
+        while True:
+            elapsed = time.time() - t0
+            if rank0.ready.is_set():
+                break
+            if elapsed >= load_timeout_s:
+                raise RuntimeError(
+                    f"load timeout: rank 0 didn't reach ready in {load_timeout_s:.0f}s. "
+                    f"rank 0 stderr tail:\n{rank0.stderr_tail()}"
+                )
+            for r in self.runners:
+                rc = r.proc.poll()
+                if rc is not None:
+                    rank = r.node["rank"]
+                    if not any(d[0] == rank for d in deaths):
+                        deaths.append((rank, rc, r.stderr_tail()))
+                        sys.stderr.write(
+                            f"[api] vlm rank {rank} died during startup (exit={rc})\n"
+                        )
+            if deaths:
+                death_t = time.time()
+                while time.time() - death_t < no_progress_grace_s:
+                    if rank0.ready.is_set():
+                        break
+                    for r in self.runners:
+                        rc = r.proc.poll()
+                        if rc is not None and not any(d[0] == r.node["rank"] for d in deaths):
+                            deaths.append((r.node["rank"], rc, r.stderr_tail()))
+                    await asyncio.sleep(0.5)
+                death_report = "\n\n".join(
+                    f"--- rank {rk} (exit={rc}) ---\n{tail}"
+                    for rk, rc, tail in sorted(deaths)
+                )
+                raise RuntimeError(
+                    f"{len(deaths)} rank(s) died during load — pool unusable.\n{death_report}"
+                )
+            await asyncio.sleep(0.5)
+        for r in self.runners:
+            rc = r.proc.poll()
+            if rc is not None:
+                raise RuntimeError(
+                    f"vlm rank {r.node['rank']} died right at ready barrier "
+                    f"(exit={rc}).\n{r.stderr_tail()}"
+                )
+        self.load_s = time.time() - t0
+        self.started_at = time.time()
+        sys.stderr.write(f"[api] vlm-dist pool ready in {self.load_s:.1f}s\n")
+
+
 class VLMPool:
     """A VL model served under an mlx-distributed cluster as a POOL, not a
     separate `<id>-vlm` sibling cluster (Argo-VLM fold, 2026-07-02).
@@ -2474,6 +2653,19 @@ def save_cluster_state_v2(cluster_id: str) -> None:
                 i = _host_to_index(cluster_id, n.get("host"))
                 if i is not None:
                     indices.append(i)
+        # Distributed VLM pool: N vlm_runner.py ranks. Its own entry shape —
+        # checked BEFORE is_vlm because VLMDistPool also carries is_vlm=True
+        # (badge), but has no port/upstream and restores through start(),
+        # not through the mlx_vlm.server relaunch.
+        if getattr(pool, "is_vlm_dist", False):
+            pools_payload.append({
+                "alias": alias,
+                "model": pool.model,
+                "is_vlm_dist": True,
+                "node_indices": indices,
+                "nodes": pool.nodes_count,
+            })
+            continue
         # VL pools (Argo-VLM fold): a single-node mlx_vlm.server proxied under
         # this cluster. Persist the VL-specific fields so the startup restore
         # relaunches the server (not a doomed RunnerPool) on the same node.
@@ -3356,6 +3548,24 @@ async def lifespan(app: FastAPI):
             alias = entry.get("alias", DEFAULT_ALIAS)
             try:
                 indices = entry.get("node_indices") or list(range(int(entry.get("nodes") or 1)))
+                # Distributed VLM pool: restore through VLMDistPool.start()
+                # (ssh-spawned ranks). Gated on the same feature flag as the
+                # load path — with the flag off the entry is skipped, never
+                # mis-restored as a text RunnerPool.
+                if entry.get("is_vlm_dist"):
+                    if not VLM_DISTRIBUTED_ENABLED:
+                        sys.stderr.write(
+                            f"[api] skipping vlm-dist restore ({cid}:{alias}) — "
+                            f"VLM_DISTRIBUTED_ENABLED is off\n"
+                        )
+                        continue
+                    vdpool = VLMDistPool(
+                        model=entry["model"], cluster=cid, alias=alias,
+                        node_indices=indices,
+                    )
+                    await vdpool.start()
+                    set_pool(cid, alias, vdpool)
+                    continue
                 # VL pool (Argo-VLM fold): relaunch the single-node
                 # mlx_vlm.server and re-register a VLMPool. Never a RunnerPool
                 # (the distributed text runner can't serve a vision model).
@@ -3783,7 +3993,7 @@ def _initial_default_config() -> Optional[dict]:
 #   major (1.7.2 → 2.0.0) — breaking API or topology change
 #
 # Use `./scripts/bump-version.sh patch|minor|major` to bump + auto-commit.
-APP_VERSION = "1.11.0"
+APP_VERSION = "1.12.0"
 
 app = FastAPI(
     title="OdyssAI-X (odyssai.eu)",
@@ -6984,7 +7194,9 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
     # internal http-proxy (body forward + <think> split + usage passthrough),
     # exactly as we proxy a telemak cluster, but pointed at the pool's upstream.
     # The text hot path below (RunnerProc generation) is untouched.
-    if getattr(pool, "is_vlm", False):
+    # VLMDistPool sets vlm_proxy=False: it is served by the normal
+    # pool.submit() path below (its ranks ARE RunnerProcs), not the proxy.
+    if getattr(pool, "is_vlm", False) and getattr(pool, "vlm_proxy", True):
         body = req.model_dump(exclude_none=True)
         return await _vlm_pool_proxy_chat_completion(pool, body, bool(req.stream))
     # Request classification + per-cluster acceptance. Replaces the older
@@ -10280,6 +10492,47 @@ async def admin_cluster_load(cluster_id: str, req: ArgoLoadRequest):
     # attempt a (doomed) text load anyway. Multi-node VL requests collapse to
     # a single node (the first requested index, else index 0 = master).
     if arch.get("is_vision") and not getattr(req, "force", False):
+        # Distributed VL path (feature-flagged). With VLM_DISTRIBUTED_ENABLED
+        # and an explicit multi-node request, spawn tensor-parallel
+        # vlm_runner.py ranks over ring/TCP instead of clamping to one node.
+        # Whole path additive: flag off => exact pre-existing behavior.
+        if len(node_indices) > 1 and VLM_DISTRIBUTED_ENABLED:
+            vlm_model_path = _vlm_resolve_model_path(req.model, base_dir)
+            async with get_admin_lock(cluster_id):
+                old = get_pool(cluster_id, alias)
+                if old is not None:
+                    try:
+                        await old.stop()
+                    except Exception as e:
+                        sys.stderr.write(
+                            f"[api] stop of old pool '{alias}' failed: {e}\n")
+                    set_pool(cluster_id, alias, None)
+                vdpool = VLMDistPool(
+                    model=vlm_model_path, cluster=cluster_id, alias=alias,
+                    node_indices=node_indices,
+                )
+                try:
+                    await vdpool.start()
+                except RuntimeError as e:
+                    raise HTTPException(500, f"{cluster_id} vlm-dist load failed: {e}")
+                set_pool(cluster_id, alias, vdpool)
+                save_cluster_state_v2(cluster_id)
+            return {
+                "loaded": True,
+                "cluster": cluster_id,
+                "alias": alias,
+                "is_vlm": True,
+                "dispatched": "vlm-dist-pool",
+                "model": vlm_model_path,
+                "nodes": len(node_indices),
+                "node_indices": node_indices,
+                "load_s": vdpool.load_s,
+                "note": (
+                    f"{req.model} is a vision model — served TENSOR-PARALLEL "
+                    f"by {len(node_indices)} vlm_runner.py ranks over ring/TCP, "
+                    f"registered as VL pool '{alias}' under {cluster_id}."
+                ),
+            }
         # Clamp to a single node. Prefer the first requested index; when the
         # request gave none (empty cluster case), that's index 0 = the master.
         vlm_index = node_indices[0]
