@@ -3130,6 +3130,48 @@ _pools: dict[str, dict[str, RunnerPool]] = {}
 _admin_locks: dict[str, asyncio.Lock] = {}
 DEFAULT_ALIAS = "default"
 
+# Pool naming (#64). Every load on a cluster becomes a first-class NAMED pool
+# published as `<cluster>:<model>` (e.g. "argo:minimax-m3-vl") — text OR VL,
+# uniform. The bare cluster id ("main") stays inactive: nothing serves under it.
+# DEFAULT_ALIAS survives only as a vestigial back-compat key (v1 state replay,
+# an explicit alias="default"); the auto-derived path never uses it.
+_SLUG_STRIP_TOKENS = {"mlx", "hf", "converted", "headbf16", "head"}
+
+
+def _slugify(s: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "-", (s or "").lower()).strip("-")
+
+
+def _cluster_slug(cluster_id: str) -> str:
+    """Readable prefix for a cluster's published pool ids — the cluster NAME
+    slugified (Argo -> "argo"), falling back to the id."""
+    try:
+        cd = get_cluster_def(cluster_id) or {}
+    except Exception:
+        cd = {}
+    return _slugify(cd.get("name") or cluster_id) or cluster_id
+
+
+def _model_slug(model: str) -> str:
+    """Readable model id from a path/name: basename, slugified, trailing
+    packaging tokens (quant/format/group) stripped.
+    "MiniMax-M3-VL-mlx-6bit-headbf16" -> "minimax-m3-vl"; keeps model size
+    like "80b" and versions like "v2"/"m3" intact."""
+    base = (model or "").rstrip("/").split("/")[-1]
+    slug = _slugify(base)
+    parts = slug.split("-")
+    while len(parts) > 1:
+        t = parts[-1]
+        if t in _SLUG_STRIP_TOKENS or re.fullmatch(r"\d+bit|q\d+|g\d+|bf16|fp16|fp8|int8|int4|gptq|awq|gguf|head.*", t):
+            parts.pop()
+        else:
+            break
+    return "-".join(parts) or slug
+
+
+def _derive_pool_alias(cluster_id: str, model: str) -> str:
+    return f"{_cluster_slug(cluster_id)}:{_model_slug(model)}"
+
 
 def get_pool(cluster_id: str, alias: str = DEFAULT_ALIAS) -> Optional[RunnerPool]:
     return _pools.get(cluster_id, {}).get(alias)
@@ -3741,7 +3783,7 @@ def _initial_default_config() -> Optional[dict]:
 #   major (1.7.2 → 2.0.0) — breaking API or topology change
 #
 # Use `./scripts/bump-version.sh patch|minor|major` to bump + auto-commit.
-APP_VERSION = "1.10.0"
+APP_VERSION = "1.11.0"
 
 app = FastAPI(
     title="OdyssAI-X (odyssai.eu)",
@@ -8839,12 +8881,18 @@ async def admin_runs(history: int = 0):
 
 
 def _pool_for_cluster_name(name: Optional[str]):
-    """Map a cluster name to its default-alias pool. Returns None for unknown / unloaded."""
+    """Map a cluster name to its primary pool. Default-alias pool when present
+    (single-pool back-compat), else the first loaded named pool (#64 — clusters
+    no longer keep a "default" pool). Returns None for unknown / unloaded."""
     if not name:
         return None
     if name == "nautilus":
         return _pool
-    return get_pool(name)
+    p = get_pool(name)
+    if p is not None:
+        return p
+    pools = list_pools(name)
+    return pools[0][1] if pools else None
 
 
 @app.post("/admin/runs/{run_id}/cancel")
@@ -9275,9 +9323,14 @@ class ClusterConfigUpdate(BaseModel):
 
 
 def _pool_for_cluster(cluster_id: str):
-    """Return the default-alias pool for this cluster, if loaded. Generic
-    over any cluster_id in topology.yaml."""
-    return get_pool(cluster_id)
+    """Return the primary pool for this cluster, if loaded: default-alias when
+    present, else the first loaded named pool (#64). Generic over any
+    cluster_id in topology.yaml."""
+    p = get_pool(cluster_id)
+    if p is not None:
+        return p
+    pools = list_pools(cluster_id)
+    return pools[0][1] if pools else None
 
 
 async def _purge_dead_pools(cluster_id: str) -> list[str]:
@@ -9845,6 +9898,7 @@ async def admin_cluster_status(cluster_id: str):
             "alias": alias,
             "model": pool.model,
             "mode": pool.mode,
+            "is_vlm": bool(getattr(pool, "is_vlm", False)),
             "use_ap": pool.use_ap,
             "nodes": pool.nodes_count,
             "node_indices": list(pool.node_indices)
@@ -9944,12 +9998,17 @@ async def admin_cluster_models(cluster_id: str, dir: Optional[str] = None):
         set_models_dir(cluster_id, dir)
     models = await asyncio.to_thread(discover_models_on_node, rank0, target_dir)
     sizes = await batch_get_model_sizes(rank0, models)
-    pool = get_pool(cluster_id)
+    # Flag every model any loaded pool serves (#64 — a cluster no longer keeps a
+    # single "default" pool; match against all named pools' concrete paths).
+    loaded_basenames = {(p.model or "").rstrip("/").split("/")[-1]
+                        for _a, p in list_pools(cluster_id)}
+    loaded_models = {p.model for _a, p in list_pools(cluster_id)}
     annotated = [{
         "id": m,
         "kind": "path",
         "size_bytes": sizes.get(m, 0),
-        "is_loaded": pool is not None and pool.model == m,
+        "is_loaded": (m in loaded_models
+                      or m.rstrip("/").split("/")[-1] in loaded_basenames),
     } for m in models]
     return {"data": annotated, "models_dir": target_dir}
 
@@ -10107,8 +10166,13 @@ async def admin_cluster_load(cluster_id: str, req: ArgoLoadRequest):
     effective_max = min(effective_max, cluster_max)
     avail = list(range(1, effective_max + 1))
 
-    # Resolve alias + node_indices.
-    alias = (req.alias or DEFAULT_ALIAS).strip().lower()
+    # Resolve alias + node_indices. No explicit alias -> derive a first-class
+    # published pool id `<cluster>:<model>` (e.g. "argo:minimax-m3-vl") so every
+    # load is a NAMED pool; the bare cluster id stays inactive (#64). `auto`
+    # tracks the derived case: it hot-swaps on reload like the old DEFAULT_ALIAS
+    # singleton, whereas an explicit alias collision is refused (409).
+    auto = not req.alias
+    alias = (req.alias.strip().lower() if req.alias else _derive_pool_alias(cluster_id, req.model))
     if not alias or "/" in alias or " " in alias or len(alias) > 64:
         raise HTTPException(400, f"invalid alias {alias!r}")
     if req.node_indices is not None and len(req.node_indices) > 0:
@@ -10146,7 +10210,7 @@ async def admin_cluster_load(cluster_id: str, req: ArgoLoadRequest):
         )
 
     existing_aliases = {a for a, _ in list_pools(cluster_id)}
-    if alias in existing_aliases and not req.force_hot_swap and alias != DEFAULT_ALIAS:
+    if alias in existing_aliases and not req.force_hot_swap and not auto:
         raise HTTPException(
             409,
             f"{cluster_id} alias {alias!r} is already loaded — unload it first or "

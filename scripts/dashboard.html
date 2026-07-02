@@ -1476,6 +1476,10 @@ function clusterState(id) {
 function isVlmInAction(id) {
   const st = clusterState(id);
   if (!st) return false;
+  // Pool-level (#64 Argo fold): a VL model served as a POOL inside a normal
+  // text cluster. The cluster kind stays mlx-distributed — VL-ness lives on the
+  // pool (is_vlm / mode="vlm"), so this wins over the cluster-level markers.
+  if (Array.isArray(st.pools) && st.pools.some(p => p && (p.is_vlm || p.mode === "vlm"))) return true;
   if (typeof st.vlm_ready === "boolean") return st.vlm_ready;
   const isVlm = st.is_vlm || CLUSTERS.find(c => c.id === id)?.is_vlm;
   const loaded = Array.isArray(st.models_loaded) ? st.models_loaded.length > 0 : !!st.loaded;
@@ -4102,6 +4106,13 @@ function renderArgoPoolsList(a) {
     const conc = (p.model || "").split("/").pop();
     const tps = p.recent_avg_tps != null ? `${p.recent_avg_tps} tok/s` : "—";
     const aliasIsDefault = p.alias === "default";
+    // #64 Argo fold — a VL pool (mlx_vlm.server on one node) served INSIDE the
+    // Argo cluster. Violet "VLM" badge so it reads at a glance, same as the
+    // telemak VL rows.
+    const isVlmPool = !!(p.is_vlm || p.mode === "vlm");
+    const kindPill = isVlmPool
+      ? `<span class="kind-pill vlm" title="VL model — mlx_vlm.server, single node">VLM</span>`
+      : "";
     // #61 — per-pool activity. The aggregate Activity hero only showed the
     // cluster total; here each pool gets its own live indicator from the
     // in-flight runs routed to its alias (runs carry {cluster, alias}).
@@ -4114,6 +4125,7 @@ function renderArgoPoolsList(a) {
     return `
       <div style="display:flex;align-items:center;gap:12px;padding:8px 12px;background:var(--surface);border:1px solid var(--line);border-radius:6px;font-family:var(--font-mono);font-size:12px">
         <span style="font-weight:600;color:var(--ink);min-width:80px">${escapeHtml(p.alias)}${aliasIsDefault && conc ? ' &rarr;' : ''}</span>
+        ${kindPill}
         <span style="color:var(--ink-2);flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${escapeHtml(conc)}</span>
         <span style="color:var(--ink-3);font-size:11px">${p.nodes_count || p.nodes || 0} node · ${escapeHtml(hostNames)}</span>
         ${actPill}
