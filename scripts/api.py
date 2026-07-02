@@ -3608,7 +3608,7 @@ def _initial_default_config() -> Optional[dict]:
 #   major (1.7.2 → 2.0.0) — breaking API or topology change
 #
 # Use `./scripts/bump-version.sh patch|minor|major` to bump + auto-commit.
-APP_VERSION = "1.8.0"
+APP_VERSION = "1.8.1"
 
 app = FastAPI(
     title="OdyssAI-X (odyssai.eu)",
@@ -11255,7 +11255,10 @@ async def admin_connection_test(nodes: int = 1, cluster: str = "default"):
 # ──────────────────────────────────────────────────────────────────────────────
 VLM_DEFAULT_VENV = env_get("VLM_VENV", "/Users/admin/.venvs/mlx-vlm")
 VLM_DEFAULT_PORT = int(env_get("VLM_PORT", "8080") or "8080")
-VLM_READY_TIMEOUT_S = float(env_get("VLM_READY_TIMEOUT_S", "180") or "180")
+# 600s default: a 327GB 6-bit VL takes ~200-240s to load and a bigger VL
+# (Q8 ~450GB, or a cold first Metal compile) needs more — 180 false-timed-out
+# on the m3vl 6-bit (2026-07-02). Per-request ready_timeout_s still overrides.
+VLM_READY_TIMEOUT_S = float(env_get("VLM_READY_TIMEOUT_S", "600") or "600")
 # Marker key stamped on cluster-config entries the engine launched, so
 # /admin/vlm/status and unload can distinguish engine-managed VLMs from
 # hand-added telemak clusters.
