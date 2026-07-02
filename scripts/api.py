@@ -6527,8 +6527,10 @@ async def list_models(include_unloaded: bool = False):
             if "image" not in mods:
                 mods.append("image")
             alias_caps["modalities"] = mods
-            alias_caps["backend"] = "http-proxy"
-            alias_caps["nodes"] = 1
+            # Single-node VLMPool = http-proxy/1 node; the distributed
+            # VLMDistPool reports its real transport and rank count.
+            alias_caps["backend"] = getattr(pool, "backend", "http-proxy")
+            alias_caps["nodes"] = int(getattr(pool, "nodes_count", 1) or 1)
         data.append({
             "id": alias, "object": "model",
             "created": _now(), "owned_by": f"odyssai-{pool_name}",
