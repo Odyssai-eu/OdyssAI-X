@@ -2635,11 +2635,15 @@ _MODELS_AUTO_OPEN_THINK = ("minimax", "qwen3.5", "qwen3.6", "step-3.7", "step3p7
 # MiniMax-M2 doesn't honor it, so we MUST keep the filter on for it even
 # when callers ask for no-thinking, otherwise the reasoning text leaks
 # into `content` verbatim (`</think>` literal visible to the user).
-# M3 is DELIBERATELY excluded: its template honors thinking_mode="disabled"
-# (mapped from enable_thinking in the runner), so no-thinking truly emits no
-# block and forcing the filter would ghost the answer. Hence "minimax-m2",
-# not bare "minimax".
-_MODELS_IGNORE_ENABLE_THINKING_FLAG = ("minimax-m2", "step-3.7", "step3p7")
+# minimax-m3 added 2026-07-02: the mlx-vlm VL serving path (m3vl) does NOT
+# honor enable_thinking=false — the model keeps thinking in adaptive mode and
+# leaks a raw <mm:think>...</mm:think> block into content. (The text M3 on the
+# jaccl runner DOES honor it, but the shared filter must cover the worst case.)
+# Keeping the filter ON when off is safe against ghosting: _seed_in_think()
+# returns False for M3 when thinking is off, so we never seed in_think and only
+# strip a block IF the model actually emits the tags; a genuine no-think answer
+# flows through untouched.
+_MODELS_IGNORE_ENABLE_THINKING_FLAG = ("minimax-m2", "minimax-m3", "step-3.7", "step3p7")
 
 # Models whose chat template reads a `reasoning_effort` system directive
 # (OpenAI o-series convention: minimal/low/medium/high). Step-3.7-Flash is a
