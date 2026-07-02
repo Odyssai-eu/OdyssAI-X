@@ -2315,6 +2315,104 @@ class RunnerPool:
             self._listeners.pop(req_id, None)
 
 
+class VLMPool:
+    """A VL model served under an mlx-distributed cluster as a POOL, not a
+    separate `<id>-vlm` sibling cluster (Argo-VLM fold, 2026-07-02).
+
+    A vision model can't run on the distributed text runner — it serves
+    single-node via `mlx_vlm.server`. This class represents that server as a
+    pool object that slots into the same `_pools[cluster][alias]` registry the
+    text RunnerPools live in, so:
+
+      * `list_pools` / `list_all_pools` see it,
+      * the load-time overlap check counts its node as used (and vice-versa —
+        a text pool can't claim the node this VL sits on),
+      * `save_cluster_state_v2` persists it (restored at startup),
+      * `_pool_view` (/admin/clusters/{id}) and `_push_loaded` (/v1/models)
+        render it under the Argo cluster with a "vlm" badge,
+      * chat routes to it via an internal http-proxy (see chat_completions).
+
+    It DUCK-TYPES the read-only attribute surface the shared machinery touches
+    on a RunnerPool (`.model`, `.alias`, `.cluster`, `.mode`, `.use_ap`,
+    `.nodes`, `.nodes_count`, `.node_indices`, `.kv_q8`, `.draft_model`,
+    `.num_draft_tokens`, `.runners`, `.started_at`, `.load_s`, `.ttl_seconds`,
+    `.last_used_at`, plus `alive_count()` / `stop()`), and adds the VL-only
+    fields `is_vlm`, `upstream`, `port`, `pid`, `model_path`. It carries NO
+    distributed runners — `runners` is always empty and `alive_count()`
+    reports 1 (the mlx_vlm.server is external; the dead-pool sweeper only
+    probes local runner children, which a VL pool has none of, so it must not
+    be mistaken for a dead pool)."""
+
+    is_vlm = True
+
+    def __init__(self, model_path: str, cluster: str, alias: str,
+                 node_indices: list[int], upstream: str, port: int,
+                 ssh_target: str, host: str, pid: Optional[str] = None):
+        # `model` is the concrete path — same contract as RunnerPool.model
+        # (what /v1/models emits as `root`/`x_concrete`, what _route_pool
+        # matches on, what capabilities read config.json from).
+        self.model = model_path
+        self.model_path = model_path
+        self.cluster = cluster
+        self.alias = alias or cluster
+        self.node_indices: Optional[list[int]] = list(node_indices) if node_indices else None
+        self.nodes_count = 1
+        # Text-pool fields the shared views/state read — inert for a VL pool
+        # but present so nothing NPEs. `mode`/`use_ap` are cosmetic here.
+        self.mode = "vlm"
+        self.use_ap = False
+        self.kv_q8 = False
+        self.draft_model: Optional[str] = None
+        self.num_draft_tokens = 4
+        self.runners: list = []
+        # VL-specific: the mlx_vlm.server upstream we proxy chat to.
+        self.upstream = (upstream or "").rstrip("/")
+        self.port = int(port)
+        self.pid = pid
+        self.ssh_target = ssh_target
+        self.host = host
+        # Node topology in the same {rank, ssh, host, models_dir} shape the
+        # rest of the code expects — single node, rank 0.
+        try:
+            self.nodes = build_topology_from_indices(cluster, list(node_indices))
+        except Exception:
+            self.nodes = [{"rank": 0, "ssh": ssh_target, "host": host, "rdma": None}]
+        self.started_at: Optional[float] = time.time()
+        self.load_s: Optional[float] = None
+        self.last_used_at: float = time.time()
+        self.last_token_at: float = time.monotonic()
+        self.ttl_seconds: int = 0
+        self.backend: str = "http-proxy"
+        # Degraded fields kept for parity with the degraded/reset ladder.
+        self.degraded: bool = False
+        self.degraded_reason: Optional[str] = None
+        self.degraded_at: Optional[float] = None
+
+    def alive_count(self) -> int:
+        """A VL pool has no local runner children — its server is an external
+        mlx_vlm.server. Report 1 so the dead-pool sweeper (which purges pools
+        with alive_count()==0 by probing LOCAL runner procs) never mistakes it
+        for a crashed distributed pool. Actual VL liveness is checked lazily by
+        the routing proxy (upstream unreachable → 502)."""
+        return 1
+
+    async def stop(self):
+        """Kill the mlx_vlm.server on this pool's node. Mirrors admin_vlm_unload
+        so /admin/clusters/{id}/unload and the shutdown teardown free the node
+        cleanly (SIGTERM → grace → SIGKILL, so Metal wired pages release)."""
+        try:
+            await asyncio.to_thread(
+                _ssh_exec, self.ssh_target,
+                _vlm_kill_cmd(self.port, self.model_path), 30,
+            )
+        except Exception as e:
+            sys.stderr.write(
+                f"[vlm-pool] {self.cluster}[{self.alias}] kill on "
+                f"{self.ssh_target} failed: {e}\n"
+            )
+        self.runners.clear()
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # State + metrics
 # ──────────────────────────────────────────────────────────────────────────────
@@ -2376,6 +2474,22 @@ def save_cluster_state_v2(cluster_id: str) -> None:
                 i = _host_to_index(cluster_id, n.get("host"))
                 if i is not None:
                     indices.append(i)
+        # VL pools (Argo-VLM fold): a single-node mlx_vlm.server proxied under
+        # this cluster. Persist the VL-specific fields so the startup restore
+        # relaunches the server (not a doomed RunnerPool) on the same node.
+        if getattr(pool, "is_vlm", False):
+            pools_payload.append({
+                "alias": alias,
+                "model": pool.model,
+                "is_vlm": True,
+                "node_indices": indices,
+                "nodes": 1,
+                "port": pool.port,
+                "upstream": pool.upstream,
+                "ssh": pool.ssh_target,
+                "host": pool.host,
+            })
+            continue
         pools_payload.append({
             "alias": alias,
             "model": pool.model,
@@ -3200,6 +3314,14 @@ async def lifespan(app: FastAPI):
             alias = entry.get("alias", DEFAULT_ALIAS)
             try:
                 indices = entry.get("node_indices") or list(range(int(entry.get("nodes") or 1)))
+                # VL pool (Argo-VLM fold): relaunch the single-node
+                # mlx_vlm.server and re-register a VLMPool. Never a RunnerPool
+                # (the distributed text runner can't serve a vision model).
+                if entry.get("is_vlm"):
+                    vpool = await _restore_vlm_pool(cid, alias, entry, indices)
+                    if vpool is not None:
+                        set_pool(cid, alias, vpool)
+                    continue
                 pool = RunnerPool(
                     model=entry["model"],
                     mode=entry.get("mode", "pipeline"),
@@ -3619,7 +3741,7 @@ def _initial_default_config() -> Optional[dict]:
 #   major (1.7.2 → 2.0.0) — breaking API or topology change
 #
 # Use `./scripts/bump-version.sh patch|minor|major` to bump + auto-commit.
-APP_VERSION = "1.9.0"
+APP_VERSION = "1.10.0"
 
 app = FastAPI(
     title="OdyssAI-X (odyssai.eu)",
@@ -6135,6 +6257,26 @@ async def list_models(include_unloaded: bool = False):
         alias_caps = dict(caps)
         alias_caps["alias_for"] = pool.model
         alias_caps["ready"] = True
+        # Argo-VLM fold: a VL pool is served single-node by mlx_vlm.server but
+        # advertised UNDER its host cluster (Argo). Keep cluster_label/kind
+        # pointing at the mlx-distributed cluster so it GROUPS under Argo in the
+        # picker, and stamp the vlm markers so the dashboard draws the "vlm"
+        # badge and clients know it takes images. (config.json already sets
+        # supports_vision for a VL checkpoint; we force it defensively.)
+        # `kind` stays the host cluster's kind (mlx-distributed) so it GROUPS
+        # under Argo in the picker — same convention as the engine-managed VLM
+        # marker in /admin/clusters (is_vlm + supports_vision drive the badge,
+        # NOT kind). We add `vlm=True` too as an explicit sub-marker.
+        if getattr(pool, "is_vlm", False):
+            alias_caps["is_vlm"] = True
+            alias_caps["vlm"] = True
+            alias_caps["supports_vision"] = True
+            mods = list(alias_caps.get("modalities") or ["text"])
+            if "image" not in mods:
+                mods.append("image")
+            alias_caps["modalities"] = mods
+            alias_caps["backend"] = "http-proxy"
+            alias_caps["nodes"] = 1
         data.append({
             "id": alias, "object": "model",
             "created": _now(), "owned_by": f"odyssai-{pool_name}",
@@ -6795,6 +6937,14 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
                         "(add ?include_unloaded=true for inventory).",
             },
         )
+    # Argo-VLM fold (2026-07-02). A VL pool has NO distributed RunnerProc — it's
+    # a single-node mlx_vlm.server served under this cluster. Route to it via
+    # internal http-proxy (body forward + <think> split + usage passthrough),
+    # exactly as we proxy a telemak cluster, but pointed at the pool's upstream.
+    # The text hot path below (RunnerProc generation) is untouched.
+    if getattr(pool, "is_vlm", False):
+        body = req.model_dump(exclude_none=True)
+        return await _vlm_pool_proxy_chat_completion(pool, body, bool(req.stream))
     # Request classification + per-cluster acceptance. Replaces the older
     # plain "Default refuses max_tokens<=32" gate with a broader probe/chat/
     # agent/longform/compile taxonomy. Default refuses probe + compile; other
@@ -7631,6 +7781,17 @@ async def anthropic_messages(req: AnthropicMessagesRequest, request: Request):
                 "ready_models": ready,
                 "hint": "GET /v1/models lists everything ready.",
             },
+        )
+
+    # Argo-VLM fold: a VL pool (single-node mlx_vlm.server) speaks the OpenAI
+    # chat shape, not the Anthropic /v1/messages shape. Route VL through
+    # /v1/chat/completions (its upstream doesn't serve /v1/messages).
+    if getattr(pool, "is_vlm", False):
+        raise HTTPException(
+            400,
+            f"'{req.model}' is a vision (VL) model served via mlx_vlm.server — "
+            f"use POST /v1/chat/completions (the OpenAI shape) for it; the "
+            f"Anthropic /v1/messages surface is not supported for VL pools.",
         )
 
     # Request classification (same logic as /v1/chat/completions).
@@ -9830,6 +9991,13 @@ class ArgoLoadRequest(BaseModel):
     #   {alias:"default",     node_indices:[0]}              → same
     #   {alias:"default-big", node_indices:[1,2,3]}          → 2nd pool on ranks 1..3
     node_indices: Optional[list[int]] = None
+    # Argo-VLM fold (2026-07-02). When the requested model is a vision model,
+    # the load auto-detects and serves it single-node via mlx_vlm.server as a
+    # VL pool under this cluster. These optional fields tune that launch; they
+    # are IGNORED for text (distributed) loads.
+    vlm_port: Optional[int] = None        # default VLM_DEFAULT_PORT (8080)
+    venv: Optional[str] = None            # default VLM_DEFAULT_VENV
+    ready_timeout_s: Optional[float] = None  # default VLM_READY_TIMEOUT_S
 
 
 @app.get("/admin/clusters/{cluster_id}/load-options")
@@ -10037,38 +10205,78 @@ async def admin_cluster_load(cluster_id: str, req: ArgoLoadRequest):
     # just die at the barrier. Independent of the RAM check below.
     arch = await get_model_arch_meta(rank0_ssh, model_abspath)
 
-    # Unified load auto-detect. The distributed text runner can't run a vision
-    # model — VL models serve single-node via mlx_vlm.server. When the requested
-    # model's config.json is a vision model, transparently DISPATCH to the
-    # engine-managed VLM launch flow (admin_vlm_load) targeting this pool's
-    # rank-0 node, so "load model X on cluster/node N" just works for both.
-    #
-    # Seam: this creates a SEPARATE engine-managed telemak/http-proxy cluster
-    # (id "<cluster_id>-vlm", routing to mlx_vlm.server on rank-0) rather than a
-    # pool inside this mlx-distributed cluster — the two runtimes are distinct.
-    # The VLM then appears in the dashboard with the "vlm" badge attributed to
-    # rank-0's host. Set force=true to bypass detection and attempt a (doomed)
-    # text load anyway. Multi-node VL requests collapse to single-node (rank-0).
+    # Argo-VLM fold (2026-07-02). Unified load auto-detect. The distributed
+    # text runner can't run a vision model — VL models serve single-node via
+    # mlx_vlm.server. When the requested model's config.json is a vision model,
+    # transparently launch mlx_vlm.server on ONE node and register it as a VL
+    # POOL *inside this mlx-distributed cluster* (NOT a separate `<id>-vlm`
+    # sibling). Argo stays the single transparent interface: the VL appears
+    # under the Argo card + /v1/models with a "vlm" badge, and chat routes to
+    # it internally via http-proxy. Set force=true to bypass detection and
+    # attempt a (doomed) text load anyway. Multi-node VL requests collapse to
+    # a single node (the first requested index, else index 0 = master).
     if arch.get("is_vision") and not getattr(req, "force", False):
-        vlm_id = f"{cluster_id}-vlm"
-        vlm_host = topo[0].get("host") or _host_id_from_ssh(rank0_ssh)
-        vlm_req = VLMLoadRequest(
-            id=re.sub(r"[^a-z0-9-]", "-", vlm_id.lower())[:41].strip("-") or "vlm",
-            host=rank0_ssh,
-            model=req.model,
-            name=f"{cd.get('name', cluster_id)} VLM",
-            models_dir=base_dir,
-        )
-        result = await admin_vlm_load(vlm_req)
+        # Clamp to a single node. Prefer the first requested index; when the
+        # request gave none (empty cluster case), that's index 0 = the master.
+        vlm_index = node_indices[0]
+        vlm_topo = build_topology_from_indices(cluster_id, [vlm_index])
+        vlm_ssh = vlm_topo[0]["ssh"]
+        vlm_host = vlm_topo[0].get("host") or _host_id_from_ssh(vlm_ssh)
+        vlm_port = int(getattr(req, "vlm_port", None) or VLM_DEFAULT_PORT)
+        vlm_model_path = _vlm_resolve_model_path(req.model, base_dir)
+        vlm_ip = _vlm_ip_from_ssh(vlm_ssh)
+        vlm_upstream = f"http://{vlm_ip}:{vlm_port}"
+        log_id = _vlm_pool_log_id(cluster_id, alias)
+        # If a server is already serving on this port (zombie / duplicate),
+        # surface it rather than launching a second one that fights for the port.
+        if await _vlm_probe_ready(vlm_ip, vlm_port) is True:
+            raise HTTPException(
+                409,
+                f"{vlm_ip}:{vlm_port} already serving a model — unload the VL "
+                f"pool first (POST /admin/clusters/{cluster_id}/unload"
+                f"?alias={alias}) or pick another port",
+            )
+        # Hold the cluster admin lock across the launch+register, same as the
+        # text load holds it across RunnerPool.start() — serialises concurrent
+        # loads on this cluster so two requests can't race the same node/alias.
+        _t_launch = time.time()
+        async with get_admin_lock(cluster_id):
+            ready, launched_pid, tail = await _launch_vlm_server(
+                vlm_ssh, log_id, vlm_model_path, vlm_port,
+                (getattr(req, "venv", None) or VLM_DEFAULT_VENV),
+                float(getattr(req, "ready_timeout_s", None) or VLM_READY_TIMEOUT_S),
+            )
+            if not ready:
+                # Mirror admin_vlm_load: return the log tail so the operator sees WHY.
+                raise HTTPException(
+                    503,
+                    f"mlx_vlm.server did not become ready on {vlm_upstream} "
+                    f"(node {vlm_host}). Log tail:\n{tail}",
+                )
+            vpool = VLMPool(
+                model_path=vlm_model_path, cluster=cluster_id, alias=alias,
+                node_indices=[vlm_index], upstream=vlm_upstream, port=vlm_port,
+                ssh_target=vlm_ssh, host=vlm_host, pid=launched_pid,
+            )
+            vpool.load_s = time.time() - _t_launch
+            set_pool(cluster_id, alias, vpool)
+            save_cluster_state_v2(cluster_id)
         return {
-            **result,
-            "dispatched": "vlm",
+            "loaded": True,
+            "cluster": cluster_id,
+            "alias": alias,
+            "is_vlm": True,
+            "dispatched": "vlm-pool",
+            "model": vlm_model_path,
+            "upstream": vlm_upstream,
+            "node": vlm_host,
+            "node_index": vlm_index,
+            "pid": launched_pid,
             "note": (
-                f"{req.model} is a vision model — the distributed text runner "
-                f"can't serve it. Launched an engine-managed VLM "
-                f"(mlx_vlm.server) on {vlm_host} instead; it appears as cluster "
-                f"'{result.get('id')}' with the VLM badge. Pass force=true to "
-                "attempt a text load anyway."
+                f"{req.model} is a vision model — served single-node by "
+                f"mlx_vlm.server on {vlm_host}, registered as VL pool "
+                f"'{alias}' under {cluster_id} (chat routes to it internally). "
+                "Pass force=true to attempt a text load anyway."
             ),
         }
 
@@ -10525,6 +10733,192 @@ async def _telemak_proxy_chat_completion(
                         if out_line is not None:
                             yield out_line
                     async for f in _telemak_emit_flush(state, cluster_id):
+                        yield f
+    from fastapi.responses import StreamingResponse
+    return StreamingResponse(_gen(), media_type="text/event-stream")
+
+
+async def _vlm_upstream_model_id(upstream: str, fallback: str) -> str:
+    """Ask a VL pool's mlx_vlm.server what model id it serves (GET /v1/models).
+    mlx_vlm.server advertises the checkpoint path it was launched with; we must
+    echo THAT id in the forwarded body's `model` field or the server 404s.
+    Falls back to the pool's launch path if the probe fails."""
+    import httpx
+    url = f"{upstream.rstrip('/')}/v1/models"
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            r = await client.get(url)
+        data = (r.json() or {}).get("data") if r.status_code < 400 else None
+        if isinstance(data, list) and data and isinstance(data[0], dict):
+            mid = data[0].get("id")
+            if isinstance(mid, str) and mid:
+                return mid
+    except Exception:
+        pass
+    return fallback
+
+
+async def _vlm_pool_proxy_chat_completion(pool, body: dict, stream: bool):
+    """Proxy a /v1/chat/completions request to a VL pool's mlx_vlm.server
+    (Argo-VLM fold). Mirrors `_telemak_proxy_chat_completion` — body forward,
+    `<think>` → reasoning_content split, usage-chunk passthrough — but pointed
+    at the pool's own upstream (not a cluster def). The response `model` is
+    rewritten to the pool alias so the client sees a stable id.
+
+    The text hot path (RunnerProc generation) is entirely separate; this only
+    runs when `_route_pool` returned a VLMPool.
+    """
+    upstream = (getattr(pool, "upstream", "") or "").rstrip("/")
+    if not upstream:
+        raise HTTPException(400, f"VL pool {pool.alias!r}: missing upstream URL")
+    label = pool.alias                       # response `model` the client sees
+    upstream_model = await _vlm_upstream_model_id(upstream, pool.model)
+    # Shared think-filter decision with the telemak path + local pool.
+    auto_think = _should_filter_think(upstream_model, body.get("enable_thinking"))
+    forward_body = dict(body)
+    if not forward_body.get("reasoning_effort"):
+        _re_default = _default_reasoning_effort(upstream_model)
+        if _re_default:
+            forward_body["reasoning_effort"] = _re_default
+    forward_body["model"] = upstream_model
+    if stream:
+        _so = dict(forward_body.get("stream_options") or {})
+        _so.setdefault("include_usage", True)
+        forward_body["stream_options"] = _so
+    pool.last_used_at = time.time()
+    import httpx
+    if not stream:
+        _t0 = time.time()
+        try:
+            async with httpx.AsyncClient(timeout=300.0) as client:
+                r = await client.post(f"{upstream}/v1/chat/completions", json=forward_body)
+        except Exception as e:
+            raise HTTPException(502, f"VL upstream unreachable: {e}")
+        _elapsed = max(0.001, time.time() - _t0)
+        if r.status_code >= 400:
+            raise HTTPException(r.status_code, f"VL upstream error: {r.text[:300]}")
+        out = r.json()
+        if auto_think:
+            for choice in out.get("choices", []) or []:
+                msg = choice.get("message") or {}
+                raw = msg.get("content") or ""
+                _om, _cm = _model_think_markers(upstream_model)
+                state = {"in_think": not raw.lstrip().startswith(_om),
+                         "carry": "", "open": _om, "close": _cm}
+                vis, reas = _split_think_stream(raw, state)
+                vis2, reas2 = _flush_think_stream(state)
+                visible = (vis + vis2).lstrip()
+                reasoning = (reas + reas2).strip()
+                msg["content"] = visible
+                if reasoning:
+                    msg["reasoning_content"] = reasoning
+                choice["message"] = msg
+        out["model"] = label
+        _usage = out.get("usage") or {}
+        record_metric(
+            client="vlm-pool-proxy",
+            ntoks=_usage.get("completion_tokens") or 0,
+            elapsed_s=_elapsed,
+            ttft_s=_elapsed,
+            prompt_chars=(_usage.get("prompt_tokens") or 0) * 4,
+            model=upstream_model,
+            cluster=pool.cluster,
+        )
+        return out
+
+    async def _gen():
+        if auto_think:
+            _om, _cm = _model_think_markers(upstream_model)
+            state = {"in_think": _seed_in_think(upstream_model, body.get("enable_thinking")),
+                     "carry": "", "open": _om, "close": _cm}
+        else:
+            state = None
+        _ttft: list = []
+        _t0 = time.time()
+        _ntoks = 0
+        async with httpx.AsyncClient(timeout=None) as client:
+            async with client.stream("POST", f"{upstream}/v1/chat/completions", json=forward_body) as r:
+                if r.status_code >= 400:
+                    err_body = (await r.aread()).decode(errors="replace")[:500]
+                    yield f"data: {json.dumps({'error': {'message': f'VL upstream {r.status_code}: {err_body}'}})}\n\n".encode()
+                    return
+                if not auto_think:
+                    async for chunk in r.aiter_raw():
+                        if chunk:
+                            if not _ttft:
+                                _ttft.append(time.time() - _t0)
+                            for line in chunk.split(b"\n"):
+                                s = line.strip()
+                                if s.startswith(b"data: ") and s != b"data: [DONE]":
+                                    try:
+                                        obj = json.loads(s[6:])
+                                        u = obj.get("usage") or {}
+                                        if u.get("completion_tokens"):
+                                            _ntoks = u["completion_tokens"]
+                                    except Exception:
+                                        pass
+                            yield chunk
+                    record_metric(
+                        client="vlm-pool-proxy", ntoks=_ntoks,
+                        elapsed_s=max(0.001, time.time() - _t0),
+                        ttft_s=_ttft[0] if _ttft else None,
+                        prompt_chars=0, model=upstream_model, cluster=pool.cluster,
+                    )
+                    return
+                buf = b""
+                done_seen = False
+                async for chunk in r.aiter_raw():
+                    if not chunk:
+                        continue
+                    buf += chunk
+                    while b"\n" in buf:
+                        line, buf = buf.split(b"\n", 1)
+                        if line.strip() == b"data: [DONE]":
+                            async for f in _telemak_emit_flush(state, label):
+                                yield f
+                            yield b"data: [DONE]\n"
+                            done_seen = True
+                            record_metric(
+                                client="vlm-pool-proxy", ntoks=_ntoks,
+                                elapsed_s=max(0.001, time.time() - _t0),
+                                ttft_s=_ttft[0] if _ttft else None,
+                                prompt_chars=0, model=upstream_model, cluster=pool.cluster,
+                            )
+                            break
+                        _st = line.strip()
+                        if _st.startswith(b"data: ") and _st != b"data: [DONE]":
+                            try:
+                                _uo = json.loads(line[6:])
+                            except Exception:
+                                _uo = None
+                            if isinstance(_uo, dict) and _uo.get("usage"):
+                                _u = _uo.get("usage") or {}
+                                if _u.get("completion_tokens"):
+                                    _ntoks = _u["completion_tokens"]
+                                if not _ttft:
+                                    _ttft.append(time.time() - _t0)
+                                yield line + b"\n"
+                                continue
+                        out_line = _telemak_filter_sse_line(line, state, label)
+                        if out_line is not None:
+                            if not _ttft:
+                                _ttft.append(time.time() - _t0)
+                            try:
+                                obj = json.loads(line[6:]) if line.strip().startswith(b"data: ") else {}
+                                u = obj.get("usage") or {}
+                                if u.get("completion_tokens"):
+                                    _ntoks = u["completion_tokens"]
+                            except Exception:
+                                pass
+                            yield out_line
+                    if done_seen:
+                        break
+                if not done_seen:
+                    if buf:
+                        out_line = _telemak_filter_sse_line(buf, state, label)
+                        if out_line is not None:
+                            yield out_line
+                    async for f in _telemak_emit_flush(state, label):
                         yield f
     from fastapi.responses import StreamingResponse
     return StreamingResponse(_gen(), media_type="text/event-stream")
@@ -11580,6 +11974,79 @@ def _vlm_resolve_model_path(model: str, models_dir: Optional[str]) -> str:
         return m
     base = (models_dir or DEFAULT_MODELS_DIR).rstrip("/")
     return f"{base}/{m}"
+
+
+async def _launch_vlm_server(
+    ssh_target: str, log_id: str, model_path: str, port: int,
+    venv: str, ready_timeout: float,
+) -> tuple[bool, Optional[str], str]:
+    """Launch mlx_vlm.server on a node and poll until ready. Shared by the
+    Argo-VLM pool load branch (admin_cluster_load) and the startup restore.
+    Reuses the exact launch/probe/log-tail helpers /admin/vlm/load uses.
+
+    Returns (ready, launched_pid, log_tail). On timeout, log_tail carries the
+    server log so the caller can surface WHY (OOM, bad checkpoint, import err).
+    """
+    ip = _vlm_ip_from_ssh(ssh_target)
+    launch = _vlm_launch_cmd(log_id, venv, model_path, port)
+    launched_pid: Optional[str] = None
+    rc, out, err = await asyncio.to_thread(_ssh_exec, ssh_target, launch, 20)
+    if rc != 0:
+        return False, None, (err or out or "").strip()[-4000:]
+    for line in (out or "").splitlines():
+        if line.startswith("VLM_PID="):
+            launched_pid = line.split("=", 1)[1].strip()
+    deadline = time.time() + ready_timeout
+    while time.time() < deadline:
+        state = await _vlm_probe_ready(ip, port)
+        if state is True:
+            return True, launched_pid, ""
+        await asyncio.sleep(3.0)
+    tail = await _vlm_log_tail(ssh_target, log_id)
+    return False, launched_pid, tail
+
+
+def _vlm_pool_log_id(cluster_id: str, alias: str) -> str:
+    """Per-(cluster, alias) log/slug id for a VL pool's mlx_vlm.server, in the
+    same `[a-z0-9-]` slug shape _vlm_log_path/_vlm_launch_cmd expect."""
+    raw = f"{cluster_id}-{alias}-vlm"
+    return re.sub(r"[^a-z0-9-]", "-", raw.lower())[:41].strip("-") or "vlm"
+
+
+async def _restore_vlm_pool(cluster_id: str, alias: str, entry: dict,
+                            indices: list[int]) -> Optional["VLMPool"]:
+    """Startup restore for a persisted VL pool: relaunch mlx_vlm.server on the
+    saved node and rebuild the VLMPool. If the server is already reachable
+    (survived a bare API restart without a node reboot), adopt it in place."""
+    model_path = entry["model"]
+    port = int(entry.get("port") or VLM_DEFAULT_PORT)
+    topo = build_topology_from_indices(cluster_id, indices)
+    ssh_target = entry.get("ssh") or topo[0]["ssh"]
+    host = entry.get("host") or topo[0].get("host") or _host_id_from_ssh(ssh_target)
+    ip = _vlm_ip_from_ssh(ssh_target)
+    upstream = entry.get("upstream") or f"http://{ip}:{port}"
+    pid = None
+    if await _vlm_probe_ready(ip, port) is True:
+        sys.stderr.write(
+            f"[api] VL pool restore ({cluster_id}:{alias}): {upstream} already "
+            f"serving — adopting in place\n"
+        )
+    else:
+        ready, pid, tail = await _launch_vlm_server(
+            ssh_target, _vlm_pool_log_id(cluster_id, alias), model_path, port,
+            VLM_DEFAULT_VENV, VLM_READY_TIMEOUT_S,
+        )
+        if not ready:
+            sys.stderr.write(
+                f"[api] VL pool restore ({cluster_id}:{alias}) failed — server "
+                f"did not become ready. Log tail:\n{tail}\n"
+            )
+            return None
+    return VLMPool(
+        model_path=model_path, cluster=cluster_id, alias=alias,
+        node_indices=indices, upstream=upstream, port=port,
+        ssh_target=ssh_target, host=host, pid=pid,
+    )
 
 
 @app.post("/admin/vlm/load")
