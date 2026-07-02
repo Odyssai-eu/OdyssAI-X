@@ -6856,7 +6856,14 @@ async function handleAct(e) {
         body.num_draft_tokens = f.default_num_draft || 4;
       }
       const r = await postJson(`/admin/clusters/${state.selected_cluster}/load`, body);
-      toast(`Default ${r.nodes}-node loaded in ${r.load_s.toFixed(1)}s`, "ok");
+      // Tolerate BOTH response shapes: a distributed text load (has nodes/load_s)
+      // and a VL-pool load (has is_vlm/node/node_index, no load_s/nodes). The
+      // old `r.load_s.toFixed(1)` crashed on a VL load and mis-reported the
+      // (successful) load as failed via the catch below.
+      const secs = (typeof r.load_s === "number") ? ` in ${r.load_s.toFixed(1)}s` : "";
+      toast(r.is_vlm
+        ? `VLM '${r.alias || "vlm"}' loaded on ${r.node || ("node " + (r.node_index ?? 0))}${secs}`
+        : `${r.alias || "Default"} · ${r.nodes || "?"}-node loaded${secs}`, "ok");
     } catch(err) { toast("default load failed: " + err.message, "err"); }
     state.busy_default_load = false; refreshAll(); return;
   }
