@@ -418,7 +418,7 @@ def get_cluster_def(cluster_id: str) -> dict:
     default = DEFAULT_CLUSTER_DEFS.get(cluster_id, {})
     overlay = cfg.get(cluster_id, {})
     merged = json.loads(json.dumps(default))  # deep copy
-    for k in ("name", "kind", "backend", "max_nodes", "models_dir", "enabled", "upstream"):
+    for k in ("name", "kind", "backend", "max_nodes", "models_dir", "enabled", "upstream", "supports_vision"):
         if k in overlay:
             merged[k] = overlay[k]
     if "nodes" in overlay and overlay["nodes"]:
@@ -6170,6 +6170,18 @@ async def list_models(include_unloaded: bool = False):
         caps = (await _telemak_capabilities(cid, cd)).get("capabilities") or {}
         stream_cap = caps.get("stream", True)
         tools_cap = caps.get("tools", False)
+        # Vision capability. The upstream /.well-known/ is absent on a plain
+        # mlx_vlm.server, so caps has no vision flag -> Companion reads
+        # x_odyssai.supports_vision as false and warns "may not support
+        # images" for a working VLM. Resolve it at the source (the engine is
+        # the capability truth), not via a client-side allowlist: honor an
+        # explicit cluster-def override, else infer from the checkpoint name
+        # (VL builds carry "vl"/"vision").
+        def _telemak_vision(name: str) -> bool:
+            if caps.get("vision") or cd.get("supports_vision"):
+                return True
+            n = (name or "").lower()
+            return any(t in n for t in ("-vl", "vl-", "_vl", "vision"))
         # cluster_label + family + quantization let the Companion picker
         # render telemak rows with the same depth as local pool rows:
         # title = cluster_label (e.g. "TeleCoder"), subtitle = family · quant.
@@ -6191,6 +6203,7 @@ async def list_models(include_unloaded: bool = False):
                     "quantization": _quant_from_name(loaded[0]),
                     "stream": stream_cap,
                     "tools": tools_cap,
+                    "supports_vision": _telemak_vision(loaded[0]),
                     "backend": "http-proxy",
                     "upstream": cd.get("upstream"),
                 },
@@ -6215,6 +6228,7 @@ async def list_models(include_unloaded: bool = False):
                         "short_id": short,
                         "stream": stream_cap,
                         "tools": tools_cap,
+                        "supports_vision": _telemak_vision(upstream_model),
                         "backend": "http-proxy",
                         "upstream": cd.get("upstream"),
                     },
