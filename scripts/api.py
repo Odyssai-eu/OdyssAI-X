@@ -3362,7 +3362,16 @@ def _model_slug(model: str) -> str:
 
 
 def _derive_pool_alias(cluster_id: str, model: str) -> str:
-    return f"{_cluster_slug(cluster_id)}:{_model_slug(model)}"
+    """Published pool id for a no-alias load = the BARE model slug
+    ("minimax-m3-vl"), so every pool reads the same clean way regardless of
+    which cluster serves it. The `<cluster>:` prefix is kept only as a
+    collision fallback: if the bare slug is already loaded on a DIFFERENT
+    cluster, disambiguate with the cluster slug so /v1/models stays unique."""
+    bare = _model_slug(model)
+    for cid, alias, _ in list_all_pools():
+        if cid != cluster_id and alias == bare:
+            return f"{_cluster_slug(cluster_id)}:{bare}"
+    return bare
 
 
 def get_pool(cluster_id: str, alias: str = DEFAULT_ALIAS) -> Optional[RunnerPool]:
@@ -3993,7 +4002,7 @@ def _initial_default_config() -> Optional[dict]:
 #   major (1.7.2 → 2.0.0) — breaking API or topology change
 #
 # Use `./scripts/bump-version.sh patch|minor|major` to bump + auto-commit.
-APP_VERSION = "1.12.0"
+APP_VERSION = "1.12.1"
 
 app = FastAPI(
     title="OdyssAI-X (odyssai.eu)",
