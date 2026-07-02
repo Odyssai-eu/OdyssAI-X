@@ -162,11 +162,42 @@ reboot d'un node sans re-vérifier qui l'utilisait après le restart.
 - Le VL distribué : prouvé de bout en bout, y compris un load prod réussi.
 - `.33` provisionné. `.32` réparé mais en1/.47 + 26.4.1 à traiter.
 
+## Phase 9 — Matin : nommage nu + le faux « degraded »
+
+Sophie voit le dashboard : `argo:minimax-m3-vl` **VLM** à côté de `ornith` nu.
+*« les nom des pools n'est pas OK. le pool 1 = argo:modele, pool 2 = modele.
+pourquoi ? je veux le meme. pool 1 = modele, pool 2 = modele »*.
+
+**Pourquoi l'incohérence** : le contrat #64 que j'avais shippé — alias
+**auto-dérivé** prenait le préfixe `argo:` (`_derive_pool_alias` =
+`cluster:model`), alias **explicite** (`ornith`, tapé hier) restait verbatim.
+Deux chemins de création → deux styles. Rien à voir avec le modèle.
+
+Faux pas dans la foulée : j'ai proposé un reset en annonçant le cluster
+`main` **degraded** — *« Le cluster main est degraded ??? on a reboot 5x
+depuis hier »*. Elle avait raison : mon « degraded » datait de la cascade
+d'hier soir, **périmé**. Vérif live : `degraded: None`, health idle, deux
+pools chargés. Retiré, excuse faite. Leçon renforcée : ne jamais ressortir un
+état sans le re-sonder.
+
+**Le fix** (`361ad78`, **v1.12.1**) : `_derive_pool_alias` publie désormais le
+**slug modèle nu** par défaut (`minimax-m3-vl`). Le préfixe `<cluster>:` ne
+revient qu'en **garde anti-collision** — appliqué seulement si le même slug est
+déjà chargé sur un AUTRE cluster (jamais le cas : un seul cluster distribué).
+Supersede le schéma #64 toujours-préfixé (le préfixe achetait peu, lisait mal à
+côté des pools nommés).
+
+Rename des pools vivants sans downtime : édition de l'alias dans
+`/app/state-main.json` (`argo:minimax-m3-vl` → `minimax-m3-vl`, backup fait)
+puis restart — le serveur VL `.29:8080` (nohup) **survit et est ré-adopté** sous
+le nouveau nom sans recharger les 327 Go ; ornith se recharge (~90 s, enfants
+ssh). Vérifié : `minimax-m3-vl` + `ornith`, tous deux nus, loaded.
+
 ## Numbers de la nuit
 
-- **Commits** : 7 sur main (`5307657` → `9252e11`), branche
+- **Commits** : 9 sur main (`5307657` → `361ad78`), branche
   `feat/mlx-vlm-distributed` mergée, push forge + internal.
-- **Version** : v1.11.0 → **v1.12.0**.
+- **Version** : v1.11.0 → **v1.12.1**.
 - **Diff** : ~1 355 lignes ajoutées (dont `vlm_runner.py` 517,
   `vlm_caption_probe.py` 232).
 - **Perf Q6 greedy** : single 24.97 · TP-2 local 13.03 · TP-2 cross 8.84 ·
@@ -175,10 +206,10 @@ reboot d'un node sans re-vérifier qui l'utilisait après le restart.
 
 ## TODO direct (par ordre)
 
-1. **Reset + assainissement** : `POST /admin/clusters/main/reset`, purger les
-   entrées mortes du state du volume (ornith), sweep .30/.32, recharger le VL.
-   Règle d'or opérationnelle immédiate : **unload des pools AVANT tout restart
-   engine** ; ne jamais restarter sans regarder le state du volume.
+1. ~~Reset + assainissement~~ — **MOOT** : les reboots de Sophie avaient déjà
+   nettoyé, cluster sain au matin (mon « degraded » était périmé). Nommage nu
+   réglé (v1.12.1). Règle d'or confirmée : **unload avant tout restart engine**,
+   et toujours lire (`cat state-main.json`) ce que le restart rejouera.
 2. **Fix root shutdown/restore** : stop effectif des pools sous la grace
    docker (ou stop-before-restart outillé), wired-guard au restore (le sweep
    retourne déjà `wired_bytes` — skip un node leaké), grace SIGTERM adaptative
