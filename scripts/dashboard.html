@@ -4125,12 +4125,28 @@ function renderArgoPoolsList(a) {
     // #61 — per-pool activity. The aggregate Activity hero only showed the
     // cluster total; here each pool gets its own live indicator from the
     // in-flight runs routed to its alias (runs carry {cluster, alias}).
-    const poolInflight = (state.runs || []).filter(
-      (r) => r.cluster === state.selected_cluster && r.alias === p.alias
-    ).length;
-    const actPill = poolInflight > 0
-      ? `<span style="background:#fff8e6;border:1px solid var(--amber);color:var(--amber-deep);padding:2px 8px;border-radius:5px;font-size:10px;font-weight:600;letter-spacing:0.04em;text-transform:uppercase"><span style="display:inline-block;width:5px;height:5px;border-radius:50%;background:var(--amber);margin-right:5px;animation:pulse 1s infinite;vertical-align:middle"></span>${poolInflight} in flight</span>`
-      : `<span style="color:var(--ink-3);font-size:10px;letter-spacing:0.04em;text-transform:uppercase">idle</span>`;
+    // #61 — per-pool activity: stage + tokens + tok/s from the pool's own
+    // in-flight runs. Runs carry `pool_alias` (the older code filtered on the
+    // non-existent `r.alias`, so named pools always read 0). Stage is derived
+    // from progress: no token yet = prefill (reading the prompt), else
+    // generating. VL runs are included (the proxy registers them now).
+    const poolRuns = (state.runs || []).filter(
+      (r) => r.cluster === state.selected_cluster &&
+             ((r.pool_alias || r.cluster) === p.alias)
+    );
+    const poolInflight = poolRuns.length;
+    let actPill;
+    if (poolInflight > 0) {
+      const toks = poolRuns.reduce((s, r) => s + (r.output_tokens || 0), 0);
+      const tpsNow = Math.max(0, ...poolRuns.map((r) => r.tok_per_s || 0));
+      const generating = poolRuns.some((r) => (r.output_tokens || 0) > 0);
+      const stage = generating ? "generating" : "prefill";
+      const extra = poolInflight > 1 ? ` ×${poolInflight}` : "";
+      const rate = tpsNow > 0 ? ` · ${tpsNow.toFixed(1)} tok/s` : "";
+      actPill = `<span style="background:#fff8e6;border:1px solid var(--amber);color:var(--amber-deep);padding:2px 8px;border-radius:5px;font-size:10px;font-weight:600;letter-spacing:0.04em;text-transform:uppercase"><span style="display:inline-block;width:5px;height:5px;border-radius:50%;background:var(--amber);margin-right:5px;animation:pulse 1s infinite;vertical-align:middle"></span>${stage}${extra} · ${toks} tok${rate}</span>`;
+    } else {
+      actPill = `<span style="color:var(--ink-3);font-size:10px;letter-spacing:0.04em;text-transform:uppercase">idle</span>`;
+    }
     return `
       <div style="display:flex;align-items:center;gap:12px;padding:8px 12px;background:var(--surface);border:1px solid var(--line);border-radius:6px;font-family:var(--font-mono);font-size:12px">
         <span style="font-weight:600;color:var(--ink);min-width:80px">${escapeHtml(p.alias)}${aliasIsDefault && conc ? ' &rarr;' : ''}</span>
