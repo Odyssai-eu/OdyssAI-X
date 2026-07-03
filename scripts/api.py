@@ -2666,10 +2666,25 @@ def load_state(cluster: str = "nautilus") -> Optional[dict]:
 # ─────────────────────────────────────────────────────────────────────────
 
 
-def save_cluster_state_v2(cluster_id: str) -> None:
-    """Persist EVERY loaded pool for this cluster. Called after any
-    successful load/unload/reset so the next container startup can restore
-    the full multi-pool topology."""
+def save_cluster_state_v2(cluster_id: str, *,
+                          remove_aliases: Optional[list[str]] = None,
+                          allow_empty_delete: bool = False) -> None:
+    """Persist the DESIRED state for this cluster — the pools the operator has
+    load-ed and not unload-ed — NOT a snapshot of the live registry.
+
+    The 2026-07-03 dead-pool bug: this used to write exactly the live registry
+    and unlink the file when it was empty. So a rank death → dead-pool purge →
+    the pool left the registry → save dropped it (or deleted the whole file) →
+    the next restart restored nothing. A transient failure (reboot, OOM, JACCL
+    crash) permanently erased the intent to serve.
+
+    Fix: MERGE. Live pools override their on-disk entry (fresh shape, clears any
+    'down' marker); on-disk pools that are no longer live are KEPT and stamped
+    `"down": true` (still desired, currently down → restore re-attempts them);
+    only `remove_aliases` (an explicit operator unload) drops entries. The file
+    is unlink-ed only when the merged desired-set is empty AND the caller is an
+    explicit unload (`allow_empty_delete=True`) — never on a liveness event."""
+    remove = {a.strip().lower() for a in (remove_aliases or [])}
     pools_payload = []
     for alias, pool in list_pools(cluster_id):
         if getattr(pool, "node_indices", None):
@@ -2721,11 +2736,35 @@ def save_cluster_state_v2(cluster_id: str) -> None:
             "num_draft_tokens": pool.num_draft_tokens,
             "backend": getattr(pool, "backend", None),
         })
-    payload = {"schema": "v2", "pools": pools_payload}
+    # Merge the live shapes over the existing on-disk DESIRED entries.
+    live_by_alias = {p["alias"]: p for p in pools_payload}
+    try:
+        existing = {p["alias"]: p for p in load_cluster_state_v2(cluster_id)
+                    if isinstance(p, dict) and p.get("alias")}
+    except Exception:
+        existing = {}
+    merged: dict = dict(existing)
+    for alias in remove:
+        merged.pop(alias, None)
+    for alias, shape in live_by_alias.items():
+        if alias in remove:
+            continue
+        merged[alias] = shape                      # live: fresh shape, no 'down'
+    # On-disk entries that are neither live nor explicitly removed = still
+    # desired but currently down. Keep them so a restart re-attempts them.
+    for alias, entry in merged.items():
+        if alias in live_by_alias:
+            entry.pop("down", None)
+        else:
+            entry["down"] = True
+
+    payload = {"schema": "v2", "pools": list(merged.values())}
     sf = state_file_for(cluster_id)
     try:
-        if not pools_payload:
-            if sf.exists():
+        if not payload["pools"]:
+            # Only an explicit operator unload may delete the file. A liveness
+            # event (purge/sweep) that happens to empty the registry must NOT.
+            if allow_empty_delete and sf.exists():
                 sf.unlink()
             return
         sf.write_text(json.dumps(payload, indent=2))
@@ -3654,7 +3693,12 @@ async def lifespan(app: FastAPI):
                 await pool.start()
                 set_pool(cid, alias, pool)
             except Exception as e:
-                sys.stderr.write(f"[api] startup load ({cid}:{alias}) failed: {e}\n")
+                # F3: a failed restore KEEPS the desired-state entry (we never
+                # remove it here) so a later restart / recovery re-attempts it.
+                # Never let one dead pool erase the intent to serve it.
+                sys.stderr.write(
+                    f"[api] startup restore ({cid}:{alias}) failed: {e} — "
+                    f"desired-state entry kept for retry\n")
     # Apply persisted default TTL to any pool that just started up.
     _apply_default_ttl_to_pools()
     # Background TTL sweeper — auto-unloads pools idle for > ttl_seconds.
@@ -3688,8 +3732,20 @@ async def lifespan(app: FastAPI):
         # several big pools loaded — the container got SIGKILLed mid-stop,
         # ranks survived stuck in collectives, and the next boot's sweep
         # SIGKILLed them into a 182GB wired leak (2026-07-03 cascade).
-        _stop_targets = ([_pool] if _pool is not None else []) + \
-                        [p for _, _, p in list_all_pools()]
+        #
+        # F5: EXCLUDE the single-node VLMPool (nohup mlx_vlm.server). It is a
+        # detached process that SURVIVES the container and is re-adopted in
+        # place at boot by _restore_vlm_pool (probe :8080 → adopt, no reload).
+        # Stopping it here would SSH-kill the running server for nothing —
+        # then restore has to cold-relaunch it (~75s of downtime for Julie),
+        # and if that relaunch fails the pool is lost. RunnerPool + VLMDistPool
+        # ARE ssh-child ranks that die with the container, so they DO need the
+        # graceful stop (frees Metal wired + JACCL queue pairs cleanly).
+        def _is_nohup_vlm(p):
+            return getattr(p, "is_vlm", False) and not getattr(p, "is_vlm_dist", False)
+        _stop_targets = [p for p in (([_pool] if _pool is not None else []) +
+                                     [p for _, _, p in list_all_pools()])
+                         if not _is_nohup_vlm(p)]
         if _stop_targets:
             async def _stop_one(p):
                 try:
@@ -4087,7 +4143,7 @@ def _initial_default_config() -> Optional[dict]:
 #   major (1.7.2 → 2.0.0) — breaking API or topology change
 #
 # Use `./scripts/bump-version.sh patch|minor|major` to bump + auto-commit.
-APP_VERSION = "1.13.0"
+APP_VERSION = "1.13.1"
 
 app = FastAPI(
     title="OdyssAI-X (odyssai.eu)",
@@ -9662,7 +9718,15 @@ async def _purge_dead_pools(cluster_id: str) -> list[str]:
 
     Best-effort: pool.stop() failures don't block the purge — if the
     SSH connection is gone the runner is already dead.
+
+    F4 (2026-07-03): if a controlled recovery is IN FLIGHT for this cluster
+    (`_WATCHDOG_RECOVERY_BY_CLUSTER`), do NOT purge — the ladder rebooted the
+    pool's nodes (ranks legitimately down) and is about to reload it. Purging
+    in that window was the sweeper↔recovery race that dropped `ornith` from
+    desired-state mid-recovery on 2026-07-02.
     """
+    if cluster_id in _WATCHDOG_RECOVERY_BY_CLUSTER:
+        return []
     purged: list[str] = []
     for alias, pool in list(list_pools(cluster_id)):
         if pool.alive_count() > 0:
@@ -9684,6 +9748,11 @@ async def _purge_dead_pools(cluster_id: str) -> list[str]:
         )
     if purged:
         try:
+            # Merge-save (no remove_aliases): the purged pools leave the LIVE
+            # registry (freeing node indices + routing) but stay in
+            # desired-state stamped `down` — a restart re-attempts them. This
+            # is a liveness event, NOT an operator unload; it must never erase
+            # desired-state (the 2026-07-03 dead-pool bug).
             save_cluster_state_v2(cluster_id)
         except Exception as e:
             print(f"[purge] {cluster_id} persist after purge failed: {e}", flush=True)
@@ -9700,18 +9769,20 @@ async def _auto_unload_cluster(cluster_id: str, reason: str) -> None:
     """
     print(f"[admin] auto-unload {cluster_id}: {reason}", flush=True)
     async with get_admin_lock(cluster_id):
+        removed: list[str] = []
         for alias, pool in list(list_pools(cluster_id)):
             try:
                 await pool.stop()
             except Exception as e:
                 print(f"[admin] {cluster_id}[{alias}] auto-unload stop failed: {e}", flush=True)
             del_pool(cluster_id, alias)
-        try:
-            sf = state_file_for(cluster_id)
-            if sf.exists():
-                sf.unlink()
-        except Exception:
-            pass
+            removed.append(alias)
+        # Config-driven invalidation (TTL idle, topology/max_nodes change) IS
+        # an intent to release — remove from desired-state + allow the file to
+        # go. Uses the same merge-save path (never a raw unlink) so a partial
+        # set is preserved when only some aliases are dropped.
+        save_cluster_state_v2(cluster_id, remove_aliases=removed,
+                              allow_empty_delete=True)
 
 
 @app.get("/admin/inventory")
@@ -11943,6 +12014,7 @@ async def admin_cluster_unload(
         except Exception:
             pass
     target = (alias or body_alias or DEFAULT_ALIAS).strip().lower()
+    removed: list[str] = []
     async with get_admin_lock(cluster_id):
         if target == "*":
             for a, p in list_pools(cluster_id):
@@ -11951,13 +12023,19 @@ async def admin_cluster_unload(
                 except Exception as e:
                     sys.stderr.write(f"[unload] {cluster_id}[{a}] stop error: {e}\n")
                 del_pool(cluster_id, a)
+                removed.append(a)
         else:
             pool = get_pool(cluster_id, target)
             if pool is not None:
                 await pool.stop()
                 del_pool(cluster_id, target)
+                removed.append(target)
         sweep = await asyncio.to_thread(_sweep_orphan_runners, cluster_id)
-    save_cluster_state_v2(cluster_id)
+    # Explicit operator unload → REMOVE these aliases from desired-state (and
+    # allow the file to be deleted if the cluster is now empty). This is the
+    # only path that erases desired-state; every liveness event preserves it.
+    save_cluster_state_v2(cluster_id, remove_aliases=removed or [target],
+                          allow_empty_delete=True)
     return {
         "loaded": False, "cluster": cluster_id,
         "unloaded_alias": target,
