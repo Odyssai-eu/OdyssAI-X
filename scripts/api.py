@@ -49,7 +49,7 @@ import sys
 import threading
 import time
 import uuid
-from collections import deque
+from collections import deque, OrderedDict
 from contextlib import asynccontextmanager, contextmanager
 from pathlib import Path
 from typing import Any, AsyncIterator, Optional, Union
@@ -3843,15 +3843,22 @@ async def _pool_ttl_sweeper() -> None:
         try:
             await asyncio.sleep(30)
             now = time.time()
+            # #29: collect the expired cluster ids FIRST, then unload after the
+            # scan. `_auto_unload_cluster` deletes from `_pools`, so unloading
+            # inside `for ... in list_all_pools()` mutated the very structure
+            # being iterated (a cluster with two idle pools could skip one).
+            expired: dict[str, str] = {}
             for cid, _alias, pool in list_all_pools():
+                if cid in expired:
+                    continue
                 ttl = int(getattr(pool, "ttl_seconds", 0) or 0)
                 if ttl <= 0:
                     continue
                 idle = now - getattr(pool, "last_used_at", now)
                 if idle >= ttl:
-                    await _auto_unload_cluster(
-                        cid, reason=f"idle {int(idle)}s ≥ ttl {ttl}s"
-                    )
+                    expired[cid] = f"idle {int(idle)}s ≥ ttl {ttl}s"
+            for cid, reason in expired.items():
+                await _auto_unload_cluster(cid, reason=reason)
         except asyncio.CancelledError:
             return
         except Exception as e:
@@ -4143,7 +4150,7 @@ def _initial_default_config() -> Optional[dict]:
 #   major (1.7.2 → 2.0.0) — breaking API or topology change
 #
 # Use `./scripts/bump-version.sh patch|minor|major` to bump + auto-commit.
-APP_VERSION = "1.13.1"
+APP_VERSION = "1.13.2"
 
 app = FastAPI(
     title="OdyssAI-X (odyssai.eu)",
@@ -4461,7 +4468,12 @@ async def health():
 
 ENGINE_VERSION = "0.7.3"
 
-_config_json_cache: dict[str, dict] = {}     # full path → parsed HF config.json
+# Bounded LRU + TTL (#29): keyed "ssh::path" → (parsed config.json, ts). Was an
+# unbounded dict "cached forever" — grew with model/host churn and never picked
+# up an on-disk config edit. maxsize + 1h TTL keep it small and self-refreshing.
+_CONFIG_CACHE_MAX = int(env_get("CONFIG_CACHE_MAX", "200"))
+_CONFIG_CACHE_TTL_S = float(env_get("CONFIG_CACHE_TTL_S", "3600"))
+_config_json_cache: "OrderedDict[str, tuple[dict, float]]" = OrderedDict()
 _caps_cache: dict[str, dict] = {}             # static caps by model_id
 
 
@@ -4624,8 +4636,13 @@ async def _validate_model_layout(ssh_target: str, model_path: str,
 async def _read_model_config(ssh_target: str, model_path: str, timeout: float = 6.0) -> Optional[dict]:
     """Read `config.json` of a model dir over SSH. Cached forever per model path."""
     cache_key = f"{ssh_target}::{model_path}"
-    if cache_key in _config_json_cache:
-        return _config_json_cache[cache_key]
+    _hit = _config_json_cache.get(cache_key)
+    if _hit is not None:
+        _cfg, _ts = _hit
+        if time.time() - _ts < _CONFIG_CACHE_TTL_S:
+            _config_json_cache.move_to_end(cache_key)   # LRU touch
+            return _cfg
+        del _config_json_cache[cache_key]               # expired
     cfg_path = f"{model_path.rstrip('/')}/config.json"
     cmd = ["ssh", "-o", "ConnectTimeout=4", "-o", "BatchMode=yes",
            ssh_target, f"cat {shlex.quote(cfg_path)} 2>/dev/null"]
@@ -4640,7 +4657,10 @@ async def _read_model_config(ssh_target: str, model_path: str, timeout: float = 
             cfg = json.loads(stdout.decode("utf-8", "ignore"))
         except Exception:
             return None
-        _config_json_cache[cache_key] = cfg
+        _config_json_cache[cache_key] = (cfg, time.time())
+        _config_json_cache.move_to_end(cache_key)
+        while len(_config_json_cache) > _CONFIG_CACHE_MAX:
+            _config_json_cache.popitem(last=False)       # evict oldest
         return cfg
     except Exception:
         return None
@@ -7250,8 +7270,8 @@ async def coeos_resolve(req, request) -> tuple:
 
 
 _TOOL_BLOCK_RE = [
-    __import__("re").compile(r"<tool_call>.*?</tool_call>", __import__("re").DOTALL),
-    __import__("re").compile(r"<tool_calls>.*?</tool_calls>", __import__("re").DOTALL),
+    re.compile(r"<tool_call>.*?</tool_call>", re.DOTALL),
+    re.compile(r"<tool_calls>.*?</tool_calls>", re.DOTALL),
 ]
 
 

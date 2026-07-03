@@ -96,6 +96,9 @@ class RunnerProc:
         self.events = []
         self._stop_streams = False
         self._lock = threading.Lock()
+        # #29: signalled whenever a new event lands so the feed loop can BLOCK
+        # on it instead of a 50ms busy-poll.
+        self._event_signal = threading.Event()
         self._stderr_thread = threading.Thread(
             target=self._drain_stderr, daemon=True
         )
@@ -123,6 +126,7 @@ class RunnerProc:
                 continue
             with self._lock:
                 self.events.append(ev)
+            self._event_signal.set()
             if ev.get("event") == "ready":
                 self.ready = True
 
@@ -214,13 +218,7 @@ def main():
         sys.exit(1)
     sys.stderr.write(f"[master] rank 0 ready in {time.time()-t0:.1f}s, sending prompts\n")
 
-    def feed_prompts():
-        if args.prompts_file:
-            f = open(args.prompts_file, "r")
-            iterator = f
-        else:
-            sys.stderr.write("[master] reading prompts from stdin (Ctrl+D to stop)\n")
-            iterator = sys.stdin
+    def _feed_from(iterator):
         for line in iterator:
             line = line.strip()
             if not line:
@@ -269,9 +267,20 @@ def main():
                 if rank0.proc.poll() is not None:
                     sys.stderr.write("[master] rank 0 died during gen\n")
                     return
-                time.sleep(0.05)
+                # #29: block on the next event (up to 0.5s) instead of a 50ms
+                # busy-poll. The 0.5s cap still re-checks proc liveness.
+                rank0._event_signal.wait(timeout=0.5)
+                rank0._event_signal.clear()
+
+    def feed_prompts():
+        # #29: `with open(...)` so the prompts file handle is released even if
+        # the feed loop raises (the old code leaked it on any exception).
         if args.prompts_file:
-            f.close()
+            with open(args.prompts_file, "r") as f:
+                _feed_from(f)
+        else:
+            sys.stderr.write("[master] reading prompts from stdin (Ctrl+D to stop)\n")
+            _feed_from(sys.stdin)
 
     interrupted = {"flag": False}
 
@@ -292,15 +301,11 @@ def main():
         sys.stderr.write(f"[master] feed loop error: {e}\n")
     finally:
         sys.stderr.write("[master] graceful stop on all runners\n")
-        # send stop simultaneously to all ranks
-        for r in runners:
-            try:
-                r.send({"cmd": "stop"})
-            except Exception:
-                pass
-        for r in runners:
-            r.close_stdin()
-        # wait/escalate
+        # #29: single stop path. graceful_stop() already sends {"cmd":"stop"} +
+        # close_stdin() before waiting/escalating — the old code's manual
+        # pre-send + close_stdin loops were a redundant double-stop. On a stop
+        # cmd each rank exits in well under the soft timeout, so per-rank
+        # graceful_stop returns fast; no parallel pre-send needed.
         for r in runners:
             r.graceful_stop()
         sys.stderr.write("[master] all runners stopped\n")
