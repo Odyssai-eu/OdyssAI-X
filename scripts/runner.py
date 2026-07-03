@@ -1811,8 +1811,13 @@ def main() -> None:
         size = 1
         log(f"init single-node mode (no distributed), model={repo}, mode={mode}")
     else:
-        log(f"init jaccl backend, model={repo}, mode={mode}, use_ap={use_ap}")
-        group = mx.distributed.init(backend="jaccl", strict=True)
+        # #40 WU4 — transport is engine-selected per pool: jaccl (RDMA, the
+        # perf default) or ring (TCP via MLX_HOSTFILE — no QP-degradation bug,
+        # the long-run stability option). The log lines keep the exact
+        # "init <backend> backend" shape the engine's phase markers grep.
+        backend = os.environ.get("RUNNER_BACKEND", "jaccl").strip().lower() or "jaccl"
+        log(f"init {backend} backend, model={repo}, mode={mode}, use_ap={use_ap}")
+        group = mx.distributed.init(backend=backend, strict=True)
         rank = group.rank()
         size = group.size()
         log(f"rank {rank}/{size} group ready in {time.time()-t0:.2f}s")

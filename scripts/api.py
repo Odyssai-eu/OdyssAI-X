@@ -227,6 +227,10 @@ VLM_RUNNER_REMOTE = env_get("VLM_RUNNER_REMOTE", f"{REMOTE_CLUSTER_DIR}/vlm_runn
 VLM_PYTHON_REMOTE = env_get("VLM_PYTHON_REMOTE", "/Users/admin/.venvs/mlx-vlm/bin/python")
 VLM_RUNNER_MATCH_PATTERN = env_get("VLM_RUNNER_MATCH_PATTERN", "mlx-cluster/vlm_runner.py")
 VLM_DISTRIBUTED_ENABLED = env_get("VLM_DISTRIBUTED_ENABLED", "0") == "1"
+# SIGTERM->SIGKILL grace for remote pkills/sweeps, in seconds (0.5s polls).
+# 12s default: big-model clean exits need the room for free_metal; ranks stuck
+# in a collective ignore SIGTERM regardless (the wired-guard covers that case).
+_SWEEP_GRACE_ITERS = max(1, int(float(env_get("SWEEP_SIGTERM_GRACE_S", "12")) * 2))
 
 _HERE = Path(__file__).resolve().parent
 CLUSTER_CONFIG_FILE = Path(os.environ.get("CLUSTER_CONFIG_FILE", _HERE / "cluster-config.json"))
@@ -1298,21 +1302,33 @@ def remote_cmd(node: dict, nodes: list[dict], model: str, mode: str, port: int,
                kv_q8: bool = False,
                draft_model: Optional[str] = None,
                num_draft_tokens: int = 4,
-               ram_weights_csv: Optional[str] = None) -> str:
-    coord_ip = next(n for n in nodes if n["rank"] == COORDINATOR_RANK)["ssh"].split("@")[1]
+               ram_weights_csv: Optional[str] = None,
+               backend: str = "jaccl") -> str:
     world_size = len(nodes)
     env = {
         "MLX_RANK": str(node["rank"]),
         "MLX_WORLD_SIZE": str(world_size),
-        "MLX_JACCL_COORDINATOR": f"{coord_ip}:{port}",
-        "MLX_IBV_DEVICES": "/tmp/mlx_jaccl_devices.json",
         "MLX_METAL_FAST_SYNCH": "1",
         "RUNNER_MODEL": model,
         "RUNNER_MODE": mode,
+        "RUNNER_BACKEND": backend,
         "RUNNER_USE_AP": "1" if use_ap else "0",
         "RUNNER_KV_Q8": "1" if kv_q8 else "0",
         "RUNNER_EMIT_BATCH": str(emit_batch),
     }
+    if backend == "ring":
+        # #40 WU4 — ring/TCP transport: MLX ring hostfile ([["ip:port"], ...]
+        # in rank order, the format the 2026-07-02 distributed-VLM night
+        # validated cross-node) instead of the jaccl coordinator/devices env.
+        ordered = sorted(nodes, key=lambda x: x["rank"])
+        hosts = [[f"{n['ssh'].split('@')[1]}:{port}"] for n in ordered]
+        hostfile_path = f"/tmp/mlx_ring_hostfile_{port}.json"
+        env["MLX_HOSTFILE"] = hostfile_path
+        write_prefix = f"echo {shlex.quote(json.dumps(hosts))} > {hostfile_path}"
+    else:
+        coord_ip = next(n for n in nodes if n["rank"] == COORDINATOR_RANK)["ssh"].split("@")[1]
+        env["MLX_JACCL_COORDINATOR"] = f"{coord_ip}:{port}"
+        env["MLX_IBV_DEVICES"] = "/tmp/mlx_jaccl_devices.json"
     # Capacity-aware pipeline split (#9). When the orchestrator knows per-rank
     # RAM (via telemetry), pass it as a CSV of weights so the runner can size
     # each rank's layer count proportionally instead of doing the even split
@@ -1326,7 +1342,8 @@ def remote_cmd(node: dict, nodes: list[dict], model: str, mode: str, port: int,
         env["RUNNER_DRAFT_MODEL"] = draft_model
         env["RUNNER_NUM_DRAFT_TOKENS"] = str(num_draft_tokens)
     env_str = " ".join(f"{k}={shlex.quote(v)}" for k, v in env.items())
-    write_devices = f"echo {shlex.quote(devices_json)} > /tmp/mlx_jaccl_devices.json"
+    if backend != "ring":
+        write_prefix = f"echo {shlex.quote(devices_json)} > /tmp/mlx_jaccl_devices.json"
     # If the model path is relative, run the runner from the node's
     # models_dir so `Path(repo).exists()` resolves correctly. Without
     # this, runner.py falls through to `hf_repo_to_path()` which tries
@@ -1340,7 +1357,7 @@ def remote_cmd(node: dict, nodes: list[dict], model: str, mode: str, port: int,
     if not model.startswith("/"):
         node_models_dir = node.get("models_dir") or DEFAULT_MODELS_DIR
         cd_prefix = f"cd {shlex.quote(node_models_dir)} && "
-    return f"{write_devices} && {cd_prefix}{env_str} {PYTHON_REMOTE} {RUNNER_REMOTE}"
+    return f"{write_prefix} && {cd_prefix}{env_str} {PYTHON_REMOTE} {RUNNER_REMOTE}"
 
 
 def remote_vlm_cmd(node: dict, nodes: list[dict], model: str, port: int,
@@ -1457,6 +1474,7 @@ class RunnerProc:
     # signal that the dashboard can show per-rank during load.
     _PHASE_MARKERS: list[tuple[str, str]] = [
         ("init jaccl backend",            "init"),
+        ("init ring backend",             "init"),
         ("group ready in",                "group_ready"),
         ("loading model (lazy=True)",     "loading_weights"),
         ("applying pipeline_auto_parallel","sharding"),
@@ -1593,7 +1611,7 @@ class RunnerProc:
             # cleanup (free_metal) finishes on big models before SIGKILL.
             cmd = (
                 f"pkill -TERM -f {pattern} 2>/dev/null && "
-                f"for i in $(seq 1 24); do "
+                f"for i in $(seq 1 {_SWEEP_GRACE_ITERS}); do "
                 f"  pgrep -f {pattern} >/dev/null 2>&1 || break; "
                 f"  sleep 0.5; "
                 f"done; "
@@ -1658,7 +1676,7 @@ def _sweep_orphan_runners(cluster_id: str,
         # is what leaks the wired pages).
         f"if pgrep -f {pattern} >/dev/null 2>&1; then "
         f"  pkill -TERM -f {pattern} 2>/dev/null; "
-        f"  for i in $(seq 1 24); do "
+        f"  for i in $(seq 1 {_SWEEP_GRACE_ITERS}); do "
         f"    pgrep -f {pattern} >/dev/null 2>&1 || break; "
         f"    sleep 0.5; "
         f"  done; "
@@ -1671,7 +1689,7 @@ def _sweep_orphan_runners(cluster_id: str,
         # prod mlx_vlm.server processes, which this sweep must never touch.
         f"if pgrep -f {pattern_vlm} >/dev/null 2>&1; then "
         f"  pkill -TERM -f {pattern_vlm} 2>/dev/null; "
-        f"  for i in $(seq 1 24); do "
+        f"  for i in $(seq 1 {_SWEEP_GRACE_ITERS}); do "
         f"    pgrep -f {pattern_vlm} >/dev/null 2>&1 || break; "
         f"    sleep 0.5; "
         f"  done; "
@@ -1794,7 +1812,8 @@ class RunnerPool:
                  draft_model: Optional[str] = None,
                  num_draft_tokens: int = 4,
                  alias: Optional[str] = None,
-                 node_indices: Optional[list[int]] = None):
+                 node_indices: Optional[list[int]] = None,
+                 backend: Optional[str] = None):
         self.model = model
         self.mode = mode
         self.use_ap = use_ap
@@ -1858,10 +1877,17 @@ class RunnerPool:
         # any successful keepalive; WU3 fires controlled recovery at threshold.
         self.keepalive_fails: int = 0
         self.last_keepalive_ok_at: Optional[float] = None
-        # WU4 groundwork: which transport this pool actually initialised with.
-        # Defaults to the cluster backend; only jaccl pools have the QP bug, so
-        # the keepalive/preventive-reload machinery targets jaccl pools.
-        self.backend: str = "jaccl"
+        # WU4 — which transport this pool initialises with. Explicit request
+        # override wins, else the cluster def's backend, else jaccl. Only
+        # jaccl pools have the QP bug, so the keepalive/preventive-reload
+        # machinery targets backend == "jaccl" pools and skips ring ones.
+        if backend:
+            self.backend = backend
+        else:
+            try:
+                self.backend = (get_cluster_def(cluster) or {}).get("backend") or "jaccl"
+            except Exception:
+                self.backend = "jaccl"
         # Degraded state — set when we detect a JACCL queue-pair death, a
         # rank that crashed mid-gen with a recognizable RDMA errno, or a
         # post-sweep wired-memory leak. Reloads that would reuse the
@@ -1966,7 +1992,8 @@ class RunnerPool:
                              self.use_ap, self.emit_batch, kv_q8=self.kv_q8,
                              draft_model=self.draft_model,
                              num_draft_tokens=self.num_draft_tokens,
-                             ram_weights_csv=ram_weights_csv)
+                             ram_weights_csv=ram_weights_csv,
+                             backend=getattr(self, "backend", "jaccl"))
             self.runners.append(RunnerProc(node, cmd, self._on_event, cluster=self.cluster))
         rank0 = next(r for r in self.runners if r.node["rank"] == 0)
 
@@ -2692,6 +2719,7 @@ def save_cluster_state_v2(cluster_id: str) -> None:
             "kv_q8": pool.kv_q8,
             "draft_model": pool.draft_model,
             "num_draft_tokens": pool.num_draft_tokens,
+            "backend": getattr(pool, "backend", None),
         })
     payload = {"schema": "v2", "pools": pools_payload}
     sf = state_file_for(cluster_id)
@@ -3533,9 +3561,25 @@ async def lifespan(app: FastAPI):
         *[asyncio.to_thread(_sweep_orphan_runners, _cid) for _cid in _sweep_cids],
         return_exceptions=True,
     )
+    # Wired-guard for the restore below: any host still holding leaked wired
+    # memory AFTER the sweep cannot take a fresh pool — the restore would
+    # OOM straight into a dead rank (2026-07-03: 182GB leaked on .31, the
+    # replayed pool respawned onto it and died at exit 255). Collect the
+    # leaked hosts here; the restore loop skips pools that touch them.
+    _restore_wired_guard_gb = float(env_get("RESTORE_WIRED_GUARD_GB", "30"))
+    _leaked_hosts: set = set()
     for _cid, _res in zip(_sweep_cids, _sweep_results):
         if isinstance(_res, Exception):
             sys.stderr.write(f"[api] orphan sweep ({_cid}) failed: {_res}\n")
+            continue
+        for _entry in (_res or {}).get("swept") or []:
+            _wgb = _entry.get("wired_gb")
+            if _wgb is not None and _wgb > _restore_wired_guard_gb:
+                _leaked_hosts.add(_entry.get("host"))
+                sys.stderr.write(
+                    f"[api] restore wired-guard: {_entry.get('host')} holds "
+                    f"{_wgb:.1f}GB wired post-sweep (> {_restore_wired_guard_gb:.0f}GB) "
+                    f"— pools on this node will NOT be restored; node needs a reboot\n")
     initial = _initial_config()
     if initial is not None:
         try:
@@ -3557,6 +3601,17 @@ async def lifespan(app: FastAPI):
             alias = entry.get("alias", DEFAULT_ALIAS)
             try:
                 indices = entry.get("node_indices") or list(range(int(entry.get("nodes") or 1)))
+                # Wired-guard: never respawn onto a node the sweep left leaked.
+                if _leaked_hosts:
+                    _cd_nodes = (get_cluster_def(cid) or {}).get("nodes") or []
+                    _entry_hosts = {_cd_nodes[i].get("host") for i in indices
+                                    if 0 <= i < len(_cd_nodes)}
+                    _bad = _entry_hosts & _leaked_hosts
+                    if _bad:
+                        sys.stderr.write(
+                            f"[api] skipping restore of {cid}:{alias} — node(s) "
+                            f"{sorted(_bad)} hold leaked wired memory (needs reboot)\n")
+                        continue
                 # Distributed VLM pool: restore through VLMDistPool.start()
                 # (ssh-spawned ranks). Gated on the same feature flag as the
                 # load path — with the flag off the entry is skipped, never
@@ -3594,6 +3649,7 @@ async def lifespan(app: FastAPI):
                     num_draft_tokens=int(entry.get("num_draft_tokens") or 4),
                     alias=alias,
                     node_indices=indices,
+                    backend=entry.get("backend"),
                 )
                 await pool.start()
                 set_pool(cid, alias, pool)
@@ -3627,13 +3683,29 @@ async def lifespan(app: FastAPI):
         # sweeper mid-operation (e.g. holding a cluster admin lock) is abandoned
         # and the subsequent pool.stop() races its half-finished state (#24).
         await asyncio.gather(ttl_task, dead_task, cancel_task, return_exceptions=True)
-        if _pool is not None:
-            await _pool.stop()
-        for _cid, _alias, pool in list_all_pools():
-            try:
-                await pool.stop()
-            except Exception:
-                pass
+        # Stop every pool CONCURRENTLY under a hard deadline. The old
+        # sequential loop could not finish inside docker's stop grace with
+        # several big pools loaded — the container got SIGKILLed mid-stop,
+        # ranks survived stuck in collectives, and the next boot's sweep
+        # SIGKILLed them into a 182GB wired leak (2026-07-03 cascade).
+        _stop_targets = ([_pool] if _pool is not None else []) + \
+                        [p for _, _, p in list_all_pools()]
+        if _stop_targets:
+            async def _stop_one(p):
+                try:
+                    await p.stop()
+                except Exception as e:
+                    sys.stderr.write(f"[shutdown] pool stop failed ({getattr(p, 'alias', '?')}): {e}\n")
+            _deadline = float(env_get("SHUTDOWN_POOL_STOP_DEADLINE_S", "90"))
+            done, pending = await asyncio.wait(
+                [asyncio.create_task(_stop_one(p)) for p in _stop_targets],
+                timeout=_deadline,
+            )
+            if pending:
+                sys.stderr.write(
+                    f"[shutdown] {len(pending)} pool stop(s) unfinished at "
+                    f"{_deadline:.0f}s deadline — remaining ranks will be "
+                    f"reaped by the next boot's orphan sweep\n")
 
 
 def _apply_default_ttl_to_pools() -> None:
@@ -3757,6 +3829,9 @@ _JACCL_PREVENTIVE_RELOAD_AGE_S = float(
 # on a 5-node pool, left alone otherwise). Set JACCL_AUTO_RECOVERY_ENABLED=0 for
 # detect-only (logs the keepalive failure, takes no action).
 _JACCL_AUTO_RECOVERY_ENABLED = os.environ.get("JACCL_AUTO_RECOVERY_ENABLED", "1") == "1"
+# Backoff after a FAILED preventive reload — without it the loop retries every
+# keepalive tick (~90s), which spammed 695 consecutive 409s on 2026-07-03.
+_JACCL_PREVENTIVE_BACKOFF_S = float(os.environ.get("JACCL_PREVENTIVE_BACKOFF_S", "1800"))
 
 
 def _jaccl_log(cluster_id: str, text: str) -> None:
@@ -3778,6 +3853,12 @@ def _pool_reload_request(pool: RunnerPool) -> ArgoLoadRequest:
         nodes=pool.nodes_count, kv_q8=pool.kv_q8,
         draft_model=pool.draft_model, num_draft_tokens=pool.num_draft_tokens,
         force=True, alias=pool.alias, node_indices=pool.node_indices,
+        # The reload targets the SAME alias on purpose (stop-old-start-new).
+        # Without this the #64 explicit-alias collision guard 409s every
+        # attempt — observed in prod 2026-07-03: 695 consecutive
+        # "preventive reload FAILED: 409 alias already loaded" ticks.
+        force_hot_swap=True,
+        backend=getattr(pool, "backend", None),
     )
 
 
@@ -3796,6 +3877,9 @@ async def _preventive_reload(cluster_id: str, pool: RunnerPool) -> None:
                    f"load_s={res.get('load_s')}")
     except Exception as e:
         _jaccl_log(cluster_id, f"preventive reload FAILED: {e}")
+        # Back off instead of retrying every keepalive tick — the 2026-07-03
+        # incident spammed a failing reload every ~90s for 17h straight.
+        pool._preventive_backoff_until = time.time() + _JACCL_PREVENTIVE_BACKOFF_S
 
 
 async def _wait_nodes_reachable(cluster_id: str, timeout_s: float = 360.0,
@@ -3928,7 +4012,8 @@ async def _jaccl_stability_loop() -> None:
                 # WU1 — preventive reload (idle + old). Claim maintenance so no
                 # gen starts mid-reload; if busy, defer to a later tick.
                 age = time.time() - (pool.started_at or time.time())
-                if age >= _JACCL_PREVENTIVE_RELOAD_AGE_S:
+                if (age >= _JACCL_PREVENTIVE_RELOAD_AGE_S
+                        and time.time() >= getattr(pool, "_preventive_backoff_until", 0.0)):
                     if pool._try_claim_maintenance():
                         try:
                             await _preventive_reload(cluster_id, pool)
@@ -4002,7 +4087,7 @@ def _initial_default_config() -> Optional[dict]:
 #   major (1.7.2 → 2.0.0) — breaking API or topology change
 #
 # Use `./scripts/bump-version.sh patch|minor|major` to bump + auto-commit.
-APP_VERSION = "1.12.1"
+APP_VERSION = "1.13.0"
 
 app = FastAPI(
     title="OdyssAI-X (odyssai.eu)",
@@ -10273,6 +10358,11 @@ class ArgoLoadRequest(BaseModel):
     #   {alias:"default",     node_indices:[0]}              → same
     #   {alias:"default-big", node_indices:[1,2,3]}          → 2nd pool on ranks 1..3
     node_indices: Optional[list[int]] = None
+    # #40 WU4 — per-POOL transport override: "ring" (TCP — no QP-degradation
+    # bug, the long-run stability option) or "jaccl" (RDMA — the perf
+    # default). None = the cluster def's backend. Ring pools are skipped by
+    # the jaccl stability loop (nothing to preventively reload).
+    backend: Optional[str] = None
     # Argo-VLM fold (2026-07-02). When the requested model is a vision model,
     # the load auto-detects and serves it single-node via mlx_vlm.server as a
     # VL pool under this cluster. These optional fields tune that launch; they
@@ -10383,6 +10473,8 @@ async def admin_cluster_load(cluster_id: str, req: ArgoLoadRequest):
         )
     if req.mode not in ("pipeline", "tensor"):
         raise HTTPException(400, f"invalid mode {req.mode}")
+    if req.backend is not None and req.backend not in ("jaccl", "ring"):
+        raise HTTPException(400, f"invalid backend {req.backend!r} — 'jaccl' or 'ring'")
     cd = get_cluster_def(cluster_id)
     cluster_max = len(cd.get("nodes", []))
     effective_max = get_cluster_max_nodes(cluster_id, default=cluster_max)
@@ -10655,6 +10747,7 @@ async def admin_cluster_load(cluster_id: str, req: ArgoLoadRequest):
                 num_draft_tokens=req.num_draft_tokens,
                 alias=alias,
                 node_indices=node_indices,
+                backend=req.backend,
             )
             try:
                 await new_pool.start()
@@ -11114,6 +11207,14 @@ async def _vlm_pool_proxy_chat_completion(pool, body: dict, stream: bool):
         _so.setdefault("include_usage", True)
         forward_body["stream_options"] = _so
     pool.last_used_at = time.time()
+    # #61 — register the run so per-pool activity (stage/tokens/tok-s) shows
+    # VL generations too, not just RunnerProc pools. Display-oriented:
+    # cancellation is not wired through the proxy (upstream has no cancel).
+    _rid = f"vlm-{uuid.uuid4().hex[:8]}"
+    _runs_register(_rid, model=label, cluster=pool.cluster,
+                   pool_alias=pool.alias, client="vlm-pool-proxy",
+                   max_tokens=int(body.get("max_tokens") or 0),
+                   kind="streaming" if stream else "unary")
     import httpx
     if not stream:
         _t0 = time.time()
@@ -11121,9 +11222,11 @@ async def _vlm_pool_proxy_chat_completion(pool, body: dict, stream: bool):
             async with httpx.AsyncClient(timeout=300.0) as client:
                 r = await client.post(f"{upstream}/v1/chat/completions", json=forward_body)
         except Exception as e:
+            _runs_finalize(_rid, status="error")
             raise HTTPException(502, f"VL upstream unreachable: {e}")
         _elapsed = max(0.001, time.time() - _t0)
         if r.status_code >= 400:
+            _runs_finalize(_rid, status="error")
             raise HTTPException(r.status_code, f"VL upstream error: {r.text[:300]}")
         out = r.json()
         if auto_think:
@@ -11152,6 +11255,10 @@ async def _vlm_pool_proxy_chat_completion(pool, body: dict, stream: bool):
             model=upstream_model,
             cluster=pool.cluster,
         )
+        _r0 = _active_runs.get(_rid)
+        if _r0 is not None and _usage.get("completion_tokens"):
+            _r0["output_tokens"] = int(_usage["completion_tokens"])
+        _runs_finalize(_rid)
         return out
 
     async def _gen():
@@ -11249,7 +11356,19 @@ async def _vlm_pool_proxy_chat_completion(pool, body: dict, stream: bool):
                     async for f in _telemak_emit_flush(state, label):
                         yield f
     from fastapi.responses import StreamingResponse
-    return StreamingResponse(_gen(), media_type="text/event-stream")
+
+    async def _gen_tracked():
+        # #61 — progress ticks (+~1 token per SSE delta) and guaranteed
+        # finalize on every exit path (done, upstream error, client
+        # disconnect) without touching _gen's control flow.
+        try:
+            async for _chunk in _gen():
+                _runs_tick(_rid)
+                yield _chunk
+        finally:
+            _runs_finalize(_rid)
+
+    return StreamingResponse(_gen_tracked(), media_type="text/event-stream")
 
 
 async def _telemak_proxy_messages(
@@ -12179,7 +12298,7 @@ def _vlm_kill_cmd(port: int, model_path: str) -> str:
     return (
         f"if pgrep -f {pattern} >/dev/null 2>&1; then "
         f"  pkill -TERM -f {pattern} 2>/dev/null; "
-        f"  for i in $(seq 1 24); do "
+        f"  for i in $(seq 1 {_SWEEP_GRACE_ITERS}); do "
         f"    pgrep -f {pattern} >/dev/null 2>&1 || break; "
         f"    sleep 0.5; "
         f"  done; "
