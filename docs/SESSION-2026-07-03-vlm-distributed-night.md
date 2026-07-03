@@ -193,11 +193,48 @@ puis restart — le serveur VL `.29:8080` (nohup) **survit et est ré-adopté** 
 le nouveau nom sans recharger les 327 Go ; ornith se recharge (~90 s, enfants
 ssh). Vérifié : `minimax-m3-vl` + `ornith`, tous deux nus, loaded.
 
+## Phase 10 — Journée : dead-pool + les 4 goals (v1.12.1 → v1.13.2)
+
+Après le briefing du matin Sophie lance un run non-stop : *« JACCL stabilisé,
+Activity par pool, #28 et #29 closed »*. Ordre choisi : comportement d'abord,
+refactor en dernier.
+
+- **#66 shutdown/restore + WU4 ring (v1.13.0)** : shutdown concurrent borné,
+  wired-guard au restore, backend `ring` par pool (`ArgoLoadRequest.backend`,
+  `remote_cmd` émet le hostfile ring, `runner.py` lit `RUNNER_BACKEND`). Et le
+  **WU1 débloqué** — `_pool_reload_request` posait un alias explicite qui
+  tapait le 409-collision-guard #64 → **695 échecs de reload préventif en 17h**
+  dans les logs prod. Fix `force_hot_swap=True` + backoff 30 min. Spam à 0.
+- **Le vrai bug dead-pool (v1.13.1)** : Sophie voit les pools disparaître après
+  restart. Racine trouvée : `save_cluster_state_v2` écrivait un snapshot du
+  registre VIVANT et **`unlink()` sur registre vide** → mort de ranks → purge →
+  pool effacé du state (ou fichier supprimé) → restart restaure rien. Fix
+  **desired-state ≠ live-registry** : `save` MERGE (les pools non-vivants
+  restent `down:true`), n'unlink que sur unload explicite ; purge merge-save
+  (garde `down`) ; F4 skip purge pendant recovery (course tueuse) ; F5 le
+  serveur VL nohup exclu du stop de shutdown (ré-adopté). 6/6 tests unitaires
+  (`scripts/test_state_persistence.py`) + **prouvé live : le serveur VL PID
+  33296 survit 2 restarts, state jamais effacé**.
+- **#61 CLOSED (v1.13.1)** : activity par pool = stage (prefill/generating) +
+  tokens + tok/s, dérivés des runs taggés `pool_alias` (bug corrigé : l'ancien
+  filtre lisait `r.alias` inexistant). Vérifié live : 141 tok, 17.7 tok/s.
+- **#29 CLOSED (v1.13.2)** : 5 items — inference*.py import-safe (guard
+  `__main__`), `__import__("re")`→`re`, `_config_json_cache` borné
+  (OrderedDict 200 + TTL 1h), ttl-sweeper collect-puis-unload, master.py
+  (`with open`, stop unique, event-driven).
+- **#28 NON fait — décision assumée** : Difficulty 13, tracking issue que
+  l'auteur veut en sub-issues, coupling circulaire à casser d'abord, blast
+  radius = tout l'engine, juste après un incident prod stabilisé, sur un modèle
+  aux safeguards intermittents. Le split se fera seam-par-seam avec Sophie
+  éveillée pour smoke-tester. Règle de base appliquée : ne pas snowballer un
+  refactor massif de nuit sur de la prod fraîchement stabilisée.
+
 ## Numbers de la nuit
 
-- **Commits** : 9 sur main (`5307657` → `361ad78`), branche
+- **Commits** : 16 sur main (`5307657` → `094969d`), branche
   `feat/mlx-vlm-distributed` mergée, push forge + internal.
-- **Version** : v1.11.0 → **v1.12.1**.
+- **Version** : v1.11.0 → **v1.13.2** (VL distribué + nommage nu + dead-pool +
+  #40 core + #61 + #29).
 - **Diff** : ~1 355 lignes ajoutées (dont `vlm_runner.py` 517,
   `vlm_caption_probe.py` 232).
 - **Perf Q6 greedy** : single 24.97 · TP-2 local 13.03 · TP-2 cross 8.84 ·
