@@ -2203,11 +2203,6 @@ function renderSettingsCoeos() {
   const entries = (state.endpoint_models || [])
     .filter(m => m.id !== COEOS_PUBLIC_ID)  // CoeOS can't route to itself
     .map(m => ({ id: m.id, label: endpointModelLabel(m) }));
-  const bound = axes.map(a => a.model).filter(Boolean).concat(decider ? [decider] : []);
-  bound.forEach(v => { if (!entries.some(e => e.id === v)) entries.push({ id: v, label: v + " (not loaded)" }); });
-  entries.sort((a, b) => a.label.localeCompare(b.label));
-  const opts = (sel) => `<option value="">— none —</option>` + entries.map(e =>
-    `<option value="${escapeHtml(e.id)}" ${e.id === sel ? "selected" : ""}>${escapeHtml(e.label)}</option>`).join("");
 
   // The Models section is DERIVED from what the settings PROPOSE — the distinct
   // model names bound across the axes. Dynamic: a new proposal in the JSON (say
@@ -2216,12 +2211,26 @@ function renderSettingsCoeos() {
   // proposed name has no registry entry, the name itself is the endpoint (legacy).
   const models = (c.models && typeof c.models === "object") ? c.models : {};
   const proposed = [...new Set(axes.map(a => a.model).filter(Boolean))];
-  const isServable = (id) => !!id && entries.some(e => e.id === id);
+  // "loaded" = truly served by /v1/models (not the not-loaded extras we add below).
+  const isServable = (id) => !!id && (state.endpoint_models || []).some(m => m.id === id);
   const endpointOf = (m) => { const e = models[m]; return (e && typeof e === "object" && e.endpoint) ? e.endpoint : m; };
   const displayOf = (m) => (models[m] && models[m].name) || m;
+  const bestOf = (a) => a.best || endpointOf(a.model);   // CoeOS-suggested endpoint for the axis
   const isLoaded = (m) => isServable(endpointOf(m));
-  const modelOpts = (sel) => `<option value="">— none —</option>` + proposed.map(m =>
-    `<option value="${escapeHtml(m)}" ${m === sel ? "selected" : ""}>${escapeHtml(displayOf(m))}</option>`).join("");
+
+  // Ensure current bindings + coeos-best endpoints appear in the list even if not
+  // currently loaded (so the select can show/select them).
+  axes.flatMap(a => [endpointOf(a.model), a.best]).concat(decider ? [decider] : []).filter(Boolean)
+    .forEach(v => { if (!entries.some(e => e.id === v)) entries.push({ id: v, label: v + " (not loaded)" }); });
+  entries.sort((a, b) => a.label.localeCompare(b.label));
+
+  const opts = (sel) => `<option value="">— none —</option>` + entries.map(e =>
+    `<option value="${escapeHtml(e.id)}" ${e.id === sel ? "selected" : ""}>${escapeHtml(e.label)}</option>`).join("");
+  // Axis picker: ALL OdyssAI-X models (/v1/models), with the CoeOS-suggested one
+  // flagged "⭐ coeos best". Selected = the axis's current endpoint. Override freely.
+  const axisOpts = (a) => { const cur = endpointOf(a.model), best = bestOf(a);
+    return `<option value="">— none —</option>` + entries.map(e =>
+      `<option value="${escapeHtml(e.id)}" ${e.id === cur ? "selected" : ""}>${escapeHtml(e.label)}${e.id === best ? "  ·  ⭐ coeos best" : ""}</option>`).join(""); };
 
   const baseUrl = endpointBaseUrl();
   const curl =
@@ -2308,13 +2317,13 @@ curl "${baseUrl}/chat/completions" \\
       <div style="background:var(--surface);border:1px solid var(--line);border-radius:12px;padding:18px;display:flex;flex-direction:column;gap:14px">
         <div>
           <div class="field-label">Skill axes — bench-derived bindings</div>
-          <div style="font-size:12px;color:var(--ink-2);margin-top:2px">One model per axis (the one the benchmarks proved best). A model may cover several axes. The binding saves immediately.</div>
+          <div style="font-size:12px;color:var(--ink-2);margin-top:2px">Each axis picks from <b>all OdyssAI-X models</b> (<span class="mono">/v1/models</span>). The one the benchmarks proved best is flagged <b>⭐ coeos best</b> — override it with any model; the binding saves immediately.</div>
         </div>
         ${axes.length ? `<div style="display:grid;grid-template-columns:repeat(3,1fr);gap:10px">
           ${axes.map(a => `
             <div style="background:var(--surface-2);border-radius:8px;padding:10px;display:flex;flex-direction:column;gap:6px">
               <div style="font-size:12px;font-weight:600">${escapeHtml(a.label||a.key)}</div>
-              <select class="ce-input mono" data-act="coeos-set-axis" data-key="${escapeHtml(a.key)}" style="width:100%;font-size:11px">${modelOpts(a.model||"")}</select>
+              <select class="ce-input mono" data-act="coeos-set-axis" data-key="${escapeHtml(a.key)}" style="width:100%;font-size:11px">${axisOpts(a)}</select>
               ${a.model && !isLoaded(a.model) ? `<div style="font-size:10px;color:#b45309">⚠ ${escapeHtml(displayOf(a.model))} — not loaded</div>` : ``}
             </div>`).join("")}
         </div>` : `<div style="font-size:12px;color:var(--ink-3)">${state.endpoint_models_loaded ? "No axes yet — import a TMB Settings file below." : "Loading…"}</div>`}
@@ -6295,8 +6304,12 @@ async function handleAct(e) {
     // Bindings save immediately. PUT replaces the whole axes array, so send the
     // full list with this one cell updated.
     const key = el.dataset.key;
+    // Preserve the CoeOS suggestion (a.best) before overriding a.model, so the
+    // "⭐ coeos best" flag survives the override.
+    const reg = (state.coeos && state.coeos.models) || {};
+    const epOf = (m) => { const e = reg[m]; return (e && e.endpoint) ? e.endpoint : m; };
     const axes = (state.coeos && Array.isArray(state.coeos.axes) ? state.coeos.axes : [])
-      .map(a => a.key === key ? { ...a, model: el.value || "" } : a);
+      .map(a => a.key === key ? { ...a, model: el.value || "", best: a.best || (a.model ? epOf(a.model) : "") } : a);
     try {
       const r = await fetch("/admin/coeos", { method: "PUT",
         headers: { "content-type": "application/json", ...authHeaders() },
