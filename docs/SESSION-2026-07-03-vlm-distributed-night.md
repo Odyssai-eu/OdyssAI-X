@@ -243,19 +243,19 @@ refactor en dernier.
 
 ## TODO direct (par ordre)
 
-1. ~~Reset + assainissement~~ — **MOOT** : les reboots de Sophie avaient déjà
-   nettoyé, cluster sain au matin (mon « degraded » était périmé). Nommage nu
-   réglé (v1.12.1). Règle d'or confirmée : **unload avant tout restart engine**,
-   et toujours lire (`cat state-main.json`) ce que le restart rejouera.
-2. **Fix root shutdown/restore** : stop effectif des pools sous la grace
-   docker (ou stop-before-restart outillé), wired-guard au restore (le sweep
-   retourne déjà `wired_bytes` — skip un node leaké), grace SIGTERM adaptative
-   aux gros modèles.
+1. **#28 split god-module `api.py`** — seam par seam AVEC Sophie éveillée pour
+   smoke-tester entre chaque (ce que la tracking-issue mandate). Ordre :
+   `state.py` → `runner_pool.py` → `cluster_config.py` → `cloud_proxy.py` →
+   `router.py` → `admin_api.py`. Casser le coupling circulaire (globals
+   partagés) d'abord. Différé cette nuit — blast radius = tout l'engine.
+2. **#40 pivot empirique** : cycler `unload`+`load` contrôlé sur un pool jaccl
+   → prouver 0 errno 16/96/2 SANS reboot. Si FAUX → WU1 devient reboot
+   préventif. Test disruptif → hors incident, cluster idle.
 3. `.32` : retirer/reconfigurer la 2e patte LAN (en1=.47), aligner macOS 26.5.
 4. VL v0 follow-ups : thinking control (le template VL ignore
    `enable_thinking`), tool-calls, prefix-cache.
-5. Phase perf : backend JACCL pour le VL distribué + PR upstream mlx-vlm
-   (fused gate/up, indexer, sharded_load).
+5. Phase perf VL distribué : backend JACCL + PR upstream mlx-vlm (fused
+   gate/up, indexer, sharded_load).
 
 ## Lessons learned
 
@@ -266,3 +266,20 @@ refactor en dernier.
   l'outil de la nuit** : chaque hypothèse tranchée en un run, zéro narration.
 - **La règle des restarts est absolue** : l'état persisté EST un acteur. Tout
   restart d'engine = d'abord lire ce qu'il va rejouer.
+- **Un fix peut fabriquer le bug suivant** : mon lot shutdown/restore (#66) a
+  révélé/aggravé le dead-pool en traitant « ranks morts » comme « unload ».
+  Corollaire : le state persisté doit modéliser l'**INTENTION** (desired-state),
+  pas la LIVENESS — une panne transitoire ne doit jamais effacer une intention
+  de servir. Un événement de liveness (purge/sweep) n'écrit JAMAIS un retrait ;
+  seul un unload opérateur le fait.
+- **Un état périmé réénoncé coûte la confiance** : j'ai ressorti un « cluster
+  degraded » de la veille sans le re-sonder — Sophie a tiqué à raison. Toujours
+  re-vérifier live avant d'affirmer un état.
+- **`compose up`/recreate jette les hot-patches** : après tout recreate sur .39,
+  re-`docker cp` `api.py` ET `dashboard.html` — sinon l'image périmée reprend
+  (badge VLM disparu, backend correct pourtant). `grep -a` obligatoire sur le
+  dashboard (unicode).
+- **Savoir NE PAS faire** : #28 (Difficulty 13) refusé de nuit en autonome sur
+  prod fraîchement stabilisée. Compléter un goal ne justifie pas de dérouler un
+  refactor à blast-radius total sans checkpoint humain. La règle de base
+  (pas de boule de neige) s'applique aussi à mes propres goals.
