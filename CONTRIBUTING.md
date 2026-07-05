@@ -105,4 +105,4 @@ Open an issue with:
 
 ## License
 
-By contributing, you agree your contributions are licensed under the [Apache License 2.0](LICENSE).
+By contributing, you agree your contributions are licensed under the [GNU Affero General Public License v3.0](LICENSE) (AGPL-3.0).

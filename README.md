@@ -69,7 +69,7 @@ see [`AGENTS.md`](AGENTS.md).
 
 ## Status
 
-**Pre-release.** The engine runs internally in production; the 0.x cycle stabilises operator onboarding (topology config, hardware discovery, first-time setup) ahead of a 1.0 cut. Apache 2.0 licensed — see [LICENSE](LICENSE).
+**Pre-release.** The engine runs internally in production; the 0.x cycle stabilises operator onboarding (topology config, hardware discovery, first-time setup) ahead of a 1.0 cut. Licensed under the **GNU Affero General Public License v3.0** (AGPL-3.0) — see [LICENSE](LICENSE). Third-party components are attributed in [NOTICE](NOTICE).
 
 ## Contributing
 

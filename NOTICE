@@ -1,7 +1,12 @@
-Odysseus (OdyssAI engine)
+OdyssAI-X (OdyssAI engine)
 Copyright 2026 OdyssAI (odyssai.eu)
 
-This product includes software developed by third parties:
+Licensed under the GNU Affero General Public License v3.0 (see LICENSE).
+
+This product includes software developed by third parties. AGPL-3.0 is
+one-way compatible with the Apache License 2.0, so the Apache-2.0-licensed
+component below may be, and is, redistributed as part of this AGPL-3.0 work;
+its original license and attribution are preserved:
 
 * scripts/odyssai-network-setup.sh (the Thunderbolt/RDMA network recipe, installed
   on cluster nodes as the eu.odyssai.networksetup LaunchDaemon payload) is derived
