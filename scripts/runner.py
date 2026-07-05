@@ -1886,12 +1886,17 @@ def main() -> None:
 
     # Load draft model AFTER target so it lands on the same device. Only on
     # rank 0 (size==1) since speculative decoding lives in the legacy path.
+    # E0 harness exception (#66 plan): RUNNER_SPEC_MULTIRANK=1 loads the
+    # draft REPLICATED on every rank — validation of the multi-rank
+    # accept-alignment invariant only, never a prod default.
+    spec_multirank = os.environ.get("RUNNER_SPEC_MULTIRANK", "0") == "1"
     draft_model = None
-    if draft_repo and size == 1:
+    if draft_repo and (size == 1 or spec_multirank):
         try:
             t_draft = time.time()
             draft_path = Path(draft_repo) if Path(draft_repo).exists() else hf_repo_to_path(draft_repo)
-            log(f"loading DRAFT model from {draft_path}")
+            log(f"loading DRAFT model from {draft_path}"
+                + (f" (MULTIRANK harness, rank {rank})" if size > 1 else ""))
             draft_model, _ = load_model(draft_path, lazy=False, strict=False)
             mx.eval(draft_model.parameters())
             log(f"draft model loaded in {time.time()-t_draft:.1f}s — speculative decoding ENABLED "
@@ -1901,10 +1906,30 @@ def main() -> None:
             draft_model = None
     elif draft_repo:
         log(f"draft_model requested but size={size} (>1) — speculative decoding only "
-            f"supported single-rank; ignoring draft")
+            f"supported single-rank (set RUNNER_SPEC_MULTIRANK=1 for the harness); "
+            f"ignoring draft")
+
+    # Native MTP (plan docs/PLAN-distributed-mtp.md): the model's own MTP
+    # head(s) as drafter, loaded NEXT TO the trunk on EVERY rank — drafting
+    # is local and identical per rank (PP all_gather / TP all_sum give all
+    # ranks the same final hidden+logits), so no new collectives.
+    native_mtp = None
+    if os.environ.get("RUNNER_MTP", "off").strip().lower() == "native":
+        try:
+            from mtp_module import load_native_mtp
+            _mtp_dir = Path(repo) if Path(repo).exists() else hf_repo_to_path(repo)
+            native_mtp = load_native_mtp(
+                model, _mtp_dir,
+                sidecar=os.environ.get("RUNNER_MTP_SIDECAR") or None,
+                quantize=os.environ.get("RUNNER_MTP_QUANT", "0") == "1",
+            )
+        except Exception as e:
+            log(f"native MTP load failed ({e}) — serving AR only")
+            native_mtp = None
 
     emit(rank, {"event": "ready", "rank": rank, "size": size, "load_s": load_s,
-                "speculative": draft_model is not None})
+                "speculative": draft_model is not None,
+                "mtp": native_mtp is not None})
 
     # Disk cache: only touch it when explicitly opted in. The 2026-05-18
     # audit flagged that even the prune scan + restore path can compete
@@ -1938,11 +1963,12 @@ def main() -> None:
     else:
         log(f"entering legacy single-stream main loop "
             f"(size={size}, batch_available={_BATCH_AVAILABLE}, "
-            f"speculative={draft_model is not None})")
+            f"speculative={draft_model is not None}, "
+            f"mtp={native_mtp is not None})")
         _run_legacy_main(model, tokenizer, repo, kv_q8_default, stop_requested,
                          rank, draft_model=draft_model,
                          num_draft_tokens=num_draft_tokens, world_size=size,
-                         group=group)
+                         group=group, native_mtp=native_mtp)
 
     # Explicit teardown BEFORE the process exits. Two reasons:
     #   1. Drop every model reference so the weights are deallocated, then
@@ -1969,7 +1995,8 @@ def main() -> None:
 def _run_legacy_main(model, tokenizer, repo: str, kv_q8_default: bool,
                      stop_requested: dict, rank: int,
                      draft_model=None, num_draft_tokens: int = 4,
-                     world_size: int = 1, group=None) -> None:
+                     world_size: int = 1, group=None,
+                     native_mtp=None) -> None:
     # Expanded stop set. `stream_generate` already breaks on
     # tokenizer.eos_token_id, but chat-tuned models often emit a "next-turn"
     # marker first (GLM emits <|user|>, Qwen emits <|im_end|>, etc.). Without
@@ -2189,8 +2216,53 @@ def _run_legacy_main(model, tokenizer, repo: str, kv_q8_default: bool,
         if draft_model is not None:
             gen_kwargs["draft_model"] = draft_model
             gen_kwargs["num_draft_tokens"] = num_draft_tokens
+
+        # Native-MTP routing (plan D6/D7). Activation travels PER REQUEST in
+        # the fan-out JSONL (`"mtp": {"on":…, "depth":…}`) — identical on
+        # every rank, so the decision is aligned by construction. Greedy v0:
+        # any sampling profile or draft model falls back to plain AR.
+        req_mtp = req.get("mtp") or {}
+        use_native_mtp = (
+            native_mtp is not None
+            and bool(req_mtp.get("on", True))
+            and _sampler is None and _lp is None
+            and draft_model is None
+        )
+        canary_sha = hashlib.sha256()
+
+        def _canary_line(payload: dict) -> None:
+            sys.stderr.write("[canary] " + json.dumps(payload) + "\n")
+            sys.stderr.flush()
+
+        if use_native_mtp:
+            from mtp_spec import native_mtp_stream_generate
+            _mtp_prompt_ids = list(prompt_tokens_full)
+            _mtp_prefix = (len(prompt_tokens_full) - len(suffix_tokens)
+                           if cached_cache is not None and suffix_tokens is not None
+                           else 0)
+            gen_iter = native_mtp_stream_generate(
+                model, tokenizer, _mtp_prompt_ids,
+                mtp=native_mtp,
+                depth=int(req_mtp.get("depth")
+                          or os.environ.get("RUNNER_MTP_DEPTH", "3")),
+                max_tokens=max_tokens,
+                prompt_cache=prompt_cache,
+                prefix_len=_mtp_prefix,
+                hidden_source=os.environ.get("RUNNER_MTP_HIDDEN", "post_norm"),
+                stop_ids=_stop_ids,
+                canary_cb=lambda r, d, n, s: _canary_line(
+                    {"rid": req_id, "rank": rank, "round": r,
+                     "drafted": d, "accepted": n, "sha": s}),
+            )
+        else:
+            gen_iter = stream_generate(model, tokenizer, gen_input, **gen_kwargs)
+
+        # E0 harness canary: per-token cumulative sha over the emitted ids,
+        # for the draft-model multi-rank alignment gate (G0). Opt-in.
+        token_canary = os.environ.get("RUNNER_TOKEN_CANARY", "0") == "1"
+
         cancelled_mid_gen = False
-        for res in stream_generate(model, tokenizer, gen_input, **gen_kwargs):
+        for res in gen_iter:
             tok_id = getattr(res, "token", None)
             # Extra stop check, BEFORE emitting the token's text. Chat-tuned
             # models emit a next-turn marker (<|im_end|>, <|role_end|>,
@@ -2207,6 +2279,12 @@ def _run_legacy_main(model, tokenizer, repo: str, kv_q8_default: bool,
             full_text_parts.append(res.text)
             if isinstance(tok_id, int):
                 gen_token_ids.append(tok_id)
+                if token_canary:
+                    canary_sha.update(tok_id.to_bytes(4, "little"))
+                    if (ntoks + 1) % 32 == 0:
+                        _canary_line({"rid": req_id, "rank": rank,
+                                      "ntoks": ntoks + 1,
+                                      "sha": canary_sha.hexdigest()[:16]})
             ntoks += 1
             if len(buf) >= emit_batch_n:
                 emit(rank, {"event": "token", "id": req_id, "text": "".join(buf)})
