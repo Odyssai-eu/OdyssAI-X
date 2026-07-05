@@ -1303,7 +1303,8 @@ def remote_cmd(node: dict, nodes: list[dict], model: str, mode: str, port: int,
                draft_model: Optional[str] = None,
                num_draft_tokens: int = 4,
                ram_weights_csv: Optional[str] = None,
-               backend: str = "jaccl") -> str:
+               backend: str = "jaccl",
+               mtp: Optional[dict] = None) -> str:
     world_size = len(nodes)
     env = {
         "MLX_RANK": str(node["rank"]),
@@ -1341,6 +1342,17 @@ def remote_cmd(node: dict, nodes: list[dict], model: str, mode: str, port: int,
     if draft_model:
         env["RUNNER_DRAFT_MODEL"] = draft_model
         env["RUNNER_NUM_DRAFT_TOKENS"] = str(num_draft_tokens)
+    if mtp and mtp.get("enabled"):
+        # Native-MTP module load (every rank). Activation stays per-request
+        # (JSONL `mtp` field) — the env only makes the module AVAILABLE.
+        env["RUNNER_MTP"] = "native"
+        env["RUNNER_MTP_DEPTH"] = str(int(mtp.get("depth") or 3))
+        if mtp.get("sidecar"):
+            env["RUNNER_MTP_SIDECAR"] = str(mtp["sidecar"])
+        if mtp.get("hidden_source"):
+            env["RUNNER_MTP_HIDDEN"] = str(mtp["hidden_source"])
+        if mtp.get("quantize"):
+            env["RUNNER_MTP_QUANT"] = "1"
     env_str = " ".join(f"{k}={shlex.quote(v)}" for k, v in env.items())
     if backend != "ring":
         write_prefix = f"echo {shlex.quote(devices_json)} > /tmp/mlx_jaccl_devices.json"
@@ -1427,9 +1439,12 @@ _WATCHDOG_RECOVERY_BY_CLUSTER: dict = {}
 
 class RunnerProc:
     def __init__(self, node: dict, cmd: str, on_event, cluster: str = "nautilus",
-                 match_pattern: Optional[str] = None):
+                 match_pattern: Optional[str] = None, pool=None):
         self.node = node
         self.cluster = cluster
+        # Backref to the owning RunnerPool (None for standalone procs, e.g.
+        # the VLM proxy) — used by the [canary] stderr hook (MTP alignment).
+        self.pool = pool
         # pkill pattern for the REMOTE process this proc spawned. Text pools
         # keep the runner.py default; the distributed VLM pool passes its own
         # so a graceful_stop never touches runner.py (or vice versa).
@@ -1506,6 +1521,16 @@ class RunnerProc:
                 self._stderr_tail.append(line)
             except Exception:
                 pass
+            # MTP canary hook: runner ranks emit
+            #   [canary] {"rid":…,"rank":…,"round":…,"drafted":…,"accepted":…,"sha":…}
+            # per speculative round. The pool aggregates PER ROUND across
+            # ranks and trips (auto-disable) on any divergence.
+            if self.pool is not None and "[canary] " in line:
+                try:
+                    payload = json.loads(line.split("[canary] ", 1)[1])
+                    self.pool._canary_ingest(rank, payload)
+                except Exception:
+                    pass
             try:
                 self._maybe_update_phase(line)
             except Exception:
@@ -1813,7 +1838,8 @@ class RunnerPool:
                  num_draft_tokens: int = 4,
                  alias: Optional[str] = None,
                  node_indices: Optional[list[int]] = None,
-                 backend: Optional[str] = None):
+                 backend: Optional[str] = None,
+                 mtp: Optional[dict] = None):
         self.model = model
         self.mode = mode
         self.use_ap = use_ap
@@ -1822,6 +1848,16 @@ class RunnerPool:
         self.kv_q8 = kv_q8
         self.draft_model = draft_model
         self.num_draft_tokens = num_draft_tokens
+        # Native-MTP pool config (plan docs/PLAN-distributed-mtp.md D7):
+        # {"enabled": bool, "depth": int, "sidecar": path?}. The runner loads
+        # the module when RUNNER_MTP=native; per-request activation travels
+        # in the fan-out JSONL and is cut engine-side on a canary trip
+        # (mtp_tripped) WITHOUT touching the pool.
+        self.mtp_cfg: Optional[dict] = dict(mtp) if mtp else None
+        self.mtp_tripped: bool = False
+        self.mtp_accept_rate: Optional[float] = None
+        self._canary_lock = threading.Lock()
+        self._canary_rounds: dict = {}   # (rid, round) -> {rank: (d, n, sha)}
         # Default alias = cluster name (back-compat: single pool per cluster
         # stays at alias=="default" / "nautilus"). Additional pool aliases
         # pools pass an explicit alias like "default-big".
@@ -1993,8 +2029,10 @@ class RunnerPool:
                              draft_model=self.draft_model,
                              num_draft_tokens=self.num_draft_tokens,
                              ram_weights_csv=ram_weights_csv,
-                             backend=getattr(self, "backend", "jaccl"))
-            self.runners.append(RunnerProc(node, cmd, self._on_event, cluster=self.cluster))
+                             backend=getattr(self, "backend", "jaccl"),
+                             mtp=self.mtp_cfg)
+            self.runners.append(RunnerProc(node, cmd, self._on_event,
+                                           cluster=self.cluster, pool=self))
         rank0 = next(r for r in self.runners if r.node["rank"] == 0)
 
         # Wait for rank 0 to emit `ready` while watching EVERY rank for death.
@@ -2159,6 +2197,49 @@ class RunnerPool:
     def _release_busy(self) -> None:
         self.busy_count = max(0, self.busy_count - 1)
 
+    def _canary_ingest(self, rank: int, c: dict) -> None:
+        """Aggregate per-round MTP canaries across ranks (thread context:
+        each RunnerProc's stderr drain). Compare ONLY when every rank has
+        reported the same (rid, round) — ranks don't write in lockstep, and
+        comparing different rounds is a guaranteed false positive (plan F-8).
+        Any true divergence trips the pool: mtp_tripped=True makes submit()
+        stop sending `mtp.on`, so the pool keeps serving AR. Round -1 is the
+        end-of-gen summary (drafted/accepted totals -> acceptance metric)."""
+        rid = c.get("rid")
+        rnd = c.get("round")
+        if rid is None or rnd is None:
+            return
+        if rnd == -1:
+            if rank == 0:
+                d, n = c.get("drafted") or 0, c.get("accepted") or 0
+                if d:
+                    self.mtp_accept_rate = round(n / d, 3)
+            with self._canary_lock:
+                stale = [k for k in self._canary_rounds if k[0] == rid]
+                for k in stale:
+                    self._canary_rounds.pop(k, None)
+            return
+        world = len(self.runners) or 1
+        key = (rid, rnd)
+        with self._canary_lock:
+            slot = self._canary_rounds.setdefault(key, {})
+            slot[rank] = (c.get("drafted"), c.get("accepted"), c.get("sha"))
+            if len(slot) < world:
+                # Bound the buffer: a rank that died mid-gen would leak keys.
+                if len(self._canary_rounds) > 4096:
+                    self._canary_rounds.clear()
+                return
+            values = set(slot.values())
+            self._canary_rounds.pop(key, None)
+        if len(values) > 1 and not self.mtp_tripped:
+            self.mtp_tripped = True
+            sys.stderr.write(
+                f"[api] MTP CANARY TRIP pool={self.alias} rid={rid} "
+                f"round={rnd}: per-rank (drafted,accepted,sha) diverge "
+                f"{sorted(values)} — auto-disabling MTP on this pool "
+                f"(serving continues AR)\n")
+            sys.stderr.flush()
+
     async def submit(self, prompt: Optional[str], max_tokens: int,
                      enable_thinking: Optional[bool],
                      messages: Optional[list[dict]] = None,
@@ -2197,6 +2278,15 @@ class RunnerPool:
             req["reasoning_effort"] = reasoning_effort
         if session_id:
             req["session_id"] = session_id
+        # Native-MTP per-request activation (plan D7): identical on every
+        # rank via the broadcast, so the on/off decision is aligned by
+        # construction. A canary trip flips mtp_tripped and the pool keeps
+        # serving AR — no restart, no control message.
+        if self.mtp_cfg:
+            req["mtp"] = {
+                "on": bool(self.mtp_cfg.get("enabled")) and not self.mtp_tripped,
+                "depth": int(self.mtp_cfg.get("depth") or 3),
+            }
         # #40: mark the pool busy (idle-gating for keepalive + preventive reload)
         # only now that the request is fully built and about to broadcast, so a
         # build-time error can't leak the counter. Released in the finally below.
@@ -2734,6 +2824,7 @@ def save_cluster_state_v2(cluster_id: str, *,
             "kv_q8": pool.kv_q8,
             "draft_model": pool.draft_model,
             "num_draft_tokens": pool.num_draft_tokens,
+            "mtp": pool.mtp_cfg,
             "backend": getattr(pool, "backend", None),
         })
     # Merge the live shapes over the existing on-disk DESIRED entries.
@@ -2801,6 +2892,7 @@ def load_cluster_state_v2(cluster_id: str) -> list[dict]:
             "kv_q8": bool(raw.get("kv_q8", False)),
             "draft_model": raw.get("draft_model"),
             "num_draft_tokens": int(raw.get("num_draft_tokens") or 4),
+            "mtp": raw.get("mtp"),
         }]
     return []
 
@@ -3686,6 +3778,7 @@ async def lifespan(app: FastAPI):
                     kv_q8=bool(entry.get("kv_q8", False)),
                     draft_model=entry.get("draft_model"),
                     num_draft_tokens=int(entry.get("num_draft_tokens") or 4),
+                    mtp=entry.get("mtp"),
                     alias=alias,
                     node_indices=indices,
                     backend=entry.get("backend"),
@@ -3915,6 +4008,7 @@ def _pool_reload_request(pool: RunnerPool) -> ArgoLoadRequest:
         model=pool.model, mode=pool.mode, use_ap=pool.use_ap,
         nodes=pool.nodes_count, kv_q8=pool.kv_q8,
         draft_model=pool.draft_model, num_draft_tokens=pool.num_draft_tokens,
+        mtp=pool.mtp_cfg,
         force=True, alias=pool.alias, node_indices=pool.node_indices,
         # The reload targets the SAME alias on purpose (stop-old-start-new).
         # Without this the #64 explicit-alias collision guard 409s every
@@ -8426,6 +8520,9 @@ async def admin_status():
             "kv_q8": _pool.kv_q8,
             "draft_model": _pool.draft_model,
             "num_draft_tokens": _pool.num_draft_tokens if _pool.draft_model else None,
+            "mtp": ({**_pool.mtp_cfg, "tripped": _pool.mtp_tripped,
+                     "accept_rate": _pool.mtp_accept_rate}
+                    if _pool.mtp_cfg else None),
             "alive": _pool.alive_count(),
             "load_s": _pool.load_s, "uptime_s": uptime,
             "recent_avg_tps": round(sum(recent_tps) / len(recent_tps), 2) if recent_tps else None,
@@ -8481,6 +8578,10 @@ class LoadRequest(BaseModel):
     kv_q8: Optional[bool] = None
     draft_model: Optional[str] = None  # speculative decoding, single-rank only
     num_draft_tokens: int = 4
+    # Native-MTP (plan docs/PLAN-distributed-mtp.md): {"enabled": bool,
+    # "depth": int, "sidecar": str?, "hidden_source": "post_norm"|"pre_norm",
+    # "quantize": bool}. Default None = pure AR, zero behavior change.
+    mtp: Optional[dict] = None
     # Hot-swap: when False (default since 2026-05-18 audit), the old pool
     # is stopped BEFORE the new one starts — no double-allocation in RAM.
     # Set True to overlap the load with the old serving (faster cutover,
@@ -8523,6 +8624,7 @@ async def admin_load(req: LoadRequest):
                 kv_q8=kv_q8,
                 draft_model=req.draft_model,
                 num_draft_tokens=req.num_draft_tokens,
+                mtp=req.mtp,
             )
             try:
                 await new_pool.start()
@@ -10307,6 +10409,9 @@ async def admin_cluster_status(cluster_id: str):
             "kv_q8": pool.kv_q8,
             "draft_model": pool.draft_model,
             "num_draft_tokens": pool.num_draft_tokens if pool.draft_model else None,
+            "mtp": ({**pool.mtp_cfg, "tripped": pool.mtp_tripped,
+                     "accept_rate": pool.mtp_accept_rate}
+                    if pool.mtp_cfg else None),
             "alive": pool.alive_count(),
             "load_s": pool.load_s,
             "uptime_s": uptime_p,
@@ -10336,6 +10441,9 @@ async def admin_cluster_status(cluster_id: str):
         "kv_q8": primary_pool.kv_q8,
         "draft_model": primary_pool.draft_model,
         "num_draft_tokens": primary_pool.num_draft_tokens if primary_pool.draft_model else None,
+        "mtp": ({**primary_pool.mtp_cfg, "tripped": primary_pool.mtp_tripped,
+                 "accept_rate": primary_pool.mtp_accept_rate}
+                if primary_pool.mtp_cfg else None),
         "alive": primary_pool.alive_count(),
         "load_s": primary_pool.load_s, "uptime_s": uptime,
         "recent_avg_tps": round(sum(recent_tps) / len(recent_tps), 2) if recent_tps else None,
@@ -10429,6 +10537,11 @@ class ArgoLoadRequest(BaseModel):
     kv_q8: Optional[bool] = None     # Q8 quantized KV cache (halves memory for long contexts)
     draft_model: Optional[str] = None  # speculative decoding (nodes=1 only)
     num_draft_tokens: int = 4
+    # Native-MTP (plan docs/PLAN-distributed-mtp.md): {"enabled": bool,
+    # "depth": int, "sidecar": str?, "hidden_source": str?, "quantize": bool}.
+    # None = pure AR. Works multi-rank (the whole point): module replicated
+    # per rank, per-request activation, canary-tripped auto-disable.
+    mtp: Optional[dict] = None
     # Power-user override for the preflight size check. Use only when you
     # know the apparent du size is overestimating (e.g. dedup / sparse files).
     force: bool = False
@@ -10836,6 +10949,7 @@ async def admin_cluster_load(cluster_id: str, req: ArgoLoadRequest):
                 kv_q8=kv_q8,
                 draft_model=req.draft_model,
                 num_draft_tokens=req.num_draft_tokens,
+                mtp=req.mtp,
                 alias=alias,
                 node_indices=node_indices,
                 backend=req.backend,

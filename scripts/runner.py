@@ -2216,6 +2216,20 @@ def _run_legacy_main(model, tokenizer, repo: str, kv_q8_default: bool,
         if draft_model is not None:
             gen_kwargs["draft_model"] = draft_model
             gen_kwargs["num_draft_tokens"] = num_draft_tokens
+            # mlx-lm's speculative_generate_step expects a COMBINED
+            # [target_layers + draft_layers] cache when prompt_cache is
+            # passed (generate.py:527 slices the tail for the draft). Our
+            # session/per-request cache is target-only → the draft slice
+            # comes out EMPTY and the draft prefill crashes (IndexError,
+            # E0 2026-07-06). Let mlx-lm build both caches itself; the
+            # session prefix is re-prefilled on this path.
+            if prompt_cache is not None:
+                gen_kwargs.pop("prompt_cache", None)
+                prompt_cache = None
+                cached_cache = None
+                suffix_tokens = None
+                gen_input = templated
+                cache_label = "draft-fresh"
 
         # Native-MTP routing (plan D6/D7). Activation travels PER REQUEST in
         # the fan-out JSONL (`"mtp": {"on":…, "depth":…}`) — identical on

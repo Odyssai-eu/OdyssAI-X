@@ -4119,9 +4119,17 @@ function renderArgoPoolsList(a) {
     // Argo cluster. Violet "VLM" badge so it reads at a glance, same as the
     // telemak VL rows.
     const isVlmPool = !!(p.is_vlm || p.mode === "vlm");
-    const kindPill = isVlmPool
-      ? `<span class="kind-pill vlm" title="VL model — mlx_vlm.server, single node">VLM</span>`
+    // Native-MTP pill: green while speculating, grey after a canary trip
+    // (auto-disabled, pool keeps serving AR). Acceptance % comes from the
+    // runner's end-of-gen canary summary via pool status.
+    const mtpPill = (p.mtp && p.mtp.enabled)
+      ? (p.mtp.tripped
+          ? `<span class="kind-pill" style="background:#5c5c66" title="MTP auto-disabled (canary trip) — serving AR">MTP off</span>`
+          : `<span class="kind-pill" style="background:#2e7d4f" title="Native-MTP speculative decoding">MTP D${p.mtp.depth || 3}${p.mtp.accept_rate != null ? " · " + Math.round(p.mtp.accept_rate * 100) + "%" : ""}</span>`)
       : "";
+    const kindPill = (isVlmPool
+      ? `<span class="kind-pill vlm" title="VL model — mlx_vlm.server, single node">VLM</span>`
+      : "") + mtpPill;
     // #61 — per-pool activity. The aggregate Activity hero only showed the
     // cluster total; here each pool gets its own live indicator from the
     // in-flight runs routed to its alias (runs carry {cluster, alias}).
