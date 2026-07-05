@@ -599,5 +599,33 @@ patcher après coup :
 | E7 hardening | 3 | E3 |
 | **v0 (E0-E3)** | **16** | — |
 
-Prochaine action après validation de ce plan : panel-à-3 (règle de base)
-sur les décisions D1-D8, puis GO Sophie sur E0/E1.
+## 12. Addendum exécution (grill Sophie, 2026-07-05 soir — GO donné)
+
+Panel-à-3 rempli par : plan ancré source (direct) + grill Sophie (intent)
++ MiniMax-M3 cross-model (sceptique, 3 rounds). Subagents indisponibles
+cette session (gotcha Fable) — forme praticable consignée.
+
+Décisions opérationnelles verrouillées au grill :
+1. **Nodes** : tout Argo libre (.29-.32) — unload des pools chauds
+   autorisé, RESTAURATION en fin de nuit. Prod engine .39 : deploy
+   AUTORISÉ (cf 2). Goal = « MTP distribué fonctionnel » = **E0→E3, G2
+   vert sur le modèle E3, greedy, canaris propres**. E4-E5 LongCat hors
+   goal (port inexistant).
+2. **Deploy .39 OK avec filet** : AVANT tout code — tag git de l'état
+   courant + copie de sauvegarde des `api.py`/`dashboard.html` déployés
+   (rollback 1-geste). `mtp.enabled=false` par défaut PARTOUT au deploy.
+3. **Règle STOP confirmée** : G1/G2 ratés après 2 tentatives de fix →
+   rapport-STOP documenté, fin de nuit. Pas de rustines empilées.
+
+Matériel vérifié sur disque (zéro download pour E0) :
+- E0 : target `mlx-community/Qwen3-Coder-30B-A3B-Instruct-6bit`
+  (Qwen3Moe, 4 KV heads → TP-2/4, trimmable) + draft
+  `mlx-community/Qwen3-0.6B-8bit` (5 nodes) — tokenizer.json sha
+  IDENTIQUES (`aeb13307…`).
+- E2/E3 : `kernelpool/GLM-5.2-Q6` — **vérifier D'ABORD que la conversion
+  a gardé les poids mtp/nextn** (les convert MLX les strippent souvent —
+  leçon qwen3_next). Si strippés : sidecar des shards mtp originaux
+  (bf16, ~10-20 GB) téléchargés depuis le repo source + quantize-on-load
+  (le loader D5 lit l'index séparément du trunc — prévu pour).
+- Référence G1 : `Youssofal/Qwen3.6-27B-MTPLX-Optimized-Speed` (+
+  `mlx-community/Qwen3.6-27B-MTP-4bit/bf16`) via MTPLX tel quel.

@@ -68,3 +68,15 @@ deliverable, les protocoles de bench ont warmup + parité par position.
 **Clôture** : convergence effective. Le panel-à-3 de la règle de base
 reste dû AVANT le premier commit de code (session d'exécution) — cette
 review cross-model n'en tient pas lieu, elle l'alimente.
+
+## Round 3 — pré-code, post-grill Sophie (2026-07-05 soir)
+
+Panel rempli : plan ancré source (direct) + grill Sophie (intent, §12 du
+plan : nodes/deploy .39 avec filet/règle STOP) + MiniMax (sceptique).
+Seed = addendum §12 + choix modèles (paire E0 sha-vérifiée, GLM-5.2-Q6
+avec risque strip-mtp flaggé M1). MiniMax a re-vérifié rev.3 point par
+point (F-31→F-37 tous présents, TP Qwen3Moe confirmé `auto_parallel.py`,
+E0 4-KV-heads divisible 2 et 4) : « No new blocking concern. You can
+start coding E0/E1 tonight. »
+
+**VERDICT: APPROVED** — GO code.
