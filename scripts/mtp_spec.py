@@ -36,6 +36,7 @@ sequence is IDENTICAL to plain AR greedy decoding of the same model.
 from __future__ import annotations
 
 import hashlib
+import os
 import time
 from dataclasses import dataclass
 from typing import Any, Callable, Generator, Optional
@@ -115,12 +116,38 @@ def native_mtp_stream_generate(
             return real_norm(x)
         inner.norm = _capture_norm
 
+    # mlx-lm runs every generation forward inside a dedicated thread-local
+    # stream (generate.py:226). Without it, the distributed pipeline's
+    # send/recv collectives serialize against the default stream and every
+    # forward pays a fixed ~4s stall (measured: constant 4.2s at any S,
+    # vs 0.08s for AR which uses this stream). Same stream = same fast path.
+    try:
+        from mlx_lm.generate import generation_stream as _gen_stream
+    except Exception:
+        _gen_stream = mx.default_stream(mx.default_device())
+    # mlx-lm holds a `wired_limit` context around the WHOLE generation
+    # (generate.py:714) so the model's buffers (esp. the 768-expert MoE
+    # weights, different experts routed per token) stay Metal-resident
+    # instead of paging from disk each forward. Missing it = the ~4.5s
+    # constant per forward we measured (paging-bound, S-independent).
+    try:
+        from mlx_lm.generate import wired_limit as _wired_limit
+    except Exception:
+        import contextlib
+        def _wired_limit(_m, _s):  # no-op fallback
+            return contextlib.nullcontext()
+
     def trunk_forward(tokens: mx.array) -> tuple[mx.array, mx.array]:
         """One trunk pass -> (logits, hidden) for all S positions."""
-        h_post = inner(tokens, trunk_cache)
-        h = capture.pop("h") if hidden_source == "pre_norm" else h_post
-        return lm_head(h_post), h
+        with mx.stream(_gen_stream):
+            h_post = inner(tokens, trunk_cache)
+            h = capture.pop("h") if hidden_source == "pre_norm" else h_post
+            return lm_head(h_post), h
 
+    # Enter the wired-limit context manually (avoids re-indenting the whole
+    # generator body); exited in the finally below.
+    _wl_ctx = _wired_limit(model, [_gen_stream])
+    _wl_ctx.__enter__()
     try:
         # ── Prefill (chunked): trunk + mtp pairs (token_{p+1}, hidden_p) ──
         t0 = time.time()
@@ -194,11 +221,50 @@ def native_mtp_stream_generate(
             first.finish_reason = finish
         yield first
 
+        # Instrumentation (TIMING_MTP=1): per-phase wall time, emitted in the
+        # final canary. draft loop + verify both force eval (.item / mx.eval)
+        # so these are REAL compute times, not lazy graph-build.
+        _timing = os.environ.get("TIMING_MTP", "0") == "1"
+        t_draft_tot = t_verify_tot = t_round_tot = 0.0
+
+        # One-time BISECT (collective — all ranks run each forward): isolate
+        # what makes inner() 4.2s. lm_head is already known-fast (draft_step
+        # runs it 3x in 68ms). Compare inner() on the POPULATED cache vs a
+        # FRESH empty cache (pure 1-token, no context), and dump the cache
+        # structure (entry count should match the LOCAL shard's layer count).
+        if _timing:
+            import sys as _sys
+            from mlx_lm.models.cache import make_prompt_cache as _mkc
+            _p = mx.array([[bonus]], dtype=mx.uint32)
+            _sys.stderr.write(
+                f"[mtp-bisect] cache_entries={len(trunk_cache)} "
+                f"type={type(trunk_cache[0]).__name__} "
+                f"offset={_cache_offset(trunk_cache)}\n")
+            with mx.stream(_gen_stream):
+                _t = time.time(); _h = inner(_p, trunk_cache); mx.eval(_h)
+                _ti = time.time() - _t
+                _t = time.time(); _l = lm_head(_h); mx.eval(_l)
+                _tl = time.time() - _t
+            trim_prompt_cache(trunk_cache, 1)
+            _sys.stderr.write(
+                f"[mtp-bisect] POPULATED S=1: inner={_ti*1000:.0f}ms "
+                f"lm_head={_tl*1000:.0f}ms\n")
+            _fc = _mkc(model)
+            with mx.stream(_gen_stream):
+                _t = time.time(); _h2 = inner(_p, _fc); mx.eval(_h2)
+                _tf = time.time() - _t
+            _sys.stderr.write(
+                f"[mtp-bisect] FRESH S=1: inner={_tf*1000:.0f}ms "
+                f"(entries={len(_fc)})\n")
+            _sys.stderr.flush()
+
         while finish is None:
             round_idx += 1
+            _tr = time.time()
             D = min(depth, max_tokens - emitted)  # never draft past the budget
 
             # (i) Draft chain: D sequential mtp steps, ONE position each.
+            _td = time.time()
             drafts: list[int] = []
             d_tok, d_hid = bonus, seed_hidden
             for _ in range(D):
@@ -207,12 +273,15 @@ def native_mtp_stream_generate(
                 d_tok = int(mx.argmax(d_logits[:, -1, :], axis=-1).item())
                 drafts.append(d_tok)
             drafted_total += D
+            t_draft_tot += time.time() - _td
 
             # (ii) Verify: ONE trunk pass over [bonus, d0..dD-1] (D+1 pos).
+            _tv = time.time()
             v_in = mx.array([[bonus] + drafts], dtype=mx.uint32)
             v_logits, v_hidden = trunk_forward(v_in)
             v_tokens_arr = mx.argmax(v_logits, axis=-1)
             mx.eval(v_tokens_arr)
+            t_verify_tot += time.time() - _tv
             v_tokens = [int(t) for t in v_tokens_arr[0].tolist()]
 
             # (iii) Greedy exact-match acceptance.
@@ -261,6 +330,15 @@ def native_mtp_stream_generate(
             # (vii) Seed next round (invariant F-1: LAST ACCEPTED position).
             bonus = new_bonus
             seed_hidden = v_hidden[:, n:n + 1, :]
+            t_round_tot += time.time() - _tr
+            if _timing and round_idx % 8 == 0:
+                import sys as _sys
+                _sys.stderr.write(
+                    f"[mtp-timing] round {round_idx}: draft={t_draft_tot/round_idx*1000:.0f}ms "
+                    f"verify={t_verify_tot/round_idx*1000:.0f}ms "
+                    f"round={t_round_tot/round_idx*1000:.0f}ms "
+                    f"(other={((t_round_tot-t_draft_tot-t_verify_tot)/round_idx)*1000:.0f}ms)\n")
+                _sys.stderr.flush()
 
         # End-of-gen invariant: offset = prompt + emitted - 1 (final bonus
         # pending). A mid-round "stop" leaves the round's remaining verified
@@ -274,5 +352,9 @@ def native_mtp_stream_generate(
         assert off in (-1, expect), f"final cache drift: {off} != {expect}"
     finally:
         inner.norm = real_norm
+        try:
+            _wl_ctx.__exit__(None, None, None)
+        except Exception:
+            pass
         if canary_cb is not None:
             canary_cb(-1, drafted_total, accepted_total, sha.hexdigest()[:16])

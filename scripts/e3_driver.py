@@ -67,6 +67,8 @@ def _spawn(rank: int, ip: str, args, mtp_on: bool) -> subprocess.Popen:
         env["RUNNER_MTP_HIDDEN"] = args.hidden_source
         if args.quantize:
             env["RUNNER_MTP_QUANT"] = "1"
+        if args.timing:
+            env["TIMING_MTP"] = "1"
     hosts = json.dumps([[f"{n}:{args.port}"] for n in args.node_list])
     env_str = " ".join(f"{k}={shlex.quote(v)}" for k, v in env.items())
     # `exec VAR=x cmd` is not valid zsh (tries to exec "VAR=x" -> 127);
@@ -180,6 +182,8 @@ def main() -> None:
     ap.add_argument("--hidden-source", default="post_norm")
     ap.add_argument("--quantize", action="store_true",
                     help="quantize the MTP module to the trunk's quant on load")
+    ap.add_argument("--timing", action="store_true",
+                    help="emit [mtp-timing] per-phase breakdown")
     ap.add_argument("--port", type=int, default=5590)
     ap.add_argument("--skip-ar", action="store_true")
     args = ap.parse_args()
