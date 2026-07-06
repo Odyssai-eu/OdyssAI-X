@@ -353,6 +353,28 @@ def load_native_mtp(model: Any, model_dir: str | Path, *,
     module = NativeMTPModule(args, DeepseekV32DecoderLayer, spec.start_layer)
     module.bind_trunk(model)
 
+    # FAST PATH — pre-quantized module-layout sidecar. Loading the bf16
+    # sidecar per-rank does `_stack_moe_experts` (mx.stack of 768 bf16
+    # experts) = a ~20GB contiguous spike ON TOP of the trunk shard, which
+    # OOM-kills the heavy all-MoE pipeline ranks (E3 2026-07-06: rank0 with
+    # the light dense shard survived, ranks 1/2 died silently). A one-time
+    # offline `build_prequantized_sidecar` writes the module already in Q6
+    # (~8GB, module-layout); loading it needs no stack and no rewrite.
+    q6_path = _prequantized_path(spec, sidecar)
+    if q6_path is not None and q6_path.exists():
+        q6 = dict(mx.load(str(q6_path)))
+        if quantize:
+            _quantize_structure(module, config, q6)
+        module.load_weights(list(q6.items()), strict=False)
+        mx.eval(module.parameters())
+        from mlx.utils import tree_flatten
+        gb = sum(v.nbytes for _, v in tree_flatten(module.parameters())) / 1e9
+        _log(f"loaded {spec} via PREQUANTIZED sidecar — {len(q6)} tensors, "
+             f"{gb:.2f} GB, {time.time()-t0:.1f}s")
+        return module
+
+    # SLOW PATH — build from the raw (bf16) sidecar. Fine on a single node /
+    # the light rank; use build_prequantized_sidecar first for multi-rank.
     raw = _load_source_weights(spec, model_dir)
     if not raw:
         _log(f"spec found ({spec}) but zero tensors loaded — AR only")
@@ -370,3 +392,82 @@ def load_native_mtp(model: Any, model_dir: str | Path, *,
     _log(f"loaded {spec} — {len(mapped)} tensors, {n_params/1e9:.2f}B params, "
          f"{time.time()-t0:.1f}s (quantize={quantize})")
     return module
+
+
+def _prequantized_path(spec: "MTPSpec", sidecar_env: Optional[str]) -> Optional[Path]:
+    """Where a pre-quantized module-layout sidecar would live (next to the
+    bf16 one, or under the RUNNER_MTP_SIDECAR dir)."""
+    cands = []
+    if sidecar_env:
+        p = Path(sidecar_env)
+        cands.append((p if p.is_dir() else p.parent) / "module-q6.safetensors")
+    if spec.source == "sidecar":
+        cands.append(spec.source_path.parent / "module-q6.safetensors")
+    return cands[0] if cands else None
+
+
+def _quantize_structure(module: NativeMTPModule, config: dict,
+                        q6_weights: dict[str, mx.array]) -> None:
+    """Convert module Linears to QuantizedLinear wherever the pre-quantized
+    sidecar carries `.scales` for that path — so load_weights lands the
+    quantized tensors in matching slots (no data touched here)."""
+    q = config.get("quantization") or config.get("quantization_config") or {}
+    if not q or "bits" not in q or "group_size" not in q:
+        return
+
+    def predicate(path: str, m: Any):
+        return hasattr(m, "to_quantized") and f"{path}.scales" in q6_weights
+
+    nn.quantize(module, group_size=int(q["group_size"]), bits=int(q["bits"]),
+                mode=q.get("mode", "affine"), class_predicate=predicate)
+
+
+def build_prequantized_sidecar(model_dir: str | Path,
+                               sidecar: Optional[str] = None,
+                               out_path: Optional[str] = None) -> Path:
+    """One-time offline: read the bf16 sidecar, build+quantize the module,
+    and save it in module layout (Q6, ~8GB). Run ONCE on a node with free
+    RAM; the result loads per-rank with no bf16 stack spike. Uses a stub
+    trunk (bind only stores embed/lm_head refs — never called here)."""
+    from mlx.utils import tree_flatten
+    from mlx_lm.models.deepseek_v32 import DeepseekV32DecoderLayer
+
+    model_dir = Path(model_dir)
+    config = _read_config(model_dir)
+    spec = detect_native_mtp(model_dir, sidecar_env=sidecar)
+    if spec is None:
+        raise RuntimeError("no native MTP sidecar found to pre-quantize")
+
+    # Minimal ModelArgs for the layer + a stub trunk carrying embed/lm_head.
+    from mlx_lm.models.glm_moe_dsa import ModelArgs
+    args = ModelArgs.from_dict(config)
+
+    class _Stub(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.args = args
+            self.model = nn.Module()
+            self.model.embed_tokens = nn.Embedding(
+                int(config["vocab_size"]), int(config["hidden_size"]))
+            self.lm_head = nn.Linear(int(config["hidden_size"]),
+                                     int(config["vocab_size"]), bias=False)
+
+    module = NativeMTPModule(args, DeepseekV32DecoderLayer, spec.start_layer)
+    module.bind_trunk(_Stub())
+    raw = _load_source_weights(spec, model_dir)
+    mapped = _rewrite_weights(raw, spec, args)
+    # Order matters: load bf16 into the bf16 module, THEN quantize the loaded
+    # weights (post_load). Quantizing the structure first would leave the
+    # bf16 mapped weights unconverted -> the saved file stays bf16 (21GB).
+    module.load_weights(list(mapped.items()), strict=False)
+    _maybe_quantize(module, config, mapped, when="post_load")
+    mx.eval(module.parameters())
+
+    flat = dict(tree_flatten(module.parameters()))
+    out = Path(out_path) if out_path else (
+        _prequantized_path(spec, sidecar)
+        or spec.source_path.parent / "module-q6.safetensors")
+    mx.save_safetensors(str(out), flat)
+    gb = sum(v.nbytes for v in flat.values()) / 1e9
+    _log(f"pre-quantized module -> {out} ({len(flat)} tensors, {gb:.2f} GB)")
+    return out
