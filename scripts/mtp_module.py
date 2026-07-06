@@ -145,25 +145,32 @@ class NativeMTPModule(nn.Module):
         self.eh_proj = nn.Linear(2 * hs, hs, bias=False)
         self.mtp_block = layer_cls(args, layer_idx=layer_idx)
         self.shared_head_norm = nn.RMSNorm(hs, eps=eps)
-        # Bound at load time (trunk references, not parameters of this module):
-        self._embed: Optional[Callable] = None
-        self._lm_head: Optional[Callable] = None
-        self._cache_factory: Optional[Callable] = None
+        # Trunk references bound at load time. They MUST stay OUT of this
+        # module's tree: nn.Module.__setattr__ registers any Module child
+        # (underscore or not), which would (a) drag the trunk's embed/head
+        # into parameters()/quantize passes — mutating the SHARED trunk —
+        # and (b) inflate the module's apparent size. object.__setattr__
+        # bypasses registration (caught by the .31 full smoke: 21 GB
+        # resident + quantize converting eh_proj around bf16 weights).
+        object.__setattr__(self, "_embed", None)
+        object.__setattr__(self, "_lm_head", None)
+        object.__setattr__(self, "_cache_factory", None)
 
     # -- binding ------------------------------------------------------------
     def bind_trunk(self, model: Any) -> None:
         inner = model.model
-        self._embed = inner.embed_tokens
+        object.__setattr__(self, "_embed", inner.embed_tokens)
         # tie_word_embeddings models expose as_linear via embed; GLM/DSv32
         # have a real lm_head.
-        self._lm_head = getattr(model, "lm_head", None)
-        if self._lm_head is None:
-            self._lm_head = lambda h: inner.embed_tokens.as_linear(h)
+        lm = getattr(model, "lm_head", None)
+        if lm is None:
+            lm = inner.embed_tokens.as_linear
+        object.__setattr__(self, "_lm_head", lm)
         # One CacheList(KVCache, KVCache) per dsv32-style layer.
         def _factory():
             from mlx_lm.models.cache import CacheList, KVCache
             return [CacheList(KVCache(), KVCache())]
-        self._cache_factory = _factory
+        object.__setattr__(self, "_cache_factory", _factory)
 
     def make_cache(self) -> list:
         assert self._cache_factory is not None, "bind_trunk() first"
@@ -247,6 +254,23 @@ def _rewrite_weights(raw: dict[str, mx.array], spec: MTPSpec,
         else:
             flat["mtp_block." + suffix] = v
 
+    # MLA kv_b absorption: DeepseekV32Attention consumes the SPLIT form
+    # (embed_q [heads, kv_lora, qk_nope] + unembed_out [heads, v_head,
+    # kv_lora]), not the raw fused kv_b_proj the checkpoint ships. Same
+    # transform the trunk conversion applies (and MTPLX's
+    # _rewrite_kv_b_projection) — caught by mtp_loader_smoke on GLM-5.2.
+    kv_b_key = "mtp_block.self_attn.kv_b_proj.weight"
+    if kv_b_key in flat:
+        v = flat.pop(kv_b_key)
+        heads = int(args.num_attention_heads)
+        nope = int(args.qk_nope_head_dim)
+        vdim = int(args.v_head_dim)
+        v = v.reshape(heads, nope + vdim, -1)
+        flat["mtp_block.self_attn.embed_q.weight"] = mx.contiguous(
+            v[:, :nope, :].swapaxes(-1, -2))
+        flat["mtp_block.self_attn.unembed_out.weight"] = mx.contiguous(
+            v[:, nope:, :])
+
     # Stack per-expert tensors into the SwitchGLU layout the dsv32 layer uses.
     n_routed = int(getattr(args, "n_routed_experts", 0) or 0)
     if n_routed and f"mtp_block.mlp.experts.0.gate_proj.weight" in flat:
@@ -264,25 +288,36 @@ def _rewrite_weights(raw: dict[str, mx.array], spec: MTPSpec,
 
 
 def _maybe_quantize(module: NativeMTPModule, config: dict,
-                    weights: dict[str, mx.array]) -> None:
+                    weights: dict[str, mx.array], *,
+                    when: str) -> None:
     """Optional trunk-aligned quantize-on-load (RUNNER_MTP_QUANT=1).
 
-    v0 default is OFF: the sidecar stays bf16 (~14 GB for GLM-5.2's MoE MTP
-    layer), which every node carries comfortably; exactness first, memory
-    optimization after G1 (plan §E1/D5).
+    Ordering matters (caught by the .31 full smoke):
+      * source ALREADY quantized (scales present) -> convert layers BEFORE
+        load_weights so the quantized tensors land in QuantizedLinear slots
+        (`when="pre_load"`);
+      * source bf16 (sidecar) -> load bf16 into the bf16 module FIRST, then
+        nn.quantize converts layers AND quantizes the loaded weights
+        (`when="post_load"`).
+    Trunk-shared embed/lm_head live OUTSIDE the module tree (bind_trunk) so
+    this can never touch them. The draft head tolerates quantization by
+    design — drafts are proposals, the trunk verify guards exactness.
     """
     q = config.get("quantization") or config.get("quantization_config") or {}
     if not q or "bits" not in q or "group_size" not in q:
         return
 
     already_quantized = any(k.endswith(".scales") for k in weights)
+    if (already_quantized and when != "pre_load") or (
+            not already_quantized and when != "post_load"):
+        return
 
     def predicate(path: str, m: Any):
         if not hasattr(m, "to_quantized"):
             return False
         if already_quantized:
             return f"{path}.scales" in weights
-        return f"{path}.weight" in weights
+        return True
 
     nn.quantize(module, group_size=int(q["group_size"]), bits=int(q["bits"]),
                 mode=q.get("mode", "affine"), class_predicate=predicate)
@@ -324,8 +359,10 @@ def load_native_mtp(model: Any, model_dir: str | Path, *,
         return None
     mapped = _rewrite_weights(raw, spec, args)
     if quantize:
-        _maybe_quantize(module, config, mapped)
+        _maybe_quantize(module, config, mapped, when="pre_load")
     module.load_weights(list(mapped.items()), strict=False)
+    if quantize:
+        _maybe_quantize(module, config, mapped, when="post_load")
     mx.eval(module.parameters())
 
     from mlx.utils import tree_flatten

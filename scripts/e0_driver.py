@@ -67,10 +67,15 @@ def _spawn(rank: int, world: int, args, hostfile: str, spec: bool,
         env["RUNNER_NUM_DRAFT_TOKENS"] = str(args.num_draft)
         env["RUNNER_SPEC_MULTIRANK"] = "1"
     err = open(logdir / f"rank{rank}.stderr", "w")
+    # Rank>0 stdout MUST be discarded: runner emit() writes on every rank and
+    # an unread PIPE back-pressures the process mid-collective — the #23
+    # deadlock (reproduced tonight: rank1 blocked on stdout write, rank0
+    # blocked waiting for it in the ring op, both at 0% CPU).
     return subprocess.Popen(
         [sys.executable, str(Path(__file__).parent / "runner.py")],
-        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=err,
-        env=env, text=True, bufsize=1,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE if rank == 0 else subprocess.DEVNULL,
+        stderr=err, env=env, text=True, bufsize=1,
     )
 
 
