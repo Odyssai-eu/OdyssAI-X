@@ -2312,8 +2312,11 @@ class RunnerPool:
         req["enable_thinking"] = enable_thinking
         # reasoning_effort: forwarded as a chat-template kwarg (Step-3.7 reads
         # it). Only set when non-empty so models that don't read it are untouched.
+        # Remapped onto the model's accepted vocabulary first (Hy3 release
+        # template raises on values outside no_think/low/high).
         if reasoning_effort:
-            req["reasoning_effort"] = reasoning_effort
+            req["reasoning_effort"] = _map_reasoning_effort(
+                self.model, reasoning_effort)
         if session_id:
             req["session_id"] = session_id
         # Native-MTP per-request activation (plan D7): identical on every
@@ -3172,6 +3175,29 @@ _MODELS_REASONING_EFFORT_DEFAULT = {
     "step-3.7": "minimal",
     "step3p7": "minimal",
 }
+
+# Per-model remap of the OpenAI-convention efforts (minimal/low/medium/high)
+# onto what the model's chat template actually accepts. The Hy3 2026-07
+# release template VALIDATES the value and raises TemplateError on anything
+# outside no_think/low/high — which killed the pool at first inference when
+# Companion sent its "medium" default (2026-07-08). Keyed by lowercase
+# substring of the model id; inner map keyed by lowercase incoming effort.
+# Values absent from the inner map pass through unchanged.
+_MODELS_REASONING_EFFORT_MAP = {
+    "hy3": {"minimal": "low", "medium": "high"},
+}
+
+
+def _map_reasoning_effort(model_id: Optional[str],
+                          effort: Optional[str]) -> Optional[str]:
+    """Translate a caller effort onto the model's accepted vocabulary."""
+    if not effort or not model_id:
+        return effort
+    needle = model_id.lower()
+    for key, table in _MODELS_REASONING_EFFORT_MAP.items():
+        if key in needle:
+            return table.get(effort.lower(), effort)
+    return effort
 
 
 def _model_auto_opens_think(model_id: Optional[str]) -> bool:
@@ -4282,7 +4308,7 @@ def _initial_default_config() -> Optional[dict]:
 #   major (1.7.2 → 2.0.0) — breaking API or topology change
 #
 # Use `./scripts/bump-version.sh patch|minor|major` to bump + auto-commit.
-APP_VERSION = "1.15.1"
+APP_VERSION = "1.15.2"
 
 app = FastAPI(
     title="OdyssAI-X (odyssai.eu)",

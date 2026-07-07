@@ -2138,18 +2138,36 @@ def _run_legacy_main(model, tokenizer, repo: str, kv_q8_default: bool,
             chat_kwargs["reasoning_effort"] = reasoning_effort
         if tools:
             chat_kwargs["tools"] = tools
-        try:
-            templated = tokenizer.apply_chat_template(messages, **chat_kwargs)
-        except Exception as e:
-            # Some tokenizers reject `tools=` for templates that don't support
-            # tool calling. Drop tools and retry, surfacing a warning.
-            if tools:
-                log(f"chat template rejected tools ({e}); retrying without")
-                chat_kwargs.pop("tools", None)
-                templated = tokenizer.apply_chat_template(messages, **chat_kwargs)
-                tools = None
-            else:
+        def _apply_template_with_fallbacks():
+            """apply_chat_template with a retry ladder on OPTIONAL kwargs a
+            template may reject — a bad optional must degrade, never kill the
+            rank (2026-07-08: the Hy3 release template VALIDATES
+            reasoning_effort and raises on "medium" → whole pool died)."""
+            nonlocal tools
+            try:
+                return tokenizer.apply_chat_template(messages, **chat_kwargs)
+            except Exception as e:
+                # 1. Tokenizers that reject `tools=` (template without tool
+                #    support). Drop and retry.
+                if tools:
+                    log(f"chat template rejected tools ({e}); retrying without")
+                    chat_kwargs.pop("tools", None)
+                    tools = None
+                    try:
+                        return tokenizer.apply_chat_template(messages, **chat_kwargs)
+                    except Exception as e2:
+                        e = e2
+                # 2. Templates that validate reasoning_effort (Hy3 release:
+                #    no_think/low/high only). Drop the dial and retry —
+                #    template default beats a dead pool.
+                if chat_kwargs.get("reasoning_effort"):
+                    log(f"chat template rejected reasoning_effort="
+                        f"{chat_kwargs['reasoning_effort']!r} ({e}); retrying without")
+                    chat_kwargs.pop("reasoning_effort", None)
+                    return tokenizer.apply_chat_template(messages, **chat_kwargs)
                 raise
+
+        templated = _apply_template_with_fallbacks()
 
         # Tokenize the templated prompt. We need the full token list for prefix
         # cache lookup; on a hit we'll feed only the suffix.
