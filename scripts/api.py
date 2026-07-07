@@ -751,6 +751,18 @@ TENSOR_CAPABLE_MODEL_TYPES = frozenset({
     "gpt_oss", "step3p5", "nemotron_h", "gemma4",
 })
 
+# Model types whose pipeline path is a runner-side patch (patches/) rather than
+# mlx-lm auto_parallel. auto_parallel (use_ap=True) would (a) read the wrong
+# config key — longcat2 exposes `num_layers`, not `num_hidden_layers`, so the
+# shard_pipeline path raises "could not find num_hidden_layers" and every rank
+# dies at startup — and (b) bypass our pipeline() patch, so ngram_embeddings
+# (272.8 GB) would NOT be dropped off the non-first ranks and OOM the cluster.
+# For these we FORCE use_ap=False at load so the sharded_load(pipeline_group)
+# path (which calls model.model.pipeline() = our patch) is taken. The dashboard
+# default is use_ap=True, which is why a hand load without the flag "failed tout
+# le temps".
+FORCE_NO_AP_MODEL_TYPES = frozenset({"longcat2"})
+
 
 def _resolve_model_abspath(model: str, base_dir: str) -> str:
     """Resolve a model id to an absolute path on the node. A leading '/' is
@@ -10936,6 +10948,18 @@ async def admin_cluster_load(cluster_id: str, req: ArgoLoadRequest):
             "hint": "Pick a valid (nodes, mode) combo — see GET "
                     f"/admin/clusters/{cluster_id}/load-options?model={req.model}",
         })
+
+    # Force use_ap=False for model types whose pipeline is a runner-side patch
+    # (longcat2 — see FORCE_NO_AP_MODEL_TYPES). The dashboard defaults use_ap
+    # to True, which routes to auto_parallel: it reads `num_hidden_layers`
+    # (longcat2 has `num_layers`) and skips our ngram-dropping pipeline() patch.
+    if req.use_ap and arch.get("model_type") in FORCE_NO_AP_MODEL_TYPES:
+        sys.stderr.write(
+            f"[load] {cluster_id}: model_type={arch.get('model_type')} requires "
+            f"the runner-side pipeline patch — forcing use_ap=False "
+            f"(auto_parallel would die on num_hidden_layers / skip the patch)\n"
+        )
+        req.use_ap = False
 
     size_bytes = await get_model_size_bytes(rank0_ssh, model_abspath)
     ok, reason, detail = _validate_load_fits(size_bytes, cluster_id, nodes_count,
