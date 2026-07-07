@@ -227,17 +227,48 @@ class Model(nn.Module):
         return self.lm_head(out)
 
     def sanitize(self, weights):
-        # Le quant InferencerLabs est déjà au layout final (switch_mlp fused,
-        # router.gate, router.expert_bias, shared_mlp). On droppe seulement les
-        # éventuels vestiges : tête MTP (num_nextn_predict_layers) et inv_freq.
-        return {
-            k: v
-            for k, v in weights.items()
-            if "rotary_emb.inv_freq" not in k
-            and ".mtp" not in k
-            and "nextn" not in k
-            and not k.startswith("model.mtp")
-        }
+        # Deux layouts possibles en entrée :
+        #  - quant InferencerLabs : déjà au layout final (switch_mlp fused,
+        #    router.gate, router.expert_bias, shared_mlp) → rien à mapper ;
+        #  - release HF brut tencent/Hy3 (2026-07) : experts PAR INDEX
+        #    (mlp.experts.E.{gate,up,down}_proj) + expert_bias directement sous
+        #    mlp → il faut stacker les 192 experts en switch_mlp (pattern
+        #    longcat2) et déplacer expert_bias sous router. Le reste
+        #    (router.gate, shared_mlp, attention GQA) matche déjà.
+        def _keep(k):
+            if "rotary_emb.inv_freq" in k or ".mtp" in k or "nextn" in k:
+                return False
+            if k.startswith("model.mtp"):
+                return False
+            # Release HF 2026-07 : la tête MTP est nommée model.layers.80.*
+            # (eh_proj/enorm/hnorm…) au-delà du trunk 0..79 — on la droppe
+            # comme longcat2 droppe ses layers hors num_layers.
+            parts = k.split(".")
+            if (len(parts) >= 3 and parts[1] == "layers" and parts[2].isdigit()
+                    and int(parts[2]) >= self.args.num_hidden_layers):
+                return False
+            return True
+
+        weights = {k: v for k, v in weights.items() if _keep(k)}
+
+        if not any(".mlp.experts." in k for k in weights):
+            return weights  # layout final (InferencerLabs) — inchangé
+
+        n_experts = self.args.num_experts
+        for l in range(self.args.num_hidden_layers):
+            prefix = f"model.layers.{l}.mlp"
+            if f"{prefix}.experts.0.gate_proj.weight" not in weights:
+                continue  # layer dense (layer 0)
+            for m in ("gate_proj", "up_proj", "down_proj"):
+                to_join = [
+                    weights.pop(f"{prefix}.experts.{e}.{m}.weight")
+                    for e in range(n_experts)
+                ]
+                weights[f"{prefix}.switch_mlp.{m}.weight"] = mx.stack(to_join)
+            bias_key = f"{prefix}.expert_bias"
+            if bias_key in weights:
+                weights[f"{prefix}.router.expert_bias"] = weights.pop(bias_key)
+        return weights
 
     @property
     def cast_predicate(self):
