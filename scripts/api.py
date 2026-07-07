@@ -769,6 +769,7 @@ FORCE_NO_AP_MODEL_TYPES = frozenset({"longcat2"})
 # dashboard can show the "Enable MTP" checkbox only when it would work.
 MTP_FAMILY_MODEL_TYPES = frozenset({
     "glm_moe_dsa", "deepseek_v32", "deepseek_v3", "kimi_k2",
+    "hy_v3",   # binding 2026-07-07 (GQA + final_layernorm, mtp_module registry)
 })
 
 
@@ -4281,7 +4282,7 @@ def _initial_default_config() -> Optional[dict]:
 #   major (1.7.2 → 2.0.0) — breaking API or topology change
 #
 # Use `./scripts/bump-version.sh patch|minor|major` to bump + auto-commit.
-APP_VERSION = "1.15.0"
+APP_VERSION = "1.15.1"
 
 app = FastAPI(
     title="OdyssAI-X (odyssai.eu)",

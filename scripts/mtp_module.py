@@ -44,8 +44,41 @@ def _log(msg: str) -> None:
 # ──────────────────────────────────────────────────────────────────────────────
 
 # model_type → family. A family fixes: layer class, weight layout, and which
-# pieces are shared with the trunk. Extend here for new architectures.
-_DEEPSEEK_FAMILY = {"glm_moe_dsa", "deepseek_v32", "deepseek_v3", "kimi_k2"}
+# pieces are shared with the trunk. Extend here for new architectures (and
+# mirror in api.py MTP_FAMILY_MODEL_TYPES for the dashboard checkbox).
+#
+#  deepseek : MLA attention (kv_b absorption), CacheList(KVCache, KVCache) per
+#             layer, shared_head.norm -> final norm, args.n_routed_experts.
+#  hy_v3    : GQA + q/k-norm (no kv_b), plain KVCache, final_layernorm -> final
+#             norm, mlp.expert_bias lives under router, args.num_experts.
+#             Hidden contract: PRE-norm trunk hidden (vLLM hy_v3_mtp.py) —
+#             prefer hidden_source="pre" at activation.
+_FAMILY_BY_MODEL_TYPE = {
+    "glm_moe_dsa": "deepseek", "deepseek_v32": "deepseek",
+    "deepseek_v3": "deepseek", "kimi_k2": "deepseek",
+    "hy_v3": "hy_v3",
+}
+
+
+def _family_layer_cls(family: str):
+    """The trunk decoder-layer class this family's MTP block instantiates.
+    Both share the (args, layer_idx) __init__ signature."""
+    if family == "hy_v3":
+        from mlx_lm.models.hy_v3 import DecoderLayer
+        return DecoderLayer
+    from mlx_lm.models.deepseek_v32 import DeepseekV32DecoderLayer
+    return DeepseekV32DecoderLayer
+
+
+def _family_cache_factory(family: str):
+    """Per-layer cache shape: dsv32 layers read a CacheList (main + indexer
+    KV); hy_v3's GQA attention consumes a plain KVCache directly."""
+    def _factory():
+        from mlx_lm.models.cache import CacheList, KVCache
+        if family == "hy_v3":
+            return [KVCache()]
+        return [CacheList(KVCache(), KVCache())]
+    return _factory
 
 
 class MTPSpec:
@@ -88,7 +121,8 @@ def detect_native_mtp(model_dir: str | Path,
         return None
 
     model_type = str(config.get("model_type", "")).lower()
-    if model_type not in _DEEPSEEK_FAMILY:
+    family = _FAMILY_BY_MODEL_TYPE.get(model_type)
+    if family is None:
         return None
     n_layers = int(config.get("num_hidden_layers") or 0)
     if not n_layers:
@@ -104,7 +138,7 @@ def detect_native_mtp(model_dir: str | Path,
             extra = {int(k.split(".")[2]) for k in keys
                      if k.startswith("model.layers.")
                      and int(k.split(".")[2]) >= n_layers}
-            return MTPSpec("deepseek", n_layers, len(extra),
+            return MTPSpec(family, n_layers, len(extra),
                            "model_index", idx_path)
 
     # 2. Sidecar recovered from the original repo.
@@ -116,7 +150,7 @@ def detect_native_mtp(model_dir: str | Path,
         if cand.is_dir():
             cand = cand / "mtp-sidecar.safetensors"
         if cand.exists():
-            return MTPSpec("deepseek", n_layers, 1, "sidecar", cand)
+            return MTPSpec(family, n_layers, 1, "sidecar", cand)
 
     return None
 
@@ -136,14 +170,18 @@ class NativeMTPModule(nn.Module):
     F-32).
     """
 
-    def __init__(self, args: Any, layer_cls: Callable, layer_idx: int):
+    def __init__(self, args: Any, layer_cls: Callable, layer_idx: int,
+                 family: str = "deepseek"):
         super().__init__()
         hs = int(args.hidden_size)
         eps = float(args.rms_norm_eps)
+        self.family = family
         self.enorm = nn.RMSNorm(hs, eps=eps)
         self.hnorm = nn.RMSNorm(hs, eps=eps)
         self.eh_proj = nn.Linear(2 * hs, hs, bias=False)
         self.mtp_block = layer_cls(args, layer_idx=layer_idx)
+        # deepseek: shared_head.norm; hy_v3: final_layernorm — both load into
+        # this slot via the family rename in _rewrite_weights.
         self.shared_head_norm = nn.RMSNorm(hs, eps=eps)
         # Trunk references bound at load time. They MUST stay OUT of this
         # module's tree: nn.Module.__setattr__ registers any Module child
@@ -166,11 +204,10 @@ class NativeMTPModule(nn.Module):
         if lm is None:
             lm = inner.embed_tokens.as_linear
         object.__setattr__(self, "_lm_head", lm)
-        # One CacheList(KVCache, KVCache) per dsv32-style layer.
-        def _factory():
-            from mlx_lm.models.cache import CacheList, KVCache
-            return [CacheList(KVCache(), KVCache())]
-        object.__setattr__(self, "_cache_factory", _factory)
+        # Cache shape is family-dependent (CacheList for dsv32, plain KVCache
+        # for hy_v3's GQA) — resolved from the registry.
+        object.__setattr__(self, "_cache_factory",
+                           _family_cache_factory(self.family))
 
     def make_cache(self) -> list:
         assert self._cache_factory is not None, "bind_trunk() first"
@@ -249,6 +286,13 @@ def _rewrite_weights(raw: dict[str, mx.array], spec: MTPSpec,
             continue  # shared with trunk
         if suffix.startswith("shared_head.norm."):
             flat["shared_head_norm." + suffix[len("shared_head.norm."):]] = v
+        elif spec.family == "hy_v3" and suffix.startswith("final_layernorm."):
+            # hy_v3 names its pre-lm_head norm final_layernorm — same slot.
+            flat["shared_head_norm." + suffix[len("final_layernorm."):]] = v
+        elif spec.family == "hy_v3" and suffix == "mlp.expert_bias":
+            # Raw HF puts expert_bias directly under mlp; the vendored hy_v3
+            # Router owns it (same move the trunk sanitize does).
+            flat["mtp_block.mlp.router.expert_bias"] = v
         elif suffix.startswith(("enorm.", "hnorm.", "eh_proj.")):
             flat[suffix] = v
         else:
@@ -271,8 +315,10 @@ def _rewrite_weights(raw: dict[str, mx.array], spec: MTPSpec,
         flat["mtp_block.self_attn.unembed_out.weight"] = mx.contiguous(
             v[:, nope:, :])
 
-    # Stack per-expert tensors into the SwitchGLU layout the dsv32 layer uses.
-    n_routed = int(getattr(args, "n_routed_experts", 0) or 0)
+    # Stack per-expert tensors into the SwitchGLU layout the MoE layer uses.
+    # deepseek args name it n_routed_experts; hy_v3 args name it num_experts.
+    n_routed = int(getattr(args, "n_routed_experts", 0)
+                   or getattr(args, "num_experts", 0) or 0)
     if n_routed and f"mtp_block.mlp.experts.0.gate_proj.weight" in flat:
         for mod in ("gate_proj", "down_proj", "up_proj"):
             for leaf in ("weight", "scales", "biases"):
@@ -345,12 +391,13 @@ def load_native_mtp(model: Any, model_dir: str | Path, *,
         return None
 
     try:
-        from mlx_lm.models.deepseek_v32 import DeepseekV32DecoderLayer
+        layer_cls = _family_layer_cls(spec.family)
     except Exception as e:
-        _log(f"deepseek_v32 layer import failed ({e})")
+        _log(f"{spec.family} layer import failed ({e})")
         return None
 
-    module = NativeMTPModule(args, DeepseekV32DecoderLayer, spec.start_layer)
+    module = NativeMTPModule(args, layer_cls, spec.start_layer,
+                             family=spec.family)
     module.bind_trunk(model)
 
     # FAST PATH — pre-quantized module-layout sidecar. Loading the bf16
@@ -430,16 +477,19 @@ def build_prequantized_sidecar(model_dir: str | Path,
     RAM; the result loads per-rank with no bf16 stack spike. Uses a stub
     trunk (bind only stores embed/lm_head refs — never called here)."""
     from mlx.utils import tree_flatten
-    from mlx_lm.models.deepseek_v32 import DeepseekV32DecoderLayer
 
     model_dir = Path(model_dir)
     config = _read_config(model_dir)
     spec = detect_native_mtp(model_dir, sidecar_env=sidecar)
     if spec is None:
         raise RuntimeError("no native MTP sidecar found to pre-quantize")
+    layer_cls = _family_layer_cls(spec.family)
 
     # Minimal ModelArgs for the layer + a stub trunk carrying embed/lm_head.
-    from mlx_lm.models.glm_moe_dsa import ModelArgs
+    if spec.family == "hy_v3":
+        from mlx_lm.models.hy_v3 import ModelArgs
+    else:
+        from mlx_lm.models.glm_moe_dsa import ModelArgs
     args = ModelArgs.from_dict(config)
 
     class _Stub(nn.Module):
@@ -452,7 +502,8 @@ def build_prequantized_sidecar(model_dir: str | Path,
             self.lm_head = nn.Linear(int(config["hidden_size"]),
                                      int(config["vocab_size"]), bias=False)
 
-    module = NativeMTPModule(args, DeepseekV32DecoderLayer, spec.start_layer)
+    module = NativeMTPModule(args, layer_cls, spec.start_layer,
+                             family=spec.family)
     module.bind_trunk(_Stub())
     raw = _load_source_weights(spec, model_dir)
     mapped = _rewrite_weights(raw, spec, args)
