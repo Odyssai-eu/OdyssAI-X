@@ -4336,8 +4336,9 @@ async def _admin_token_middleware(request: Request, call_next):
     public_always = (
         path == "/admin/discovery/state"        # watcher poll
     )
-    # Public only while the discovery gate is open:
-    if path == "/admin/pair" and get_discovery_state().get("active"):
+    # Public while the discovery gate is open, OR with a valid pre-shared enroll
+    # secret (CodeOS clients: no operator window). Companion window flow unaffected.
+    if path == "/admin/pair" and (get_discovery_state().get("active") or _valid_enroll_secret(request)):
         public_always = True
     # /admin/crew/self accepts a crew bearer (not admin):
     if path == "/admin/crew/self" and request.method == "DELETE" and bearer:
@@ -6423,6 +6424,17 @@ def _hash_token(plain: str) -> str:
     return hashlib.sha256(plain.encode("utf-8")).hexdigest()
 
 
+def _valid_enroll_secret(request: "Request") -> bool:
+    """CodeOS clients pair without the operator window: a pre-shared enrollment
+    secret (env CODEOS_ENROLL_SECRET) presented in X-Codeos-Enroll. Constant-time.
+    Feature is OFF unless the env var is set (Companion window flow unaffected)."""
+    expected = os.environ.get("CODEOS_ENROLL_SECRET", "")
+    if not expected:
+        return False
+    presented = request.headers.get("x-codeos-enroll", "")
+    return bool(presented) and secrets.compare_digest(presented, expected)
+
+
 def get_crew() -> list[dict]:
     cfg = _load_cluster_config()
     return cfg.get("crew", []) or []
@@ -6521,12 +6533,14 @@ class PairRequest(BaseModel):
 
 
 @app.post("/admin/pair")
-async def admin_pair(req: PairRequest):
-    """Pair a new client. Only callable while discovery is active. Returns
-    a crew token (plaintext, ONCE) and the engine metadata for auto-config."""
+async def admin_pair(req: PairRequest, request: Request):
+    """Pair a new client. Callable while discovery is active OR with a valid
+    pre-shared enrollment secret (CodeOS). Returns a crew token (plaintext, ONCE)
+    and the engine metadata for auto-config."""
     state = get_discovery_state()
-    if not state.get("active"):
-        raise HTTPException(403, "discovery gate is closed — ask the operator to enable it")
+    enrolled = _valid_enroll_secret(request)
+    if not state.get("active") and not enrolled:
+        raise HTTPException(403, "discovery gate is closed — enable it or present a valid enroll secret")
 
     if not req.client_id or not req.client_name:
         raise HTTPException(400, "client_id and client_name required")
@@ -6552,11 +6566,17 @@ async def admin_pair(req: PairRequest):
     crew.append(entry)
     save_crew(crew)
 
-    # Auto-close the gate
-    set_discovery_state({"active": False, "started_at": None, "expires_at": None})
-    sys.stderr.write(
-        f"[discovery] gate CLOSED (pair success: {req.client_name} → {crew_id})\n"
-    )
+    # Auto-close the gate ONLY if it was the operator-window flow. An enroll-secret
+    # pairing (CodeOS) does not touch the gate — nothing was opened.
+    if state.get("active"):
+        set_discovery_state({"active": False, "started_at": None, "expires_at": None})
+        sys.stderr.write(
+            f"[discovery] gate CLOSED (pair success: {req.client_name} → {crew_id})\n"
+        )
+    else:
+        sys.stderr.write(
+            f"[enroll] CodeOS pair success: {req.client_name} → {crew_id}\n"
+        )
 
     return {
         "ok": True,
