@@ -4985,6 +4985,10 @@ function renderFormRow2(f, busy, presence, fitCheck) {
   // fitCheck — no risk of disagreement between the pills and the Load
   // button about which N is loadable.
   const selectedModel = f.default_model;
+  // Native-MTP checkbox: only when load-options says the sidecar is at the
+  // canonical path AND the runner has a family binding for this model_type.
+  const loKey = `${state.selected_cluster}::${selectedModel}`;
+  const mtpAvailable = Boolean(state.load_options[loKey]?.model_meta?.mtp_available);
   const optN = selectedModel ? optimalNodesForModel(state.selected_cluster, selectedModel) : null;
   const fitByN = {};
   for (const n of nodeChoices) {
@@ -5033,6 +5037,12 @@ function renderFormRow2(f, busy, presence, fitCheck) {
             <span class="check-text">KV cache Q8</span>
             <span class="check-hint">long contexts</span>
           </label>
+          ${mtpAvailable ? `
+          <label data-act="form-default-mtp" title="Native-MTP speculative decoding — mtp-sidecar/ detected for this model">
+            <div class="box ${f.default_mtp?"on":""}">${f.default_mtp?Icon.check:""}</div>
+            <span class="check-text">Enable MTP</span>
+            <span class="check-hint">sidecar present</span>
+          </label>` : ""}
         </div>
       </div>
       <div style="flex:1"></div>
@@ -5060,6 +5070,7 @@ function isLoadConfigChanged(a, f) {
     (f.default_mode || "pipeline") !== a.mode ||
     Boolean(f.default_use_ap) !== Boolean(a.use_ap) ||
     Boolean(f.default_kv_q8) !== Boolean(a.kv_q8) ||
+    Boolean(f.default_mtp) !== Boolean(a.mtp && a.mtp.enabled) ||
     (f.default_draft || "") !== (a.draft_model || "")
   );
 }
@@ -6825,6 +6836,7 @@ async function handleAct(e) {
   if (act === "form-default-mode") { if (e.type==="click") { f.default_mode = v; render(); } return; }
   if (act === "form-default-ap")   { if (e.type==="click") { f.default_use_ap = !f.default_use_ap; render(); } return; }
   if (act === "form-default-kv-q8"){ if (e.type==="click") { f.default_kv_q8 = !f.default_kv_q8; render(); } return; }
+  if (act === "form-default-mtp")  { if (e.type==="click") { f.default_mtp = !f.default_mtp; render(); } return; }
   if (act === "form-default-nodes"){ if (e.type==="click") {
     f.default_nodes = parseInt(v);
     f.default_nodes_user_picked = true;  // respect this choice on next model change
@@ -6891,6 +6903,13 @@ async function handleAct(e) {
       if (f.default_draft && f.default_draft.trim()) {
         body.draft_model = f.default_draft.trim();
         body.num_draft_tokens = f.default_num_draft || 4;
+      }
+      // Native-MTP: only when the checkbox is on AND load-options confirmed a
+      // usable sidecar for THIS model (the checkbox may be stale from a
+      // previously selected model — availability re-gates it here).
+      const mtpMeta = state.load_options[`${state.selected_cluster}::${model}`]?.model_meta;
+      if (f.default_mtp && mtpMeta?.mtp_available) {
+        body.mtp = { enabled: true, depth: 3 };
       }
       const r = await postJson(`/admin/clusters/${state.selected_cluster}/load`, body);
       // Tolerate BOTH response shapes: a distributed text load (has nodes/load_s)

@@ -763,6 +763,31 @@ TENSOR_CAPABLE_MODEL_TYPES = frozenset({
 # le temps".
 FORCE_NO_AP_MODEL_TYPES = frozenset({"longcat2"})
 
+# Mirror of mtp_module._DEEPSEEK_FAMILY — the model_types whose native-MTP
+# binding exists in the runner. Keep in sync when a new family binding lands
+# (hy_v3 pending). Used by load-options to expose `mtp_available` so the
+# dashboard can show the "Enable MTP" checkbox only when it would work.
+MTP_FAMILY_MODEL_TYPES = frozenset({
+    "glm_moe_dsa", "deepseek_v32", "deepseek_v3", "kimi_k2",
+})
+
+
+async def probe_mtp_sidecar(ssh: str, abspath: str) -> bool:
+    """True when `<model_dir>/mtp-sidecar/mtp-sidecar.safetensors` exists on the
+    node — the canonical auto-discovery location mtp_module.detect_native_mtp
+    checks (its RUNNER_MTP_SIDECAR-less fallback). One cheap ssh test."""
+    p = abspath.rstrip("/") + "/mtp-sidecar/mtp-sidecar.safetensors"
+    try:
+        out = await asyncio.to_thread(
+            subprocess.run,
+            ["ssh", "-o", "ConnectTimeout=5", "-o", "BatchMode=yes", ssh,
+             f"test -f {shlex.quote(p)} && echo yes"],
+            capture_output=True, text=True, timeout=15,
+        )
+        return out.stdout.strip() == "yes"
+    except Exception:
+        return False
+
 
 def _resolve_model_abspath(model: str, base_dir: str) -> str:
     """Resolve a model id to an absolute path on the node. A leading '/' is
@@ -4256,7 +4281,7 @@ def _initial_default_config() -> Optional[dict]:
 #   major (1.7.2 → 2.0.0) — breaking API or topology change
 #
 # Use `./scripts/bump-version.sh patch|minor|major` to bump + auto-commit.
-APP_VERSION = "1.14.2"
+APP_VERSION = "1.15.0"
 
 app = FastAPI(
     title="OdyssAI-X (odyssai.eu)",
@@ -10638,6 +10663,11 @@ async def admin_cluster_load_options(cluster_id: str, model: str):
     mt = arch.get("model_type")
     layers = arch.get("num_hidden_layers")
     kv = arch.get("num_key_value_heads")
+    # Native-MTP availability: sidecar at the canonical auto-discovery path AND
+    # a runner-side family binding for this model_type. Drives the dashboard's
+    # "Enable MTP" checkbox (shown only when a load would actually pick it up).
+    mtp_sidecar = await probe_mtp_sidecar(rank0_ssh, model_abspath)
+    mtp_family = (mt in MTP_FAMILY_MODEL_TYPES) if mt else False
 
     options = []
     for n in range(1, effective_max + 1):
@@ -10672,6 +10702,9 @@ async def admin_cluster_load_options(cluster_id: str, model: str):
             "size_bytes": size_bytes,
             "size_gb": round(size_bytes / 1024**3, 1) if size_bytes else None,
             "tensor_capable": (mt in TENSOR_CAPABLE_MODEL_TYPES) if mt else None,
+            "mtp_sidecar_present": mtp_sidecar,
+            "mtp_family_supported": mtp_family,
+            "mtp_available": bool(mtp_sidecar and mtp_family),
         },
     }
 
