@@ -2869,7 +2869,7 @@ def save_cluster_state_v2(cluster_id: str, *,
             "kv_q8": pool.kv_q8,
             "draft_model": pool.draft_model,
             "num_draft_tokens": pool.num_draft_tokens,
-            "mtp": pool.mtp_cfg,
+            "mtp": getattr(pool, "mtp_cfg", None),
             "backend": getattr(pool, "backend", None),
         })
     # Merge the live shapes over the existing on-disk DESIRED entries.
@@ -4100,7 +4100,7 @@ def _pool_reload_request(pool: RunnerPool) -> ArgoLoadRequest:
         model=pool.model, mode=pool.mode, use_ap=pool.use_ap,
         nodes=pool.nodes_count, kv_q8=pool.kv_q8,
         draft_model=pool.draft_model, num_draft_tokens=pool.num_draft_tokens,
-        mtp=pool.mtp_cfg,
+        mtp=getattr(pool, "mtp_cfg", None),
         force=True, alias=pool.alias, node_indices=pool.node_indices,
         # The reload targets the SAME alias on purpose (stop-old-start-new).
         # Without this the #64 explicit-alias collision guard 409s every
@@ -4371,7 +4371,7 @@ def _initial_default_config() -> Optional[dict]:
 #   major (1.7.2 → 2.0.0) — breaking API or topology change
 #
 # Use `./scripts/bump-version.sh patch|minor|major` to bump + auto-commit.
-APP_VERSION = "1.16.1"
+APP_VERSION = "1.16.2"
 
 app = FastAPI(
     title="OdyssAI-X (odyssai.eu)",
@@ -8667,9 +8667,9 @@ async def admin_status():
             "kv_q8": _pool.kv_q8,
             "draft_model": _pool.draft_model,
             "num_draft_tokens": _pool.num_draft_tokens if _pool.draft_model else None,
-            "mtp": ({**_pool.mtp_cfg, "tripped": _pool.mtp_tripped,
-                     "accept_rate": _pool.mtp_accept_rate}
-                    if _pool.mtp_cfg else None),
+            "mtp": ({**_pool.mtp_cfg, "tripped": getattr(_pool, "mtp_tripped", False),
+                     "accept_rate": getattr(_pool, "mtp_accept_rate", None)}
+                    if getattr(_pool, "mtp_cfg", None) else None),
             "alive": _pool.alive_count(),
             "load_s": _pool.load_s, "uptime_s": uptime,
             "recent_avg_tps": round(sum(recent_tps) / len(recent_tps), 2) if recent_tps else None,
@@ -10807,9 +10807,12 @@ async def admin_cluster_status(cluster_id: str):
             "kv_q8": pool.kv_q8,
             "draft_model": pool.draft_model,
             "num_draft_tokens": pool.num_draft_tokens if pool.draft_model else None,
-            "mtp": ({**pool.mtp_cfg, "tripped": pool.mtp_tripped,
-                     "accept_rate": pool.mtp_accept_rate}
-                    if pool.mtp_cfg else None),
+            # getattr: the pool registry is polymorphic (RunnerPool/VLMPool/
+            # VLMDistPool) and VLMPool has no mtp_* attributes — a bare access
+            # 500'd every /status once the VLM pool was re-adopted (2026-07-08).
+            "mtp": ({**pool.mtp_cfg, "tripped": getattr(pool, "mtp_tripped", False),
+                     "accept_rate": getattr(pool, "mtp_accept_rate", None)}
+                    if getattr(pool, "mtp_cfg", None) else None),
             "alive": pool.alive_count(),
             "load_s": pool.load_s,
             "uptime_s": uptime_p,
