@@ -4371,7 +4371,7 @@ def _initial_default_config() -> Optional[dict]:
 #   major (1.7.2 → 2.0.0) — breaking API or topology change
 #
 # Use `./scripts/bump-version.sh patch|minor|major` to bump + auto-commit.
-APP_VERSION = "1.16.4"
+APP_VERSION = "1.16.5"
 
 app = FastAPI(
     title="OdyssAI-X (odyssai.eu)",
@@ -11879,19 +11879,50 @@ async def _vlm_pool_proxy_chat_completion(pool, body: dict, stream: bool):
         forward_body["stream_options"] = _so
     pool.last_used_at = time.time()
     # #61 — register the run so per-pool activity (stage/tokens/tok-s) shows
-    # VL generations too, not just RunnerProc pools. Display-oriented:
-    # cancellation is not wired through the proxy (upstream has no cancel).
+    # VL generations too, not just RunnerProc pools.
+    # 2026-07-08 fix: cancel_event WAS discarded here, so an explicit cancel
+    # (POST /admin/runs/{rid}/cancel — the Companion "stop" button, distinct
+    # from an actual client disconnect) had zero effect on a VL generation:
+    # nothing in this function ever checked it, unlike the text path (see
+    # RunnerPool.submit() callers) which breaks its loop on `cancel_event.
+    # is_set()`. Verified against mlx-vlm 0.6.3 source on the upstream node
+    # (server/generation.py TokenQueue.close(): closing/GC'ing the consumer
+    # calls `_cancel_fn(uid)` — so breaking OUR loop and letting `async with
+    # client.stream(...)` close the connection DOES propagate a real cancel
+    # to the upstream generation, even though mlx-vlm's only explicit HTTP
+    # cancel route (`/responses/{id}/cancel`) is a different, unrelated API
+    # family that /chat/completions never registers into).
     _rid = f"vlm-{uuid.uuid4().hex[:8]}"
-    _runs_register(_rid, model=label, cluster=pool.cluster,
-                   pool_alias=pool.alias, client="vlm-pool-proxy",
-                   max_tokens=int(body.get("max_tokens") or 0),
-                   kind="streaming" if stream else "unary")
+    _vlm_cancel_event = _runs_register(
+        _rid, model=label, cluster=pool.cluster,
+        pool_alias=pool.alias, client="vlm-pool-proxy",
+        max_tokens=int(body.get("max_tokens") or 0),
+        kind="streaming" if stream else "unary")
     import httpx
     if not stream:
         _t0 = time.time()
         try:
             async with httpx.AsyncClient(timeout=300.0) as client:
-                r = await client.post(f"{upstream}/v1/chat/completions", json=forward_body)
+                _post_task = asyncio.ensure_future(
+                    client.post(f"{upstream}/v1/chat/completions", json=forward_body))
+                _cancel_wait = asyncio.ensure_future(_vlm_cancel_event.wait())
+                done, pending = await asyncio.wait(
+                    {_post_task, _cancel_wait}, return_when=asyncio.FIRST_COMPLETED)
+                if _post_task not in done:
+                    # Cancel requested before the upstream responded: drop the
+                    # in-flight request (closing the client aborts the socket,
+                    # which is the same disconnect-driven cancel the streaming
+                    # path relies on) instead of waiting out the full 300s.
+                    _post_task.cancel()
+                    for _p in pending:
+                        _p.cancel()
+                    _runs_finalize(_rid, status="cancelled")
+                    raise HTTPException(499, "VL generation cancelled")
+                for _p in pending:
+                    _p.cancel()
+                r = _post_task.result()
+        except HTTPException:
+            raise
         except Exception as e:
             _runs_finalize(_rid, status="error")
             raise HTTPException(502, f"VL upstream unreachable: {e}")
@@ -11950,6 +11981,17 @@ async def _vlm_pool_proxy_chat_completion(pool, body: dict, stream: bool):
                     return
                 if not auto_think:
                     async for chunk in r.aiter_raw():
+                        if _vlm_cancel_event.is_set():
+                            # Breaking here lets `async with client.stream(...)`
+                            # close on the way out — that connection drop is
+                            # what the upstream's disconnect-driven cancel
+                            # relies on (see the long comment above this
+                            # function). Emit a synthetic finish so the client
+                            # gets a clean stop instead of a truncated stream.
+                            yield (b'data: {"choices":[{"index":0,"delta":{},'
+                                   b'"finish_reason":"cancelled"}]}\n\n')
+                            yield b"data: [DONE]\n\n"
+                            break
                         if chunk:
                             if not _ttft:
                                 _ttft.append(time.time() - _t0)
@@ -11974,6 +12016,13 @@ async def _vlm_pool_proxy_chat_completion(pool, body: dict, stream: bool):
                 buf = b""
                 done_seen = False
                 async for chunk in r.aiter_raw():
+                    if _vlm_cancel_event.is_set():
+                        async for f in _telemak_emit_flush(state, label):
+                            yield f
+                        yield (b'data: {"choices":[{"index":0,"delta":{},'
+                               b'"finish_reason":"cancelled"}]}\n\n')
+                        yield b"data: [DONE]\n\n"
+                        break
                     if not chunk:
                         continue
                     buf += chunk
