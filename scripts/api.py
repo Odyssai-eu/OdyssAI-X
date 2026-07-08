@@ -1951,6 +1951,10 @@ class RunnerPool:
         # any successful keepalive; WU3 fires controlled recovery at threshold.
         self.keepalive_fails: int = 0
         self.last_keepalive_ok_at: Optional[float] = None
+        # Timestamp of the last keepalive MISS (never reset) — feeds the WU1
+        # reactive gate: age-based preventive reload only fires on recent
+        # evidence of degradation (2026-07-08 re-calibration).
+        self.last_keepalive_miss_at: float = 0.0
         # WU4 — which transport this pool initialises with. Explicit request
         # override wins, else the cluster def's backend, else jaccl. Only
         # jaccl pools have the QP bug, so the keepalive/preventive-reload
@@ -4035,13 +4039,37 @@ async def _pool_ttl_sweeper() -> None:
 # (idle-gated, reload-not-reboot, pool-nodes-only) refresh runs before the
 # degradation window, not after. The QPT death rate is load-dependent; 3h is the
 # idle-decay margin, not a guarantee for a single very-long active generation.
+#
+# RE-CALIBRATION (2026-07-08): the 3h window BACKFIRED. Every reload is a JACCL
+# re-init — exactly where the QP bug lives — so 8-12 cycles/day multiplied the
+# exposure: preventive reloads KILLED healthy pools ("1 rank(s) died during
+# load — pool unusable", observed 2026-07-06 18:05 GLM-5.2 and 2026-07-08 01:10
+# Hy3 mid-bench). The medicine caused more deaths than the disease. New policy:
+#   - default window 3h → 24h (env-overridable as before);
+#   - the age-based reload only fires when the keepalive has ACTUALLY missed
+#     recently (reactive, not blind-preventive) — or past a hard-max age;
+#   - never within RECENT_ACTIVITY of the last request (the instant idle-gate
+#     saw the pool "idle" BETWEEN two bench runs and killed it mid-battery);
+#   - a reload that dies (ranks died) escalates to the WU3 ladder (per-node
+#     reboot + reload) instead of leaving the pool dead under a backoff.
 # ──────────────────────────────────────────────────────────────────────────────
 _JACCL_STABILITY_ENABLED = os.environ.get("JACCL_STABILITY_ENABLED", "1") == "1"
 _JACCL_KEEPALIVE_INTERVAL_S = float(os.environ.get("JACCL_KEEPALIVE_INTERVAL_S", "90"))
 _JACCL_KEEPALIVE_TIMEOUT_S = float(os.environ.get("JACCL_KEEPALIVE_TIMEOUT_S", "20"))
 _JACCL_KEEPALIVE_FAIL_THRESHOLD = int(os.environ.get("JACCL_KEEPALIVE_FAIL_THRESHOLD", "2"))
 _JACCL_PREVENTIVE_RELOAD_AGE_S = float(
-    os.environ.get("JACCL_PREVENTIVE_RELOAD_AGE_S", str(3 * 3600)))
+    os.environ.get("JACCL_PREVENTIVE_RELOAD_AGE_S", str(24 * 3600)))
+# Reactive gate: the age-based reload requires a keepalive miss within this
+# window (evidence of actual QP degradation) — unless age exceeds the hard max.
+_JACCL_PREVENTIVE_MISS_WINDOW_S = float(
+    os.environ.get("JACCL_PREVENTIVE_MISS_WINDOW_S", str(3600)))
+_JACCL_PREVENTIVE_HARD_MAX_S = float(
+    os.environ.get("JACCL_PREVENTIVE_HARD_MAX_S", str(48 * 3600)))
+# No maintenance within this window of the last served request — the instant
+# idle-gate can't see a bench/agent pausing between requests (2026-07-08 01:10:
+# the Hy3 pool was reloaded-to-death BETWEEN two bench runs).
+_JACCL_RECENT_ACTIVITY_S = float(
+    os.environ.get("JACCL_RECENT_ACTIVITY_S", str(1800)))
 # WU3 auto-recovery (reboot the POOL'S nodes + reload on a keepalive-detected
 # hang). Default ON since 2026-06-14: the recovery is now PER-NODE — only the
 # wedged pool's own nodes reboot (never reboot-all), so it cannot touch a node
@@ -4101,6 +4129,24 @@ async def _preventive_reload(cluster_id: str, pool: RunnerPool) -> None:
         # Back off instead of retrying every keepalive tick — the 2026-07-03
         # incident spammed a failing reload every ~90s for 17h straight.
         pool._preventive_backoff_until = time.time() + _JACCL_PREVENTIVE_BACKOFF_S
+        # If the reload itself KILLED the pool (ranks died during the re-init
+        # — the QP bug), the old pool is already gone: a backoff alone leaves
+        # a dead pool for a human to find (2026-07-06 18:05: 48min gap).
+        # Escalate to the WU3 ladder (per-node reboot of THIS pool's nodes +
+        # reload) — deduped via the watchdog map, honors AUTO_RECOVERY arming.
+        msg = str(e).lower()
+        if ("died" in msg or "unusable" in msg) and _JACCL_AUTO_RECOVERY_ENABLED \
+                and cluster_id not in _WATCHDOG_RECOVERY_BY_CLUSTER:
+            _jaccl_log(cluster_id,
+                       f"preventive reload killed the pool ({pool.alias}) — "
+                       f"escalating to per-node reboot+reload ladder")
+            _mark_cluster_degraded(cluster_id,
+                                   "preventive reload died mid-re-init",
+                                   {"alias": pool.alias, "error": str(e)[:200]})
+            t = asyncio.create_task(_keepalive_recovery_ladder(cluster_id, req))
+            _WATCHDOG_RECOVERY_BY_CLUSTER[cluster_id] = t
+            t.add_done_callback(
+                lambda _d, c=cluster_id: _WATCHDOG_RECOVERY_BY_CLUSTER.pop(c, None))
 
 
 async def _wait_nodes_reachable(cluster_id: str, timeout_s: float = 360.0,
@@ -4230,10 +4276,24 @@ async def _jaccl_stability_loop() -> None:
                     continue
                 if cluster_id in _WATCHDOG_RECOVERY_BY_CLUSTER:
                     continue
-                # WU1 — preventive reload (idle + old). Claim maintenance so no
-                # gen starts mid-reload; if busy, defer to a later tick.
+                # WU1 — preventive reload. Fires only when ALL of:
+                #   - the pool is old enough (AGE_S);
+                #   - the keepalive has ACTUALLY missed recently (reactive
+                #     evidence of QP degradation) OR age >= hard max;
+                #   - no request was served within RECENT_ACTIVITY_S (the
+                #     instant idle-gate misses bench/agent pauses);
+                #   - not under failure backoff.
+                # Rationale 2026-07-08: blind 3h reloads were killing healthy
+                # pools via the re-init QP bug they were meant to dodge.
                 age = time.time() - (pool.started_at or time.time())
+                last_miss = getattr(pool, "last_keepalive_miss_at", 0.0)
+                miss_recent = (time.time() - last_miss) <= _JACCL_PREVENTIVE_MISS_WINDOW_S
+                recently_used = (
+                    (time.time() - getattr(pool, "last_used_at", 0.0))
+                    < _JACCL_RECENT_ACTIVITY_S)
                 if (age >= _JACCL_PREVENTIVE_RELOAD_AGE_S
+                        and (miss_recent or age >= _JACCL_PREVENTIVE_HARD_MAX_S)
+                        and not recently_used
                         and time.time() >= getattr(pool, "_preventive_backoff_until", 0.0)):
                     if pool._try_claim_maintenance():
                         try:
@@ -4255,6 +4315,9 @@ async def _jaccl_stability_loop() -> None:
                     pool.keepalive_fails = 0
                 else:
                     pool.keepalive_fails += 1
+                    # Feeds the WU1 reactive gate: a recent miss is the
+                    # evidence that a preventive reload is actually warranted.
+                    pool.last_keepalive_miss_at = time.time()
                     _jaccl_log(cluster_id,
                         f"keepalive miss {pool.keepalive_fails}/"
                         f"{_JACCL_KEEPALIVE_FAIL_THRESHOLD} ({alias}): "
@@ -4308,7 +4371,7 @@ def _initial_default_config() -> Optional[dict]:
 #   major (1.7.2 → 2.0.0) — breaking API or topology change
 #
 # Use `./scripts/bump-version.sh patch|minor|major` to bump + auto-commit.
-APP_VERSION = "1.15.2"
+APP_VERSION = "1.15.3"
 
 app = FastAPI(
     title="OdyssAI-X (odyssai.eu)",
