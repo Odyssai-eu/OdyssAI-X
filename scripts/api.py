@@ -4371,7 +4371,7 @@ def _initial_default_config() -> Optional[dict]:
 #   major (1.7.2 → 2.0.0) — breaking API or topology change
 #
 # Use `./scripts/bump-version.sh patch|minor|major` to bump + auto-commit.
-APP_VERSION = "1.16.3"
+APP_VERSION = "1.16.4"
 
 app = FastAPI(
     title="OdyssAI-X (odyssai.eu)",
@@ -10786,6 +10786,35 @@ async def admin_cluster_status(cluster_id: str):
             "models_dir": models_dir_for(cluster_id),
             "degraded": _cluster_degraded.get(cluster_id),
         }
+    # Real liveness probe for VLM pools (2026-07-08 fix). VLMPool.alive_count()
+    # is hardcoded to 1 by design (the dead-pool sweeper, which purges on
+    # alive_count()==0 by probing LOCAL runner processes, must never mistake
+    # an external mlx_vlm.server for a crashed distributed pool). /status
+    # needs the TRUTH instead — probe :port here (this handler is async,
+    # alive_count() is sync and can't do it itself) and hand the result to
+    # the pool views below via alias lookup.
+    #
+    # Gate on ssh_target/port PRESENCE, not just `is_vlm` — VLMDistPool also
+    # carries is_vlm=True but inherits RunnerPool (no .ssh_target/.port, ring
+    # backend across multiple ranks) and its alive_count() is the REAL
+    # local-process count, not the VLMPool sentinel. Duck-typing on `is_vlm`
+    # alone would AttributeError on VLMDistPool — the exact polymorphism bug
+    # this whole day was about (mtp_cfg on VLMPool, 2026-07-08).
+    _vlm_probe_targets = {
+        a: p for a, p in all_loaded
+        if getattr(p, "is_vlm", False)
+        and not getattr(p, "is_vlm_dist", False)
+        and getattr(p, "ssh_target", None)
+    }
+    _vlm_alive_by_alias: dict[str, int] = {}
+    if _vlm_probe_targets:
+        _probed = await asyncio.gather(*[
+            _vlm_probe_ready(_vlm_ip_from_ssh(p.ssh_target), p.port)
+            for p in _vlm_probe_targets.values()
+        ])
+        for _alias, _probed_state in zip(_vlm_probe_targets, _probed):
+            _vlm_alive_by_alias[_alias] = 1 if _probed_state is True else 0
+
     # Multi-pool: build per-pool views. Top-level fields (model / nodes /
     # mode / etc.) reflect the DEFAULT alias for back-compat with single-
     # pool clients. The `pools` array contains the full picture.
@@ -10813,7 +10842,9 @@ async def admin_cluster_status(cluster_id: str):
             "mtp": ({**pool.mtp_cfg, "tripped": getattr(pool, "mtp_tripped", False),
                      "accept_rate": getattr(pool, "mtp_accept_rate", None)}
                     if getattr(pool, "mtp_cfg", None) else None),
-            "alive": pool.alive_count(),
+            # Real probe for VLM pools (see _vlm_alive_by_alias above); falls
+            # back to alive_count() (always 1) for non-VLM/unprobed pools.
+            "alive": _vlm_alive_by_alias.get(alias, pool.alive_count()),
             "load_s": pool.load_s,
             "uptime_s": uptime_p,
             "recent_avg_tps": round(sum(recent_tps_p) / len(recent_tps_p), 2)
@@ -10846,7 +10877,7 @@ async def admin_cluster_status(cluster_id: str):
                  "tripped": getattr(primary_pool, "mtp_tripped", False),
                  "accept_rate": getattr(primary_pool, "mtp_accept_rate", None)}
                 if getattr(primary_pool, "mtp_cfg", None) else None),
-        "alive": primary_pool.alive_count(),
+        "alive": _vlm_alive_by_alias.get(primary_pool.alias, primary_pool.alive_count()),
         "load_s": primary_pool.load_s, "uptime_s": uptime,
         "recent_avg_tps": round(sum(recent_tps) / len(recent_tps), 2) if recent_tps else None,
         "topology": [{"rank": n["rank"], "ssh": n["ssh"]} for n in topo],
@@ -11270,31 +11301,44 @@ async def admin_cluster_load(cluster_id: str, req: ArgoLoadRequest):
                 f"pool first (POST /admin/clusters/{cluster_id}/unload"
                 f"?alias={alias}) or pick another port",
             )
+        # Populate the SAME loading-progress state the text path uses (2026-07-08
+        # fix): without this, /status never reports `.loading` for a VLM load —
+        # the dashboard shows nothing for the ~60-90s the server takes to come
+        # up, then the pool just appears. Posted BEFORE the admin lock so a
+        # concurrent /status poll (which doesn't take that lock) sees it
+        # immediately.
+        vlm_size_bytes = await get_model_size_bytes(vlm_ssh, vlm_model_path)
+        vlm_estimated_s = estimate_load_s(req.model, vlm_size_bytes, cluster_id, 1)
+        vlm_loading_state = _loading_state_for(cluster_id)
+        _begin_loading(vlm_loading_state, req.model, 1, vlm_size_bytes, vlm_estimated_s)
         # Hold the cluster admin lock across the launch+register, same as the
         # text load holds it across RunnerPool.start() — serialises concurrent
         # loads on this cluster so two requests can't race the same node/alias.
         _t_launch = time.time()
-        async with get_admin_lock(cluster_id):
-            ready, launched_pid, tail = await _launch_vlm_server(
-                vlm_ssh, log_id, vlm_model_path, vlm_port,
-                (getattr(req, "venv", None) or VLM_DEFAULT_VENV),
-                float(getattr(req, "ready_timeout_s", None) or VLM_READY_TIMEOUT_S),
-            )
-            if not ready:
-                # Mirror admin_vlm_load: return the log tail so the operator sees WHY.
-                raise HTTPException(
-                    503,
-                    f"mlx_vlm.server did not become ready on {vlm_upstream} "
-                    f"(node {vlm_host}). Log tail:\n{tail}",
+        try:
+            async with get_admin_lock(cluster_id):
+                ready, launched_pid, tail = await _launch_vlm_server(
+                    vlm_ssh, log_id, vlm_model_path, vlm_port,
+                    (getattr(req, "venv", None) or VLM_DEFAULT_VENV),
+                    float(getattr(req, "ready_timeout_s", None) or VLM_READY_TIMEOUT_S),
                 )
-            vpool = VLMPool(
-                model_path=vlm_model_path, cluster=cluster_id, alias=alias,
-                node_indices=[vlm_index], upstream=vlm_upstream, port=vlm_port,
-                ssh_target=vlm_ssh, host=vlm_host, pid=launched_pid,
-            )
-            vpool.load_s = time.time() - _t_launch
-            set_pool(cluster_id, alias, vpool)
-            save_cluster_state_v2(cluster_id)
+                if not ready:
+                    # Mirror admin_vlm_load: return the log tail so the operator sees WHY.
+                    raise HTTPException(
+                        503,
+                        f"mlx_vlm.server did not become ready on {vlm_upstream} "
+                        f"(node {vlm_host}). Log tail:\n{tail}",
+                    )
+                vpool = VLMPool(
+                    model_path=vlm_model_path, cluster=cluster_id, alias=alias,
+                    node_indices=[vlm_index], upstream=vlm_upstream, port=vlm_port,
+                    ssh_target=vlm_ssh, host=vlm_host, pid=launched_pid,
+                )
+                vpool.load_s = time.time() - _t_launch
+                set_pool(cluster_id, alias, vpool)
+                save_cluster_state_v2(cluster_id)
+        finally:
+            _end_loading(vlm_loading_state)
         return {
             "loaded": True,
             "cluster": cluster_id,
