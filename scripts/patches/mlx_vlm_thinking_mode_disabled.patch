@@ -1,0 +1,15 @@
+--- a/mlx_vlm/prompt_utils.py
++++ b/mlx_vlm/prompt_utils.py
+@@ -742,6 +742,12 @@
+             and _template_references_kw(template_processor, "thinking_mode")
+         ):
+             template_kwargs["thinking_mode"] = "enabled"
++        elif (
++            "thinking_mode" not in template_kwargs
++            and template_kwargs.get("enable_thinking") is False
++            and _template_references_kw(template_processor, "thinking_mode")
++        ):
++            template_kwargs["thinking_mode"] = "disabled"
+
+         try:
+             return template_processor.apply_chat_template(
