@@ -1457,7 +1457,7 @@ _GEN_IDLE_TIMEOUT_S = float(env_get("GEN_IDLE_TIMEOUT_S", "120"))
 # in prod and declared contexts reach 1M tokens, so we only abort well beyond
 # the legitimate window. Both env-overridable.
 _GEN_PREFILL_DEADLINE_S = float(env_get("GEN_PREFILL_DEADLINE_S", "600"))
-_GEN_DECODE_DEADLINE_S = float(env_get("GEN_DECODE_DEADLINE_S", "90"))
+_GEN_DECODE_DEADLINE_S = float(env_get("GEN_DECODE_DEADLINE_S", "300"))
 # Conservative floor prefill throughput (tok/s) used to scale the prefill
 # deadline by estimated prompt size: a 1M-token context legitimately prefills
 # for minutes, so a flat 600s would false-positive on it. prefill_deadline =
@@ -1966,6 +1966,15 @@ class RunnerPool:
                 self.backend = (get_cluster_def(cluster) or {}).get("backend") or "jaccl"
             except Exception:
                 self.backend = "jaccl"
+        # Per-pool decode watchdog override. cluster_def["decode_deadline_s"] wins
+        # over the global GEN_DECODE_DEADLINE_S; useful for reasoning models that
+        # legitimately stall >90s mid-decode (long CoT, JACCL transient). Falls
+        # back to the global (default 300s) when absent.
+        try:
+            _pool_dd = (get_cluster_def(cluster) or {}).get("decode_deadline_s")
+            self._decode_deadline_s: float = float(_pool_dd) if _pool_dd is not None else _GEN_DECODE_DEADLINE_S
+        except Exception:
+            self._decode_deadline_s = _GEN_DECODE_DEADLINE_S
         # Degraded state — set when we detect a JACCL queue-pair death, a
         # rank that crashed mid-gen with a recognizable RDMA errno, or a
         # post-sweep wired-memory leak. Reloads that would reuse the
@@ -2369,7 +2378,7 @@ class RunnerPool:
             last_progress = time.monotonic()
             seen_token = False
             while True:
-                deadline = _GEN_DECODE_DEADLINE_S if seen_token else prefill_deadline
+                deadline = self._decode_deadline_s if seen_token else prefill_deadline
                 # Pool-aware: the runner is WEDGED only if it emits no token for
                 # ANY request within the deadline. Without this, a request queued
                 # behind a long-running one on the serialised multi-rank runner
@@ -4374,7 +4383,7 @@ def _initial_default_config() -> Optional[dict]:
 #   major (1.7.2 → 2.0.0) — breaking API or topology change
 #
 # Use `./scripts/bump-version.sh patch|minor|major` to bump + auto-commit.
-APP_VERSION = "1.16.7"
+APP_VERSION = "1.16.8"
 
 app = FastAPI(
     title="OdyssAI-X (odyssai.eu)",
