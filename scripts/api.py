@@ -4371,7 +4371,7 @@ def _initial_default_config() -> Optional[dict]:
 #   major (1.7.2 → 2.0.0) — breaking API or topology change
 #
 # Use `./scripts/bump-version.sh patch|minor|major` to bump + auto-commit.
-APP_VERSION = "1.16.2"
+APP_VERSION = "1.16.3"
 
 app = FastAPI(
     title="OdyssAI-X (odyssai.eu)",
@@ -10842,9 +10842,10 @@ async def admin_cluster_status(cluster_id: str):
         "kv_q8": primary_pool.kv_q8,
         "draft_model": primary_pool.draft_model,
         "num_draft_tokens": primary_pool.num_draft_tokens if primary_pool.draft_model else None,
-        "mtp": ({**primary_pool.mtp_cfg, "tripped": primary_pool.mtp_tripped,
-                 "accept_rate": primary_pool.mtp_accept_rate}
-                if primary_pool.mtp_cfg else None),
+        "mtp": ({**primary_pool.mtp_cfg,
+                 "tripped": getattr(primary_pool, "mtp_tripped", False),
+                 "accept_rate": getattr(primary_pool, "mtp_accept_rate", None)}
+                if getattr(primary_pool, "mtp_cfg", None) else None),
         "alive": primary_pool.alive_count(),
         "load_s": primary_pool.load_s, "uptime_s": uptime,
         "recent_avg_tps": round(sum(recent_tps) / len(recent_tps), 2) if recent_tps else None,
