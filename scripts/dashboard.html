@@ -3249,8 +3249,13 @@ function renderSyncJobRow(j) {
   const bytesTotalOne = j.bytes_total || 0;          // bytes per target
   const bytesTotalAll = bytesTotalOne * total;       // sum over targets
   const bytesDone = (j.per_target || []).reduce((s, t) => s + (t.bytes_transferred || 0), 0);
+  // Rate/ETA measure THIS job's transfer only: subtract the resume baseline
+  // (bytes already on disk from a previous run) — without it a re-run over a
+  // near-full target showed 13.1 GB/s over 24s (2026-07-08).
+  const bytesBase = (j.per_target || []).reduce((s, t) => s + (t.bytes_baseline || 0), 0);
+  const bytesMoved = Math.max(0, bytesDone - bytesBase);
   const pct = bytesTotalAll > 0 ? Math.min(100, Math.round((bytesDone / bytesTotalAll) * 100)) : null;
-  const rate = (running && elapsed > 0 && bytesDone > 0) ? (bytesDone / elapsed) : null;  // B/s
+  const rate = (running && elapsed > 0 && bytesMoved > 0) ? (bytesMoved / elapsed) : null;  // B/s
   const etaSec = (rate && bytesTotalAll > bytesDone) ? Math.round((bytesTotalAll - bytesDone) / rate) : null;
 
   return `

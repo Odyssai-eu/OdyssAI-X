@@ -4371,7 +4371,7 @@ def _initial_default_config() -> Optional[dict]:
 #   major (1.7.2 → 2.0.0) — breaking API or topology change
 #
 # Use `./scripts/bump-version.sh patch|minor|major` to bump + auto-commit.
-APP_VERSION = "1.15.3"
+APP_VERSION = "1.16.0"
 
 app = FastAPI(
     title="OdyssAI-X (odyssai.eu)",
@@ -9603,12 +9603,24 @@ _sync_jobs: dict[str, dict] = {}
 _sync_procs: dict[str, list] = {}  # job_id -> list of asyncio.subprocess.Process
 
 
-async def _measure_dir_kb(ssh_target: str, path: str, timeout: float = 10.0) -> Optional[int]:
+async def _measure_dir_kb(ssh_target: str, path: str, timeout: float = 10.0,
+                          exclude_hidden: bool = False) -> Optional[int]:
     """Return size in KB of `path` on `ssh_target`, or None on error.
 
-    Uses `du -sk` — fast, no network bandwidth, gives a stable byte-level read."""
-    cmd = ["ssh", "-o", "ConnectTimeout=5", "-o", "BatchMode=yes", ssh_target,
-           f"du -sk {shlex.quote(path)} 2>/dev/null | awk '{{print $1}}'"]
+    Uses `du -sk` — fast, no network bandwidth, gives a stable byte-level read.
+    exclude_hidden=True sums NON-dotfiles only (find+stat): rsync writes each
+    in-flight file as a hidden temp (`.name.XXXXXX`) and a cancelled job leaves
+    those temps orphaned — `du` counts them, which made the progress bar read
+    315.5/303.6 GB and sit at "100%" while the transfer was still running
+    (2026-07-08). Progress polling uses the filtered measure; totals keep du."""
+    if exclude_hidden:
+        inner = (f"find {shlex.quote(path)} -type f ! -name '.*' -print0 2>/dev/null "
+                 "| xargs -0 stat -f%z 2>/dev/null "
+                 "| awk '{s+=$1} END {printf \"%d\", s/1024}'")
+        cmd = ["ssh", "-o", "ConnectTimeout=5", "-o", "BatchMode=yes", ssh_target, inner]
+    else:
+        cmd = ["ssh", "-o", "ConnectTimeout=5", "-o", "BatchMode=yes", ssh_target,
+               f"du -sk {shlex.quote(path)} 2>/dev/null | awk '{{print $1}}'"]
     try:
         p = await asyncio.create_subprocess_exec(
             *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
@@ -9638,9 +9650,17 @@ async def _poll_sync_progress(job_id: str, model: str, src: dict, targets: list[
             if not dst:
                 continue
             dst_path = f"{dst['models_dir'].rstrip('/')}/{model}"
-            kb = await _measure_dir_kb(dst["ssh"], dst_path)
+            # exclude_hidden: don't count rsync's in-flight temps / cancel
+            # orphans — they made the bar overshoot its total (2026-07-08).
+            kb = await _measure_dir_kb(dst["ssh"], dst_path, exclude_hidden=True)
             if kb is not None:
                 slot["bytes_transferred"] = kb * 1024
+                # First measurement = the RESUME BASELINE (bytes already on
+                # disk from a previous run). The dashboard subtracts it from
+                # the rate so a re-run over a near-full target doesn't show
+                # a fantasy throughput (13.1 GB/s over 24s, 2026-07-08).
+                if "bytes_baseline" not in slot:
+                    slot["bytes_baseline"] = kb * 1024
         await asyncio.sleep(4)
 
 
@@ -9649,6 +9669,172 @@ class RsyncJobRequest(BaseModel):
     source: str           # configured host id
     targets: list[str]    # target host ids
     delete: bool = False  # rsync --delete on target (default False = safe)
+
+
+# ── TB5 fast-path for the sync matrix (2026-07-08) ───────────────────────────
+# The plain `rsync -a` over LAN ssh moves ~100-115 MB/s (single encrypted
+# stream): a 300 GB model takes ~50 min. The ultras' Thunderbolt mesh carries
+# link-local IPs (169.254.x on the TB interfaces — measured 3.1 GB/s with a
+# plain 8 MB-chunk TCP stream on 2026-07-06). Fast path: raw tar-over-TCP
+# across the TB5 link, then the ordinary rsync -a as a VERIFY pass (delta ≈ 0,
+# fixes perms, provides the authoritative exit status). Discovery is fully
+# dynamic — both ends' 169.254 addresses are enumerated live and the sender
+# tries every (src_ip → dst_ip) pair until one connects (link-locals are
+# per-link, so only a pair on the SAME cable works). No route → silent
+# fallback to the classic rsync path. Kill switch: SYNC_TB5_ENABLED=0.
+_SYNC_TB5_ENABLED = os.environ.get("SYNC_TB5_ENABLED", "1") == "1"
+
+# Receiver (runs on the TARGET via ssh): IPv6 listener on an ephemeral port,
+# prints it, accepts ONE connection, pipes the stream into `tar xf - -C dir`.
+# Self-kills if nobody connects within 45s (no zombies on probe failure).
+# IPv6 link-local (fe80, scoped) is used INSTEAD of 169.254: IPv4 link-locals
+# share one /16 route on macOS so replies leave by the wrong cable (verified
+# 2026-07-08 — every v4 pair probe failed while ping6 %en5 answered in 0.8 ms
+# and scoped v6 TCP moved 4 GiB at 5.46 GiB/s on the same wire).
+_TB5_RECEIVER_PY = r'''
+import socket, subprocess, sys
+srv = socket.socket(socket.AF_INET6)
+srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+srv.bind(("::", 0))
+srv.listen(1)
+print(srv.getsockname()[1], flush=True)
+srv.settimeout(45)
+conn, _ = srv.accept()
+conn.settimeout(300)
+p = subprocess.Popen(["tar", "xf", "-", "-C", sys.argv[1]], stdin=subprocess.PIPE)
+while True:
+    b = conn.recv(8 << 20)
+    if not b:
+        break
+    p.stdin.write(b)
+p.stdin.close()
+sys.exit(p.wait())
+'''
+
+# Sender (runs on the SOURCE via ssh): stdin = tar stream; tries every
+# (local_iface, dst_fe80) pair as a SCOPED v6 connect (`fe80::x%en5`) — the
+# scope pins both directions to the physical wire, so only the pair on the
+# same cable answers (ND replies in <1 ms there, times out elsewhere).
+# Same-name pairs are tried first (the mesh is usually wired port-to-port).
+_TB5_SENDER_PY = r'''
+import concurrent.futures as cf
+import socket, sys, threading
+port = int(sys.argv[1])
+ifaces = sys.argv[2].split(",")
+dsts = sys.argv[3].split(",")
+win = []
+lock = threading.Lock()
+
+def probe(ifname, dst):
+    # ND answers <1ms on the actual cable, times out elsewhere — but the
+    # receiver accepts exactly ONE connection, so only the first winner is
+    # kept; every other successful connect (impossible on other wires, but
+    # belt-and-braces) is closed immediately.
+    try:
+        ai = socket.getaddrinfo(dst + "%" + ifname, port,
+                                socket.AF_INET6, socket.SOCK_STREAM)
+        s = socket.socket(socket.AF_INET6)
+        s.settimeout(1.5)
+        s.connect(ai[0][4])
+        with lock:
+            if not win:
+                win.append((ifname, dst, s))
+                return
+        s.close()
+    except Exception:
+        pass
+
+with cf.ThreadPoolExecutor(max_workers=16) as ex:
+    list(ex.map(lambda p: probe(*p), [(i, d) for i in ifaces for d in dsts]))
+if not win:
+    sys.exit(3)
+ifname, dst, sock = win[0]
+sock.settimeout(300)
+print("tb5-link %" + ifname + " -> " + dst, file=sys.stderr, flush=True)
+while True:
+    b = sys.stdin.buffer.read(8 << 20)
+    if not b:
+        break
+    sock.sendall(b)
+sock.close()
+'''
+
+
+async def _tb5_linklocal_ips(ssh_target: str, with_iface: bool = False) -> list[str]:
+    """Live enumeration of a host's Thunderbolt fe80 link-local addresses.
+    with_iface=False → the bare fe80 addresses (what a remote peer dials, its
+    OWN scope added at connect time); True → the local INTERFACE names (what
+    the sender scopes its connects with). Only interfaces that carry an
+    IPv4 169.254 too are listed — that fingerprint selects the TB mesh ports
+    and skips awdl/utun/etc. Empty list → no TB mesh port."""
+    cmd = ["ssh", "-o", "ConnectTimeout=5", "-o", "BatchMode=yes", ssh_target,
+           'for i in $(ifconfig -l); do ip=$(ipconfig getifaddr $i 2>/dev/null); '
+           '[ -n "$ip" ] || continue; case $ip in 169.254.*) '
+           'f=$(ifconfig $i | awk \'/inet6 fe80/{print $2}\' | head -1 | cut -d% -f1); '
+           '[ -n "$f" ] && echo "$i=$f";; esac; done']
+    try:
+        p = await asyncio.create_subprocess_exec(
+            *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
+        out, _ = await asyncio.wait_for(p.communicate(), timeout=12)
+        specs = [l.strip() for l in (out or b"").decode().splitlines()
+                 if "=fe80" in l]
+        if with_iface:
+            return [s.split("=", 1)[0] for s in specs]
+        return [s.split("=", 1)[1] for s in specs]
+    except Exception:
+        return []
+
+
+async def _tb5_fast_copy(job_id: str, model: str, src: dict, dst: dict,
+                         slot: dict) -> bool:
+    """tar-over-TCP across the TB5 mesh. True = stream completed (caller still
+    runs the rsync verify); False = not attempted / failed (caller falls back
+    to plain rsync — the copy is never worse off, tar is resumable by rsync)."""
+    src_ips, dst_ips = await asyncio.gather(
+        _tb5_linklocal_ips(src["ssh"], with_iface=True),
+        _tb5_linklocal_ips(dst["ssh"]))
+    if not src_ips or not dst_ips:
+        return False
+    src_parent = os.path.dirname(f"{src['models_dir'].rstrip('/')}/{model}")
+    dst_parent = os.path.dirname(f"{dst['models_dir'].rstrip('/')}/{model}")
+    leaf = os.path.basename(model.rstrip("/"))
+    try:
+        recv = await asyncio.create_subprocess_exec(
+            "ssh", "-o", "ConnectTimeout=5", "-o", "BatchMode=yes", dst["ssh"],
+            f"mkdir -p {shlex.quote(dst_parent)} && "
+            f"python3 -c {shlex.quote(_TB5_RECEIVER_PY)} {shlex.quote(dst_parent)}",
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+        _sync_procs.setdefault(job_id, []).append(recv)
+        port_line = await asyncio.wait_for(recv.stdout.readline(), timeout=15)
+        port = int(port_line.strip())
+        sender_sh = (
+            f"cd {shlex.quote(src_parent)} && tar cf - {shlex.quote(leaf)} | "
+            f"python3 -c {shlex.quote(_TB5_SENDER_PY)} {port} "
+            f"{shlex.quote(','.join(src_ips))} {shlex.quote(','.join(dst_ips))}")
+        send = await asyncio.create_subprocess_exec(
+            "ssh", "-o", "ConnectTimeout=5", "-o", "BatchMode=yes", src["ssh"],
+            sender_sh,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+        _sync_procs.setdefault(job_id, []).append(send)
+        _, send_err = await send.communicate()
+        await recv.communicate()
+        if send.returncode == 3:
+            _jaccl_log("sync", f"tb5 fast-path: no link-local route "
+                       f"{src['id']}→{dst['id']} — falling back to rsync")
+            return False
+        ok = send.returncode == 0 and recv.returncode == 0
+        if ok:
+            link = next((l for l in (send_err or b"").decode().splitlines()
+                         if l.startswith("tb5-link")), "")
+            _jaccl_log("sync", f"tb5 fast-path OK {src['id']}→{dst['id']} ({link}); "
+                       f"rsync verify follows")
+        else:
+            _jaccl_log("sync", f"tb5 fast-path failed (send rc={send.returncode}, "
+                       f"recv rc={recv.returncode}) — rsync fallback")
+        return ok
+    except Exception as e:
+        _jaccl_log("sync", f"tb5 fast-path error ({e}) — rsync fallback")
+        return False
 
 
 def _resolve_host(host_id: str) -> Optional[dict]:
@@ -9701,6 +9887,13 @@ async def _run_one_rsync(job_id: str, model: str, src: dict, dst: dict, slot: di
             )[:400]
             slot["finished_at"] = time.time()
             return slot
+        # TB5 fast-path (2026-07-08): raw tar-over-TCP on the Thunderbolt mesh
+        # (~3.1 GB/s vs ~110 MB/s LAN rsync). Whatever it returns, the rsync
+        # below still runs — as a near-instant VERIFY pass after a successful
+        # stream, or as the full transfer on fallback. Slot semantics unchanged.
+        if _SYNC_TB5_ENABLED:
+            slot["transport"] = "tb5+rsync-verify" if await _tb5_fast_copy(
+                job_id, model, src, dst, slot) else "rsync"
         proc = await asyncio.create_subprocess_exec(
             *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
         )
