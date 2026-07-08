@@ -4371,7 +4371,7 @@ def _initial_default_config() -> Optional[dict]:
 #   major (1.7.2 → 2.0.0) — breaking API or topology change
 #
 # Use `./scripts/bump-version.sh patch|minor|major` to bump + auto-commit.
-APP_VERSION = "1.16.0"
+APP_VERSION = "1.16.1"
 
 app = FastAPI(
     title="OdyssAI-X (odyssai.eu)",
@@ -9785,53 +9785,111 @@ async def _tb5_linklocal_ips(ssh_target: str, with_iface: bool = False) -> list[
         return []
 
 
+async def _dir_manifest(ssh_target: str, path: str,
+                        timeout: float = 30.0) -> Optional[dict]:
+    """{rel_path: size} of every NON-hidden file under `path` on the host.
+    None on error; {} for an absent/empty dir (valid: nothing there yet)."""
+    inner = (f"cd {shlex.quote(path)} 2>/dev/null && "
+             "find . -type f ! -name '.*' -print0 | xargs -0 stat -f '%z %N' "
+             "2>/dev/null; true")
+    try:
+        p = await asyncio.create_subprocess_exec(
+            "ssh", "-o", "ConnectTimeout=5", "-o", "BatchMode=yes",
+            ssh_target, inner,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
+        out, _ = await asyncio.wait_for(p.communicate(), timeout=timeout)
+        man = {}
+        for line in (out or b"").decode("utf-8", "ignore").splitlines():
+            size, _, rel = line.partition(" ")
+            if size.isdigit() and rel.startswith("./"):
+                man[rel[2:]] = int(size)
+        return man
+    except Exception:
+        return None
+
+
 async def _tb5_fast_copy(job_id: str, model: str, src: dict, dst: dict,
                          slot: dict) -> bool:
-    """tar-over-TCP across the TB5 mesh. True = stream completed (caller still
-    runs the rsync verify); False = not attempted / failed (caller falls back
-    to plain rsync — the copy is never worse off, tar is resumable by rsync)."""
+    """Delta-first tar-over-TCP across the TB5 mesh (handoff syncTB5
+    2026-07-08). Per round: diff the two manifests (name+size), stream ONLY
+    the missing/mismatched files, re-diff; up to 3 rounds (auto-resume in
+    TB5 — a truncated file has size < source, so the next round retakes it,
+    no .part marker needed). True = manifests converged (caller still runs
+    rsync -a as the authoritative verify/perms pass); False = not attempted
+    or not converged (caller falls back to plain rsync — never worse off).
+    Discovery stays 100% dynamic: fe80 enumerated per job, nothing pinned."""
     src_ips, dst_ips = await asyncio.gather(
         _tb5_linklocal_ips(src["ssh"], with_iface=True),
         _tb5_linklocal_ips(dst["ssh"]))
     if not src_ips or not dst_ips:
         return False
-    src_parent = os.path.dirname(f"{src['models_dir'].rstrip('/')}/{model}")
-    dst_parent = os.path.dirname(f"{dst['models_dir'].rstrip('/')}/{model}")
+    src_dir = f"{src['models_dir'].rstrip('/')}/{model}"
+    dst_dir = f"{dst['models_dir'].rstrip('/')}/{model}"
+    src_parent = os.path.dirname(src_dir)
+    dst_parent = os.path.dirname(dst_dir)
     leaf = os.path.basename(model.rstrip("/"))
     try:
-        recv = await asyncio.create_subprocess_exec(
-            "ssh", "-o", "ConnectTimeout=5", "-o", "BatchMode=yes", dst["ssh"],
-            f"mkdir -p {shlex.quote(dst_parent)} && "
-            f"python3 -c {shlex.quote(_TB5_RECEIVER_PY)} {shlex.quote(dst_parent)}",
-            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
-        _sync_procs.setdefault(job_id, []).append(recv)
-        port_line = await asyncio.wait_for(recv.stdout.readline(), timeout=15)
-        port = int(port_line.strip())
-        sender_sh = (
-            f"cd {shlex.quote(src_parent)} && tar cf - {shlex.quote(leaf)} | "
-            f"python3 -c {shlex.quote(_TB5_SENDER_PY)} {port} "
-            f"{shlex.quote(','.join(src_ips))} {shlex.quote(','.join(dst_ips))}")
-        send = await asyncio.create_subprocess_exec(
-            "ssh", "-o", "ConnectTimeout=5", "-o", "BatchMode=yes", src["ssh"],
-            sender_sh,
-            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
-        _sync_procs.setdefault(job_id, []).append(send)
-        _, send_err = await send.communicate()
-        await recv.communicate()
-        if send.returncode == 3:
-            _jaccl_log("sync", f"tb5 fast-path: no link-local route "
-                       f"{src['id']}→{dst['id']} — falling back to rsync")
-            return False
-        ok = send.returncode == 0 and recv.returncode == 0
-        if ok:
+        src_man = await _dir_manifest(src["ssh"], src_dir)
+        if not src_man:
+            return False   # unreadable/empty source — let rsync report it
+        for rnd in range(1, 4):
+            dst_man = await _dir_manifest(dst["ssh"], dst_dir)
+            if dst_man is None:
+                return False
+            delta = [rel for rel, size in src_man.items()
+                     if dst_man.get(rel) != size]
+            if not delta:
+                if rnd > 1:
+                    _jaccl_log("sync", f"tb5 {src['id']}→{dst['id']}: converged "
+                               f"after {rnd - 1} round(s); rsync verify follows")
+                return True
+            _jaccl_log("sync", f"tb5 {src['id']}→{dst['id']} round {rnd}: "
+                       f"{len(delta)}/{len(src_man)} file(s) to stream")
+            # Manifest file on the source (argv can't carry hundreds of shard
+            # paths); tar reads it with -T. Paths are parent-relative so the
+            # archive keeps the `leaf/...` layout the receiver expects.
+            manifest_body = "\n".join(f"{leaf}/{rel}" for rel in sorted(delta))
+            mpath = f"/tmp/tbsync_manifest_{job_id}.txt"
+            recv = await asyncio.create_subprocess_exec(
+                "ssh", "-o", "ConnectTimeout=5", "-o", "BatchMode=yes", dst["ssh"],
+                f"mkdir -p {shlex.quote(dst_parent)} && "
+                f"python3 -c {shlex.quote(_TB5_RECEIVER_PY)} {shlex.quote(dst_parent)}",
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+            _sync_procs.setdefault(job_id, []).append(recv)
+            port_line = await asyncio.wait_for(recv.stdout.readline(), timeout=15)
+            port = int(port_line.strip())
+            sender_sh = (
+                f"cat > {shlex.quote(mpath)} <<'TBSYNC_EOF'\n{manifest_body}\nTBSYNC_EOF\n"
+                f"cd {shlex.quote(src_parent)} && "
+                f"tar cf - -T {shlex.quote(mpath)} | "
+                f"python3 -c {shlex.quote(_TB5_SENDER_PY)} {port} "
+                f"{shlex.quote(','.join(src_ips))} {shlex.quote(','.join(dst_ips))}; "
+                f"rc=$?; rm -f {shlex.quote(mpath)}; exit $rc")
+            send = await asyncio.create_subprocess_exec(
+                "ssh", "-o", "ConnectTimeout=5", "-o", "BatchMode=yes", src["ssh"],
+                sender_sh,
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+            _sync_procs.setdefault(job_id, []).append(send)
+            _, send_err = await send.communicate()
+            await recv.communicate()
+            if send.returncode == 3:
+                _jaccl_log("sync", f"tb5 fast-path: no link-local route "
+                           f"{src['id']}→{dst['id']} — falling back to rsync")
+                return False
             link = next((l for l in (send_err or b"").decode().splitlines()
                          if l.startswith("tb5-link")), "")
-            _jaccl_log("sync", f"tb5 fast-path OK {src['id']}→{dst['id']} ({link}); "
-                       f"rsync verify follows")
-        else:
-            _jaccl_log("sync", f"tb5 fast-path failed (send rc={send.returncode}, "
-                       f"recv rc={recv.returncode}) — rsync fallback")
-        return ok
+            _jaccl_log("sync", f"tb5 {src['id']}→{dst['id']} round {rnd} done "
+                       f"(send rc={send.returncode}, recv rc={recv.returncode}"
+                       f"{', ' + link if link else ''})")
+            # Non-zero rc → the re-diff decides: whatever landed stays counted,
+            # the next round streams only the remainder (auto-resume).
+        dst_man = await _dir_manifest(dst["ssh"], dst_dir)
+        converged = dst_man is not None and all(
+            dst_man.get(rel) == size for rel, size in src_man.items())
+        if not converged:
+            _jaccl_log("sync", f"tb5 {src['id']}→{dst['id']}: not converged "
+                       f"after 3 rounds — rsync takes over")
+        return converged
     except Exception as e:
         _jaccl_log("sync", f"tb5 fast-path error ({e}) — rsync fallback")
         return False
