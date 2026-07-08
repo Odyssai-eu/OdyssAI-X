@@ -41,6 +41,14 @@ try:
 except ImportError:
     BailingMoeLinearInnerModel = None  # type: ignore[assignment,misc]
     _HAS_BAILING_MOE_LINEAR = False
+try:
+    from mlx_lm.models.mimo_v2_flash import (
+        LanguageModel as MimoV2FlashInnerModel,
+    )
+    _HAS_MIMO_V2_FLASH = True
+except ImportError:
+    MimoV2FlashInnerModel = None  # type: ignore[assignment,misc]
+    _HAS_MIMO_V2_FLASH = False
 from mlx_lm.models.deepseek_v32 import DeepseekV32MLP
 from mlx_lm.models.deepseek_v32 import Model as DeepseekV32Model
 from mlx_lm.models.gemma4 import Model as Gemma4Model
@@ -355,6 +363,33 @@ def pipeline_auto_parallel(
             if "full_attention" not in inner_model_instance.layer_types
             else inner_model_instance.layer_types.index("full_attention")
         )
+
+    if _HAS_MIMO_V2_FLASH and isinstance(
+        inner_model_instance, MimoV2FlashInnerModel
+    ):
+        # mimo_v2_flash.LanguageModel computes swa_idx/ga_idx ONCE at init from
+        # the FULL config.hybrid_layer_pattern (.index(1)/.index(0)); its
+        # __call__ uses them to pick which layer's cache builds the SWA vs
+        # full-attention mask (cache[ga_idx] / cache[swa_idx]). After the
+        # pipeline slice, cache[] is LOCAL to this shard, so a global index
+        # points at the wrong layer's cache — the mask's KV length diverges
+        # from the real keys/values as session offsets grow, crashing with
+        # "[broadcast_shapes] ... cannot be broadcast" on the 2nd+ request of a
+        # multi-turn session (first request happens to line up). Recompute both
+        # as shard-LOCAL indices from the sliced layers' is_sliding_window flag
+        # (same fix class as GptOss above / Step35 below / bailing_moe_linear).
+        sliding_layers = [
+            i
+            for i, layer in enumerate(layers)
+            if getattr(layer, "is_sliding_window", False)
+        ]
+        full_layers = [
+            i
+            for i, layer in enumerate(layers)
+            if not getattr(layer, "is_sliding_window", True)
+        ]
+        inner_model_instance.swa_idx = sliding_layers[0] if sliding_layers else 0
+        inner_model_instance.ga_idx = full_layers[0] if full_layers else 0
 
     if isinstance(inner_model_instance, Step35InnerModel):
         inner_model_instance.num_layers = len(layers)
