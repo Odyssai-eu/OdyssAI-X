@@ -3156,15 +3156,18 @@ _MODELS_AUTO_OPEN_THINK = ("minimax", "qwen3.5", "qwen3.6", "step-3.7", "step3p7
 # MiniMax-M2 doesn't honor it, so we MUST keep the filter on for it even
 # when callers ask for no-thinking, otherwise the reasoning text leaks
 # into `content` verbatim (`</think>` literal visible to the user).
-# minimax-m3 added 2026-07-02: the mlx-vlm VL serving path (m3vl) does NOT
-# honor enable_thinking=false — the model keeps thinking in adaptive mode and
-# leaks a raw <mm:think>...</mm:think> block into content. (The text M3 on the
-# jaccl runner DOES honor it, but the shared filter must cover the worst case.)
-# Keeping the filter ON when off is safe against ghosting: _seed_in_think()
-# returns False for M3 when thinking is off, so we never seed in_think and only
-# strip a block IF the model actually emits the tags; a genuine no-think answer
-# flows through untouched.
-_MODELS_IGNORE_ENABLE_THINKING_FLAG = ("minimax-m2", "minimax-m3", "step-3.7", "step3p7")
+# minimax-m3 added 2026-07-02, REMOVED 2026-07-08: the mlx-vlm VL serving
+# path (m3vl) didn't honor enable_thinking=false because of an upstream
+# mlx_vlm bug — enable_thinking=False was never mapped to the chat-template
+# kwarg thinking_mode="disabled" (prompt_utils.py only handled the True
+# case), so thinking_mode stayed undefined and M3's template fell back to
+# adaptive. Patched locally on all mlx-vlm venvs (scripts/patches/
+# mlx_vlm_thinking_mode_disabled.patch, applied by scripts/install-mlx-vlm.sh)
+# — M3 now genuinely honors enable_thinking=false, so keeping it on this list
+# would ghost every no-think answer into reasoning_content with empty
+# content (the exact Companion-ghost failure this list exists to avoid for
+# models that DO honor the flag — see Qwen3.5/3.6 note above).
+_MODELS_IGNORE_ENABLE_THINKING_FLAG = ("minimax-m2", "step-3.7", "step3p7")
 
 # Models whose chat template reads a `reasoning_effort` system directive
 # (OpenAI o-series convention: minimal/low/medium/high). Step-3.7-Flash is a
@@ -4371,7 +4374,7 @@ def _initial_default_config() -> Optional[dict]:
 #   major (1.7.2 → 2.0.0) — breaking API or topology change
 #
 # Use `./scripts/bump-version.sh patch|minor|major` to bump + auto-commit.
-APP_VERSION = "1.16.5"
+APP_VERSION = "1.16.6"
 
 app = FastAPI(
     title="OdyssAI-X (odyssai.eu)",
