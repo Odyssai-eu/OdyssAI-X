@@ -278,6 +278,23 @@ MODEL_SAMPLING_DEFAULTS: dict[str, dict] = {
         # ~150-token block repeating; 20 was way too short to detect).
         "repetition_context_size": 128,
     },
+    # MiMo-V2.5-Pro (Xiaomi). Had no profile until 2026-07-09 → fell through to
+    # mlx-lm greedy + no repetition penalty, the exact degenerate-loop recipe
+    # this table exists to prevent (see the NEMO-20-5 comment above). Observed on
+    # a 4-node pipeline: a long code generation (repetitive bash `${...}`)
+    # collapsed into a 20802-token run of a single char with NO EOS — the
+    # non-stream path buffered the whole response so Companion showed nothing
+    # while the engine kept emitting. Authors' recommended sampling is
+    # temp 1.0 / top_p 0.95. repetition_penalty 1.05 + context 512 breaks the
+    # loop; NO no_repeat_ngram — mimo generates code, and the n-gram ban drops
+    # operators/identifiers and corrupts syntax (same reason the "minimax" M2
+    # entry above omits it).
+    "mimo": {
+        "temp": 1.0,
+        "top_p": 0.95,
+        "repetition_penalty": 1.05,
+        "repetition_context_size": 512,
+    },
 }
 
 
