@@ -599,11 +599,8 @@ footer a:hover { color: var(--accent3); }
 const HOST = window.location.hostname;
 
 const SHARDS = [
-  { id: 'company', label: 'Company',  port: 8767, model: 'tele-fast · company memory',   primary: true },
-  { id: 'shard1',  label: 'Shard 1',  port: 8768, model: 'telerag1 · qwen3-coder-30b' },
-  { id: 'shard2',  label: 'Shard 2',  port: 8769, model: 'telerag2 · qwen3-coder-30b' },
-  { id: 'shard3',  label: 'Shard 3',  port: 8770, model: 'telerag3 · qwen3-coder-30b' },
-  { id: 'shard4',  label: 'Shard 4',  port: 8771, model: 'tele-fast · qwen3-coder-30b' },
+  { id: 'alpha',   label: 'Alpha',    port: 8766, model: 'tele-fast · consolidated corpus', primary: true },
+  { id: 'company', label: 'Company',  port: 8767, model: 'tele-fast · company memory' },
 ];
 
 const ODYSSAI_URL = `http://${HOST}:8000`;

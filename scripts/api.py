@@ -4383,7 +4383,7 @@ def _initial_default_config() -> Optional[dict]:
 #   major (1.7.2 → 2.0.0) — breaking API or topology change
 #
 # Use `./scripts/bump-version.sh patch|minor|major` to bump + auto-commit.
-APP_VERSION = "1.16.9"
+APP_VERSION = "1.16.10"
 
 app = FastAPI(
     title="OdyssAI-X (odyssai.eu)",
@@ -4573,8 +4573,8 @@ async def odyrag():
 async def odyrag_proxy(shard_id: str, path: str, request: Request):
     """Proxy requests to LightRAG shard instances — avoids browser CORS restrictions."""
     _SHARD_PORTS: dict[str, int] = {
+        "alpha": 8766,
         "company": 8767,
-        "shard1": 8768, "shard2": 8769, "shard3": 8770, "shard4": 8771,
     }
     port = _SHARD_PORTS.get(shard_id)
     if port is None:
