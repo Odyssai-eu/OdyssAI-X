@@ -6370,9 +6370,29 @@ async def admin_coeos_fit():
 
 
 @app.put("/admin/coeos")
-async def admin_coeos_update(req: CoeosConfig):
+async def admin_coeos_update(request: Request):
     # Importing a TMB Settings file = a PUT with {name, decider_model,
     # default_axis, axes, …}. Validate the axes shape + reserved id.
+    raw = await request.json()
+    if not isinstance(raw, dict):
+        raise HTTPException(400, detail={"error": "bad_body",
+            "message": "expected a JSON object."})
+    # Auto-detect an UNWRAPPED score-table import: TMB-Score-Table.json has
+    # its OWN top-level `axes` (a dict of axis metadata) and `models` (rich
+    # per-model rows), which don't match the settings shape (axes = a LIST
+    # of {key,label,model} bindings) — dropping the file in as-is used to
+    # 422 on `axes` (Sophie hit this 2026-07-14). Recognise the table by its
+    # format marker and wrap it transparently, so "import this file" works
+    # the same regardless of which TMB file it is; `{"score_table": {...}}`
+    # (already-wrapped) still works too, since that shape has no top-level
+    # "format" key of its own.
+    if raw.get("format") == "tmb-score-table/1":
+        raw = {"score_table": raw}
+    try:
+        req = CoeosConfig(**raw)
+    except Exception as e:
+        raise HTTPException(422, detail={"error": "bad_coeos_config",
+            "message": f"could not parse CoeOS config: {e}"})
     if req.axes is not None:
         if not isinstance(req.axes, list):
             raise HTTPException(400, detail={"error": "bad_axes",
