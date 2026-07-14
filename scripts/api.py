@@ -4383,7 +4383,7 @@ def _initial_default_config() -> Optional[dict]:
 #   major (1.7.2 → 2.0.0) — breaking API or topology change
 #
 # Use `./scripts/bump-version.sh patch|minor|major` to bump + auto-commit.
-APP_VERSION = "1.16.10"
+APP_VERSION = "1.17.0"
 
 app = FastAPI(
     title="OdyssAI-X (odyssai.eu)",
@@ -6301,6 +6301,10 @@ class CoeosConfig(BaseModel):
     axes: Optional[list] = None                  # [{key, label, model(=logical), description?}, …]
     models: Optional[dict] = None                # logical name → {name, endpoint} registry
     cold_boot_autoload: Optional[bool] = None
+    score_table: Optional[dict] = None            # TMB-Score-Table (2026-07-14): modele x axe
+                                                   # x {score, cout, tps} — le resolver s'en sert
+                                                   # pour proposer un modele quand un axe n'est
+                                                   # pas pinne (voir _coeos_axis_models).
 
 
 @app.get("/admin/coeos")
@@ -6319,6 +6323,50 @@ async def admin_coeos_decisions():
     return {"decisions": [
         {"model": k[0], "axis": k[1], "fallback": k[2], "count": v}
         for k, v in sorted(_coeos_decisions.items(), key=lambda kv: -kv[1])]}
+
+
+@app.get("/admin/coeos/fit")
+async def admin_coeos_fit():
+    """Per axis: the effective model (pin or self-ranked proposal) plus every
+    registry candidate with its table score/cost/tps and live servability —
+    what an operator UI shows when they change a model in the registry, so
+    they see immediately whether their pick 'fits' the axis (2026-07-14,
+    Sophie: 'il voit directement si le modele qu'il va choisir fit ou pas')."""
+    cfg = get_coeos_config()
+    st = cfg.get("score_table") or {}
+    models = st.get("models") or {}
+    lut = _coeos_table_lookup(cfg)
+    hot = _coeos_hot_model_ids()
+    axes_out = []
+    for ax in _coeos_axes(cfg):
+        k = ax.get("key")
+        pin = ax.get("model") or ""
+        proposed = pscore = None
+        if cfg.get("score_table"):
+            proposed, _row, pscore = _coeos_propose(cfg, k)
+        candidates = []
+        for logical in _coeos_model_registry(cfg):
+            row = lut.get(str(logical).strip().lower())
+            m = models.get(row) if row else None
+            score = ((m or {}).get("axes") or {}).get(k, {}).get("score")
+            endpoint, _display = _coeos_resolve_endpoint(cfg, logical)
+            candidates.append({
+                "model": logical, "score": score,
+                "cost_per_test": (m or {}).get("cost_per_test"),
+                "tps_median": (m or {}).get("tps_median"),
+                "reference": (m or {}).get("role") == "reference",
+                "servable": _coeos_is_servable(endpoint, hot),
+            })
+        candidates.sort(key=lambda c: (c["score"] is None, -(c["score"] or 0)))
+        effective = pin or proposed or ""
+        eff_score = next((c["score"] for c in candidates if c["model"] == effective), None)
+        axes_out.append({
+            "key": k, "pinned": bool(pin), "effective": effective,
+            "effective_score": eff_score, "proposed": proposed,
+            "proposed_score": pscore, "candidates": candidates,
+        })
+    return {"has_score_table": bool(cfg.get("score_table")),
+            "updated": st.get("updated"), "axes": axes_out}
 
 
 @app.put("/admin/coeos")
@@ -6343,10 +6391,17 @@ async def admin_coeos_update(req: CoeosConfig):
             if m and str(m).strip().lower() == COEOS_MODEL_ID:
                 raise HTTPException(400, detail={"error": "reserved_id",
                     "message": "'coeos' is the router's own id and can't be bound to an axis."})
+    if req.score_table is not None and (
+            not isinstance(req.score_table, dict)
+            or not isinstance(req.score_table.get("models"), dict)):
+        raise HTTPException(400, detail={"error": "bad_score_table",
+            "message": "score_table must be a dict with a 'models' dict "
+                       "(format tmb-score-table/1)."})
     with _cluster_config_txn() as cfg:
         c = cfg.get("coeos_config") or {}
         for field in ("enabled", "name", "regime", "updated", "note", "decider_model",
-                      "default_axis", "axes", "models", "cold_boot_autoload"):
+                      "default_axis", "axes", "models", "cold_boot_autoload",
+                      "score_table"):
             val = getattr(req, field)
             if val is not None:
                 c[field] = bool(val) if field in ("enabled", "cold_boot_autoload") else val
@@ -7272,12 +7327,23 @@ def _coeos_axes(cfg: dict) -> list:
 
 def _coeos_axis_models(cfg: dict) -> dict:
     """axis key → bound model (a LOGICAL name resolved via the registry, or a
-    literal endpoint in legacy configs). Non-empty, not the reserved coeos id."""
+    literal endpoint in legacy configs). Non-empty, not the reserved coeos id.
+
+    Self-ranking (2026-07-14): an operator PIN (axis.model set) always wins,
+    unchanged from before. An axis with NO pin, when a score_table is
+    imported, gets FILLED from the table's best model for that axis among
+    the operator's own registry — CoeOS proposes instead of requiring a
+    pre-baked binding. No score_table imported → identical to the prior
+    behaviour (empty axes stay unbound, exactly as before this change)."""
     out = {}
     for ax in _coeos_axes(cfg):
         k, m = ax.get("key"), ax.get("model")
         if k and m and str(m).lower() != COEOS_MODEL_ID:
             out[k] = m
+        elif k and cfg.get("score_table"):
+            logical, _row, _score = _coeos_propose(cfg, k)
+            if logical:
+                out[k] = logical
     return out
 
 
@@ -7288,6 +7354,53 @@ def _coeos_model_registry(cfg: dict) -> dict:
     mapped yet. Absent registry = legacy alias-based config (see resolve)."""
     reg = cfg.get("models")
     return reg if isinstance(reg, dict) else {}
+
+
+def _coeos_table_lookup(cfg: dict) -> dict:
+    """logical/alias/or_id/served_model (lowercased) -> row name in the
+    score_table. Multiple join keys because the table's row names are OUR
+    bench naming, not the operator's — this is what lets a differently-named
+    registry entry still match a table row."""
+    st = cfg.get("score_table") or {}
+    out: dict = {}
+    for name, m in (st.get("models") or {}).items():
+        if not isinstance(m, dict):
+            continue
+        for key in (name, m.get("alias"), m.get("or_id"), m.get("served_model")):
+            if key:
+                out[str(key).strip().lower()] = name
+    return out
+
+
+def _coeos_propose(cfg: dict, axis: str) -> tuple:
+    """Best score_table model for this axis, restricted to logicals the
+    OPERATOR'S registry can map (that's 'their fleet' — no separate fleet
+    declaration needed, per Sophie 2026-07-14). Reference-role rows (our
+    benchmark etalons) are never proposed. Tie-break: score desc, then cost
+    asc (unknown cost last), then name — same rule as the generator's
+    build()/tie_band, kept simple here (no configurable band: the operator
+    always sees the full candidate list via /admin/coeos/fit if they want
+    to override the pin themselves).
+    Returns (logical, table_row_name, score) or (None, None, None)."""
+    st = cfg.get("score_table") or {}
+    models = st.get("models") or {}
+    lut = _coeos_table_lookup(cfg)
+    best = None
+    for logical in _coeos_model_registry(cfg):
+        row = lut.get(str(logical).strip().lower())
+        if not row:
+            continue
+        m = models.get(row) or {}
+        if m.get("role") == "reference":       # benchmark etalons: never proposed
+            continue
+        score = ((m.get("axes") or {}).get(axis) or {}).get("score")
+        if score is None:
+            continue
+        cost = m.get("cost_per_test")
+        key = (-score, cost is None, cost if cost is not None else 0.0, str(logical))
+        if best is None or key < best[0]:
+            best = (key, logical, row, score)
+    return (best[1], best[2], best[3]) if best else (None, None, None)
 
 
 def _coeos_resolve_endpoint(cfg: dict, logical) -> tuple:
