@@ -7405,9 +7405,18 @@ def _coeos_propose(cfg: dict, axis: str) -> tuple:
     st = cfg.get("score_table") or {}
     models = st.get("models") or {}
     lut = _coeos_table_lookup(cfg)
+    registry = _coeos_model_registry(cfg)
     best = None
-    for logical in _coeos_model_registry(cfg):
+    for logical, entry in registry.items():
+        # Try the registry KEY first, then the entry's own canonical
+        # endpoint id. The key is usually a SLUGIFIED display name (e.g. a
+        # generator turning "RING2.6 OR" into "ring2.6-or") that rarely
+        # matches a table row's own name verbatim — the canonical endpoint
+        # is the join that actually holds across differently-named configs
+        # (caught live on coeos-se .21:4600, 2026-07-14, ported here).
         row = lut.get(str(logical).strip().lower())
+        if not row and isinstance(entry, dict) and entry.get("endpoint"):
+            row = lut.get(str(entry["endpoint"]).strip().lower())
         if not row:
             continue
         m = models.get(row) or {}

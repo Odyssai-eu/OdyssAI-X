@@ -112,6 +112,19 @@ c4 = {"axes": [{"key": "reasoning"}],
 logical, row, score = api._coeos_propose(c4, "reasoning")
 check("4 REF never proposed (aion3 wins over Fusion-REF's 100.0)", logical, "aion3 OR")
 
+# 4b) the REAL-WORLD case (caught live on coeos-se .21:4600, 2026-07-14,
+#     ported here): a settings generator SLUGIFIES display names into
+#     registry keys ("aion3 OR" -> "aion3-or"), so the key essentially
+#     never equals a table row's own name — only the registry entry's OWN
+#     `endpoint` id does (mirroring the table's `or_id`). A join that only
+#     tries the key (the original bug — see the 2a/2b workaround above,
+#     which sidestepped this instead of catching it) resolves nothing.
+c4b = {"axes": [{"key": "reasoning"}],
+       "models": {"aion3-or": {"name": "aion3 OR", "endpoint": "aion-labs/aion-3.0"}},
+       "score_table": TABLE}
+logical, row, score = api._coeos_propose(c4b, "reasoning")
+check("4b matches via registry endpoint when key is slugified", logical, "aion3-or")
+
 # 5) a table model with no registry entry is ignored entirely.
 c5 = {"axes": [{"key": "reasoning"}],
       "models": {},  # empty registry: nothing is "this operator's fleet"
