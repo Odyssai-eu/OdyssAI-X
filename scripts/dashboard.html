@@ -2195,43 +2195,6 @@ function renderSettingsCoeos() {
   const enabled = c.enabled === true;
   const autoload = c.cold_boot_autoload === true;
   const axes = Array.isArray(c.axes) ? c.axes : [];
-  const decider = c.decider_model || "";
-  const defaultAxis = c.default_axis || "";
-
-  // Model options = the live /v1/models list (same source as Endpoints): local
-  // pools (Argo…), Telemak clusters, and cloud — real routing id + friendly label.
-  const entries = (state.endpoint_models || [])
-    .filter(m => m.id !== COEOS_PUBLIC_ID)  // CoeOS can't route to itself
-    .map(m => ({ id: m.id, label: endpointModelLabel(m) }));
-
-  // The Models section is DERIVED from what the settings PROPOSE — the distinct
-  // model names bound across the axes. Dynamic: a new proposal in the JSON (say
-  // "macaron") shows up as a new box automatically. The optional `models` registry
-  // only stores a display name + the operator's endpoint per proposed model; if a
-  // proposed name has no registry entry, the name itself is the endpoint (legacy).
-  const models = (c.models && typeof c.models === "object") ? c.models : {};
-  const proposed = [...new Set(axes.map(a => a.model).filter(Boolean))];
-  // "loaded" = truly served by /v1/models (not the not-loaded extras we add below).
-  const isServable = (id) => !!id && (state.endpoint_models || []).some(m => m.id === id);
-  const endpointOf = (m) => { const e = models[m]; return (e && typeof e === "object" && e.endpoint) ? e.endpoint : m; };
-  const displayOf = (m) => (models[m] && models[m].name) || m;
-  const bestOf = (a) => a.best || endpointOf(a.model);   // CoeOS-suggested endpoint for the axis
-  const isLoaded = (m) => isServable(endpointOf(m));
-
-  // Ensure current bindings + coeos-best endpoints appear in the list even if not
-  // currently loaded (so the select can show/select them).
-  axes.flatMap(a => [endpointOf(a.model), a.best]).concat(decider ? [decider] : []).filter(Boolean)
-    .forEach(v => { if (!entries.some(e => e.id === v)) entries.push({ id: v, label: v + " (not loaded)" }); });
-  entries.sort((a, b) => a.label.localeCompare(b.label));
-
-  const opts = (sel) => `<option value="">— none —</option>` + entries.map(e =>
-    `<option value="${escapeHtml(e.id)}" ${e.id === sel ? "selected" : ""}>${escapeHtml(e.label)}</option>`).join("");
-  // Axis picker: ALL OdyssAI-X models (/v1/models), with the CoeOS-suggested one
-  // flagged "⭐ coeos best". Selected = the axis's current endpoint. Override freely.
-  const axisOpts = (a) => { const cur = endpointOf(a.model), best = bestOf(a);
-    return `<option value="">— none —</option>` + entries.map(e =>
-      `<option value="${escapeHtml(e.id)}" ${e.id === cur ? "selected" : ""}>${escapeHtml(e.label)}${e.id === best ? "  ·  ⭐ coeos best" : ""}</option>`).join(""); };
-
   const baseUrl = endpointBaseUrl();
   const curl =
 `export OPENAI_BASE_URL="${baseUrl}"
@@ -2244,7 +2207,7 @@ curl "${baseUrl}/chat/completions" \\
 
   const loadedLine = c.name
     ? `Loaded: <b>${escapeHtml(c.name)}</b>${c.regime ? ` · <span class="mono">${escapeHtml(c.regime)}</span>` : ""}${c.updated ? ` · ${escapeHtml(c.updated)}` : ""}`
-    : `No TMB Settings loaded — import a file below, or bind axes by hand.`;
+    : `No settings loaded.`;
 
   return `
     <div style="display:flex;flex-direction:column;gap:20px">
@@ -2273,71 +2236,6 @@ curl "${baseUrl}/chat/completions" \\
             <input type="checkbox" data-act="coeos-toggle-autoload" ${autoload?"checked":""}/>
             <span style="font-family:var(--font-mono);font-size:12px;color:${autoload?'var(--blue-deep)':'var(--ink-3)'}">${autoload?'ON':'OFF'}</span>
           </label>
-        </div>
-      </div>
-
-      <div style="background:var(--surface);border:1px solid var(--line);border-radius:12px;padding:18px;display:flex;flex-direction:column;gap:14px">
-        <div>
-          <div class="field-label">Decider &amp; default</div>
-          <div style="font-size:12px;color:var(--ink-2);margin-top:2px">The <b>decider</b> classifies each request into one axis — it must stay <b>hot</b> (small &amp; fast, e.g. nex-n2-mini). If it's cold or unsure, requests fall to the <b>default axis</b>.</div>
-        </div>
-        <div style="display:flex;gap:12px;flex-wrap:wrap">
-          <div style="flex:1;min-width:240px;display:flex;flex-direction:column;gap:4px">
-            <span style="font-size:11px;color:var(--ink-3)">Decider model</span>
-            <select class="ce-input mono" data-act="coeos-set-decider" style="width:100%;font-size:12px">${opts(decider)}</select>
-          </div>
-          <div style="flex:1;min-width:240px;display:flex;flex-direction:column;gap:4px">
-            <span style="font-size:11px;color:var(--ink-3)">Default axis</span>
-            <select class="ce-input mono" data-act="coeos-set-default-axis" style="width:100%;font-size:12px">
-              <option value="">— first bound —</option>
-              ${axes.map(a => `<option value="${escapeHtml(a.key)}" ${a.key===defaultAxis?"selected":""}>${escapeHtml(a.label||a.key)}</option>`).join("")}
-            </select>
-          </div>
-        </div>
-      </div>
-
-      ${proposed.length ? `<div style="background:var(--surface);border:1px solid var(--line);border-radius:12px;padding:18px;display:flex;flex-direction:column;gap:14px">
-        <div>
-          <div class="field-label">Models — proposed by the settings</div>
-          <div style="font-size:12px;color:var(--ink-2);margin-top:2px">One box per model the loaded settings propose — <b>generated from the JSON</b>, so a new proposal appears here automatically. Each is matched against your <span class="mono">/v1/models</span>: <span style="color:var(--blue-deep)">● loaded</span> if served, else <span style="color:#b45309">○ not loaded</span>. You can override which endpoint a proposal maps to.</div>
-        </div>
-        <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:10px">
-          ${proposed.map(m => `
-            <div style="background:var(--surface-2);border-radius:8px;padding:10px;display:flex;flex-direction:column;gap:6px">
-              <div style="display:flex;align-items:center;justify-content:space-between;gap:6px">
-                <div style="font-size:12px;font-weight:600">${escapeHtml(displayOf(m))}</div>
-                ${isLoaded(m) ? `<span style="font-size:10px;color:var(--blue-deep)">● loaded</span>` : `<span style="font-size:10px;color:#b45309">○ not loaded</span>`}
-              </div>
-              <div class="mono" style="font-size:10px;color:var(--ink-3)">${escapeHtml(m)}</div>
-              <select class="ce-input mono" data-act="coeos-set-endpoint" data-model="${escapeHtml(m)}" style="width:100%;font-size:11px">${opts(endpointOf(m))}</select>
-            </div>`).join("")}
-        </div>
-      </div>` : ``}
-
-      <div style="background:var(--surface);border:1px solid var(--line);border-radius:12px;padding:18px;display:flex;flex-direction:column;gap:14px">
-        <div>
-          <div class="field-label">Skill axes — bench-derived bindings</div>
-          <div style="font-size:12px;color:var(--ink-2);margin-top:2px">Each axis picks from <b>all OdyssAI-X models</b> (<span class="mono">/v1/models</span>). The one the benchmarks proved best is flagged <b>⭐ coeos best</b> — override it with any model; the binding saves immediately.</div>
-        </div>
-        ${axes.length ? `<div style="display:grid;grid-template-columns:repeat(3,1fr);gap:10px">
-          ${axes.map(a => `
-            <div style="background:var(--surface-2);border-radius:8px;padding:10px;display:flex;flex-direction:column;gap:6px">
-              <div style="font-size:12px;font-weight:600">${escapeHtml(a.label||a.key)}</div>
-              <select class="ce-input mono" data-act="coeos-set-axis" data-key="${escapeHtml(a.key)}" style="width:100%;font-size:11px">${axisOpts(a)}</select>
-              ${a.model && !isLoaded(a.model) ? `<div style="font-size:10px;color:#b45309">⚠ ${escapeHtml(displayOf(a.model))} — not loaded</div>` : ``}
-            </div>`).join("")}
-        </div>` : `<div style="font-size:12px;color:var(--ink-3)">${state.endpoint_models_loaded ? "No axes yet — import a TMB Settings file below." : "Loading…"}</div>`}
-      </div>
-
-      <div style="background:var(--surface);border:1px solid var(--line);border-radius:12px;padding:18px;display:flex;flex-direction:column;gap:14px">
-        <div>
-          <div class="field-label">TMB Settings file</div>
-          <div style="font-size:12px;color:var(--ink-2);margin-top:2px">Import a curated settings file to configure everything at once (taxonomy + bindings + decider) — then edit any cell above. Export to share or version. We ship a <span class="mono">local</span> (sovereign) and a <span class="mono">cloud</span> (best-of-all) variant, refreshed monthly.</div>
-        </div>
-        <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">
-          <button class="btn btn-sm" style="background:var(--blue);color:white;border-color:var(--blue)" data-act="coeos-import">${Icon.upload || ""}<span>Import TMB Settings…</span></button>
-          <button class="btn btn-sm" data-act="coeos-export">${Icon.download || ""}<span>Export current</span></button>
-          <input type="file" accept="application/json,.json" data-act="coeos-import-file" style="display:none"/>
         </div>
       </div>
 
@@ -6338,94 +6236,6 @@ async function handleAct(e) {
       toast(`Coeos ${field} = ${el.checked ? "on" : "off"}`, "ok");
     } catch (e) { toast(`Save failed: ${e.message}`, "err"); }
     render();
-    return;
-  }
-  if (act === "coeos-set-axis") {
-    // Bindings save immediately. PUT replaces the whole axes array, so send the
-    // full list with this one cell updated.
-    const key = el.dataset.key;
-    // Preserve the CoeOS suggestion (a.best) before overriding a.model, so the
-    // "⭐ coeos best" flag survives the override.
-    const reg = (state.coeos && state.coeos.models) || {};
-    const epOf = (m) => { const e = reg[m]; return (e && e.endpoint) ? e.endpoint : m; };
-    const axes = (state.coeos && Array.isArray(state.coeos.axes) ? state.coeos.axes : [])
-      .map(a => a.key === key ? { ...a, model: el.value || "", best: a.best || (a.model ? epOf(a.model) : "") } : a);
-    try {
-      const r = await fetch("/admin/coeos", { method: "PUT",
-        headers: { "content-type": "application/json", ...authHeaders() },
-        body: JSON.stringify({ axes }) });
-      if (!r.ok) { const t = await r.text(); throw new Error(t.slice(0, 200)); }
-      state.coeos = await r.json();
-      toast(`${key} → ${el.value || "none"}`, "ok");
-    } catch (e) { toast(`Save failed: ${e.message}`, "err"); }
-    render();
-    return;
-  }
-  if (act === "coeos-set-endpoint") {
-    // Map a logical model name → the operator's served endpoint. PUT the whole
-    // registry with this one entry updated.
-    const mk = el.dataset.model;
-    const models = { ...((state.coeos && state.coeos.models) || {}) };
-    models[mk] = { ...(models[mk] || {}), endpoint: el.value || "" };
-    try {
-      const r = await fetch("/admin/coeos", { method: "PUT",
-        headers: { "content-type": "application/json", ...authHeaders() },
-        body: JSON.stringify({ models }) });
-      if (!r.ok) { const t = await r.text(); throw new Error(t.slice(0, 200)); }
-      state.coeos = await r.json();
-      toast(`${(models[mk] || {}).name || mk} → ${el.value || "—"}`, "ok");
-    } catch (e) { toast(`Save failed: ${e.message}`, "err"); }
-    render();
-    return;
-  }
-  if (act === "coeos-set-decider" || act === "coeos-set-default-axis") {
-    const field = act === "coeos-set-decider" ? "decider_model" : "default_axis";
-    try {
-      const r = await fetch("/admin/coeos", { method: "PUT",
-        headers: { "content-type": "application/json", ...authHeaders() },
-        body: JSON.stringify({ [field]: el.value || "" }) });
-      if (!r.ok) { const t = await r.text(); throw new Error(t.slice(0, 200)); }
-      state.coeos = await r.json();
-      toast(`${field} = ${el.value || "—"}`, "ok");
-    } catch (e) { toast(`Save failed: ${e.message}`, "err"); }
-    render();
-    return;
-  }
-  if (act === "coeos-export") {
-    // Export the live config as a TMB Settings file (taxonomy + bindings + decider).
-    const cfg = { ...(state.coeos || {}) };
-    const blob = new Blob([JSON.stringify(cfg, null, 2)], { type: "application/json" });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement("a");
-    a.href = url;
-    a.download = (cfg.name ? cfg.name.replace(/[^a-z0-9._-]+/gi, "-") : "TMB-Settings") + ".json";
-    document.body.appendChild(a); a.click();
-    document.body.removeChild(a); URL.revokeObjectURL(url);
-    return;
-  }
-  if (act === "coeos-import") {
-    const inp = document.querySelector('[data-act="coeos-import-file"]');
-    if (inp) inp.click();
-    return;
-  }
-  if (act === "coeos-import-file") {
-    const file = el.files && el.files[0];
-    if (!file) return;
-    try {
-      const parsed = JSON.parse(await file.text());
-      // Send the whole settings file as the config (taxonomy + bindings + decider).
-      const body = {};
-      ["name", "regime", "updated", "note", "decider_model", "default_axis", "axes", "models", "cold_boot_autoload"]
-        .forEach(k => { if (parsed[k] !== undefined) body[k] = parsed[k]; });
-      const r = await fetch("/admin/coeos", { method: "PUT",
-        headers: { "content-type": "application/json", ...authHeaders() },
-        body: JSON.stringify(body) });
-      if (!r.ok) { const t = await r.text(); throw new Error(t.slice(0, 200)); }
-      state.coeos = await r.json();
-      render();
-      toast(`Imported: ${parsed.name || "TMB Settings"} (${(parsed.axes || []).length} axes)`, "ok");
-    } catch (e) { toast(`Import failed: ${e.message}`, "err"); }
-    el.value = "";  // allow re-importing the same file
     return;
   }
   if (act === "server-restart") {
