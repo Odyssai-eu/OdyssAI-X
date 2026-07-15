@@ -4383,7 +4383,7 @@ def _initial_default_config() -> Optional[dict]:
 #   major (1.7.2 → 2.0.0) — breaking API or topology change
 #
 # Use `./scripts/bump-version.sh patch|minor|major` to bump + auto-commit.
-APP_VERSION = "1.17.0"
+APP_VERSION = "1.17.1"
 
 app = FastAPI(
     title="OdyssAI-X (odyssai.eu)",
@@ -7799,6 +7799,21 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
                   or request.headers.get("X-Session-Id")
                   or req.session_id)
     session_meta: dict = {"id": session_id} if session_id else {}
+
+    # Resolve enable_thinking to the effective server default (cluster
+    # settings / THINKING_DEFAULT) BEFORE the <think>-split decisions below.
+    # _should_filter_think / _seed_in_think read the raw Optional[bool]: when a
+    # caller OMITS the flag (None), the generation path resolves it to the
+    # default (OFF → the template bakes an empty <think></think>, no reasoning
+    # block) while the filter still saw None and seeded in_think=True — trapping
+    # the model's direct answer in reasoning_content, i.e. empty content
+    # ("ghost", reproduced on glm-5-2 / GLM-5.2-Q6 2026-07-15; TMB BenchRunner
+    # in "défaut" thinking mode sends no flag, unlike Companion which always
+    # sends an explicit bool). Resolving once here keeps the filter and the
+    # template in agreement. pool.submit re-resolves None identically, so
+    # passing the resolved bool changes nothing for generation.
+    if req.enable_thinking is None:
+        req.enable_thinking = get_enable_thinking_default()
 
     if not req.stream:
         text_parts: list[str] = []
