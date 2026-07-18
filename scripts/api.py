@@ -4383,7 +4383,7 @@ def _initial_default_config() -> Optional[dict]:
 #   major (1.7.2 → 2.0.0) — breaking API or topology change
 #
 # Use `./scripts/bump-version.sh patch|minor|major` to bump + auto-commit.
-APP_VERSION = "1.17.1"
+APP_VERSION = "1.17.2"
 
 app = FastAPI(
     title="OdyssAI-X (odyssai.eu)",
@@ -7583,8 +7583,21 @@ async def _coeos_llm_classify(decider_id, axes, messages) -> Optional[str]:
                 tele_cluster, get_cluster_def(tele_cluster), body, False,
                 requested_short_id=tele_short)
             buf = ((out.get("choices") or [{}])[0].get("message", {}) or {}).get("content") or ""
+        elif find_cloud_alias(decider_id):
+            # 2. Cloud/OR decider — a published cloud alias (e.g. a fast
+            #    gemini-flash / OR classifier). `_route_pool` can't see cloud
+            #    aliases (they're not local pools), so dispatch through the same
+            #    proxy helper the chat endpoint uses. Without this branch a cloud
+            #    decider passed the servability gate then silently returned None
+            #    → every request fell to `default_axis` (the .39 symptom, 2026-07).
+            prov_id, prov, entry = find_cloud_alias(decider_id)
+            body = {"model": decider_id, "messages": dmsg, "max_tokens": 160,
+                    "enable_thinking": False, "stream": False}
+            resp = await _proxy_chat_completion(prov_id, prov, entry, body)
+            data = json.loads(resp.body)
+            buf = ((data.get("choices") or [{}])[0].get("message", {}) or {}).get("content") or ""
         else:
-            # 2. Local pool decider (back-compat, e.g. a small local classifier).
+            # 3. Local pool decider (back-compat, e.g. a small local classifier).
             pool = _route_pool(decider_id)
             if pool is None:
                 return None
