@@ -4383,7 +4383,7 @@ def _initial_default_config() -> Optional[dict]:
 #   major (1.7.2 → 2.0.0) — breaking API or topology change
 #
 # Use `./scripts/bump-version.sh patch|minor|major` to bump + auto-commit.
-APP_VERSION = "1.17.2"
+APP_VERSION = "1.17.3"
 
 app = FastAPI(
     title="OdyssAI-X (odyssai.eu)",
@@ -7645,6 +7645,23 @@ async def coeos_resolve(req, request) -> tuple:
             axis = await _coeos_llm_classify(decider_id, axes, messages)
     if axis not in keys:
         axis = default_axis
+    # Politique thinking/effort PAR AXE (2026-07-19) : certains axes
+    # (creative/reasoning/plan) ont besoin que le modèle RAISONNE, d'autres non
+    # (fast_tools/code_general). Réglée dans les settings — champs `thinking`
+    # (bool) et `reasoning_effort` (low|medium|high|xhigh) de l'axe — appliquée
+    # ICI. Placement CRUCIAL : coeos_resolve tourne AVANT le passthrough cloud
+    # (req.model_dump y capte enable_thinking) ET avant le défaut global du path
+    # local — sans quoi un modèle cloud (glm) partait avec le thinking du défaut
+    # serveur, sous-raisonnant (T01 : 331 reasoning au lieu de 2360). Le CLIENT
+    # garde la priorité : un enable_thinking / reasoning_effort déjà posé n'est
+    # jamais écrasé. enable_thinking = levier glm-family, reasoning_effort =
+    # levier o-series/MiniMax : on injecte ce que l'axe déclare, le modèle lit
+    # ce qu'il comprend.
+    ax_cfg = next((a for a in axes if a.get("key") == axis), None) or {}
+    if req.enable_thinking is None and ax_cfg.get("thinking") is not None:
+        req.enable_thinking = bool(ax_cfg["thinking"])
+    if not req.reasoning_effort and ax_cfg.get("reasoning_effort"):
+        req.reasoning_effort = str(ax_cfg["reasoning_effort"])
     # Resolve the axis binding through the model registry: axes bind a LOGICAL
     # model name (portable, e.g. "minimax-m3"); the registry maps it to the
     # operator's endpoint + a public display name. Legacy configs without a
