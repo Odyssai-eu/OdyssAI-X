@@ -4258,6 +4258,29 @@ _LEAK_REBOOT_COOLDOWN_S = float(os.environ.get("LEAK_REBOOT_COOLDOWN_S", "1800")
 _WIRED_LEAK_THRESHOLD_B = 15 * 1024**3  # same bar as the sweep's WIRED_WARN_THRESHOLD
 _leak_reboot_last: dict[str, float] = {}
 _leak_reboot_in_flight: set[str] = set()
+# Strong refs to in-flight recovery tasks. asyncio's loop holds only WEAK
+# refs to tasks — a bare `asyncio.create_task(...)` with the result dropped
+# can be garbage-collected BEFORE it runs (observed live 2026-07-22 21:12 and
+# 2026-07-23 08:56: two leak-recovery firings, zero log lines, no exception —
+# the coroutine simply never executed). Same pattern as the keepalive ladder,
+# which survives via its _WATCHDOG_RECOVERY_BY_CLUSTER reference.
+_leak_recovery_tasks: set = set()
+
+
+def _spawn_leak_recovery(cluster_id: str, sweep_result: dict,
+                         reload_reqs: Optional[list] = None) -> None:
+    """create_task with a strong reference held until completion, and loud
+    surfacing of any exception — a recovery that dies must never be silent."""
+    t = asyncio.create_task(
+        _auto_reboot_leaked_nodes(cluster_id, sweep_result, reload_reqs))
+    _leak_recovery_tasks.add(t)
+
+    def _done(d, cid=cluster_id):
+        _leak_recovery_tasks.discard(d)
+        if not d.cancelled() and d.exception() is not None:
+            _jaccl_log(cid, f"leak recovery task CRASHED: {d.exception()!r}")
+
+    t.add_done_callback(_done)
 
 
 async def _probe_wired_gb(host: dict) -> Optional[float]:
@@ -4506,7 +4529,7 @@ def _initial_default_config() -> Optional[dict]:
 #   major (1.7.2 → 2.0.0) — breaking API or topology change
 #
 # Use `./scripts/bump-version.sh patch|minor|major` to bump + auto-commit.
-APP_VERSION = "1.18.0"
+APP_VERSION = "1.18.1"
 
 app = FastAPI(
     title="OdyssAI-X (odyssai.eu)",
@@ -9139,7 +9162,7 @@ async def admin_unload():
     leak_recovery = None
     if sweep.get("warnings"):
         leak_recovery = "fired" if _JACCL_AUTO_RECOVERY_ENABLED else "disarmed"
-        asyncio.create_task(_auto_reboot_leaked_nodes("nautilus", sweep))
+        _spawn_leak_recovery("nautilus", sweep)
     return {"loaded": False, "sweep": sweep, "leak_recovery": leak_recovery}
 
 
@@ -13019,7 +13042,7 @@ async def admin_cluster_unload(
     leak_recovery = None
     if sweep.get("warnings"):
         leak_recovery = "fired" if _JACCL_AUTO_RECOVERY_ENABLED else "disarmed"
-        asyncio.create_task(_auto_reboot_leaked_nodes(cluster_id, sweep))
+        _spawn_leak_recovery(cluster_id, sweep)
     return {
         "loaded": False, "cluster": cluster_id,
         "unloaded_alias": target,
@@ -13157,8 +13180,7 @@ async def _cluster_reset(cluster_id: str) -> dict:
         # returns now, the healing shows in the jaccl-stability log).
         report["leak_recovery"] = ("fired" if _JACCL_AUTO_RECOVERY_ENABLED
                                    else "disarmed")
-        asyncio.create_task(
-            _auto_reboot_leaked_nodes(cluster_id, sweep_result, reload_reqs))
+        _spawn_leak_recovery(cluster_id, sweep_result, reload_reqs)
     return report
 
 
