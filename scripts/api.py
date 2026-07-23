@@ -4238,6 +4238,129 @@ async def _keepalive_recovery_ladder(cluster_id: str, req: ArgoLoadRequest) -> N
             return
 
 
+# ── Wired-leak auto-recovery (2026-07-22) ─────────────────────────────────────
+# A runner SIGKILLed while wedged inside a native MLX/JACCL call (prefill
+# collective hang, QP-degradation class) leaves its Metal/RDMA wired pages
+# stuck in the KERNEL — no process owns them, nothing app-side can free them,
+# only a reboot does (probed live 2026-07-22: 627 GB across the 4 Argo ultras
+# with zero runner.py alive). The keepalive path already finishes its recovery
+# with a per-node reboot (_keepalive_recovery_ladder); the watchdog/reset and
+# unload paths used to stop at "degraded + reboot may be needed", leaving the
+# operator to reboot by hand every time. This helper gives those paths the
+# same ending: reboot ONLY the nodes the sweep flagged as leaked, wait for
+# them, re-probe wired (targeted vm_stat — NOT a re-sweep, which would TERM
+# live sibling pools' runners cluster-wide), clear degraded on success, then
+# reload the snapshotted pools when the caller wants service restored.
+# Same arming switch as the keepalive ladder (JACCL_AUTO_RECOVERY_ENABLED);
+# a per-host cooldown guards against reboot loops if a node somehow still
+# shows high wired right after a fresh boot.
+_LEAK_REBOOT_COOLDOWN_S = float(os.environ.get("LEAK_REBOOT_COOLDOWN_S", "1800"))
+_WIRED_LEAK_THRESHOLD_B = 15 * 1024**3  # same bar as the sweep's WIRED_WARN_THRESHOLD
+_leak_reboot_last: dict[str, float] = {}
+_leak_reboot_in_flight: set[str] = set()
+
+
+async def _probe_wired_gb(host: dict) -> Optional[float]:
+    """Targeted wired-memory probe of one node (no killing, no sweeping)."""
+    cmd = "vm_stat | awk '/Pages wired/{gsub(\"\\\\.\",\"\",$4); print $4*16384}'"
+    try:
+        rc, out, _err = await asyncio.to_thread(_ssh_exec, host["ssh"], cmd, 10)
+        if rc == 0 and out.strip():
+            return float(out.strip().splitlines()[0]) / 1024**3
+    except Exception:
+        pass
+    return None
+
+
+async def _auto_reboot_leaked_nodes(cluster_id: str, sweep_result: dict,
+                                    reload_reqs: Optional[list] = None) -> None:
+    """Finish a leak-detecting sweep with the reboot it says is needed.
+
+    Reboots only the swept nodes flagged `wired_warn`, waits for them, then
+    confirms the wired reset with a targeted probe before clearing the
+    degraded flag. When `reload_reqs` is given (watchdog/reset path — the
+    pools were snapshotted before teardown), reloads them so the cluster
+    returns to service without an operator in the loop."""
+    if cluster_id in _leak_reboot_in_flight:
+        return
+    leaked = [r["host"] for r in sweep_result.get("swept", [])
+              if r.get("wired_warn") and r.get("host")]
+    if not leaked:
+        return
+    if not _JACCL_AUTO_RECOVERY_ENABLED:
+        _jaccl_log(cluster_id,
+                   f"leak recovery DISARMED — {leaked} hold leaked wired; "
+                   f"manual reboot needed (JACCL_AUTO_RECOVERY_ENABLED=0)")
+        return
+    now = time.time()
+    cooled = [h for h in leaked
+              if now - _leak_reboot_last.get(h, 0.0) >= _LEAK_REBOOT_COOLDOWN_S]
+    skipped = sorted(set(leaked) - set(cooled))
+    if skipped:
+        _jaccl_log(cluster_id,
+                   f"leak recovery: {skipped} were auto-rebooted "
+                   f"<{int(_LEAK_REBOOT_COOLDOWN_S)}s ago and leak again — "
+                   f"NOT rebooting again, needs eyes")
+    if not cooled:
+        return
+    hosts = [h for h in (_resolve_host(hid) for hid in cooled) if h]
+    if not hosts:
+        _jaccl_log(cluster_id, "leak recovery: no leaked hosts resolved — left degraded")
+        return
+    _leak_reboot_in_flight.add(cluster_id)
+    try:
+        for h in hosts:
+            _leak_reboot_last[h["id"]] = now
+        _jaccl_log(cluster_id,
+                   f"leak recovery: rebooting {[h['id'] for h in hosts]} — "
+                   f"kernel-held wired pages post-SIGKILL, only a reboot frees them")
+        results = await asyncio.gather(*[_reboot_one(h) for h in hosts])
+        _jaccl_log(cluster_id,
+                   f"leak recovery reboot methods: {[r.get('method') for r in results]}")
+        if not await _wait_nodes_reachable(cluster_id,
+                                           host_ids=[h["id"] for h in hosts]):
+            _jaccl_log(cluster_id,
+                       "leak recovery: nodes did not return in time — left degraded")
+            return
+        still_high = []
+        for h in hosts:
+            gb = await _probe_wired_gb(h)
+            if gb is not None and gb * 1024**3 > _WIRED_LEAK_THRESHOLD_B:
+                still_high.append(f"{h['id']}={gb:.1f}GB")
+        if still_high:
+            _jaccl_log(cluster_id,
+                       f"leak recovery: wired STILL high after reboot ({still_high}) "
+                       f"— left degraded, needs eyes")
+            return
+        _clear_cluster_degraded(cluster_id)
+        _jaccl_log(cluster_id,
+                   f"leak recovery: wired reset confirmed on {[h['id'] for h in hosts]} "
+                   f"— cluster clean")
+        if reload_reqs:
+            # /Volumes/models lags SSH by a few seconds after reboot (seen
+            # 2026-06-14 in the keepalive ladder) — grace + one retry each.
+            await asyncio.sleep(12)
+            for req in reload_reqs:
+                for attempt in (1, 2):
+                    try:
+                        res = await admin_cluster_load(cluster_id, req)
+                        _jaccl_log(cluster_id,
+                                   f"leak recovery reload ({req.alias}): "
+                                   f"loaded={res.get('loaded')} load_s={res.get('load_s')}")
+                        break
+                    except Exception as e:
+                        if attempt == 1:
+                            _jaccl_log(cluster_id,
+                                       f"leak recovery reload attempt 1 failed ({e}); "
+                                       f"retry in 15s (mount race?)")
+                            await asyncio.sleep(15)
+                            continue
+                        _jaccl_log(cluster_id,
+                                   f"leak recovery reload error ({req.alias}): {e}")
+    finally:
+        _leak_reboot_in_flight.discard(cluster_id)
+
+
 def _fire_keepalive_recovery(cluster_id: str, pool: RunnerPool, res: dict) -> None:
     """WU3 trigger — mark degraded and launch the recovery ladder, deduped per
     cluster via the existing watchdog map. Snapshots the reload config BEFORE
@@ -4383,7 +4506,7 @@ def _initial_default_config() -> Optional[dict]:
 #   major (1.7.2 → 2.0.0) — breaking API or topology change
 #
 # Use `./scripts/bump-version.sh patch|minor|major` to bump + auto-commit.
-APP_VERSION = "1.17.3"
+APP_VERSION = "1.18.0"
 
 app = FastAPI(
     title="OdyssAI-X (odyssai.eu)",
@@ -9012,7 +9135,12 @@ async def admin_unload():
             STATE_FILE.unlink()
     except Exception:
         pass
-    return {"loaded": False, "sweep": sweep}
+    # Same leak auto-recovery as the per-cluster unload endpoint.
+    leak_recovery = None
+    if sweep.get("warnings"):
+        leak_recovery = "fired" if _JACCL_AUTO_RECOVERY_ENABLED else "disarmed"
+        asyncio.create_task(_auto_reboot_leaked_nodes("nautilus", sweep))
+    return {"loaded": False, "sweep": sweep, "leak_recovery": leak_recovery}
 
 
 @app.get("/admin/logs")
@@ -12884,11 +13012,20 @@ async def admin_cluster_unload(
     # only path that erases desired-state; every liveness event preserves it.
     save_cluster_state_v2(cluster_id, remove_aliases=removed or [target],
                           allow_empty_delete=True)
+    # Leak auto-recovery: when the sweep reports kernel-held wired on some
+    # nodes, finish the job with the reboot it says is needed (detached — the
+    # unload response returns immediately, the healing shows in jaccl logs).
+    # No reload here: the operator explicitly unloaded.
+    leak_recovery = None
+    if sweep.get("warnings"):
+        leak_recovery = "fired" if _JACCL_AUTO_RECOVERY_ENABLED else "disarmed"
+        asyncio.create_task(_auto_reboot_leaked_nodes(cluster_id, sweep))
     return {
         "loaded": False, "cluster": cluster_id,
         "unloaded_alias": target,
         "remaining_aliases": pool_aliases(cluster_id),
         "sweep": sweep,
+        "leak_recovery": leak_recovery,
     }
 
 
@@ -12915,6 +13052,21 @@ async def _cluster_reset(cluster_id: str) -> dict:
 
     def _step(name: str, ok: bool, detail: Any = None) -> None:
         report["steps"].append({"name": name, "ok": ok, "detail": detail})
+
+    # 0. Snapshot the live pools' load params BEFORE tearing them down — if
+    # the sweep then finds leaked wired, the auto-recovery reboots the leaked
+    # nodes and needs these to restore service (same snapshot-before-teardown
+    # pattern as _fire_keepalive_recovery).
+    reload_reqs: list = []
+    try:
+        if cluster_id == "nautilus":
+            if _pool is not None:
+                reload_reqs.append(_pool_reload_request(_pool))
+        else:
+            for _a, _p in list_pools(cluster_id):
+                reload_reqs.append(_pool_reload_request(_p))
+    except Exception as e:
+        sys.stderr.write(f"[reset] {cluster_id} reload snapshot error: {e}\n")
 
     # 1. Cancel in-flight runs scoped to this cluster
     try:
@@ -12999,6 +13151,14 @@ async def _cluster_reset(cluster_id: str) -> dict:
     else:
         report["cleared"] = False
         report["still_degraded"] = _cluster_degraded.get(cluster_id)
+        # 6. Finish the recovery instead of leaving "reboot may be needed" to
+        # the operator: reboot the leaked nodes, confirm the wired reset, and
+        # reload the pools snapshotted in step 0 (detached — the reset report
+        # returns now, the healing shows in the jaccl-stability log).
+        report["leak_recovery"] = ("fired" if _JACCL_AUTO_RECOVERY_ENABLED
+                                   else "disarmed")
+        asyncio.create_task(
+            _auto_reboot_leaked_nodes(cluster_id, sweep_result, reload_reqs))
     return report
 
 

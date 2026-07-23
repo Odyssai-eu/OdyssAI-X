@@ -1023,6 +1023,7 @@ const state = {
   busy_default_load: false,
   pending_form: {
     default_model: null, default_mode: "pipeline", default_use_ap: true, default_nodes: 3, default_kv_q8: false,
+    default_backend: "",   // "" = cluster default | "jaccl" | "ring" (per-load transport, #40 WU4)
     default_draft: "", default_num_draft: 4,
     default_targets: {},
     // Multi-pool "+ Add pool" inline form (2026-05-19). When open=true,
@@ -4928,6 +4929,14 @@ function renderFormRow2(f, busy, presence, fitCheck) {
         </div>
       </div>
       <div class="field">
+        <div class="field-label">Transport</div>
+        <div class="seg-mode">
+          ${[["","défaut"],["jaccl","jaccl"],["ring","ring"]].map(([bv,bl]) =>
+            `<button class="pill ${bv===(f.default_backend||"")?"selected":""}" data-act="form-default-backend" data-v="${bv}" title="${bv==="ring"?"TCP — pas de bug QP, l'option longues sessions / bench":bv==="jaccl"?"RDMA TB5 — perf, QP degradation après longues sessions":"backend du cluster"}">${bl}</button>`
+          ).join("")}
+        </div>
+      </div>
+      <div class="field">
         <div class="field-label">Options</div>
         <div class="check-row">
           <label data-act="form-default-ap">
@@ -4974,7 +4983,11 @@ function isLoadConfigChanged(a, f) {
     Boolean(f.default_use_ap) !== Boolean(a.use_ap) ||
     Boolean(f.default_kv_q8) !== Boolean(a.kv_q8) ||
     Boolean(f.default_mtp) !== Boolean(a.mtp && a.mtp.enabled) ||
-    (f.default_draft || "") !== (a.draft_model || "")
+    (f.default_draft || "") !== (a.draft_model || "") ||
+    // Transport: "" = cluster default (no change contribution). A concrete
+    // pick counts as a change when it differs from the pool's backend — or
+    // when the status doesn't expose one (worst case: button enabled).
+    Boolean(f.default_backend) && f.default_backend !== (a.backend || "")
   );
 }
 
@@ -6649,6 +6662,7 @@ async function handleAct(e) {
     return;
   }
   if (act === "form-default-mode") { if (e.type==="click") { f.default_mode = v; render(); } return; }
+  if (act === "form-default-backend") { if (e.type==="click") { f.default_backend = v; render(); } return; }
   if (act === "form-default-ap")   { if (e.type==="click") { f.default_use_ap = !f.default_use_ap; render(); } return; }
   if (act === "form-default-kv-q8"){ if (e.type==="click") { f.default_kv_q8 = !f.default_kv_q8; render(); } return; }
   if (act === "form-default-mtp")  { if (e.type==="click") { f.default_mtp = !f.default_mtp; render(); } return; }
@@ -6715,6 +6729,7 @@ async function handleAct(e) {
     state.busy_default_load = true; render();
     try {
       const body = { model, mode: f.default_mode, use_ap: f.default_use_ap, nodes: f.default_nodes, kv_q8: f.default_kv_q8 };
+      if (f.default_backend) body.backend = f.default_backend;  // "" = cluster default
       if (f.default_draft && f.default_draft.trim()) {
         body.draft_model = f.default_draft.trim();
         body.num_draft_tokens = f.default_num_draft || 4;
