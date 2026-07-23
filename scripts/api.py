@@ -13048,6 +13048,7 @@ async def _cluster_reset(cluster_id: str) -> dict:
     reset endpoints below. Always best-effort: failures at any step are
     reported but never raised — the goal is to get the cluster as clean
     as possible regardless of partial progress."""
+    global _pool
     report: dict = {"cluster": cluster_id, "steps": []}
 
     def _step(name: str, ok: bool, detail: Any = None) -> None:
@@ -13091,7 +13092,6 @@ async def _cluster_reset(cluster_id: str) -> dict:
     # 2. Stop the pool (handles state file + admin lock)
     try:
         if cluster_id == "nautilus":
-            global _pool
             async with _admin_lock:
                 if _pool is not None:
                     await _pool.stop()
