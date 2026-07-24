@@ -1672,6 +1672,15 @@ class RunnerProc:
             pattern = shlex.quote(self._match_pattern)
             # 24×0.5s = 12s grace so the runner's SIGTERM-driven Metal
             # cleanup (free_metal) finishes on big models before SIGKILL.
+            # Capture-before-kill (2026-07-24, panel Phase 0): a runner that
+            # ignored SIGTERM is wedged inside a NATIVE call — exactly the
+            # class-B state nobody has ever stack-dumped (every prior wedge
+            # was SIGKILLed uncaptured). `sample <pid> 2` costs ~2s and writes
+            # the native stack to /tmp/wedge-<pid>-<ts>.txt ON THE NODE before
+            # the SIGKILL, so the next wedge tells us which layer it is stuck
+            # in (libjaccl send/recv vs MLX eval vs ibv_reg_mr) WITHOUT
+            # disarming the self-healing. Grace 12s + sample 2s → ssh timeout
+            # raised 15→32s.
             cmd = (
                 f"pkill -TERM -f {pattern} 2>/dev/null && "
                 f"for i in $(seq 1 {_SWEEP_GRACE_ITERS}); do "
@@ -1680,12 +1689,16 @@ class RunnerProc:
                 f"done; "
                 f"pgrep -f {pattern} >/dev/null 2>&1 && "
                 f"  (echo 'SIGTERM ignored, escalating to SIGKILL — wired memory will leak' >&2 && "
+                f"   for p in $(pgrep -f {pattern}); do "
+                f"     sample $p 2 -file /tmp/wedge-$p-$(date +%Y%m%d-%H%M%S).txt >/dev/null 2>&1; "
+                f"   done; "
+                f"   echo 'wedge stack captured to /tmp/wedge-*.txt' >&2 && "
                 f"   pkill -9 -f {pattern}) || "
                 f"  echo 'clean exit'"
             )
             r = subprocess.run(
                 ["ssh", "-o", "ConnectTimeout=5", "-o", "StrictHostKeyChecking=no", ssh, cmd],
-                capture_output=True, text=True, timeout=15,
+                capture_output=True, text=True, timeout=32,
             )
             tail = (r.stdout + r.stderr).strip().splitlines()[-1:] if (r.stdout or r.stderr) else []
             sys.stderr.write(f"[rank{rank}] remote kill result: {tail[0] if tail else '(no output)'}\n")
@@ -4529,7 +4542,7 @@ def _initial_default_config() -> Optional[dict]:
 #   major (1.7.2 → 2.0.0) — breaking API or topology change
 #
 # Use `./scripts/bump-version.sh patch|minor|major` to bump + auto-commit.
-APP_VERSION = "1.18.1"
+APP_VERSION = "1.18.2"
 
 app = FastAPI(
     title="OdyssAI-X (odyssai.eu)",

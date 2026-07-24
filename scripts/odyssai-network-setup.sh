@@ -110,7 +110,17 @@ networksetup -listallhardwareports \
       esac
     done
 
-# Pass 2: one DHCP service per Thunderbolt port.
+# Pass 2: one service per Thunderbolt port. STATIC link-local when the node
+# ships a static-ips.conf (JACCL APIPA-GID fix, 2026-07-24 — the ::ffff GID
+# JACCL routes must be PRESENT and IMMUTABLE; DHCP-on-serverless-link yields
+# a volatile APIPA: absent in a boot window, renumbered on every link event
+# → RTR errno 22/96 at init, stale dst GID under live UC QPs). DHCP fallback
+# when no conf entry (backward-compatible onboarding). Because this script
+# re-runs via the LaunchDaemon (RunAtLoad + 1786s), the static is REASSERTED
+# every cycle — the daemon becomes the guardian of the GID instead of the
+# thing that clobbers it.
+# Conf format: one `SERVICE NAME|IP` per line, e.g. "Odyssai Thunderbolt 4|169.254.250.5".
+STATIC_CONF="/Library/Application Support/Odyssai/static-ips.conf"
 networksetup -listallhardwareports \
   | awk -F': ' '/Hardware Port: / {print $2}' \
   | while IFS= read -r name; do
@@ -122,12 +132,25 @@ networksetup -listallhardwareports \
           service_exists "$svc" \
             || networksetup -createnetworkservice "$svc" "$name" 2>/dev/null \
             || continue
-          networksetup -setdhcp "$svc" 2>/dev/null \
-            || log "warn: setdhcp failed for '${svc}' (continuing)"
+          static_ip=""
+          [ -f "$STATIC_CONF" ] \
+            && static_ip=$(awk -F'|' -v s="$svc" '$1==s{print $2; exit}' "$STATIC_CONF")
+          if [ -n "$static_ip" ]; then
+            # Exact-match idempotence: only rewrite when method or IP drifted.
+            cur_info=$(networksetup -getinfo "$svc" 2>/dev/null)
+            if ! printf '%s' "$cur_info" | grep -q "^Manual" \
+               || ! printf '%s' "$cur_info" | grep -q "^IP address: ${static_ip}$"; then
+              networksetup -setmanual "$svc" "$static_ip" 255.255.255.0 2>/dev/null \
+                || log "warn: setmanual failed for '${svc}' (continuing)"
+            fi
+          else
+            networksetup -setdhcp "$svc" 2>/dev/null \
+              || log "warn: setdhcp failed for '${svc}' (continuing)"
+          fi
           ;;
       esac
     done
-log "services recreated (mgmt/Wi-Fi first, TB ports DHCP)"
+log "services recreated (mgmt/Wi-Fi first, TB ports static-or-DHCP)"
 
 # --- 5. disable the Thunderbolt Bridge service (resolved name, never literal) --
 # configd may have re-materialized a bridge service in the new location; re-resolve
