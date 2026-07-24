@@ -120,7 +120,14 @@ networksetup -listallhardwareports \
 # every cycle — the daemon becomes the guardian of the GID instead of the
 # thing that clobbers it.
 # Conf format: one `SERVICE NAME|IP` per line, e.g. "Odyssai Thunderbolt 4|169.254.250.5".
+# Optional `TB_PREFIX|<prefix>` line overrides the service-name prefix — lets the
+# SAME script drive nodes still on exo-era service naming ("EXO Thunderbolt N",
+# .30/.31/.32) without creating duplicate Odyssai-named services on their ports.
 STATIC_CONF="/Library/Application Support/Odyssai/static-ips.conf"
+if [ -f "$STATIC_CONF" ]; then
+  _pfx=$(awk -F'|' '$1=="TB_PREFIX"{print $2; exit}' "$STATIC_CONF")
+  [ -n "$_pfx" ] && TB_PREFIX="$_pfx"
+fi
 networksetup -listallhardwareports \
   | awk -F': ' '/Hardware Port: / {print $2}' \
   | while IFS= read -r name; do
