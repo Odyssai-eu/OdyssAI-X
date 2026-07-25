@@ -1727,6 +1727,16 @@ def _resolve_eos_token_seqs(tokenizer) -> list[list[int]]:
         for t in eos:
             _add(t)
 
+    # mlx-lm's TokenizerWrapper carries the MODEL config's `eos_token_id` — often
+    # a LIST — in `eos_token_ids` (see mlx_lm/utils.py: load_tokenizer is called
+    # with eos_token_ids=config["eos_token_id"]). `tokenizer.eos_token_id` above
+    # only ever exposes the single primary id from tokenizer_config.json, so the
+    # extra turn-enders were dropped. Laguna: config declares [2, 24] = 〈|EOS|〉 +
+    # `</assistant>`, but only 2 survived — the model emitted 24, nothing stopped
+    # it, and `</assistant>` leaked into the text before generation looped.
+    for t in (getattr(tokenizer, "eos_token_ids", None) or ()):
+        _add(t)
+
     # HF generation_config can declare a list of eos ids that differs from the
     # tokenizer's primary eos. Read it if present.
     try:
@@ -1748,9 +1758,15 @@ def _resolve_eos_token_seqs(tokenizer) -> list[list[int]]:
                    # Bailing / Ring-2.x turn boundary (eos_token is <|endoftext|>
                    # but the chat template ends assistant turns with this)
                    "<|role_end|>")
+    # `convert_tokens_to_ids` returns the UNK id (not None) for a name absent
+    # from the vocab, so every model missing all of the above silently gained
+    # <unk> as a stop token — on Laguna that was id 0 = 〈|UNK|〉. Skip it.
+    unk_id = getattr(tokenizer, "unk_token_id", None)
     for name in extra_names:
         try:
             tid = tokenizer.convert_tokens_to_ids(name)
+            if unk_id is not None and tid == unk_id:
+                continue
             _add(tid)
         except Exception:
             pass
@@ -1851,7 +1867,10 @@ def main() -> None:
         # custom tokenizer/model Python files referenced via `auto_map` in their
         # config; without this flag transformers prompts interactively and hangs.
         # Safe here because we own/curate the model dirs on the cluster filesystem.
-        tokenizer = tokenizer_utils.load(repo_path, tokenizer_config_extra={"trust_remote_code": True})
+        # eos_token_ids: mirror mlx_lm.utils.load — the MODEL config declares the
+        # full stop set (often a list), tokenizer_config.json only the primary id.
+        tokenizer = tokenizer_utils.load(repo_path, tokenizer_config_extra={"trust_remote_code": True},
+                                         eos_token_ids=model_config.get("eos_token_id"))
     elif use_ap:
         # exo-style: load full, then auto-parallel shard
         # Resolve HF repo to local path if needed
@@ -1883,7 +1902,10 @@ def main() -> None:
         # custom tokenizer/model Python files referenced via `auto_map` in their
         # config; without this flag transformers prompts interactively and hangs.
         # Safe here because we own/curate the model dirs on the cluster filesystem.
-        tokenizer = tokenizer_utils.load(repo_path, tokenizer_config_extra={"trust_remote_code": True})
+        # eos_token_ids: mirror mlx_lm.utils.load — the MODEL config declares the
+        # full stop set (often a list), tokenizer_config.json only the primary id.
+        tokenizer = tokenizer_utils.load(repo_path, tokenizer_config_extra={"trust_remote_code": True},
+                                         eos_token_ids=model_config.get("eos_token_id"))
     else:
         if mode == "tensor":
             model, tokenizer = sharded_load(repo, tensor_group=group)
