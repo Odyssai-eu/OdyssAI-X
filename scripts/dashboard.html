@@ -1211,7 +1211,7 @@ async function refreshAll() {
     // Global (non-cluster-scoped) endpoints — fetched in parallel too.
     const [metrics, sessions, telemetry, runs, syncJobs, inventory,
            providers, crew, discoveryState, serverSettings, versionInfo, providerTemplates,
-           coeosConfig, coeosModels] = await Promise.all([
+           coeosConfig, coeosModels, downloads] = await Promise.all([
       getJson("/admin/metrics").catch(() => ({ data: [] })),
       getJson("/admin/sessions").catch(() => ({ data: [], count: 0 })),
       getJson("/admin/nodes/telemetry").catch(() => null),
@@ -1226,6 +1226,10 @@ async function refreshAll() {
       getJson("/admin/providers/templates").catch(() => ({ data: [] })),
       getJson("/admin/coeos").catch(() => ({})),
       getJson("/admin/coeos/available-models").catch(() => ({ data: [] })),
+      // HF download queue. Best-effort like every other global endpoint:
+      // `null` on failure so the previous list survives a transient 5xx
+      // instead of the whole download surface blinking out for one tick.
+      getJson("/admin/downloads").catch(() => null),
     ]);
     if (serverSettings) state.server_settings = serverSettings;
     state.coeos = coeosConfig || {};
@@ -1237,7 +1241,10 @@ async function refreshAll() {
     state.discovery = discoveryState || { active: false };
     if (inventory) state.inventory = inventory;
     state.metrics = metrics?.data || [];
-    state.downloads = [];
+    // Was hardcoded to [] — which made the whole download list, its progress
+    // bar and its buttons dead code, unreachable from the origin (2026-07-25).
+    // `downloads === null` means the fetch failed: keep whatever we had.
+    if (downloads) state.downloads = downloads.data || [];
     state.sessions = sessions?.data || [];
     state.telemetry = telemetry;
     state.runs = runs?.data || [];
@@ -5195,7 +5202,12 @@ function renderHFDownload(clusterId) {
           <div class="section-title">Download from Hugging Face</div>
           <div class="section-sub">Download to one or more nodes of this cluster · rsync afterwards if needed</div>
         </div>
-        <span class="section-sub">${dls.filter(d=>d.status==="running").length} active · ${dls.filter(d=>d.status==="done").length} done today</span>
+        <div style="display:flex;align-items:center;gap:12px">
+          <span class="section-sub">${dls.filter(d=>dlStatus(d)==="running").length} active · ${dls.filter(d=>dlStatus(d)==="paused").length} paused · ${dls.filter(d=>dlStatus(d)==="completed").length} done</span>
+          ${dls.some(d => DL_TERMINAL.includes(dlStatus(d)))
+            ? `<button class="btn btn-xs" data-act="dl-clear-finished" title="Remove every completed / cancelled / failed entry from the list. Files on the nodes are kept.">${Icon.trash}<span>Clear finished</span></button>`
+            : ""}
+        </div>
       </div>
       <div class="hf-form" style="margin-top:18px">
         <div class="form-row" style="align-items:flex-end">
@@ -5269,54 +5281,116 @@ function clusterTargetNodes(cluster) {
   });
 }
 
+// ─── HF download queue — status model ───────────────────────────────
+//
+// Frozen API contract (2026-07-25): a job is one of
+//   queued | running | paused | completed | cancelled | failed
+// Older engine builds emitted done/error/partial for the same states. We
+// normalise on READ only (Postel): what we SEND stays strictly on-contract.
+// Without this a pre-contract payload renders a row with zero buttons.
+const DL_STATUS_ALIAS = { done: "completed", error: "failed", partial: "failed" };
+const DL_TERMINAL = ["completed", "cancelled", "failed"];
+
+function dlStatus(d) {
+  const s = String(d?.status || "").toLowerCase();
+  return DL_STATUS_ALIAS[s] || s || "queued";
+}
+
+function dlStatusStyle(s) {
+  switch (s) {
+    case "running":   return { bg: "var(--blue-soft)",  fg: "var(--blue-deep)",  pip: "var(--blue)" };
+    case "paused":    return { bg: "var(--amber-soft)", fg: "var(--amber-deep)", pip: "var(--amber)" };
+    case "completed": return { bg: "var(--green-soft)", fg: "var(--green-deep)", pip: "var(--green)" };
+    case "failed":    return { bg: "var(--rust-soft)",  fg: "var(--rust-deep)",  pip: "var(--rust)" };
+    // queued | cancelled | unknown. NOT --surface-2: that is .hf-active's own
+    // background (#FAFBFC), so the pill would have zero contrast against the
+    // card it sits on — renderSyncJobRow gets away with it only because its
+    // card is --surface. --ground is the house recessed-chip tone.
+    default:          return { bg: "var(--ground)",     fg: "var(--ink-2)",      pip: "var(--ink-3)" };
+  }
+}
+
 function renderDownloadRow(d) {
-  const running = d.status === "running";
-  const resumable = (d.status === "cancelled" || d.status === "error" || d.status === "partial");
+  const st = dlStatus(d);
+  const running = st === "running";
+  const id = escapeHtml(d.id);
+  const sty = dlStatusStyle(st);
   const per = d.per_target || [];
   // Live aggregate across targets — per-target bytes update live; d.bytes only
   // finalises at the end. total_bytes = repo_size × N targets (HF API, #14).
   const liveBytes = per.reduce((s, p) => s + (p.bytes || 0), 0) || d.bytes || 0;
   const hasTotal = d.total_bytes > 0;
-  const pct = hasTotal ? Math.min(100, Math.round((liveBytes / d.total_bytes) * 100)) : (d.status === "done" ? 100 : 0);
+  const pct = hasTotal ? Math.min(100, Math.round((liveBytes / d.total_bytes) * 100)) : (st === "completed" ? 100 : 0);
   // Real % when the repo size is known; otherwise a moving indeterminate bar.
   const indeterminate = running && !hasTotal;
-  const elapsed = ((d.finished_at || Date.now()/1000) - d.started_at).toFixed(0);
+  const startedAt = d.started_at || d.created_at || 0;
+  const elapsed = startedAt ? ((d.finished_at || Date.now()/1000) - startedAt).toFixed(0) : "0";
+  // Bytes read-out: transferred / total when the repo size is known. Paused
+  // jobs keep their partial bytes, which is exactly what makes resume useful,
+  // so show them for every non-queued status.
+  const bytesLabel = liveBytes
+    ? `${fmtBytes(liveBytes)}${hasTotal ? " / " + fmtBytes(d.total_bytes) : ""}`
+    : (hasTotal ? `0 B / ${fmtBytes(d.total_bytes)}` : escapeHtml(d.size || "0B"));
   const targetsSummary = per.length
     ? per.map(p => {
-        const dot = p.status === "done" ? "🟢"
-                  : p.status === "running" ? "🔵"
-                  : p.status === "cancelled" ? "⚪"
-                  : p.status === "error" ? "🔴" : "⚪";
-        const sz = p.size ? ` ${p.size}` : "";
+        const ps = dlStatus(p);
+        const dot = ps === "completed" ? "🟢"
+                  : ps === "running" ? "🔵"
+                  : ps === "paused" ? "🟡"
+                  : ps === "failed" ? "🔴" : "⚪";
+        // escapeHtml, not raw: p.size is server-formatted today, but this row
+        // went from dead code to live in this change (state.downloads was
+        // hardcoded []), so the only unescaped interpolation left in the row
+        // is now actually reachable. Everything the payload carries is escaped.
+        const sz = p.size ? ` ${escapeHtml(p.size)}` : "";
         return `<span title="${escapeHtml(p.error || p.status || "")}" style="font-family:var(--font-mono);font-size:11px;margin-right:8px">${dot} ${escapeHtml(p.host)}${sz}</span>`;
       }).join("")
     : (d.target ? "→ " + escapeHtml(d.target.split("/").pop()) : "");
-  const statusBadge = d.status === "done" ? '<span style="color:var(--green-deep);font-weight:600">done</span>'
-                    : d.status === "cancelled" ? '<span style="color:var(--ink-3);font-weight:600">cancelled</span>'
-                    : d.status === "error" ? '<span style="color:var(--rust-deep);font-weight:600">error</span>'
-                    : d.status === "partial" ? '<span style="color:var(--amber-deep);font-weight:600">partial</span>'
-                    : '';
+  const statusBadge = `
+    <span style="display:inline-flex;align-items:center;gap:5px;padding:2px 8px;background:${sty.bg};border-radius:999px;vertical-align:middle">
+      <span style="width:5px;height:5px;border-radius:3px;background:${sty.pip}"></span>
+      <span style="font-size:10px;font-weight:600;color:${sty.fg};letter-spacing:0.04em;text-transform:uppercase">${escapeHtml(st)}</span>
+    </span>`;
   const errLine = d.error
-    ? `<div style="font-family:var(--font-mono);font-size:11px;color:var(--rust-deep);margin-top:4px;word-break:break-all">${escapeHtml(d.error.slice(0, 200))}</div>`
+    ? `<div style="font-family:var(--font-mono);font-size:11px;color:var(--rust-deep);margin-top:4px;word-break:break-all">${escapeHtml(String(d.error).slice(0, 200))}</div>`
     : "";
+
+  // Per-item actions — mirror the Swift reference: only render what the
+  // current status actually allows, so no button can 409 on the backend.
+  //   running   → Pause, Cancel        queued    → Cancel
+  //   paused    → Continue, Cancel     completed → Delete
+  //   failed / cancelled → Retry, Delete
+  const B = {
+    pause:   `<button class="btn btn-xs" data-act="dl-pause" data-id="${id}" title="Kill the transfer now — partial files stay on the nodes so Continue resumes them">${Icon.pause}<span>Pause</span></button>`,
+    resume:  `<button class="btn btn-xs" data-act="dl-resume" data-id="${id}" title="Resume where it stopped (hf download continues partial files)">${Icon.play}<span>Continue</span></button>`,
+    retry:   `<button class="btn btn-xs" data-act="dl-retry" data-id="${id}" title="Run it again with the same repo/targets; partial files are reused">${Icon.refresh}<span>Retry</span></button>`,
+    cancel:  `<button class="btn btn-xs btn-destructive" data-act="dl-cancel" data-id="${id}" title="Stop the job. The entry stays in the list.">${Icon.x}<span>Cancel</span></button>`,
+    delete:  `<button class="btn btn-xs btn-ghost" data-act="dl-delete" data-id="${id}" data-repo="${escapeHtml(d.repo || "")}" title="Remove this entry (optionally delete the downloaded files on the nodes)">${Icon.trash}<span>Delete</span></button>`,
+  };
+  const actions = st === "running"   ? [B.pause, B.cancel]
+                : st === "queued"    ? [B.cancel]
+                : st === "paused"    ? [B.resume, B.cancel]
+                : st === "completed" ? [B.delete]
+                : DL_TERMINAL.includes(st) ? [B.retry, B.delete]   // failed | cancelled
+                : [B.delete];                                      // unknown status — never strand a row
+
   return `
     <div class="hf-active">
       <div class="head">
         <div class="left">
-          <div class="pip-pulse"><div class="ring"></div><div class="core"></div></div>
+          <div class="pip-pulse"><div class="ring" style="background:${sty.pip}"></div><div class="core" style="background:${sty.pip}"></div></div>
           <div class="repo">${escapeHtml(d.repo || "")}</div>
           <div class="hint">${targetsSummary} ${statusBadge}</div>
         </div>
         <div style="display:flex;align-items:center;gap:8px">
-          <div class="stats">${escapeHtml(d.size||"0B")} · ${elapsed}s</div>
-          ${running ? `<button class="btn btn-xs btn-destructive" data-act="dl-cancel" data-id="${d.id}">${Icon.x}<span>Cancel</span></button>` : ""}
-          ${resumable ? `<button class="btn btn-xs" data-act="dl-resume" data-id="${d.id}" title="Re-run; HF CLI resumes partial files">${Icon.refresh}<span>Resume</span></button>` : ""}
+          <div class="stats">${bytesLabel} · ${elapsed}s</div>
+          ${actions.join("")}
         </div>
       </div>
       <div class="progress">
         <div class="bar">${indeterminate
-          ? `<div class="fill" style="width:30%;animation:syncIndeterminate 1.6s linear infinite"></div>`
-          : `<div class="fill" style="width:${pct}%"></div>`}</div>
+          ? `<div class="fill" style="width:30%;background:${sty.pip};animation:syncIndeterminate 1.6s linear infinite"></div>`
+          : `<div class="fill" style="width:${pct}%;background:${sty.pip}"></div>`}</div>
         <div class="pct">${indeterminate ? escapeHtml(d.size || "…") : pct + "%"}</div>
       </div>
       ${errLine}
@@ -7081,18 +7155,70 @@ async function handleAct(e) {
     } catch(err) { toast("dl err: " + err.message, "err"); }
     refreshAll(); return;
   }
-  if (act === "dl-cancel") {
-    if (!confirm("Cancel download? Partial files are kept; click Resume to continue.")) return;
-    try { await delJson("/admin/downloads/" + el.dataset.id); toast("cancelled", "ok"); }
-    catch(err){ toast("err: " + err.message, "err"); }
-    refreshAll(); return;
+  // ── Download queue lifecycle (frozen contract 2026-07-25) ──
+  //   POST   /admin/downloads/{id}/pause    kill the ssh procs, keep partials
+  //   POST   /admin/downloads/{id}/resume   continue (hf download resumes)
+  //   POST   /admin/downloads/{id}/retry    same, allowed from failed/cancelled
+  //   POST   /admin/downloads/{id}/cancel   kill, status=cancelled
+  //   DELETE /admin/downloads/{id}?delete_files=0|1
+  if (act === "dl-pause") {
+    try { await postJson(`/admin/downloads/${encodeURIComponent(el.dataset.id)}/pause`, {}); toast("paused — partial files kept", "ok"); }
+    catch (err) { toast("pause failed: " + err.message, "err"); }
+    await refreshAll(); return;
   }
   if (act === "dl-resume") {
+    try { await postJson(`/admin/downloads/${encodeURIComponent(el.dataset.id)}/resume`, {}); toast("resumed", "ok"); }
+    catch (err) { toast("resume failed: " + err.message, "err"); }
+    await refreshAll(); return;
+  }
+  if (act === "dl-retry") {
+    try { await postJson(`/admin/downloads/${encodeURIComponent(el.dataset.id)}/retry`, {}); toast("retry started", "ok"); }
+    catch (err) { toast("retry failed: " + err.message, "err"); }
+    await refreshAll(); return;
+  }
+  if (act === "dl-cancel") {
+    if (!confirm("Cancel this download?\n\nPartial files stay on the nodes — Retry continues from there.")) return;
+    try { await postJson(`/admin/downloads/${encodeURIComponent(el.dataset.id)}/cancel`, {}); toast("cancelled", "ok"); }
+    catch (err) { toast("cancel failed: " + err.message, "err"); }
+    await refreshAll(); return;
+  }
+  if (act === "dl-delete") {
+    // Two-step native confirm() rather than a checkbox in the row, ON PURPOSE:
+    // _isEditing() freezes the 5 s poll for 8 s after any form interaction and
+    // for as long as an <input> holds focus, so a permanent checkbox per row
+    // would stall the whole dashboard's refresh just by being clicked. A
+    // transient state flag would survive the poll but adds a render path for a
+    // once-in-a-while destructive action. confirm() blocks the event loop, is
+    // impossible to mis-click through, and leaves the list markup inert.
+    // Step 1 = remove the entry, step 2 = the destructive opt-in.
+    const repo = el.dataset.repo || "this download";
+    if (!confirm(`Remove "${repo}" from the download list?`)) return;
+    const wipe = confirm(
+      "Also DELETE the downloaded files on the target nodes?\n\n" +
+      "OK    → remove the entry AND erase the model files on every target node (irreversible)\n" +
+      "Cancel → remove the entry only, files stay on disk"
+    );
     try {
-      await postJson(`/admin/downloads/${el.dataset.id}/resume`, {});
-      toast("resumed", "ok");
-    } catch(err){ toast("resume failed: " + err.message, "err"); }
-    refreshAll(); return;
+      await delJson(`/admin/downloads/${encodeURIComponent(el.dataset.id)}?delete_files=${wipe ? 1 : 0}`);
+      toast(wipe ? "entry removed + files deleted on nodes" : "entry removed (files kept)", "ok");
+    } catch (err) { toast("delete failed: " + err.message, "err"); }
+    await refreshAll(); return;
+  }
+  if (act === "dl-clear-finished") {
+    // No bulk endpoint in the contract — loop the per-id DELETE. Always
+    // delete_files=0: "Clear" is a list-hygiene action, it must never touch
+    // bytes on disk.
+    const victims = (state.downloads || []).filter(d => DL_TERMINAL.includes(dlStatus(d)));
+    if (!victims.length) { toast("nothing to clear"); return; }
+    if (!confirm(`Remove ${victims.length} finished download${victims.length > 1 ? "s" : ""} (completed / cancelled / failed) from the list?\n\nFiles on the nodes are kept.`)) return;
+    let ok = 0; const failures = [];
+    for (const d of victims) {
+      try { await delJson(`/admin/downloads/${encodeURIComponent(d.id)}?delete_files=0`); ok++; }
+      catch (err) { failures.push(`${d.repo || d.id}: ${err.message}`); }
+    }
+    if (failures.length) toast(`cleared ${ok}, ${failures.length} failed — ${failures[0]}`, "err");
+    else toast(`cleared ${ok} entr${ok > 1 ? "ies" : "y"}`, "ok");
+    await refreshAll(); return;
   }
 }
 

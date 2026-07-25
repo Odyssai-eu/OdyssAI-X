@@ -22,6 +22,14 @@ Admin (no auth by default — see ODYSSAI_X_ADMIN_TOKEN):
   POST /admin/clusters/{id}/reboot-all
   Shared:
     GET  /admin/metrics, /admin/sessions, /admin/logs, /admin/runs
+  HF downloads (queue management):
+    GET    /admin/downloads                        — list jobs (token never returned)
+    POST   /admin/downloads                        — start repo → N targets
+    POST   /admin/downloads/{id}/pause             — kill procs, keep partial bytes
+    POST   /admin/downloads/{id}/resume            — restart a paused job (HF native resume)
+    POST   /admin/downloads/{id}/retry             — same, from failed/cancelled
+    POST   /admin/downloads/{id}/cancel[?host=]    — terminal stop (local ssh + remote hf)
+    DELETE /admin/downloads/{id}?delete_files=0|1  — drop the entry (+ optional rm -rf on nodes)
 
 State persistence:
   scripts/state-<cluster_id>.json     (one per cluster)
@@ -1123,6 +1131,28 @@ _downloads: dict[str, dict] = {}
 # Per-job → per-host process map. Host-keyed so cancel can target one target
 # without killing the whole multi-host download.
 _dl_procs: dict[str, dict[str, asyncio.subprocess.Process]] = {}
+# Strong refs on the fan-out tasks. asyncio only keeps a WEAK ref to a running
+# task, so a `create_task(...)` nobody holds can be garbage-collected in flight
+# (same bug class as the leak-recovery tasks, 52a2651). Keyed by job id — a
+# resume/retry replaces the entry for that job.
+_dl_tasks: dict[str, asyncio.Task] = {}
+
+# Job status vocabulary — FROZEN API contract, shared verbatim with the
+# dashboard: queued | running | paused | completed | cancelled | failed.
+# `paused` is an operator stop: procs killed, partial bytes kept on disk,
+# resumable. There is no `partial` STATUS (a job that did not fully land is
+# `failed`); the boolean `partial` field tells the UI some targets did land.
+_DL_TERMINAL = {"completed", "cancelled", "failed"}
+# States that still own bytes/processes — deleting an entry in one of these
+# would orphan a live ssh client or silently abandon partial files.
+_DL_ACTIVE = {"queued", "running", "paused"}
+#
+# This registry is in-memory ONLY and stays that way (no SQLite here — out of
+# scope by decision). A container restart therefore loses it, and kills every
+# ssh client with it, so there is NO orphan class to reconcile at boot: the
+# dict is empty by construction. The in-PROCESS orphan (a runner that died
+# without writing a terminal status) is caught by _dl_spawn's finally-guard,
+# so a job labelled "running" always has a live runner behind it.
 
 
 async def _hf_repo_total_bytes(repo: str, token: Optional[str]) -> Optional[int]:
@@ -1206,17 +1236,23 @@ async def _hf_dl_one(dl_id: str, host: dict, repo: str,
         poll_task.cancel()
     slot["finished_at"] = time.time()
     if proc.returncode == 0:
-        slot["status"] = "done"
-    elif slot.get("status") == "cancelled":
+        slot["status"] = "completed"
+    elif slot.get("status") in ("cancelled", "paused"):
+        # The endpoint labelled this slot BEFORE killing us: the non-zero exit
+        # is our own kill, not a download failure. Keep the operator's label.
         pass
     else:
-        slot["status"] = "error"
+        slot["status"] = "failed"
         slot["error"] = (
             stderr.decode(errors="replace")[:800] if stderr else f"exit {proc.returncode}"
         )
     # Per-target proc done — remove from registry. Parent decides overall status.
+    # Identity check: a resume/retry may already have registered a NEW proc for
+    # this same host while our killed ssh was still dying. Only ever unregister
+    # our own proc, never the successor's.
     by_host = _dl_procs.get(dl_id) or {}
-    by_host.pop(host["id"], None)
+    if by_host.get(host["id"]) is proc:
+        by_host.pop(host["id"], None)
     return slot
 
 
@@ -1231,17 +1267,23 @@ def _human_bytes(n: int) -> str:
 
 
 async def _hf_dl_run(dl_id: str, repo: str, hf_token: Optional[str],
-                     targets: list[dict]) -> None:
+                     targets: list[dict], gen: Optional[int] = None) -> None:
     """Fan-out download to N targets in parallel. Each target lives in
-    its own slot under `per_target`. Job's top-level `status` aggregates:
+    its own slot under `per_target`. Job's top-level `status` aggregates
+    (frozen contract vocabulary):
 
       - running  : at least one target still running
-      - done     : all targets done
-      - cancelled: any target cancelled and no other targets running
-      - partial  : some done + some failed
-      - error    : all targets failed
+      - completed: all targets done
+      - cancelled: every target cancelled
+      - failed   : at least one target failed; `partial` flags "some landed"
+
+    `gen` is the generation this run belongs to (see _dl_spawn). Resume/retry
+    re-use the SAME job id, so a dying previous runner would otherwise clobber
+    the new run's state — a stale generation never writes back.
     """
     job = _downloads[dl_id]
+    if gen is None:
+        gen = int(job.get("_gen") or 0)
     job["per_target"] = [{"host": t["id"], "ssh": t["ssh"], "status": "queued"}
                          for t in targets]
     # Map host_id → slot for the runner to mutate
@@ -1253,20 +1295,59 @@ async def _hf_dl_run(dl_id: str, repo: str, hf_token: Optional[str],
     if repo_bytes:
         job["repo_bytes"] = repo_bytes
         job["total_bytes"] = repo_bytes * max(1, len(targets))
+    # The size probe above is an AWAIT (an HTTPS round trip, up to 15 s), and
+    # the slots already exist and read `queued` while it is in flight — so the
+    # pause/cancel endpoints accept during that window and label the job, while
+    # not a single transfer has started yet for them to kill. Re-check the
+    # verdict before launching anything: without this the runner started the
+    # downloads AFTER the operator stopped the job (UI says "paused", bytes
+    # keep moving), and the resume/retry that followed ran a SECOND
+    # `hf download` into the same --local-dir as the first.
+    if int(job.get("_gen") or 0) != gen:
+        return                      # superseded: the new generation owns everything
+    if job.get("status") in ("paused", "cancelled"):
+        _dl_procs.pop(dl_id, None)
+        return
+    # Same window, per-target: `POST .../cancel?host=` may have retired one slot
+    # while the job as a whole stays running. Only launch slots still queued.
+    startable = [t for t in targets if by_id[t["id"]].get("status") == "queued"]
     coros = [_hf_dl_one(dl_id, t, repo, hf_token, by_id[t["id"]])
-             for t in targets]
-    results = await asyncio.gather(*coros, return_exceptions=True)
+             for t in startable]
+    results = list(await asyncio.gather(*coros, return_exceptions=True))
+    # Targets stopped before they ever started have no gather result, but their
+    # slot already carries the operator's verdict — fold it in so the aggregate
+    # below still sees every target.
+    _started = {t["id"] for t in startable}
+    results += [by_id[t["id"]] for t in targets if t["id"] not in _started]
+    # Two cases where this runner must NOT pronounce a verdict:
+    #  - superseded: a resume/retry already started a newer generation on this
+    #    job id, and owns `per_target` + the proc registry;
+    #  - frozen: the operator moved the job to paused/cancelled, so our procs
+    #    died from OUR kill — relabelling that as failed would be a lie.
+    superseded = int(job.get("_gen") or 0) != gen
+    frozen = job.get("status") in ("paused", "cancelled")
+    if superseded or frozen:
+        if not superseded:
+            # Still refresh the byte counters: a paused job should show how far
+            # it got, and those partial files are what resume continues from.
+            total_bytes = sum(int(p.get("bytes") or 0) for p in job["per_target"])
+            job["bytes"] = total_bytes
+            job["size"] = _human_bytes(total_bytes)
+            _dl_procs.pop(dl_id, None)
+        return
     # Aggregate status
-    statuses = [r.get("status") if isinstance(r, dict) else "error"
+    statuses = [r.get("status") if isinstance(r, dict) else "failed"
                 for r in results]
-    if all(s == "done" for s in statuses):
-        job["status"] = "done"
-    elif all(s == "cancelled" for s in statuses):
+    done_n = sum(1 for s in statuses if s == "completed")
+    # `partial` is a flag, not a status: the contract has no "partial" state,
+    # and a half-landed job must stay retryable (i.e. "failed").
+    job["partial"] = 0 < done_n < len(statuses)
+    if statuses and done_n == len(statuses):
+        job["status"] = "completed"
+    elif statuses and all(s == "cancelled" for s in statuses):
         job["status"] = "cancelled"
-    elif any(s == "done" for s in statuses):
-        job["status"] = "partial"
     else:
-        job["status"] = "error"
+        job["status"] = "failed"
         first_err = next((r.get("error") for r in results
                           if isinstance(r, dict) and r.get("error")), None)
         if first_err:
@@ -1278,6 +1359,186 @@ async def _hf_dl_run(dl_id: str, repo: str, hf_token: Optional[str],
     job["size"] = _human_bytes(total_bytes)
     # Drop per-job proc registry once everything's done.
     _dl_procs.pop(dl_id, None)
+
+
+def _dl_public(job: dict) -> dict:
+    """Public projection of a download job. Every `_`-prefixed key is private —
+    the memorised HF token above all — and never crosses the API boundary.
+    `hf_token_set` (a plain bool) is what the UI reads to show the auth state."""
+    return {k: v for k, v in job.items() if not k.startswith("_")}
+
+
+def _dl_spawn(dl_id: str, repo: str, hf_token: Optional[str],
+              targets: list[dict]) -> None:
+    """Start (or restart) the fan-out for a job id, under a fresh generation.
+
+    Resume/retry re-use the SAME job id — that is the point, the partial bytes
+    on disk belong to it — so two runners can briefly overlap while the old one
+    drains its killed ssh clients. The generation counter is what makes the
+    overlap harmless: only the current generation writes the job back.
+    """
+    job = _downloads[dl_id]
+    gen = int(job.get("_gen") or 0) + 1
+    job["_gen"] = gen
+
+    async def _guarded() -> None:
+        try:
+            await _hf_dl_run(dl_id, repo, hf_token, targets, gen)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            j = _downloads.get(dl_id)
+            if j is not None and int(j.get("_gen") or 0) == gen and j.get("status") == "running":
+                j["status"] = "failed"
+                j["error"] = f"download runner crashed: {e}"[:800]
+                j["finished_at"] = time.time()
+        finally:
+            # A job still labelled "running" once its runner has returned is an
+            # orphan by construction (task cancelled, or collected mid-flight).
+            # Mark it here so no endpoint ever trusts a "running" label that has
+            # nothing behind it — the in-memory registry has no other watchdog.
+            j = _downloads.get(dl_id)
+            if j is not None and int(j.get("_gen") or 0) == gen and j.get("status") == "running":
+                j["status"] = "failed"
+                j["error"] = j.get("error") or "download runner exited unexpectedly"
+                j["finished_at"] = time.time()
+            if _dl_tasks.get(dl_id) is asyncio.current_task():
+                _dl_tasks.pop(dl_id, None)
+
+    # Strong ref: without it the task can be collected before it even runs.
+    _dl_tasks[dl_id] = asyncio.create_task(_guarded())
+
+
+def _dl_shell_stable_tail(path: str) -> str:
+    """The part of a REMOTE path that survives the remote shell — i.e. what is
+    actually in the process argv we have to match.
+
+    `HF_BIN_REMOTE` defaults to `$HOME/mlx-cluster/.venv/bin/hf`: sshd hands the
+    command to the login shell, which expands `$HOME` BEFORE exec, so the `hf`
+    process shows `/Users/admin/mlx-cluster/.venv/bin/hf …`. Everything up to
+    and including the last `$VAR` / `${VAR}` (or a leading `~`) is therefore
+    unmatchable — only the literal tail is.
+    """
+    last = None
+    for last in re.finditer(r"\$\{[^}]*\}|\$[A-Za-z_][A-Za-z0-9_]*", path):
+        pass
+    if last is not None:
+        return path[last.end():]
+    if path.startswith("~"):
+        i = path.find("/")
+        return path[i:] if i >= 0 else ""
+    return path
+
+
+def _dl_kill_pattern(repo: str) -> str:
+    """`pkill -f` pattern matching ONLY the `hf download <repo>` we started.
+
+    The remote command line is
+        <venv>/bin/hf download <org/name> --local-dir <models_dir>/<org/name> …
+    so anchoring on the venv binary + the exact repo + `--local-dir` cannot
+    match another repo's download, an unrelated `hf` invocation, or anything
+    that is not ours. Three precautions in the pattern itself:
+
+      - only the shell-expansion-stable TAIL of HF_BIN_REMOTE is used. Matching
+        the raw value hit nothing but the `sh -c` wrapper (the only argv that
+        keeps the literal `$HOME`); the real `hf` survived, reparented to init,
+        and kept downloading — exactly the bug this reap exists to prevent;
+      - every ERE metacharacter is escaped (model names carry dots and plus
+        signs: `Qwen2.5-…`), so `.` never widens the match;
+      - the `d` of `download` is written as the class `[d]` so the pattern does
+        NOT match the pkill command line itself — the remote `sh -c` wrapper
+        carries the pattern verbatim in its argv, and `pkill -f` would happily
+        kill our own shell. Same trick as `ps | grep [p]attern`.
+    """
+    def _ere(s: str) -> str:
+        return re.sub(r"([.^$*+?()\[\]{}|\\])", r"\\\1", s)
+    tail = _dl_shell_stable_tail(HF_BIN_REMOTE)
+    head = f"{_ere(tail)} " if tail else ""
+    return f"{head}[d]ownload {_ere(repo)} --local-dir"
+
+
+def _dl_pkill_remote(ssh: str, pattern: str) -> None:
+    """Best-effort remote reap of a node's `hf download`. `pkill` exits 1 when
+    nothing matched — the normal case when the transfer had already finished —
+    so the return code is deliberately ignored."""
+    try:
+        _ssh_exec(ssh, f"pkill -f -- {shlex.quote(pattern)} || true", 10)
+    except Exception:
+        pass
+
+
+async def _dl_stop(dl_id: str, job: dict, mark: str,
+                   host_id: Optional[str] = None) -> list[str]:
+    """Stop a download's targets and label their slots `mark` ("paused" or
+    "cancelled"). Returns the host ids acted on.
+
+    Slots are labelled BEFORE the kill: _hf_dl_one reads that label when its
+    proc dies and, seeing an operator stop, refrains from relabelling the
+    forced exit as a failure.
+
+    Both ends are killed. Terminating the local ssh client is not enough —
+    sshd does not reliably signal a non-tty remote command when the client
+    goes away, so the `hf download` used to keep writing (and keep eating
+    bandwidth) on the node long after the UI said "stopped".
+    """
+    by_host = _dl_procs.get(dl_id) or {}
+    hosts = [host_id] if host_id else list(by_host.keys())
+    if not hosts and not host_id:
+        # No live proc registered (already-paused job, or procs reaped between
+        # two calls): still re-label whatever slot is not terminal.
+        hosts = [s.get("host") for s in (job.get("per_target") or [])
+                 if s.get("status") in _DL_ACTIVE]
+    acted: list[str] = []
+    for h in hosts:
+        if not h or h in acted:
+            continue
+        for slot in (job.get("per_target") or []):
+            if slot.get("host") == h and slot.get("status") in _DL_ACTIVE:
+                slot["status"] = mark
+        proc = by_host.get(h)
+        if proc is not None and proc.returncode is None:
+            try:
+                proc.terminate()
+            except Exception:
+                pass
+        acted.append(h)
+    repo = job.get("repo") or ""
+    ssh_targets: list[str] = []
+    for h in acted:
+        slot = next((s for s in (job.get("per_target") or [])
+                     if s.get("host") == h), None)
+        ssh = (slot or {}).get("ssh") or ((_resolve_host(h) or {}).get("ssh"))
+        if ssh:
+            ssh_targets.append(ssh)
+    if repo and ssh_targets:
+        pattern = _dl_kill_pattern(repo)
+        await asyncio.gather(*[
+            asyncio.to_thread(_dl_pkill_remote, s, pattern) for s in ssh_targets
+        ], return_exceptions=True)
+    return acted
+
+
+def _dl_restart(dl_id: str, d: dict) -> dict:
+    """Shared body of resume/retry: re-resolve the recorded targets, wipe the
+    previous verdict and re-fan-out under a new generation — with the token
+    memorised at creation, which is what makes a gated repo resumable at all."""
+    resolved = []
+    for tid in d.get("targets", []):
+        h = next((x for x in HOSTS_REGISTRY if x["id"] == tid), None)
+        if h:
+            resolved.append(h)
+    if not resolved:
+        raise HTTPException(400, "no valid targets recorded on this download")
+    d["status"] = "running"
+    d["error"] = None
+    d["partial"] = False
+    d["finished_at"] = None
+    d["started_at"] = time.time()
+    d["per_target"] = []   # re-initialised by the runner
+    _dl_spawn(dl_id, d["repo"], d.get("_hf_token"), resolved)
+    return {"ok": True, "id": dl_id, "status": "running",
+            "targets": [h["id"] for h in resolved],
+            "hf_token_set": bool(d.get("_hf_token"))}
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -3771,6 +4032,13 @@ async def lifespan(app: FastAPI):
     # Any sync_jobs left in 'running' state are orphaned from a previous
     # container life — mark them as interrupted so the UI shows truth.
     _persist.mark_orphans_interrupted()
+    # HF downloads need no equivalent pass: `_downloads` is in-memory only (by
+    # decision — no SQLite for it), so it is empty here and there is nothing to
+    # relabel. What DID survive the restart is the remote `hf` on the nodes if
+    # the container was killed hard; it finishes on its own and the files land
+    # where the next download would put them anyway (hf resumes), so we do not
+    # reap it blindly at boot — that would risk killing a transfer an operator
+    # started from a shell. In-process orphans are handled by _dl_spawn.
     # Trim runs history to a reasonable upper bound (keep last 5000).
     _persist.prune_runs(keep=5000)
     # Reap any runner.py left running on cluster nodes from a previous container
@@ -4542,7 +4810,7 @@ def _initial_default_config() -> Optional[dict]:
 #   major (1.7.2 → 2.0.0) — breaking API or topology change
 #
 # Use `./scripts/bump-version.sh patch|minor|major` to bump + auto-commit.
-APP_VERSION = "1.18.2"
+APP_VERSION = "1.19.0"
 
 app = FastAPI(
     title="OdyssAI-X (odyssai.eu)",
@@ -9319,14 +9587,24 @@ async def admin_downloads_create(req: HFDownloadRequest):
         "per_target": [],
         "hf_token_set": bool(req.hf_token),
         "error": None,
+        "partial": False,
+        # PRIVATE (stripped by _dl_public before any response): the token is
+        # memorised for the lifetime of the entry so resume/retry can re-auth.
+        # Until 1.19.0 it was deliberately dropped, and every resume on a gated
+        # repo 401'd — the entry was effectively single-shot. Same blast radius
+        # as the request that carried it, kept in RAM only, gone with the entry.
+        "_hf_token": req.hf_token or None,
+        "_gen": 0,
     }
-    asyncio.create_task(_hf_dl_run(dl_id, req.repo, req.hf_token, resolved))
+    _dl_spawn(dl_id, req.repo, req.hf_token, resolved)
     return {"id": dl_id}
 
 
 @app.get("/admin/downloads")
 async def admin_downloads_list():
-    return {"data": list(_downloads.values())}
+    """List every download job. Projected through _dl_public: the memorised HF
+    token stays inside the process, the UI only ever sees `hf_token_set`."""
+    return {"data": [_dl_public(j) for j in _downloads.values()]}
 
 
 @app.get("/admin/hf/search")
@@ -9363,64 +9641,144 @@ async def admin_hf_search(q: str, limit: int = 20):
         raise HTTPException(502, f"HF search error: {e}")
 
 
-@app.delete("/admin/downloads/{dl_id}")
-async def admin_downloads_cancel(dl_id: str, host: Optional[str] = None):
-    """Cancel a download. If `host` is given, only cancel that target;
-    otherwise cancel every running target. Cancelled targets can be
-    resumed via POST /admin/downloads/{id}/resume — partial files on
-    disk are kept and `hf download` continues from where it left."""
+@app.post("/admin/downloads/{dl_id}/pause")
+async def admin_downloads_pause(dl_id: str):
+    """Pause a running download: kill the ssh clients AND the remote `hf`,
+    keeping every partial byte on disk. No `finished_at` is written — the job
+    is stopped, not finished, and the row must not read as terminal.
+
+    Pause is a real kill, not a SIGSTOP (Sophie's call): a stopped-but-alive
+    `hf` would still hold its sockets, its HF connection slot and the node's
+    page cache for nothing, while `hf download` resumes natively on partial
+    files anyway. Nothing is gained by keeping the process frozen."""
     d = _downloads.get(dl_id)
     if not d:
         raise HTTPException(404, "no such download")
-    by_host = _dl_procs.get(dl_id) or {}
-    targets = [host] if host else list(by_host.keys())
-    for h in targets:
-        proc = by_host.get(h)
-        if proc and proc.returncode is None:
-            try:
-                proc.terminate()
-            except Exception:
-                pass
-            # Mark the per-target slot so the runner doesn't relabel as error.
-            for slot in (d.get("per_target") or []):
-                if slot.get("host") == h:
-                    slot["status"] = "cancelled"
-    # If we cancelled them all, mirror at the top level so the UI shows
-    # a Resume button. Otherwise leave it running for the surviving targets.
-    if not host and not any(p.returncode is None for p in by_host.values()):
-        d["status"] = "cancelled"
-    return {"ok": True}
+    if d.get("status") != "running":
+        raise HTTPException(
+            409, f"cannot pause a '{d.get('status')}' download — "
+                 "only a running one can be paused")
+    # Set the job label BEFORE the kill: the runner checks it when its procs
+    # die and then refuses to relabel the job as failed.
+    d["status"] = "paused"
+    hosts = await _dl_stop(dl_id, d, "paused")
+    return {"ok": True, "id": dl_id, "status": "paused", "stopped": hosts}
 
 
 @app.post("/admin/downloads/{dl_id}/resume")
 async def admin_downloads_resume(dl_id: str):
-    """Restart a previously cancelled / failed download. Picks up partial
-    files via HF CLI's snapshot_download resume_download=True. We keep the
-    original `repo` + `targets` and re-fan-out; targets already complete
-    are skipped (HF CLI is a no-op when local files already match remote)."""
+    """Resume a paused download. Re-uses the recorded repo + targets + the
+    memorised HF token, and leans on `hf download`'s native resume: partial
+    files on the node are continued, already-complete ones are a no-op."""
     d = _downloads.get(dl_id)
     if not d:
         raise HTTPException(404, "no such download")
-    if d.get("status") == "running":
-        raise HTTPException(409, "already running")
-    resolved = []
-    for tid in d.get("targets", []):
-        h = next((x for x in HOSTS_REGISTRY if x["id"] == tid), None)
-        if h:
-            resolved.append(h)
-    if not resolved:
-        raise HTTPException(400, "no valid targets recorded on this download")
-    # Reset top-level state. Per-target slots are re-initialised by the runner.
-    d["status"] = "running"
-    d["error"] = None
-    d["finished_at"] = None
-    d["started_at"] = time.time()
-    d["per_target"] = []
-    # We don't store the HF token (security) — caller must re-pass it via
-    # /admin/downloads if their resume needs auth. For unauthenticated repos
-    # this is fine.
-    asyncio.create_task(_hf_dl_run(dl_id, d["repo"], None, resolved))
-    return {"ok": True}
+    if d.get("status") != "paused":
+        raise HTTPException(
+            409, f"cannot resume a '{d.get('status')}' download — only a paused "
+                 "one can be resumed (use /retry for failed or cancelled)")
+    return _dl_restart(dl_id, d)
+
+
+@app.post("/admin/downloads/{dl_id}/retry")
+async def admin_downloads_retry(dl_id: str):
+    """Retry a failed or cancelled download: same relaunch as resume, but from
+    a terminal state, and it clears `error` so the UI stops showing the previous
+    failure.
+
+    NB the deliberate divergence from /admin/sync/jobs/{id}/retry, which forks a
+    NEW job id: an rsync job is a history row, a download is a directory on
+    disk. Retrying on the same id is what lets `hf download` continue the bytes
+    already there instead of starting a second, parallel truth."""
+    d = _downloads.get(dl_id)
+    if not d:
+        raise HTTPException(404, "no such download")
+    if d.get("status") not in ("failed", "cancelled"):
+        raise HTTPException(
+            409, f"cannot retry a '{d.get('status')}' download — retry is for "
+                 "failed or cancelled jobs (use /resume for a paused one)")
+    return _dl_restart(dl_id, d)
+
+
+@app.post("/admin/downloads/{dl_id}/cancel")
+async def admin_downloads_cancel(dl_id: str, host: Optional[str] = None):
+    """Cancel a download — a terminal stop. With `host`, only that target is
+    cancelled and the job keeps running for the others.
+
+    Hardened in 1.19.0: it now (a) writes `finished_at` so the row stops
+    reading as live, and (b) reaps the REMOTE `hf` process instead of only the
+    local ssh client — see _dl_stop. Partial files are kept on disk: /retry
+    continues from them, DELETE?delete_files=1 removes them."""
+    d = _downloads.get(dl_id)
+    if not d:
+        raise HTTPException(404, "no such download")
+    if d.get("status") not in _DL_ACTIVE:
+        raise HTTPException(
+            409, f"download is already '{d.get('status')}' — nothing to cancel "
+                 "(DELETE /admin/downloads/{id} removes the entry)")
+    if host and host not in (d.get("targets") or []):
+        # Guard the per-host path: _dl_stop pkills on the node it is handed, so
+        # it must only ever be handed a node THIS job was actually targeting.
+        raise HTTPException(400, f"{host} is not a target of this download")
+    if not host:
+        # Whole-job cancel is unconditional and decided here, before the kill,
+        # so the dying runner sees the operator's verdict and honours it.
+        d["status"] = "cancelled"
+        d["finished_at"] = time.time()
+    hosts = await _dl_stop(dl_id, d, "cancelled", host_id=host)
+    if host:
+        # Single-target cancel: the job stays running while any other target
+        # does. Once the last one is gone we pronounce the job cancelled — the
+        # runner may have raced us to "failed", our verdict is the truthful one.
+        live = [s for s in (d.get("per_target") or [])
+                if s.get("status") in ("queued", "running")]
+        if not live:
+            d["status"] = "cancelled"
+            d["finished_at"] = time.time()
+    return {"ok": True, "id": dl_id, "status": d.get("status"), "stopped": hosts}
+
+
+@app.delete("/admin/downloads/{dl_id}")
+async def admin_downloads_delete(dl_id: str, delete_files: bool = False):
+    """Remove a download entry from the list. With `delete_files=1` it ALSO
+    rm -rf's the repo directory on every node the job targeted, and reports the
+    outcome per node — same guarded delete as the sync matrix (_safe_model_name
+    + a case-glob that refuses any path outside the node's models_dir).
+
+    Refuses while the job is queued/running/paused: those own live ssh clients
+    or partial bytes, so the stop must be explicit (POST .../cancel) and reap
+    the remote `hf` first.
+
+    NB this verb USED to be the cancel endpoint (until 1.19.0). Cancel now
+    lives at POST /admin/downloads/{id}/cancel per the frozen contract."""
+    d = _downloads.get(dl_id)
+    if not d:
+        raise HTTPException(404, "no such download")
+    if d.get("status") in _DL_ACTIVE:
+        raise HTTPException(
+            409, f"download is '{d.get('status')}' — cancel it before deleting "
+                 "the entry")
+    repo = d.get("repo") or ""
+    results: list[dict] = []
+    if delete_files:
+        if not _safe_model_name(repo):
+            raise HTTPException(400, f"refusing to delete unsafe repo path: {repo}")
+        hosts = [h for h in (_resolve_host(t) for t in (d.get("targets") or [])) if h]
+        if hosts:
+            results = list(await asyncio.gather(*[_delete_one(h, repo) for h in hosts]))
+        # Files just vanished on the nodes — drop the matrix cache so the next
+        # refresh doesn't advertise a model that is no longer there.
+        _sync_matrix_cache["data"] = None
+        _sync_matrix_cache["ts"] = 0.0
+    _downloads.pop(dl_id, None)
+    _dl_procs.pop(dl_id, None)
+    # Defensive: a terminal job's runner is already done, but never leave a
+    # dangling task ref keyed on an id that no longer exists.
+    t = _dl_tasks.pop(dl_id, None)
+    if t is not None and not t.done():
+        t.cancel()
+    return {"ok": True, "id": dl_id, "removed": True,
+            "delete_files": bool(delete_files), "results": results}
 
 
 # ──────────────────────────────────────────────────────────────────────────────
