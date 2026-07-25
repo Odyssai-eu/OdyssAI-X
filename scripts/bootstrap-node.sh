@@ -10,6 +10,11 @@
 #   ~/mlx-cluster/exo_stubs.py         # backport compatibility
 #   ~/mlx-cluster/patches/             # per-model patches loaded at boot
 #
+# plus, inside the venv's site-packages/mlx_lm/models/, the custom and vendored
+# architecture modules from scripts/mlx_models/ (step 4, via
+# scripts/install-model-modules.sh). Stock mlx-lm cannot resolve laguna,
+# hy_v3, deepseek_v4 or inkling_mm without them.
+#
 # This script puts them in place on a remote node. Run it from the repo
 # root for each node in your topology.
 #
@@ -62,7 +67,7 @@ echo "  models dir         : $MODELS_DIR  (resolved on $NODE)"
 echo
 
 # 1. Verify SSH + Python on the node
-echo "[1/4] Checking SSH + Python on $NODE…"
+echo "[1/5] Checking SSH + Python on $NODE…"
 # First-contact friendliness: accept-new pins the host key on first
 # connection (the GUI runs us non-interactively — without this, a brand-new
 # target fails "Host key verification failed" / exit 255). Known keys are
@@ -84,7 +89,7 @@ ssh $SSH_OPTS "$NODE" "
 "
 
 # 2. Copy the scripts the orchestrator will spawn + the pinned requirements
-echo "[2/4] Syncing runner + helpers + requirements to $NODE…"
+echo "[2/5] Syncing runner + helpers + requirements to $NODE…"
 scp $SSH_OPTS -q \
   "$REPO_ROOT/scripts/runner.py" \
   "$REPO_ROOT/scripts/auto_parallel.py" \
@@ -100,7 +105,7 @@ ssh $SSH_OPTS "$NODE" "mkdir -p $REMOTE_DIR/patches"
 scp $SSH_OPTS -q "$REPO_ROOT/scripts/patches/"*.py "$NODE:$REMOTE_DIR/patches/"
 
 # 3. Create + populate the venv on the node, pinning via requirements-node.txt
-echo "[3/4] Setting up Python venv on $NODE (pinned via requirements-node.txt)…"
+echo "[3/5] Setting up Python venv on $NODE (pinned via requirements-node.txt)…"
 ssh $SSH_OPTS "$NODE" "
   set -e
   cd $REMOTE_DIR
@@ -112,8 +117,15 @@ ssh $SSH_OPTS "$NODE" "
   ./.venv/bin/pip install --quiet -r requirements-node.txt
 "
 
-# 4. Smoke test
-echo "[4/4] Smoke test on $NODE…"
+# 4. Custom / vendored mlx-lm model modules (laguna, hy_v3, deepseek_v4, …).
+# Must run AFTER the venv exists — they land inside site-packages/mlx_lm/models.
+# Without this a fresh node loads stock mlx-lm and dies on "Model type X not
+# supported" for every architecture we had to port or vendor.
+echo "[4/5] Installing custom model modules on $NODE…"
+"$REPO_ROOT/scripts/install-model-modules.sh" "$NODE"
+
+# 5. Smoke test
+echo "[5/5] Smoke test on $NODE…"
 ssh $SSH_OPTS "$NODE" "
   cd $REMOTE_DIR
   ./.venv/bin/python -c 'import mlx.core; import mlx_lm; print(\"OK\", mlx.core.__version__, mlx_lm.__version__)'
