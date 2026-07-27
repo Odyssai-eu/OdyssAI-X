@@ -4820,7 +4820,7 @@ def _initial_default_config() -> Optional[dict]:
 #   major (1.7.2 → 2.0.0) — breaking API or topology change
 #
 # Use `./scripts/bump-version.sh patch|minor|major` to bump + auto-commit.
-APP_VERSION = "1.19.1"
+APP_VERSION = "1.20.0"
 
 app = FastAPI(
     title="OdyssAI-X (odyssai.eu)",
@@ -6742,6 +6742,11 @@ class CoeosConfig(BaseModel):
                                                    # x {score, cout, tps} — le resolver s'en sert
                                                    # pour proposer un modele quand un axe n'est
                                                    # pas pinne (voir _coeos_axis_models).
+    guardian: Optional[dict] = None               # 2e agent interne du routeur (2026-07-17) :
+                                                   # le DECIDEUR dit quel axe, le GARDIEN dit ou la
+                                                   # requete a le droit d'aller. Voir _coeos_guardian_*.
+                                                   # {enabled, url, threshold, action, contextual,
+                                                   #  llm_base, llm_model}
 
 
 @app.get("/admin/coeos")
@@ -6760,6 +6765,33 @@ async def admin_coeos_decisions():
     return {"decisions": [
         {"model": k[0], "axis": k[1], "fallback": k[2], "count": v}
         for k, v in sorted(_coeos_decisions.items(), key=lambda kv: -kv[1])]}
+
+
+@app.get("/admin/coeos/guardian")
+async def admin_coeos_guardian():
+    """Etat du gardien + compteur de ses decisions (action x severite).
+    `configured` reflete la config ; `reachable` sonde le sidecar (health)."""
+    cfg = get_coeos_config()
+    g = cfg.get("guardian") if isinstance(cfg.get("guardian"), dict) else {}
+    out = {"configured": bool(_coeos_guardian_cfg(cfg)),
+           "action": (g.get("action") or "warn"),
+           "url": g.get("url") or None,
+           "contextual": bool(g.get("contextual") and g.get("llm_base")),
+           "decisions": [{"action": k[0], "severity": k[1], "count": v}
+                         for k, v in sorted(_coeos_guard_decisions.items(),
+                                            key=lambda kv: -kv[1])]}
+    if g.get("url"):
+        health = re.sub(r"/guard/?$", "/health", str(g["url"]))
+        try:
+            async with httpx.AsyncClient(timeout=5.0) as client:
+                r = await client.get(health)
+            out["reachable"] = r.status_code == 200
+            if r.status_code == 200:
+                out["sidecar"] = r.json()
+        except Exception as e:
+            out["reachable"] = False
+            out["error"] = f"{type(e).__name__}: {e}"
+    return out
 
 
 @app.get("/admin/coeos/fit")
@@ -6858,7 +6890,7 @@ async def admin_coeos_update(request: Request):
         c = cfg.get("coeos_config") or {}
         for field in ("enabled", "name", "regime", "updated", "note", "decider_model",
                       "default_axis", "axes", "models", "cold_boot_autoload",
-                      "score_table"):
+                      "score_table", "guardian"):
             val = getattr(req, field)
             if val is not None:
                 c[field] = bool(val) if field in ("enabled", "cold_boot_autoload") else val
@@ -7857,7 +7889,10 @@ def _coeos_propose(cfg: dict, axis: str) -> tuple:
         if not row:
             continue
         m = models.get(row) or {}
-        if m.get("role") == "reference":       # benchmark etalons: never proposed
+        # etalons (reference) ET lignes CoeOS (self) : jamais proposees — une
+        # ligne CoeOS en candidat boucle (les settings sont ce que CoeOS appelle)
+        # et gagnerait partout puisqu'elle route vers le meilleur (2026-07-17).
+        if (m.get("role") or "contender") != "contender":
             continue
         score = ((m.get("axes") or {}).get(axis) or {}).get("score")
         if score is None:
@@ -8049,6 +8084,112 @@ async def _coeos_llm_classify(decider_id, axes, messages) -> Optional[str]:
     return _coeos_parse_axis(buf, keys)
 
 
+# ── Guardian : le 2e agent interne du routeur ────────────────────────────────
+# Le DECIDEUR repond "quel axe ?", le GARDIEN repond "cette requete a-t-elle le
+# droit de sortir ?". Meme moteur de detection que Companion (sidecar
+# odyssai-guardian : etage 1 GLiNER ~40 ms, etage 2 DSPy contextuel opt-in) et
+# memes 3 policies (warn / force-local / block) — la logique de DETECTION vit
+# dans le sidecar, la POLITIQUE ici. Pose au ROUTEUR (2026-07-17, Sophie) parce
+# que depuis l'etape 6 les agents (superagent, CodeOS, OMP, tout client API)
+# appellent CoeOS en direct sans passer par Companion : le garde-fou du chat ne
+# couvrait plus rien de cette surface.
+#
+# Contrat FAIL-SOFT, identique a Companion : sidecar injoignable / lent / reponse
+# illisible => AUCUN verdict, la requete passe. Un garde-fou ne doit jamais
+# devenir une panne.
+_coeos_guard_decisions: dict = {}          # (action, severity) -> count
+
+
+def _coeos_guardian_cfg(cfg: dict) -> dict:
+    g = cfg.get("guardian")
+    return g if isinstance(g, dict) and g.get("enabled") and g.get("url") else {}
+
+
+def _coeos_is_cloud_endpoint(mid) -> bool:
+    """True si l'endpoint sort de la maison (alias cloud publie). Meme
+    discriminant que partout ailleurs : l'appartenance au registre cloud
+    (`odyssai-cloud-*` dans /v1/models), jamais un filtre par nom."""
+    try:
+        return bool(mid) and find_cloud_alias(mid) is not None
+    except Exception:
+        return False
+
+
+async def _coeos_guardian_check(gcfg: dict, messages: list) -> Optional[dict]:
+    """Classe le dernier tour utilisateur via le sidecar guardian.
+    -> {"sensitive": bool, "max_severity": str, "findings": [...], "ms": int}
+    ou None (fail-soft). Meme payload que Companion (server/lib/guard.ts)."""
+    text = ""
+    for m in reversed(messages or []):
+        if (m.get("role") or "") != "user":
+            continue
+        c = m.get("content")
+        if isinstance(c, str):
+            text = c
+        elif isinstance(c, list):
+            text = "\n".join(p if isinstance(p, str) else (p.get("text") or "")
+                             for p in c)
+        break
+    if not text.strip():
+        return None
+    contextual = bool(gcfg.get("contextual") and gcfg.get("llm_base"))
+    payload = {"text": text[:8000],
+               "threshold": float(gcfg.get("threshold") or 0.5),
+               "contextual": contextual}
+    if contextual:
+        payload["llm_base"] = gcfg["llm_base"]
+        payload["llm_model"] = gcfg.get("llm_model") or "tele-fast"
+    # etage 2 (LLM) peut prendre plusieurs secondes ; etage 1 seul ~40 ms.
+    timeout = float(gcfg.get("timeout_s") or (25.0 if contextual else 6.0))
+    t0 = time.time()
+    try:
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            r = await client.post(gcfg["url"], json=payload)
+        if r.status_code != 200:
+            sys.stderr.write(f"[coeos/guardian] HTTP {r.status_code} — skipped\n")
+            return None
+        body = r.json()
+        if not isinstance(body.get("sensitive"), bool):
+            return None
+        return {"sensitive": body["sensitive"],
+                "max_severity": body.get("max_severity") or "none",
+                "findings": body.get("findings") or [],
+                "ms": int((time.time() - t0) * 1000)}
+    except Exception as e:
+        sys.stderr.write(f"[coeos/guardian] {type(e).__name__}: {e} — skipped\n")
+        return None
+
+
+def _coeos_local_alternative(cfg: dict, axis: str) -> tuple:
+    """Meilleur modele LOCAL de la score-table sur cet axe (etalons + lignes
+    self exclus comme partout), restreint aux logiques que le registry sait
+    resoudre. -> (logical, endpoint, display) ou (None, None, None).
+    C'est la version force-local de _coeos_propose : meme data, meme ordre
+    (score desc, cout asc), filtre 'endpoint non-cloud' en plus."""
+    st = cfg.get("score_table") or {}
+    models = st.get("models") or {}
+    lut = _coeos_table_lookup(cfg)
+    best = None
+    for logical in _coeos_model_registry(cfg):
+        endpoint, display = _coeos_resolve_endpoint(cfg, logical)
+        if not endpoint or _coeos_is_cloud_endpoint(endpoint):
+            continue
+        row = lut.get(str(logical).strip().lower()) or lut.get(str(endpoint).strip().lower())
+        if not row:
+            continue
+        m = models.get(row) or {}
+        if (m.get("role") or "contender") != "contender":
+            continue
+        score = ((m.get("axes") or {}).get(axis) or {}).get("score")
+        if score is None:
+            continue
+        cost = m.get("cost_per_test")
+        key = (-score, cost is None, cost if cost is not None else 0.0, str(logical))
+        if best is None or key < best[0]:
+            best = (key, logical, endpoint, display)
+    return (best[1], best[2], best[3]) if best else (None, None, None)
+
+
 async def coeos_resolve(req, request) -> tuple:
     """Resolve `coeos` → (concrete model id, axis). Classify the request into one
     CONFIGURED axis (explicit `x-coeos-axis` header → decider LLM if it's hot →
@@ -8105,6 +8246,59 @@ async def coeos_resolve(req, request) -> tuple:
     # registry treat the binding as a literal endpoint (back-compat).
     logical = axis_models.get(axis) if axis else None
     endpoint, display = _coeos_resolve_endpoint(cfg, logical)
+
+    # ── Gardien : la requete a-t-elle le droit de sortir ? ────────────────────
+    # Tourne APRES le choix d'axe (on sait vers quoi on allait router) et AVANT
+    # la servabilite (un blocage n'a pas a dependre de ce qui est chaud).
+    gcfg = _coeos_guardian_cfg(cfg)
+    guard_action = None
+    if gcfg:
+        verdict = await _coeos_guardian_check(
+            gcfg, [m.model_dump(exclude_none=True) for m in req.messages])
+        if verdict and verdict.get("sensitive"):
+            cats = [f.get("category") for f in verdict.get("findings") or []]
+            sev = verdict.get("max_severity")
+            action = (gcfg.get("action") or "warn").strip().lower()
+            going_cloud = _coeos_is_cloud_endpoint(endpoint)
+            sys.stderr.write(
+                f"[coeos/guardian] sensitive severity={sev} categories={cats} "
+                f"axis={axis} endpoint={endpoint!r} cloud={going_cloud} "
+                f"action={action} ({verdict['ms']}ms)\n")
+            if action == "block" and going_cloud:
+                guard_action = "blocked"
+                _coeos_guard_decisions[(guard_action, sev)] = \
+                    _coeos_guard_decisions.get((guard_action, sev), 0) + 1
+                raise HTTPException(status_code=451, detail={
+                    "error": "coeos_confidential_blocked",
+                    "axis": axis, "severity": sev, "categories": cats,
+                    "recommended": display or logical or "?",
+                    "message": "Confidential content detected — this request would "
+                               "leave your infrastructure. CoeOS refused to route it "
+                               "to a cloud provider. Call a local model directly, or "
+                               "set the guardian action to 'force-local'."})
+            if action == "force-local" and going_cloud:
+                alt_logical, alt_endpoint, alt_display = _coeos_local_alternative(cfg, axis)
+                if alt_endpoint:
+                    sys.stderr.write(
+                        f"[coeos/guardian] force-local: {endpoint!r} -> {alt_endpoint!r} "
+                        f"(axis {axis})\n")
+                    logical, endpoint, display = alt_logical, alt_endpoint, alt_display
+                    guard_action = "forced_local"
+                else:
+                    guard_action = "blocked_no_local"
+                    _coeos_guard_decisions[(guard_action, sev)] = \
+                        _coeos_guard_decisions.get((guard_action, sev), 0) + 1
+                    raise HTTPException(status_code=451, detail={
+                        "error": "coeos_confidential_no_local",
+                        "axis": axis, "severity": sev, "categories": cats,
+                        "message": f"Confidential content detected, but no LOCAL model "
+                                   f"is mapped for axis '{axis}'. CoeOS will not send it "
+                                   "to a cloud provider. Map a local endpoint for this "
+                                   "criterion in the console."})
+            if guard_action is None:
+                guard_action = "warned"
+            _coeos_guard_decisions[(guard_action, sev)] = \
+                _coeos_guard_decisions.get((guard_action, sev), 0) + 1
 
     # No silent fallback to a different model. If the recommended model isn't
     # mapped or isn't loaded, surface it ("<name> — not loaded") so the operator
