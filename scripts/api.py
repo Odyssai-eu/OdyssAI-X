@@ -779,7 +779,13 @@ FORCE_NO_AP_MODEL_TYPES = frozenset({"longcat2"})
 # is only supported for MLX converted models". A use_ap:false in the request
 # (dashboard Default-form checkbox, 2026-07-26) must not be able to take that
 # path.
-FORCE_AP_MODEL_TYPES = frozenset({"glm_moe_dsa"})
+FORCE_AP_MODEL_TYPES = frozenset({
+    "glm_moe_dsa",
+    # kimi_k3 has no PipelineMixin, and its attention-residual transport
+    # (the second tensor crossing each rank boundary) lives in
+    # pipeline_auto_parallel — the sharded_load path would drop it.
+    "kimi_k3",
+})
 
 # Mirror of mtp_module._DEEPSEEK_FAMILY — the model_types whose native-MTP
 # binding exists in the runner. Keep in sync when a new family binding lands
@@ -862,6 +868,12 @@ async def get_model_arch_meta(ssh: str, abspath: str) -> dict:
         "num_hidden_layers": _nested("num_hidden_layers"),
         "num_key_value_heads": _nested("num_key_value_heads"),
         "is_vision": is_vision,
+        # Fields the arch-aware RAM overhead needs (see _arch_load_overhead).
+        # Absent on every architecture that doesn't have them — the helper
+        # falls back to the flat factors when it can't compute.
+        "linear_attn_config": _nested("linear_attn_config"),
+        "kv_lora_rank": _nested("kv_lora_rank"),
+        "qk_rope_head_dim": _nested("qk_rope_head_dim"),
     }
 
 
@@ -889,6 +901,65 @@ def _validate_load_mode(model_type, num_layers, num_kv_heads,
             return False, f"KV-heads {num_kv_heads} non divisible par {nodes_count}"
         return True, ""
     return False, f"mode inconnu : {mode}"
+
+
+# Serving context budget for kimi_k3 in v1. NOT the architectural maximum
+# (1M) — the gate charges the KV cost of this budget, so raising it is a
+# deliberate act that has to pass the gate again.
+_KIMI_K3_CTX_BUDGET = 131072
+
+# Flat per-rank allowance for the runtime itself (Metal scratch, the framework,
+# macOS headroom) once the cache cost is accounted for exactly.
+_ARCH_RUNTIME_MARGIN_BYTES = 6 * 1024**3
+
+
+def _arch_load_overhead(arch: Optional[dict], nodes_count: int) -> Optional[dict]:
+    """Exact cache cost for architectures where it is CALCULABLE, else None.
+
+    The flat 1.15 / 1.10 factors below are proxies calibrated on GQA models,
+    where the KV cache grows with both layer count and context and can plausibly
+    reach that fraction of the weights. They are wrong by a wide margin for
+    fixed-state architectures: kimi_k3 carries a recurrent state of CONSTANT
+    size on its linear-attention layers and a compressed latent KV on the rest,
+    so its real overhead is a couple of GiB — not 15% of 1.4 TB. Charging the
+    proxy would refuse a load that fits comfortably.
+
+    Returns {"extra_total_bytes", "extra_rank_bytes", "note"} or None when the
+    architecture is unknown or the config didn't carry what's needed, in which
+    case callers keep the historical factors.
+    """
+    if not arch or arch.get("model_type") != "kimi_k3":
+        return None
+
+    lac = arch.get("linear_attn_config") or {}
+    layers = arch.get("num_hidden_layers")
+    full_attn = lac.get("full_attn_layers")
+    heads, head_dim = lac.get("num_heads"), lac.get("head_dim")
+    kv_lora, qk_rope = arch.get("kv_lora_rank"), arch.get("qk_rope_head_dim")
+    if not all((layers, full_attn, heads, head_dim, kv_lora, qk_rope)):
+        return None
+
+    n_mla = len(full_attn)
+    n_kda = layers - n_mla
+    ctx = _KIMI_K3_CTX_BUDGET
+
+    # MLA keeps one compressed latent per token per full-attention layer.
+    kv_bytes = n_mla * ctx * (kv_lora + qk_rope) * 2
+    # KDA's recurrent state is (head_dim x head_dim) per head, fp32, and does
+    # NOT grow with context — that is the whole point of the architecture.
+    kda_bytes = n_kda * heads * head_dim * head_dim * 4
+
+    margin = _ARCH_RUNTIME_MARGIN_BYTES * max(nodes_count, 1)
+    return {
+        "extra_total_bytes": kv_bytes + kda_bytes + margin,
+        "extra_rank_bytes": _ARCH_RUNTIME_MARGIN_BYTES
+        + (kv_bytes + kda_bytes) // max(nodes_count, 1),
+        "note": (
+            f"kimi_k3: KV {kv_bytes / 1024**3:.1f} GiB @ {ctx} ctx + "
+            f"KDA state {kda_bytes / 1024**3:.2f} GiB + "
+            f"{_ARCH_RUNTIME_MARGIN_BYTES / 1024**3:.0f} GiB/rank runtime"
+        ),
+    }
 
 
 def _model_load_overhead_factor() -> float:
@@ -951,14 +1022,21 @@ def _cluster_total_ram_bytes(cluster: str, nodes_count: int) -> tuple[int, list[
     return total, out
 
 
-def _hetero_pipeline_ceiling(per_node: list[dict]) -> int:
+def _hetero_pipeline_ceiling(
+    per_node: list[dict], extra_rank_bytes: int = 0, activations_factor: float = 1.10
+) -> int:
     """Max model bytes loadable in PIPELINE mode under the capacity-aware
     split the loader actually performs (see ram_weights_csv in start_runners):
     each rank's shard is proportional to its weight (wired_limit | raw RAM),
     and must fit its budget (wired_limit | 0.75×RAM) with the +10%
     activations factor. Returns 0 when the loader would NOT activate the
     capacity-aware split (a weight missing, or all nodes identical — in
-    which case the even-split math of the caller is already exact)."""
+    which case the even-split math of the caller is already exact).
+
+    When the architecture has a calculable overhead (_arch_load_overhead), the
+    caller passes it as a flat per-rank SUBTRACTION and neutralises the
+    multiplicative factor — a proxy fraction of 1.4 TB of weights is not a
+    meaningful stand-in for a fixed-size recurrent state."""
     weights: list[int] = []
     budgets: list[int] = []
     for nd in per_node:
@@ -971,12 +1049,18 @@ def _hetero_pipeline_ceiling(per_node: list[dict]) -> int:
     if len(weights) < 2 or len(set(weights)) == 1:
         return 0
     sw = sum(weights)
-    return int(min(b * sw / (1.10 * w) for w, b in zip(weights, budgets)))
+    return int(
+        min(
+            max(b - extra_rank_bytes, 0) * sw / (activations_factor * w)
+            for w, b in zip(weights, budgets)
+        )
+    )
 
 
 def _validate_load_fits(model_size_bytes: int, cluster: str,
                          nodes_count: int,
-                         mode: Optional[str] = None) -> tuple[bool, str, dict]:
+                         mode: Optional[str] = None,
+                         arch: Optional[dict] = None) -> tuple[bool, str, dict]:
     """Returns (ok, reason, detail) for a (model, nodes) combo.
 
     Two checks (both must pass):
@@ -1012,7 +1096,15 @@ def _validate_load_fits(model_size_bytes: int, cluster: str,
     activations_factor = 1.10  # +10% per-rank for KV + activations + scratch
     default_headroom_factor = 0.75
 
+    # Architectures whose cache cost is CALCULABLE replace both proxy factors
+    # with an additive term — see _arch_load_overhead.
+    arch_overhead = _arch_load_overhead(arch, nodes_count)
+    if arch_overhead:
+        activations_factor = 1.0
+
     per_rank_required = int((model_size_bytes / max(nodes_count, 1)) * activations_factor)
+    if arch_overhead:
+        per_rank_required += arch_overhead["extra_rank_bytes"]
 
     # Smallest node's budget — that's the binding constraint
     node_budgets = []
@@ -1024,8 +1116,15 @@ def _validate_load_fits(model_size_bytes: int, cluster: str,
     per_node_budget = min(node_budgets) if node_budgets else 0
     min_node_ram = min((n["ram_bytes"] for n in per_node if n["ram_bytes"]), default=0)
 
-    overall_required = int(model_size_bytes * _model_load_overhead_factor())
-    overall_headroom = total_ram - overall_required
+    if arch_overhead:
+        # The real ceiling is the sum of what Metal may actually wire, not the
+        # raw RAM total — at 95% utilisation the difference decides the load.
+        overall_budget = sum(node_budgets) if node_budgets else total_ram
+        overall_required = model_size_bytes + arch_overhead["extra_total_bytes"]
+    else:
+        overall_budget = total_ram
+        overall_required = int(model_size_bytes * _model_load_overhead_factor())
+    overall_headroom = overall_budget - overall_required
 
     # Indicate whether budget came from actual tuned wired_limit or fallback
     budget_source = "wired_limit_mb" if any(n.get("wired_limit_bytes") for n in per_node) else f"{default_headroom_factor}×RAM"
@@ -1042,12 +1141,33 @@ def _validate_load_fits(model_size_bytes: int, cluster: str,
         "per_node_budget_gb": round(per_node_budget / 1024**3, 1),
         "per_node_budget_source": budget_source,
         "overall_required_gb": round(overall_required / 1024**3, 1),
+        "overall_budget_gb": round(overall_budget / 1024**3, 1),
         "activations_factor": activations_factor,
         "per_node": per_node,
     }
+    if arch_overhead:
+        detail["arch_overhead"] = arch_overhead["note"]
+        detail["arch_overhead_rank_gb"] = round(
+            arch_overhead["extra_rank_bytes"] / 1024**3, 1
+        )
 
     # Check #1 : overall budget
     if overall_headroom < 0:
+        if arch_overhead:
+            # iogpu.wired_limit_mb does NOT survive a reboot — including the
+            # automatic ones the wired-leak self-healing triggers. A load that
+            # fit yesterday and doesn't today is usually that, not a real
+            # capacity change.
+            budgets_gb = [round(b / 1024**3) for b in node_budgets]
+            return False, (
+                f"model {detail['model_size_gb']} GB + {detail['arch_overhead']} = "
+                f"{detail['overall_required_gb']} GB needed, only "
+                f"{detail['overall_budget_gb']} GB wirable across "
+                f"{nodes_count} node{'s' if nodes_count>1 else ''} "
+                f"(per-node wired budgets: {budgets_gb} GB). "
+                f"iogpu.wired_limit_mb is not persistent — re-apply it if a node "
+                f"rebooted, then wait ~5s for the telemetry probe."
+            ), detail
         return False, (
             f"model {detail['model_size_gb']} GB × {_model_load_overhead_factor()} overhead = "
             f"{detail['overall_required_gb']} GB needed, only {detail['cluster_ram_gb']} GB total "
@@ -1061,7 +1181,13 @@ def _validate_load_fits(model_size_bytes: int, cluster: str,
     # gate refuses loads the engine handles fine (Ling-Q8 1T on 512+4×256).
     if per_rank_required > per_node_budget and per_node_budget > 0:
         if mode == "pipeline":
-            ceiling = _hetero_pipeline_ceiling(per_node)
+            ceiling = _hetero_pipeline_ceiling(
+                per_node,
+                extra_rank_bytes=(
+                    arch_overhead["extra_rank_bytes"] if arch_overhead else 0
+                ),
+                activations_factor=activations_factor,
+            )
             if ceiling and model_size_bytes <= ceiling:
                 detail["capacity_aware_split"] = True
                 detail["hetero_ceiling_gb"] = round(ceiling / 1024**3, 1)
@@ -4820,7 +4946,7 @@ def _initial_default_config() -> Optional[dict]:
 #   major (1.7.2 → 2.0.0) — breaking API or topology change
 #
 # Use `./scripts/bump-version.sh patch|minor|major` to bump + auto-commit.
-APP_VERSION = "1.19.1"
+APP_VERSION = "1.20.0"
 
 app = FastAPI(
     title="OdyssAI-X (odyssai.eu)",
@@ -11792,7 +11918,8 @@ async def admin_cluster_load_options(cluster_id: str, model: str):
             # Fit is mode-dependent: pipeline gets the capacity-aware split.
             fit_ok, fit_reason, fit_detail = _validate_load_fits(
                 size_bytes, cluster_id, n,
-                mode="pipeline" if mode in ("solo", "pipeline") else mode)
+                mode="pipeline" if mode in ("solo", "pipeline") else mode,
+                arch=arch)
             # solo reuses the pipeline arch-validity (always ok for n==1).
             mode_ok, mode_reason = _validate_load_mode(
                 mt, layers, kv, n, "pipeline" if mode == "solo" else mode)
@@ -12133,7 +12260,7 @@ async def admin_cluster_load(cluster_id: str, req: ArgoLoadRequest):
 
     size_bytes = await get_model_size_bytes(rank0_ssh, model_abspath)
     ok, reason, detail = _validate_load_fits(size_bytes, cluster_id, nodes_count,
-                                             mode=req.mode)
+                                             mode=req.mode, arch=arch)
     if not ok and not getattr(req, "force", False):
         raise HTTPException(400, {
             "error": "model_too_big_for_cluster",
