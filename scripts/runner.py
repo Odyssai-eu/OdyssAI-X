@@ -2333,8 +2333,15 @@ def _run_legacy_main(model, tokenizer, repo: str, kv_q8_default: bool,
         token_canary = os.environ.get("RUNNER_TOKEN_CANARY", "0") == "1"
 
         cancelled_mid_gen = False
+        # stream_generate's LAST response carries finish_reason ("stop" on an
+        # eos_token_ids hit, "length" on the max_tokens cap). Capture it so the
+        # done event can tell the API layer which one it was.
+        gen_finish: Optional[str] = None
         for res in gen_iter:
             tok_id = getattr(res, "token", None)
+            rf = getattr(res, "finish_reason", None)
+            if rf:
+                gen_finish = rf
             # Extra stop check, BEFORE emitting the token's text. Chat-tuned
             # models emit a next-turn marker (<|im_end|>, <|role_end|>,
             # <|user|>…) to end the assistant turn. When that marker IS the
@@ -2345,6 +2352,7 @@ def _run_legacy_main(model, tokenizer, repo: str, kv_q8_default: bool,
             # break BEFORE appending it, or it leaks into the completion
             # (the "391<|role_end|>" bug). See _resolve_eos_token_seqs.
             if isinstance(tok_id, int) and tok_id in _stop_ids:
+                gen_finish = "stop"
                 break
             buf.append(res.text)
             full_text_parts.append(res.text)
@@ -2415,6 +2423,11 @@ def _run_legacy_main(model, tokenizer, repo: str, kv_q8_default: bool,
         }
         if cancelled_mid_gen:
             done_event["finish_reason"] = "cancelled"
+        else:
+            # Fallback when the generator yielded no finish_reason (MTP path,
+            # stop_requested break): infer from the token count vs the cap.
+            done_event["finish_reason"] = gen_finish or (
+                "length" if ntoks >= max_tokens else "stop")
         if tool_calls:
             done_event["tool_calls"] = tool_calls
         if session_id:
@@ -2430,7 +2443,8 @@ def _run_legacy_main(model, tokenizer, repo: str, kv_q8_default: bool,
         log(f"req {req_id}: {ntoks} toks in {elapsed:.1f}s = {tps:.2f} tok/s"
             + (" · CANCELLED" if cancelled_mid_gen else "")
             + (f" · {len(tool_calls)} tool_call(s)" if tool_calls else "")
-            + (f" · session={session_id}({cache_label})" if session_id else ""))
+            + (f" · session={session_id}({cache_label})" if session_id else "")
+            + (f" · finish={done_event['finish_reason']}" if not cancelled_mid_gen else ""))
 
 
 # ──────────────────────────────────────────────────────────────────────────────

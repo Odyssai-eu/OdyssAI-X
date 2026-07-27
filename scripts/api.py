@@ -771,6 +771,16 @@ TENSOR_CAPABLE_MODEL_TYPES = frozenset({
 # le temps".
 FORCE_NO_AP_MODEL_TYPES = frozenset({"longcat2"})
 
+# Inverse guard: model types whose ONLY working multi-node path is
+# auto_parallel. glm_moe_dsa's DSA patch (Option A) declares Indexer params on
+# every layer, including the `shared` layers whose indexer weights don't exist
+# in the checkpoint — so the stock sharded_load(pipeline_group) path (use_ap
+# False) dies on the weight_map lookup with the misleading "Pipeline loading
+# is only supported for MLX converted models". A use_ap:false in the request
+# (dashboard Default-form checkbox, 2026-07-26) must not be able to take that
+# path.
+FORCE_AP_MODEL_TYPES = frozenset({"glm_moe_dsa"})
+
 # Mirror of mtp_module._DEEPSEEK_FAMILY — the model_types whose native-MTP
 # binding exists in the runner. Keep in sync when a new family binding lands
 # (hy_v3 pending). Used by load-options to expose `mtp_available` so the
@@ -4810,7 +4820,7 @@ def _initial_default_config() -> Optional[dict]:
 #   major (1.7.2 → 2.0.0) — breaking API or topology change
 #
 # Use `./scripts/bump-version.sh patch|minor|major` to bump + auto-commit.
-APP_VERSION = "1.19.0"
+APP_VERSION = "1.19.1"
 
 app = FastAPI(
     title="OdyssAI-X (odyssai.eu)",
@@ -8277,6 +8287,7 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
         ntoks = 0
         nstream_prompt_tokens: Optional[int] = None
         nstream_cached_tokens: int = 0
+        nstream_finish: Optional[str] = None
         elapsed_s = 0.0
         ttft_s: Optional[float] = None
         tool_calls: list[dict] = []
@@ -8308,6 +8319,7 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
                     session_meta.update(ev.get("session", {}) or {})
                     nstream_prompt_tokens = ev.get("prompt_tokens")
                     nstream_cached_tokens = int(ev.get("cached_tokens") or 0)
+                    nstream_finish = ev.get("finish_reason")
         finally:
             _runs_finalize(completion_id)
         _touch_session(pool.cluster, session_meta, model_id)
@@ -8364,7 +8376,11 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
             "choices": [{
                 "index": 0,
                 "message": message_obj,
-                "finish_reason": "tool_calls" if tool_calls else "stop",
+                # "length" comes from the runner's done event (generator hit
+                # the max_tokens cap). Anything else stays "stop" — OpenAI
+                # clients only understand stop/length/tool_calls here.
+                "finish_reason": "tool_calls" if tool_calls
+                                 else ("length" if nstream_finish == "length" else "stop"),
             }],
             "usage": usage_obj,
             "x_mlx_cluster": {
@@ -8483,6 +8499,7 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
                             yield f"data: {json.dumps(chunk)}\n\n".encode()
                     ntoks_total = ev.get("ntoks", 0)
                     elapsed_total = ev.get("elapsed_s", 0.0)
+                    stream_finish = ev.get("finish_reason")
                     tool_calls = ev.get("tool_calls", []) or []
                     tool_calls_count = len(tool_calls)
                     sess = ev.get("session", {}) or {}
@@ -8504,7 +8521,8 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
                     final = {"id": completion_id, "object": "chat.completion.chunk",
                              "created": created, "model": model_id,
                              "choices": [{"index": 0, "delta": delta,
-                                          "finish_reason": "tool_calls" if tool_calls else "stop"}],
+                                          "finish_reason": "tool_calls" if tool_calls
+                                          else ("length" if stream_finish == "length" else "stop")}],
                              # OpenAI-compat usage in the final chunk so clients
                              # (Companion etc.) can render prompt/completion counts
                              # regardless of stream_options.include_usage.
@@ -12103,6 +12121,15 @@ async def admin_cluster_load(cluster_id: str, req: ArgoLoadRequest):
             f"(auto_parallel would die on num_hidden_layers / skip the patch)\n"
         )
         req.use_ap = False
+
+    # Symmetric guard — see FORCE_AP_MODEL_TYPES. glm_moe_dsa's ap=False path
+    # dies on shared-layer indexer params missing from the weight index.
+    if not req.use_ap and arch.get("model_type") in FORCE_AP_MODEL_TYPES:
+        sys.stderr.write(
+            f"[load] {cluster_id}: model_type={arch.get('model_type')} only "
+            f"loads via auto_parallel — forcing use_ap=True\n"
+        )
+        req.use_ap = True
 
     size_bytes = await get_model_size_bytes(rank0_ssh, model_abspath)
     ok, reason, detail = _validate_load_fits(size_bytes, cluster_id, nodes_count,
