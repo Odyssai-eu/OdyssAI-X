@@ -2,7 +2,7 @@
 # Install the vendored/custom mlx-lm model modules onto cluster nodes.
 #
 # Some architectures have no upstream mlx-lm support (laguna → issue #1378) or
-# needed a from-scratch port (deepseek_v4, hy_v3, inkling_mm). Those modules
+# needed a from-scratch port (deepseek_v4, hy_v3, inkling_mm, kimi_k3). Those modules
 # live in `scripts/mlx_models/` and must land in each node's
 # `…/site-packages/mlx_lm/models/` for `_get_classes()` to resolve the
 # model_type at load.
