@@ -295,9 +295,13 @@ def convert(args):
             {"metadata": {"total_size": total_bytes}, "weight_map": weight_map},
             open(os.path.join(dst, "model.safetensors.index.json"), "w"),
         )
+        # The tokenizer's dynamic-module chain hashes EVERY local source file it
+        # references — omitting encoding_k3.py killed rank 3 at startup on the
+        # first real load (FileNotFoundError inside transformers' module hash).
         for extra in (
             "tokenizer_config.json", "tokenization_kimi.py", "tiktoken.model",
             "generation_config.json", "chat_template.jinja", "tokenizer.json",
+            "encoding_k3.py", "configuration_kimi_k3.py", "media_utils.py",
         ):
             p = os.path.join(src, extra)
             if os.path.exists(p):
