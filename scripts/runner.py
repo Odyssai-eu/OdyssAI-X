@@ -496,6 +496,51 @@ def _last_user_text(messages) -> str:
     return ""
 
 
+# ── Anti-loop — detect-and-stop on degenerate repetition ──────────────────
+# When the TAIL of the generated token-id stream is >= N consecutive
+# repetitions of the same p-token block, generation ends cleanly
+# (finish_reason="stop" + `loop_detected` on the done event) instead of
+# burning tokens to the max_tokens cap.
+#
+# Deterministic — a pure function of the emitted ids — so on multi-rank
+# pools every rank reaches the same verdict at the same token and breaks in
+# lockstep, exactly like the _stop_ids break in the stream loop. Distinct
+# from the sampler-level no_repeat_ngram profiles (MODEL_SAMPLING_DEFAULTS):
+# those BEND the distribution to avoid repeats (and can garble); this never
+# touches sampling, it only ends the turn once the loop is proven. Per
+# request opt-out via the fan-out field `anti_loop: false`.
+ANTI_LOOP_CHECK_EVERY = 16   # tokens between checks
+ANTI_LOOP_MIN_SPAN = 48      # repeating tail must cover >= this many tokens
+ANTI_LOOP_MAX_PERIOD = 64    # longest repeating block considered
+ANTI_LOOP_MIN_REPEATS = 4    # and repeat at least this many times
+ANTI_LOOP_WINDOW = 640       # ids scanned (>= MAX_PERIOD * (MIN_REPEATS + 1))
+
+
+def _detect_loop(ids: list) -> Optional[tuple]:
+    """(period, repeats) when the tail of `ids` is a degenerate loop, else None.
+
+    Thresholds are deliberately conservative: 4+ EXACT repetitions of the
+    same token block covering 48+ tokens is vanishingly rare in legitimate
+    output (tables vary cell by cell, code lines differ), while a stuck
+    model produces hundreds. Short periods need proportionally more repeats
+    (period 1 → 48 repeats) so a stylistic "!!!" never trips it."""
+    n = len(ids)
+    if n < ANTI_LOOP_MIN_SPAN:
+        return None
+    tail = ids[-ANTI_LOOP_WINDOW:]
+    n = len(tail)
+    for p in range(1, ANTI_LOOP_MAX_PERIOD + 1):
+        if n < 2 * p:
+            break
+        r = 1
+        while (n - (r + 1) * p >= 0
+               and tail[n - (r + 1) * p: n - r * p] == tail[n - r * p: n - (r - 1) * p]):
+            r += 1
+        if r >= max(ANTI_LOOP_MIN_REPEATS, -(-ANTI_LOOP_MIN_SPAN // p)):
+            return p, r
+    return None
+
+
 def _looks_like_code_request(messages, tools=None) -> bool:
     """Conservative: True only on strong code signals — a ``` fence, a source
     file extension, a code verb + code noun IN PROXIMITY (same clause), or
@@ -2333,6 +2378,8 @@ def _run_legacy_main(model, tokenizer, repo: str, kv_q8_default: bool,
         token_canary = os.environ.get("RUNNER_TOKEN_CANARY", "0") == "1"
 
         cancelled_mid_gen = False
+        loop_detected = False
+        anti_loop = bool(req.get("anti_loop", True))
         # stream_generate's LAST response carries finish_reason ("stop" on an
         # eos_token_ids hit, "length" on the max_tokens cap). Capture it so the
         # done event can tell the API layer which one it was.
@@ -2368,6 +2415,18 @@ def _run_legacy_main(model, tokenizer, repo: str, kv_q8_default: bool,
             if len(buf) >= emit_batch_n:
                 emit(rank, {"event": "token", "id": req_id, "text": "".join(buf)})
                 buf.clear()
+            # Anti-loop: every N tokens, test the id stream for degenerate
+            # repetition. Pure function of ids identical on every rank →
+            # every rank breaks at the same token (multi-rank safe, same
+            # construction as the _stop_ids break above).
+            if anti_loop and ntoks % ANTI_LOOP_CHECK_EVERY == 0:
+                _hit = _detect_loop(gen_token_ids)
+                if _hit:
+                    loop_detected = True
+                    gen_finish = "stop"
+                    log(f"req {req_id}: anti-loop stop "
+                        f"(period={_hit[0]} repeats={_hit[1]} ntoks={ntoks})")
+                    break
             # Hard cancel: the reader thread set our req_id in _cancelled_ids
             # when /admin/runs/{id}/cancel propagated to us. Break out of
             # the generator so MLX stops computing and we surface a clean
@@ -2428,6 +2487,8 @@ def _run_legacy_main(model, tokenizer, repo: str, kv_q8_default: bool,
             # stop_requested break): infer from the token count vs the cap.
             done_event["finish_reason"] = gen_finish or (
                 "length" if ntoks >= max_tokens else "stop")
+        if loop_detected:
+            done_event["loop_detected"] = True
         if tool_calls:
             done_event["tool_calls"] = tool_calls
         if session_id:
@@ -2557,6 +2618,8 @@ def _run_batched_main(model, tokenizer, repo: str, kv_q8_default: bool,
         }
         if finish_reason:
             done_event["finish_reason"] = finish_reason
+        if s.get("loop_detected"):
+            done_event["loop_detected"] = True
         if tool_calls:
             done_event["tool_calls"] = tool_calls
         if s["session_id"]:
@@ -2730,6 +2793,8 @@ def _run_batched_main(model, tokenizer, repo: str, kv_q8_default: bool,
                 "session_id": session_id,
                 "cache_label": cache_label,
                 "detok": tokenizer.detokenizer,  # new instance per slot
+                "anti_loop": bool(req.get("anti_loop", True)),
+                "loop_detected": False,
             }
             log(f"req {req_id}: inserted as uid={uid} "
                 f"session={session_id or '-'} cache={cache_label} "
@@ -2835,6 +2900,19 @@ def _run_batched_main(model, tokenizer, repo: str, kv_q8_default: bool,
                             emit(rank, {"event": "token", "id": s["req_id"],
                                         "text": "".join(s["buf"])})
                             s["buf"].clear()
+                # Anti-loop (batched path): same detector as the multi-rank
+                # loop. _emit_done_for drains the buffer, emits done with the
+                # loop flag, removes the uid from the BG and drops the slot —
+                # later responses for this uid fall through `uid not in slot`.
+                if (s["anti_loop"]
+                        and s["ntoks"] % ANTI_LOOP_CHECK_EVERY == 0):
+                    _hit = _detect_loop(s["gen_token_ids"])
+                    if _hit:
+                        s["loop_detected"] = True
+                        log(f"req {s['req_id']}: anti-loop stop "
+                            f"(period={_hit[0]} repeats={_hit[1]} ntoks={s['ntoks']})")
+                        _emit_done_for(uid, finish_reason="stop")
+                        continue
             if finish:
                 # Finalize detokenizer to flush any trailing bytes (e.g.
                 # an incomplete multi-byte sequence at the very end).

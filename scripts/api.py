@@ -2721,7 +2721,8 @@ class RunnerPool:
                      tools: Optional[list[dict]] = None,
                      session_id: Optional[str] = None,
                      request_id: Optional[str] = None,
-                     reasoning_effort: Optional[str] = None) -> AsyncIterator[dict]:
+                     reasoning_effort: Optional[str] = None,
+                     anti_loop: bool = True) -> AsyncIterator[dict]:
         # Concurrent submits are allowed: the runner side handles serialisation
         # (single-rank uses BatchGenerator for true parallelism; multi-rank
         # serialises in the gen loop but tokens are routed by req_id).
@@ -2747,6 +2748,9 @@ class RunnerPool:
         if enable_thinking is None:
             enable_thinking = get_enable_thinking_default()
         req["enable_thinking"] = enable_thinking
+        # Anti-loop detect-and-stop (runner-side, default ON). Identical on
+        # every rank via the broadcast, so multi-rank pools break in lockstep.
+        req["anti_loop"] = bool(anti_loop)
         # reasoning_effort: forwarded as a chat-template kwarg (Step-3.7 reads
         # it). Only set when non-empty so models that don't read it are untouched.
         # Remapped onto the model's accepted vocabulary first (Hy3 release
@@ -3940,6 +3944,9 @@ class ChatCompletionRequest(BaseModel):
     tools: Optional[list[dict]] = None
     tool_choice: Optional[Any] = None
     session_id: Optional[str] = None  # opt-in prefix-cache key (also: X-Session-Id header)
+    # Anti-loop detect-and-stop (runner-side). Default ON; `false` disables
+    # detection for this request (legitimately repetitive output).
+    anti_loop: Optional[bool] = None
 
     @model_validator(mode="after")
     def _alias_max_completion_tokens(self) -> "ChatCompletionRequest":
@@ -8476,6 +8483,7 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
         nstream_prompt_tokens: Optional[int] = None
         nstream_cached_tokens: int = 0
         nstream_finish: Optional[str] = None
+        nstream_loop = False
         elapsed_s = 0.0
         ttft_s: Optional[float] = None
         tool_calls: list[dict] = []
@@ -8487,6 +8495,7 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
         run_status = "completed"
         try:
             async for ev in pool.submit(None, req.max_tokens or 512, req.enable_thinking,
+                                        anti_loop=(req.anti_loop is not False),
                                         messages=messages, tools=req.tools,
                                         session_id=session_id,
                                         request_id=completion_id,
@@ -8508,6 +8517,7 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
                     nstream_prompt_tokens = ev.get("prompt_tokens")
                     nstream_cached_tokens = int(ev.get("cached_tokens") or 0)
                     nstream_finish = ev.get("finish_reason")
+                    nstream_loop = bool(ev.get("loop_detected"))
         finally:
             _runs_finalize(completion_id)
         _touch_session(pool.cluster, session_meta, model_id)
@@ -8579,6 +8589,8 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
         }
         if session_meta:
             body["x_mlx_cluster"]["session"] = session_meta
+        if nstream_loop:
+            body["x_mlx_cluster"]["loop_detected"] = True
         if coeos_routed:
             body["x_odyssai_routed"] = {"router": COEOS_DISPLAY_ID,
                                         "routed_to": coeos_routed,
@@ -8627,6 +8639,7 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
                 "strip": _model_think_strips(model_id),
             }
             async for ev in pool.submit(None, req.max_tokens or 512, req.enable_thinking,
+                                        anti_loop=(req.anti_loop is not False),
                                         messages=messages, tools=req.tools,
                                         session_id=session_id,
                                         request_id=completion_id,
@@ -8690,6 +8703,7 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
                     ntoks_total = ev.get("ntoks", 0)
                     elapsed_total = ev.get("elapsed_s", 0.0)
                     stream_finish = ev.get("finish_reason")
+                    stream_loop = bool(ev.get("loop_detected"))
                     tool_calls = ev.get("tool_calls", []) or []
                     tool_calls_count = len(tool_calls)
                     sess = ev.get("session", {}) or {}
@@ -8720,7 +8734,9 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
                              "x_mlx_cluster": {"elapsed_s": elapsed_total,
                                                "ttft_s": ttft_s,
                                                "tps": ev.get("tps"),
-                                               "ntoks": ntoks_total}}
+                                               "ntoks": ntoks_total,
+                                               **({"loop_detected": True}
+                                                  if stream_loop else {})}}
                     yield f"data: {json.dumps(final)}\n\n".encode()
             yield b"data: [DONE]\n\n"
         finally:
