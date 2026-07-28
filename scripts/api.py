@@ -1889,8 +1889,16 @@ class RunnerProc:
         # write(), stalling the distributed barrier -> deadlock. Send their
         # stdout to DEVNULL so the kernel never back-pressures them (#23).
         _stdout = subprocess.PIPE if node["rank"] == 0 else subprocess.DEVNULL
+        # ServerAliveInterval=10 alone means CountMax defaults to 3: the client
+        # tears the session down after 30s of an unresponsive sshd. Loading
+        # Kimi-K3 (15 GiB single-tensor layers, 233 GiB/rank of mmap page-in)
+        # starves the whole node hard enough that sshd misses keepalives for
+        # minutes — observed twice as a rank dying with exit=255, no stderr, no
+        # crash report, on a DIFFERENT node each time. 10s×30 keeps dead-node
+        # detection (5 min) while surviving the page-in storm of a heavy load.
         self.proc = subprocess.Popen(
-            ["ssh", "-o", "ServerAliveInterval=10", _safe_ssh_target(node["ssh"]), cmd],
+            ["ssh", "-o", "ServerAliveInterval=10", "-o", "ServerAliveCountMax=30",
+             _safe_ssh_target(node["ssh"]), cmd],
             stdin=subprocess.PIPE, stdout=_stdout, stderr=subprocess.PIPE,
             text=True, bufsize=1,
         )
