@@ -1897,7 +1897,13 @@ class RunnerProc:
         # crash report, on a DIFFERENT node each time. 10s×30 keeps dead-node
         # detection (5 min) while surviving the page-in storm of a heavy load.
         self.proc = subprocess.Popen(
-            ["ssh", "-o", "ServerAliveInterval=10", "-o", "ServerAliveCountMax=30",
+            # 60s x 60 = 1h of keepalive tolerance. Rank 0 of the Q3e load
+            # died at exactly startup+300s — the previous 10x30 ceiling — while
+            # paging 392 GiB off the slow external volume: sshd starved longer
+            # than the tolerance and the CLIENT killed a healthy load. Dead-node
+            # detection does not rest on keepalives anyway: the orchestrator's
+            # soft-timeout ladder (SIGTERM -> remote kill) owns that.
+            ["ssh", "-o", "ServerAliveInterval=60", "-o", "ServerAliveCountMax=60",
              _safe_ssh_target(node["ssh"]), cmd],
             stdin=subprocess.PIPE, stdout=_stdout, stderr=subprocess.PIPE,
             text=True, bufsize=1,
