@@ -3535,7 +3535,31 @@ _THINK_MAX_PARTIAL = max(len(_THINK_OPEN), len(_THINK_CLOSE)) - 1  # 7
 # (content=null) — exactly M3's first-smoke symptom (2026-06-13).
 _THINK_MARKERS = {
     "minimax-m3": ("<mm:think>", "</mm:think>"),
+    # Kimi K3 envelope: <|open|>think<|sep|>REASONING<|close|>think<|sep|>
+    # <|open|>response<|sep|>ANSWER<|close|>response<|sep|><|close|>message<|sep|>.
+    # The CLOSE marker here is the RESPONSE open: it is emitted in BOTH modes
+    # (thinking on and off), so seeding in_think=True is correct for both — a
+    # no-think stream starts with it and flips to visible at offset 0, no ghost.
+    # The stray <|close|>think<|sep|> lands in reasoning; the trailing envelope
+    # tags are removed by _THINK_STRIP.
+    "kimi-k3": ("<|open|>think<|sep|>", "<|open|>response<|sep|>"),
 }
+
+
+# Residual envelope tokens to erase from the SPLIT output (both channels).
+# Kimi K3 closes its envelope with tags the (open, close) pair cannot cover.
+_THINK_STRIP = {
+    "kimi-k3": ("<|close|>response<|sep|>", "<|close|>message<|sep|>",
+                "<|close|>think<|sep|>"),
+}
+
+
+def _model_think_strips(model_id: Optional[str]) -> tuple:
+    needle = (model_id or "").lower()
+    for key, toks in _THINK_STRIP.items():
+        if key in needle:
+            return toks
+    return ()
 
 
 def _model_think_markers(model_id: Optional[str]) -> tuple[str, str]:
@@ -3579,7 +3603,8 @@ def _seed_in_think(model_id: Optional[str], enable_thinking) -> bool:
 # (off -> empty <think></think> baked in the prompt, no output block), like
 # Qwen3.5/3.6 -> goes HERE only, NOT in _MODELS_IGNORE_ENABLE_THINKING_FLAG.
 # Substring "glm-5.2" matches the concrete HF path (kernelpool/GLM-5.2-*, all quants).
-_MODELS_AUTO_OPEN_THINK = ("minimax", "qwen3.5", "qwen3.6", "step-3.7", "step3p7", "glm-5.2")
+_MODELS_AUTO_OPEN_THINK = ("minimax", "qwen3.5", "qwen3.6", "step-3.7", "step3p7", "glm-5.2",
+                           "kimi-k3")
 # Subset of _MODELS_AUTO_OPEN_THINK that IGNORES the `enable_thinking`
 # kwarg and always wraps reasoning in <think>...</think>. Per MiniMax M2
 # docs (2026-05-20 update): "The model's reasoning is wrapped in <think>
@@ -3600,7 +3625,11 @@ _MODELS_AUTO_OPEN_THINK = ("minimax", "qwen3.5", "qwen3.6", "step-3.7", "step3p7
 # would ghost every no-think answer into reasoning_content with empty
 # content (the exact Companion-ghost failure this list exists to avoid for
 # models that DO honor the flag — see Qwen3.5/3.6 note above).
-_MODELS_IGNORE_ENABLE_THINKING_FLAG = ("minimax-m2", "step-3.7", "step3p7")
+_MODELS_IGNORE_ENABLE_THINKING_FLAG = ("minimax-m2", "step-3.7", "step3p7",
+                                       # K3 is always-thinking by design (reasoning_effort,
+                                       # not enable_thinking) and emits its response envelope
+                                       # in every mode — the filter must stay on to strip it.
+                                       "kimi-k3")
 
 # Models whose chat template reads a `reasoning_effort` system directive
 # (OpenAI o-series convention: minimal/low/medium/high). Step-3.7-Flash is a
@@ -3708,7 +3737,24 @@ def _split_think_stream(text: str, state: dict) -> tuple[str, str]:
     """
     open_m = state.get("open", _THINK_OPEN)
     close_m = state.get("close", _THINK_CLOSE)
-    max_partial = max(len(open_m), len(close_m)) - 1
+    strips = state.get("strip") or ()
+    _markers = (open_m, close_m, *strips)
+    max_partial = max(len(t) for t in _markers) - 1
+
+    def _clean(chunk: str) -> str:
+        for tok in strips:
+            chunk = chunk.replace(tok, "")
+        return chunk
+
+    def _holdback(chunk: str) -> int:
+        """Longest suffix of `chunk` that is a proper prefix of any marker —
+        that many chars must wait in carry or a marker could be emitted split
+        across two chunks and never matched/stripped."""
+        for n in range(min(len(chunk), max_partial), 0, -1):
+            tail = chunk[-n:]
+            if any(m.startswith(tail) for m in _markers):
+                return n
+        return 0
     text = state.get("carry", "") + (text or "")
     state["carry"] = ""
     visible_parts: list[str] = []
@@ -3718,27 +3764,27 @@ def _split_think_stream(text: str, state: dict) -> tuple[str, str]:
         if state.get("in_think"):
             idx = text.find(close_m)
             if idx == -1:
-                # No close marker — emit body up to the last few chars that
-                # could be the start of the close tag. Hold those back.
-                tail_len = min(len(text), max_partial)
+                # No close marker — emit the body except a suffix that could
+                # still start a marker on the next chunk.
+                tail_len = _holdback(text)
                 if len(text) > tail_len:
-                    reasoning_parts.append(text[:-tail_len])
+                    reasoning_parts.append(_clean(text[:-tail_len] if tail_len else text))
                 state["carry"] = text[-tail_len:] if tail_len else ""
                 text = ""
             else:
-                reasoning_parts.append(text[:idx])
+                reasoning_parts.append(_clean(text[:idx]))
                 text = text[idx + len(close_m):]
                 state["in_think"] = False
         else:
             idx = text.find(open_m)
             if idx == -1:
-                tail_len = min(len(text), max_partial)
+                tail_len = _holdback(text)
                 if len(text) > tail_len:
-                    visible_parts.append(text[:-tail_len])
+                    visible_parts.append(_clean(text[:-tail_len] if tail_len else text))
                 state["carry"] = text[-tail_len:] if tail_len else ""
                 text = ""
             else:
-                visible_parts.append(text[:idx])
+                visible_parts.append(_clean(text[:idx]))
                 text = text[idx + len(open_m):]
                 state["in_think"] = True
 
@@ -3750,6 +3796,8 @@ def _flush_think_stream(state: dict) -> tuple[str, str]:
     Returns (visible, reasoning) for the residual."""
     carry = state.get("carry", "")
     state["carry"] = ""
+    for tok in state.get("strip") or ():
+        carry = carry.replace(tok, "")
     if not carry:
         return "", ""
     if state.get("in_think"):
@@ -8489,7 +8537,8 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
             # filter catch it. Full content in hand here, so detect directly.
             seed = not content.lstrip().startswith(open_m)
             ts: dict = {"in_think": seed, "carry": "",
-                        "open": open_m, "close": close_m}
+                        "open": open_m, "close": close_m,
+                        "strip": _model_think_strips(model_id)}
             visible_full, reasoning_full = _split_think_stream(content, ts)
             fl_vis, fl_reason = _flush_think_stream(ts)
             content = visible_full + fl_vis
@@ -8575,6 +8624,7 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
             think_state: dict = {
                 "in_think": think_filter_active and _seed_in_think(model_id, req.enable_thinking),
                 "carry": "", "open": _open_m, "close": _close_m,
+                "strip": _model_think_strips(model_id),
             }
             async for ev in pool.submit(None, req.max_tokens or 512, req.enable_thinking,
                                         messages=messages, tools=req.tools,
@@ -12568,7 +12618,8 @@ async def _telemak_proxy_chat_completion(
                 raw = msg.get("content") or ""
                 _om, _cm = _model_think_markers(upstream_model)
                 state = {"in_think": not raw.lstrip().startswith(_om),
-                         "carry": "", "open": _om, "close": _cm}
+                         "carry": "", "open": _om, "close": _cm,
+                         "strip": _model_think_strips(upstream_model)}
                 vis, reas = _split_think_stream(raw, state)
                 vis2, reas2 = _flush_think_stream(state)
                 visible = (vis + vis2).lstrip()
@@ -12600,7 +12651,8 @@ async def _telemak_proxy_chat_completion(
         if auto_think:
             _om, _cm = _model_think_markers(upstream_model)
             state = {"in_think": _seed_in_think(upstream_model, body.get("enable_thinking")),
-                     "carry": "", "open": _om, "close": _cm}
+                     "carry": "", "open": _om, "close": _cm,
+                     "strip": _model_think_strips(upstream_model)}
         else:
             state = None
         _ttft: list = []          # mutable cell for TTFT
@@ -12826,7 +12878,8 @@ async def _vlm_pool_proxy_chat_completion(pool, body: dict, stream: bool):
                 raw = msg.get("content") or ""
                 _om, _cm = _model_think_markers(upstream_model)
                 state = {"in_think": not raw.lstrip().startswith(_om),
-                         "carry": "", "open": _om, "close": _cm}
+                         "carry": "", "open": _om, "close": _cm,
+                         "strip": _model_think_strips(upstream_model)}
                 vis, reas = _split_think_stream(raw, state)
                 vis2, reas2 = _flush_think_stream(state)
                 visible = (vis + vis2).lstrip()
@@ -12856,7 +12909,8 @@ async def _vlm_pool_proxy_chat_completion(pool, body: dict, stream: bool):
         if auto_think:
             _om, _cm = _model_think_markers(upstream_model)
             state = {"in_think": _seed_in_think(upstream_model, body.get("enable_thinking")),
-                     "carry": "", "open": _om, "close": _cm}
+                     "carry": "", "open": _om, "close": _cm,
+                     "strip": _model_think_strips(upstream_model)}
         else:
             state = None
         _ttft: list = []
