@@ -1,22 +1,25 @@
-"""Does one rank's share of Kimi K3 actually fit under its wired limit?
+"""Attempted single-node capacity probe for one Kimi K3 rank — INCONCLUSIVE.
 
-The load is planned at ~95% of the wired budget, which is further than this
-cluster has ever gone (previous high: Ling-1T at 74%). The failure mode at that
-level is not an error — it is PAGING: the allocation succeeds, macOS starts
-compressing and swapping, and throughput collapses. That has to be measured,
-not argued about.
+Kept for the record of what was tried and what it taught. Three runs on .33
+(245 GiB wired limit, 227 GiB slice of the real converted checkpoint):
 
-This loads a real slice of the converted checkpoint sized to one rank's share
-on a single node, runs a forward, and reports what the memory system did. No
-cluster, no distributed init, no risk to anything else.
+  1. one-shot mx.eval of the slice        -> process killed, no verdict
+  2. per-layer eval + mx.set_wired_limit  -> GPU Timeout at ~layer 12: a 15 GiB
+     layer materialising under I/O starvation demand-pages inside one Metal
+     command buffer, which has a timeout; CPU reads do not
+  3. + CPU page-prefetch per layer        -> prefetch cured the GPU timeout,
+     then jetsam SIGKILLed the process (file-cache pressure, RSS small)
 
-    test_kimi_k3_rank_capacity.py --model <converted dir> --target-gib 233
-                                  [--ctx 2048]
+Root limitation: mx.eval of mmap-loaded weights is zero-copy — wired stayed at
+~4.6 GiB in every run. The weights only get wired at generation time (residency
+set + set_wired_limit inside the serving process). A harness cannot reproduce
+that lifecycle without BEING the runner, so the 95%-utilisation question is
+only answerable by the real load, with a human watching vm_stat and the Q3
+fallback one command away.
 
-Reads `--target-gib` worth of consecutive layers starting at layer 0. Verdict:
-
-  CLEAN   allocation stayed wired, compressor flat -> the real load will hold
-  PAGING  free collapsed / compressor grew -> the split does NOT fit, fall back
+What transfers to the real load: prefetching a layer's pages on the CPU before
+the GPU touches them removes the GPU-timeout failure mode, and the last rank
+of a 256 GiB node enters the starved regime for roughly its final third.
 """
 
 import argparse
@@ -99,6 +102,14 @@ def main():
     n_layers = max(layers) + 1 if layers else 0
     print(f"{len(shards)} shards, {total/GIB:.1f} GiB, layers 0..{n_layers-1}")
 
+    # Wire MLX buffers the way generation does (mlx_lm.generate:257 /
+    # runner via stream_generate): without this the weights stay file-backed,
+    # nothing gets wired, and the first GPU op demand-pages 227 GiB through
+    # the disk — observed as a GPU Timeout crash, not a measurement.
+    info = mx.device_info()
+    mx.set_wired_limit(info["max_recommended_working_set_size"])
+    print(f"mlx wired limit: {info['max_recommended_working_set_size']/GIB:.0f} GiB")
+
     before = vm_stat()
     show("avant", before)
 
@@ -132,7 +143,32 @@ def main():
     have = {k: v for k, v in weights.items() if k.startswith("model.layers.")}
     model.model.layers = model.model.layers[:n_layers]
     model.load_weights(list(have.items()), strict=False)
-    mx.eval(model.parameters())
+    # Materialise layer by layer, the way pipeline_auto_parallel does. A single
+    # eval of 227 GiB forces the kernel to evict that much file cache at once
+    # and got the process jetsam-killed on a node fresh out of a 1.4 TB sync.
+    # Map each layer to its shard so its pages can be prefetched on the CPU
+    # right before the GPU materialises it. Without this, once free RAM is
+    # exhausted the eval demand-pages a 15 GiB layer from disk INSIDE a Metal
+    # command buffer and dies on kIOGPUCommandBufferCallbackErrorTimeout —
+    # observed twice at layer ~12. Sequential CPU reads have no timeout.
+    layer_shard = {}
+    for k, sh in wmap.items():
+        if k.startswith("model.layers.") and sh in shards:
+            layer_shard.setdefault(int(k.split(".")[2]), set()).add(sh)
+
+    def prefetch(paths):
+        buf = bytearray(64 * 1024 * 1024)
+        for path in paths:
+            with open(path, "rb", buffering=0) as f:
+                while f.readinto(buf):
+                    pass
+
+    for i, layer in enumerate(model.model.layers):
+        prefetch(os.path.join(a.model, sh) for sh in layer_shard.get(i, ()))
+        mx.eval(layer.parameters())
+        mx.clear_cache()
+        if i % 4 == 0:
+            show(f"couche {i}", vm_stat())
     loaded = vm_stat()
     show("apres chargement", loaded)
 
