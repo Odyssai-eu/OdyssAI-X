@@ -753,7 +753,11 @@ async def batch_get_model_sizes(ssh: str, paths: list[str]) -> dict[str, int]:
 # branch is added in auto_parallel.py, add its model_type string here too.
 TENSOR_CAPABLE_MODEL_TYPES = frozenset({
     "llama", "ministral3",
-    "deepseek_v3", "deepseek_v32", "kimi_k25", "deepseek_v4",
+    "deepseek_v3", "deepseek_v32", "kimi_k25",
+    # deepseek_v4 retiré 2026-08-03 : le module V4 est désormais dérivé du
+    # fork ivan (PipelineMixin, sans V4Attention) — l'import d'auto_parallel
+    # échoue proprement et la DeepseekV4ShardingStrategy (écrite contre
+    # l'ancien loader OdyssAI, jamais validée end-to-end) est inerte.
     "minimax", "glm4_moe", "glm4_moe_lite",
     "qwen3", "qwen3_moe", "qwen3_next", "qwen3_5", "qwen3_5_moe", "qwen3_vl",
     "gpt_oss", "step3p5", "nemotron_h", "gemma4",
@@ -769,7 +773,15 @@ TENSOR_CAPABLE_MODEL_TYPES = frozenset({
 # path (which calls model.model.pipeline() = our patch) is taken. The dashboard
 # default is use_ap=True, which is why a hand load without the flag "failed tout
 # le temps".
-FORCE_NO_AP_MODEL_TYPES = frozenset({"longcat2"})
+FORCE_NO_AP_MODEL_TYPES = frozenset({
+    "longcat2",
+    # deepseek_v4 (2026-08-03) : module dérivé du fork ivan, PipelineMixin.
+    # Le chemin sharded_load(pipeline_group) = model.model.pipeline() est
+    # celui prouvé 33.5 tok/s pipeline-2 (saga dv_c1/dv_e). Le chemin AP
+    # shard_pipeline n'a jamais vu le hidden 4D des HyperConnections
+    # (hc_mult=4) — non validé, donc interdit.
+    "deepseek_v4",
+})
 
 # Inverse guard: model types whose ONLY working multi-node path is
 # auto_parallel. glm_moe_dsa's DSA patch (Option A) declares Indexer params on
@@ -5015,7 +5027,7 @@ def _initial_default_config() -> Optional[dict]:
 #   major (1.7.2 → 2.0.0) — breaking API or topology change
 #
 # Use `./scripts/bump-version.sh patch|minor|major` to bump + auto-commit.
-APP_VERSION = "1.21.0"
+APP_VERSION = "1.22.0"
 
 app = FastAPI(
     title="OdyssAI-X (odyssai.eu)",
