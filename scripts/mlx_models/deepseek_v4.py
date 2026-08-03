@@ -10,6 +10,8 @@
 # Copyright © 2026 Apple Inc.
 
 import math
+import os
+import time as _time
 from dataclasses import dataclass, field
 from functools import partial
 from typing import Any, Dict, List, Optional, Tuple, Union
@@ -1040,6 +1042,25 @@ class DeepseekV4Model(PipelineMixin, nn.Module):
         pipeline_rank = self.pipeline_rank
         pipeline_size = self.pipeline_size
 
+        # A ps=2 le graphe lazy recv->layers->send->all_gather s'evalue sans
+        # accroc (une seule paire send/recv). A ps>2 la chaine de collectives
+        # peut se desynchroniser a l'evaluation paresseuse -> deadlock (le
+        # forward pend, aucun token). On force alors un mx.eval APRES chaque
+        # collective et apres le bloc de couches : lockstep explicite, tous les
+        # rangs progressent en meme temps. Le chemin ps<=2 (Flash, prouve
+        # rapide) reste lazy et intact.
+        _lock = pipeline_size > 2
+        _trace = _lock and bool(os.environ.get("ODYSSEUS_FWD_TRACE"))
+        _t0 = _time.time()
+
+        def _step(_h, _tag):
+            if _lock:
+                mx.eval(_h)
+            if _trace:
+                with open(f"/tmp/fwd-r{pipeline_rank}.log", "a") as _f:
+                    _f.write(f"+{_time.time() - _t0:.1f}s {_tag}\n")
+            return _h
+
         if cache is None:
             cache = [None] * len(self.pipeline_layers)
 
@@ -1053,12 +1074,15 @@ class DeepseekV4Model(PipelineMixin, nn.Module):
             window_size=self.args.sliding_window,
             return_array=True,
         )
+        h = _step(h, "embed+mask")
 
         if pipeline_rank < pipeline_size - 1:
             h = mx.distributed.recv_like(h, (pipeline_rank + 1))
+            h = _step(h, f"recv<-r{pipeline_rank + 1}")
 
         for layer, layer_cache in zip(self.pipeline_layers, cache):
             h = layer(h, mask, layer_cache, inputs)
+        h = _step(h, f"{len(self.pipeline_layers)} layers")
 
         if pipeline_rank != 0:
             h = mx.distributed.send(h, (pipeline_rank - 1) % pipeline_size)
@@ -1067,9 +1091,11 @@ class DeepseekV4Model(PipelineMixin, nn.Module):
                 cache_item = cache_item[0]
             if cache_item is not None:
                 cache_item.keys = mx.depends(cache_item.keys, h)
+            h = _step(h, f"send->r{pipeline_rank - 1}")
 
         if pipeline_size > 1:
             h = mx.distributed.all_gather(h)[: h.shape[0]]
+            h = _step(h, "all_gather")
 
         return self.norm(self.hc_head(h))
 
