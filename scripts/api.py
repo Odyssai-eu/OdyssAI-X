@@ -1275,6 +1275,13 @@ def _loading_snapshot(state: dict) -> Optional[dict]:
 # vary by Python version, so we point at the configured venv path instead.
 HF_BIN_REMOTE = env_get("HF_BIN_REMOTE", f"{REMOTE_CLUSTER_DIR}/.venv/bin/hf")
 
+# P8.1 — derniere activite de service par cluster (unload-guard).
+# Mis a jour au moment ou une requete /v1/* est resolue vers un pool
+# charge ; lu par admin_cluster_unload pour refuser un unload pendant
+# qu'un utilisateur est servi (incident 2026-08-04).
+_CLUSTER_LAST_SERVED: dict[str, float] = {}
+UNLOAD_GUARD_S = float(env_get("UNLOAD_GUARD_S", "30"))
+
 _downloads: dict[str, dict] = {}
 # Per-job → per-host process map. Host-keyed so cancel can target one target
 # without killing the whole multi-host download.
@@ -8430,6 +8437,9 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
                         "(add ?include_unloaded=true for inventory).",
             },
         )
+    # P8.1 — pool resolved to a loaded pool: mark this cluster as recently
+    # served so admin_cluster_unload's guard can refuse a concurrent unload.
+    _CLUSTER_LAST_SERVED[pool.cluster] = time.time()
     # Argo-VLM fold (2026-07-02). A VL pool has NO distributed RunnerProc — it's
     # a single-node mlx_vlm.server served under this cluster. Route to it via
     # internal http-proxy (body forward + <think> split + usage passthrough),
@@ -13605,6 +13615,28 @@ async def admin_cluster_unload(
     """
     if not cluster_exists(cluster_id):
         raise HTTPException(404, f"unknown cluster {cluster_id}")
+    # P8.1 — unload-guard: refuse an unload within UNLOAD_GUARD_S seconds of
+    # this cluster having served a request, unless the caller passes
+    # {"force": true}. Runs before any unload action, including the telemak
+    # proxy branch below (incident 2026-08-04: an unload killed a live
+    # 1183-token generation mid-flight).
+    payload: Optional[dict] = None
+    try:
+        raw = await request.body()
+        if raw:
+            parsed = json.loads(raw)
+            if isinstance(parsed, dict):
+                payload = parsed
+    except Exception:
+        pass
+    body_force = bool((payload or {}).get("force"))
+    last = _CLUSTER_LAST_SERVED.get(cluster_id, 0.0)
+    if not body_force and last and (time.time() - last) < UNLOAD_GUARD_S:
+        raise HTTPException(409, {
+            "error": "unload_guard",
+            "message": f"cluster served a request {time.time()-last:.1f}s ago "
+                       f"(guard {UNLOAD_GUARD_S:.0f}s); pass force:true to override",
+        })
     # kind=telemak: proxy to upstream /admin/unload. Optional `model` in
     # the body targets a specific loaded model; absent → unload all.
     cd_proxy = get_cluster_def(cluster_id)
