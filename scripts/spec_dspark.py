@@ -79,7 +79,7 @@ OP_RUN, OP_STOP = 0, 1
 
 # Seuil du margin-gate du propose (0 = gate off). Marge logit top1-top2 :
 # en dessous, le draft est tronque (moins de rejets = moins de recommits).
-_MARGIN_GATE = float(os.environ.get("SPEC_MARGIN_GATE", "2.0"))
+_MARGIN_GATE = float(os.environ.get("SPEC_MARGIN_GATE", "1.2"))
 
 
 # ── ctx-cache drafter (dspartha CtxCache, append-only) — copie dv_g ──────────
