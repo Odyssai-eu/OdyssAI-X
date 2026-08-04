@@ -152,6 +152,10 @@ except Exception:
     make_prompt_cache = None  # type: ignore
     QuantizedKVCache = None  # type: ignore
     _CACHE_AVAILABLE = False
+try:
+    from mlx_lm.models.cache import CacheList as _CacheListCls  # type: ignore
+except Exception:
+    _CacheListCls = None  # type: ignore
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -172,6 +176,17 @@ except Exception:
 # The runner is single-threaded; the lock is only against the eviction sweep.
 # ──────────────────────────────────────────────────────────────────────────────
 import threading
+
+# Prefix-cache par snapshot pour les caches NON-trimmables (V4 PoolingCache).
+# Defaut ON : le tour-2 pendait parce que le snapshot capturait des arrays
+# ENCORE LAZY (l'etat poole de PoolingCache n'est PAS ancetre des logits
+# courants, donc mx.eval(logits) ne le materialisait pas) — au tour suivant,
+# restaurer puis forward ces arrays re-executait le graphe de collectives
+# distribues du tour precedent HORS lockstep -> deadlock. Corrige :
+# _manual_prefill force desormais l'eval de l'ETAT COMPLET du cache (voir
+# _cache_state_arrays), le snapshot est donc inerte. RUNNER_SNAP_CACHE=0 pour
+# desactiver (repli au re-prefill integral).
+_SNAP_CACHE_ENABLED = os.environ.get("RUNNER_SNAP_CACHE", "1") == "1"
 
 _session_store: dict[str, dict] = {}
 _session_lock = threading.Lock()
@@ -765,6 +780,113 @@ def _truncatable_cache(cache) -> bool:
     return all(isinstance(c, safe) for c in cache)
 
 
+def _snap_cache(cache) -> list:
+    """O(1) snapshot de l'etat d'un prompt cache — refs `vars()` par couche.
+
+    Les arrays MLX sont immutables : toute mutation ulterieure (generation)
+    REBIND les attributs des objets cache sur de nouveaux arrays, les refs
+    capturees ici restent l'etat exact du moment. C'est le pattern prouve du
+    rollback spec-decode (dv_c2, saga DSpark) applique au serving : il donne
+    un prefix-cache aux modeles dont le cache n'est PAS trimmable (V4
+    PoolingCache/CacheList) — au tour suivant on RESTAURE au lieu de
+    rembobiner."""
+    out = []
+    for c in cache:
+        if _CacheListCls is not None and isinstance(c, _CacheListCls):
+            out.append(("l", [dict(vars(x)) for x in c.caches]))
+        else:
+            out.append(("o", dict(vars(c))))
+    return out
+
+
+def _restore_from_snap(template_cache, snap) -> list:
+    """Reconstruit une liste de caches NEUFS depuis un snapshot.
+
+    `template_cache` (le cache vivant stocke avec la session) fournit les
+    CLASSES par couche ; le snapshot fournit l'etat. Les objets retournes
+    sont frais : la generation les mute sans toucher ni au snapshot ni au
+    cache stocke — le snapshot est donc reutilisable a chaque tour."""
+    fresh = []
+    for c, (kind, st) in zip(template_cache, snap):
+        if kind == "l":
+            subs = []
+            for sub, d in zip(c.caches, st):
+                obj = sub.__class__.__new__(sub.__class__)
+                obj.__dict__.update(dict(d))
+                subs.append(obj)
+            cl = c.__class__.__new__(c.__class__)
+            cl.__dict__.update(dict(vars(c)))
+            cl.caches = subs
+            fresh.append(cl)
+        else:
+            obj = c.__class__.__new__(c.__class__)
+            obj.__dict__.update(dict(st))
+            fresh.append(obj)
+    return fresh
+
+
+def _cache_state_arrays(cache) -> list:
+    """Aplatit tout mx.array vivant d'un prompt cache, couche par couche et
+    sous-cache de CacheList compris.
+
+    But : forcer l'eval de l'ETAT COMPLET du cache apres un prefill, pas
+    seulement les logits. Un array de cache laisse LAZY porte le graphe des
+    collectives distribues (recv/send/all_gather) du forward courant ; si on le
+    snapshotte puis qu'on le reutilise au tour suivant, son eval re-declenche
+    ces collectives HORS lockstep -> deadlock. En particulier l'etat POOLE de
+    PoolingCache (V4) n'est PAS ancetre des logits courants, donc mx.eval(logits)
+    seul le laisse lazy — d'ou le hang du tour 2. On materialise tout ici."""
+    import mlx.core as _mx  # local — module-level import may be aliased
+    out: list = []
+
+    def _pull(c) -> None:
+        got = False
+        st = getattr(c, "state", None)   # contrat mlx-lm : arrays (possiblement niches)
+        if st is not None:
+            stack = [st]
+            while stack:
+                x = stack.pop()
+                if isinstance(x, _mx.array):
+                    out.append(x); got = True
+                elif isinstance(x, (list, tuple)):
+                    stack.extend(x)
+                elif isinstance(x, dict):
+                    stack.extend(x.values())
+        if not got:                      # repli : scan brut du __dict__
+            try:
+                for v in vars(c).values():
+                    if isinstance(v, _mx.array):
+                        out.append(v)
+            except TypeError:
+                pass
+
+    for c in cache:
+        if _CacheListCls is not None and isinstance(c, _CacheListCls):
+            for sub in c.caches:
+                _pull(sub)
+        else:
+            _pull(c)
+    return out
+
+
+def _manual_prefill(model, cache, tokens: list[int], chunk: int = 2048) -> None:
+    """Prefill explicite de `tokens` dans `cache`, par chunks evalues.
+
+    Reproduit ce que stream_generate fait en interne, mais SOUS NOTRE
+    CONTROLE pour pouvoir snapshotter l'etat exactement en fin de prompt.
+    L'eval par chunk borne la memoire ET sert de lockstep distribue (tous
+    les rangs executent ce meme code sur les memes tokens).
+
+    Eval-isolation (corrige le hang du tour-2, cf _cache_state_arrays) : on
+    materialise logits ET l'etat complet du cache a chaque chunk — sinon l'etat
+    poole reste lazy et son graphe de collectives est rejoue hors lockstep au
+    tour suivant."""
+    for i in range(0, len(tokens), chunk):
+        seg = mx.array(tokens[i:i + chunk], dtype=mx.uint32)[None]
+        logits = model(seg, cache=cache)
+        mx.eval(logits, *_cache_state_arrays(cache))
+
+
 def _truncate_cache_to(cache, target_offset: int) -> None:
     """Set every layer's offset to `target_offset`. New tokens fed via
     `stream_generate` will overwrite the K/V slots beyond that position."""
@@ -1092,6 +1214,20 @@ def _session_lookup(session_id: str, model_id: str, prompt_tokens: list[int]):
             # The stored tokens went further than what the new prompt agrees
             # with — must rewind. Only safe for plain/quantized KVCache.
             if not _truncatable_cache(cache):
+                # Fallback V4-class : le cache vivant ne se rembobine pas,
+                # mais si un snapshot fin-de-prompt existe et que ses tokens
+                # sont un PREFIXE STRICT du nouveau prompt (garanti quand la
+                # conversation etend l'historique : le prompt du tour N est
+                # prefixe du tour N+1 par determinisme du template), on
+                # restaure des objets frais depuis le snapshot — zero rewind.
+                snap = entry.get("snap") if _SNAP_CACHE_ENABLED else None
+                snap_tokens = entry.get("snap_tokens")
+                if snap and snap_tokens:
+                    sc = _common_prefix_len(snap_tokens, prompt_tokens)
+                    if sc == len(snap_tokens) and sc < len(prompt_tokens):
+                        entry["last_used"] = time.time()
+                        restored = _restore_from_snap(cache, snap)
+                        return restored, prompt_tokens[sc:], "snap-hit"
                 del _session_store[session_id]
                 return None, None, "non-truncatable"
             _truncate_cache_to(cache, common)
@@ -1102,7 +1238,9 @@ def _session_lookup(session_id: str, model_id: str, prompt_tokens: list[int]):
 
 def _session_store_after_gen(session_id: str, model_id: str, cache,
                              all_tokens: list[int],
-                             rank: int = 0, world: int = 1) -> None:
+                             rank: int = 0, world: int = 1,
+                             snap: Optional[list] = None,
+                             snap_tokens: Optional[list[int]] = None) -> None:
     """Persist the populated cache + cumulative token list under this session.
     Also records the cache byte cost so the byte-budgeted evictor can do its
     job (otherwise it would never know how big each entry is).
@@ -1120,6 +1258,13 @@ def _session_store_after_gen(session_id: str, model_id: str, cache,
             "model_id": model_id,
             "last_used": time.time(),
             "bytes": cache_bytes,
+            # Snapshot fin-de-prompt (modeles non-trimmables, V4) : refs O(1)
+            # vers l'etat du cache AVANT generation. Le tour suivant restaure
+            # ce prefixe garanti au lieu de rembobiner (impossible). Peut
+            # garder en vie ~1 copie des buffers K/V au point du prompt en
+            # plus du cache vivant — assume, c'est le prix du prefix-hit.
+            "snap": snap,
+            "snap_tokens": list(snap_tokens) if snap_tokens else None,
         }
     _evict_sessions()
     # Disk persist — opt-in via RUNNER_CACHE_DISK_ENABLED=1, single-rank only.
@@ -2273,7 +2418,7 @@ def _run_legacy_main(model, tokenizer, repo: str, kv_q8_default: bool,
         if cached_cache is not None:
             prompt_cache = cached_cache
             gen_input = suffix_tokens
-            cache_label = "session-HIT"
+            cache_label = "session-HIT" if hit_kind != "snap-hit" else "snap-HIT"
         else:
             # Build a per-request prompt cache. Q8 quantized cache halves memory
             # for long contexts (Qwen3-Coder-Next 32k, GLM-5.1, Hy3-preview).
@@ -2282,6 +2427,27 @@ def _run_legacy_main(model, tokenizer, repo: str, kv_q8_default: bool,
             cache_label = ("Q8" if kv_q8 else "fp16") + (
                 f"·{hit_kind}" if session_id else ""
             )
+
+        # Snapshot fin-de-prompt pour les caches NON-trimmables (V4 :
+        # PoolingCache). Sans lui, chaque tour de conversation diverge en fin
+        # de prefixe (la reponse generee est re-templatisee differemment), le
+        # rewind est impossible -> re-prefill INTEGRAL a chaque tour (TTFT
+        # 20s+ observe en prod sur Pro). On prefill nous-memes tout sauf le
+        # dernier token, on snapshotte (O(1), arrays immutables), et le tour
+        # suivant restaure ce prefixe garanti. Modeles a cache trimmable :
+        # chemin historique intact.
+        _snap_pending = None
+        _snap_tokens_pending = None
+        if (_SNAP_CACHE_ENABLED
+                and session_id and prompt_cache is not None and draft_model is None
+                and not _truncatable_cache(prompt_cache)):
+            _pre = (suffix_tokens if cached_cache is not None
+                    else prompt_tokens_full)
+            if len(_pre) > 1:
+                _manual_prefill(model, prompt_cache, _pre[:-1])
+            _snap_pending = _snap_cache(prompt_cache)
+            _snap_tokens_pending = prompt_tokens_full[:-1]
+            gen_input = prompt_tokens_full[-1:]
 
         if rank == 0:
             log(f"req {req_id}: session={session_id or '-'} "
@@ -2458,7 +2624,9 @@ def _run_legacy_main(model, tokenizer, repo: str, kv_q8_default: bool,
         if session_id and prompt_cache is not None:
             cumulative = list(prompt_tokens_full) + gen_token_ids
             _session_store_after_gen(session_id, repo, prompt_cache, cumulative,
-                                     rank=rank, world=world_size)
+                                     rank=rank, world=world_size,
+                                     snap=_snap_pending,
+                                     snap_tokens=_snap_tokens_pending)
 
         # Prefix-cache hit accounting. When `cached_cache` was found and
         # `suffix_tokens` < `prompt_tokens_full`, the difference is the count
