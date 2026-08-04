@@ -5034,7 +5034,7 @@ def _initial_default_config() -> Optional[dict]:
 #   major (1.7.2 → 2.0.0) — breaking API or topology change
 #
 # Use `./scripts/bump-version.sh patch|minor|major` to bump + auto-commit.
-APP_VERSION = "1.22.0"
+APP_VERSION = "1.23.0"
 
 app = FastAPI(
     title="OdyssAI-X (odyssai.eu)",
@@ -8523,6 +8523,9 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
                                         request_id=completion_id,
                                         reasoning_effort=(req.reasoning_effort
                                                           or _default_reasoning_effort(model_id))):
+                # P8.1 — re-stamp per chunk: a long in-flight generation must
+                # keep the unload-guard window open, not just its first 30s.
+                _CLUSTER_LAST_SERVED[pool.cluster] = time.time()
                 if cancel_event.is_set():
                     run_status = "cancelled"
                     break
@@ -8667,6 +8670,8 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
                                         request_id=completion_id,
                                         reasoning_effort=(req.reasoning_effort
                                                           or _default_reasoning_effort(model_id))):
+                # P8.1 — re-stamp per chunk (see streaming path above).
+                _CLUSTER_LAST_SERVED[pool.cluster] = time.time()
                 if await request.is_disconnected():
                     run_status = "disconnected"
                     break
@@ -9322,6 +9327,10 @@ async def anthropic_messages(req: AnthropicMessagesRequest, request: Request):
             },
         )
 
+    # P8.1 — unload-guard stamp: this handler resolves its pool itself and
+    # never passes through chat_completions, so it must stamp on its own.
+    _CLUSTER_LAST_SERVED[pool.cluster] = time.time()
+
     # Argo-VLM fold: a VL pool (single-node mlx_vlm.server) speaks the OpenAI
     # chat shape, not the Anthropic /v1/messages shape. Route VL through
     # /v1/chat/completions (its upstream doesn't serve /v1/messages).
@@ -9380,6 +9389,8 @@ async def anthropic_messages(req: AnthropicMessagesRequest, request: Request):
                                     session_id=session_id,
                                     request_id=msg_id,
                                     reasoning_effort=_default_reasoning_effort(model_id)):
+            # P8.1 — re-stamp per chunk (in-flight coverage, cf chat path).
+            _CLUSTER_LAST_SERVED[pool.cluster] = time.time()
             if ev.get("event") == "token":
                 if ttft_s is None:
                     ttft_s = time.time() - t_start
@@ -9456,6 +9467,8 @@ async def anthropic_messages(req: AnthropicMessagesRequest, request: Request):
                                         session_id=session_id,
                                         request_id=msg_id,
                                         reasoning_effort=_default_reasoning_effort(model_id)):
+                # P8.1 — re-stamp per chunk (in-flight coverage, cf chat path).
+                _CLUSTER_LAST_SERVED[pool.cluster] = time.time()
                 if await request.is_disconnected():
                     break
                 if ev.get("event") == "token":
