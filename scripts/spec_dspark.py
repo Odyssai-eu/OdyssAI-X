@@ -80,6 +80,12 @@ OP_RUN, OP_STOP = 0, 1
 # Seuil du margin-gate du propose (0 = gate off). Marge logit top1-top2 :
 # en dessous, le draft est tronque (moins de rejets = moins de recommits).
 _MARGIN_GATE = float(os.environ.get("SPEC_MARGIN_GATE", "1.2"))
+# Cold-skip : apres N proposes consecutifs gates a vide (passage "froid",
+# prose), on saute le propose (~20ms/round) et on ne re-sonde que tous les
+# PROBE rounds — le round froid devient ~un step plain. Reset des qu'un
+# draft survit au gate.
+_COLD_AFTER = int(os.environ.get("SPEC_COLD_AFTER", "3"))
+_COLD_PROBE = int(os.environ.get("SPEC_COLD_PROBE", "3"))
 
 
 # ── ctx-cache drafter (dspartha CtxCache, append-only) — copie dv_g ──────────
@@ -364,7 +370,11 @@ def _spec_body(
                 break
             if flag:
                 _restore(cache, servant_snap)
-            else:
+            elif S > 1:
+                # S==1 flag=0 = step plain (draft vide) : pas de rollback
+                # possible -> pas de snapshot (miroir du skip rank0). Un
+                # recommit (flag=1) ne suit jamais qu'un verify S>1, donc
+                # servant_snap est toujours frais quand il sert.
                 servant_snap = _snap(cache)
             o, _ = fwd(mx.array([v[HDR:HDR + S]], dtype=mx.int32), cache)
             mx.eval(o)
@@ -422,11 +432,25 @@ def _spec_body(
         yield _mk(pending, finish=finish)
 
         # ── boucle spec : propose -> verify -> accept -> yield ──
+        cold = 0          # proposes consecutifs gates a vide
+        since_probe = 0   # rounds depuis le dernier propose en mode froid
         while finish is None:
-            draft = R.propose(pending, ctx, embed, lm_head, K, MASK)
+            if cold >= _COLD_AFTER and since_probe < _COLD_PROBE:
+                draft = []            # round froid : pas de propose du tout
+                since_probe += 1
+            else:
+                draft = R.propose(pending, ctx, embed, lm_head, K, MASK)
+                since_probe = 0
+                if draft:
+                    cold = 0
+                else:
+                    cold += 1
             drafted_total += len(draft)
             block = [pending] + draft
-            s = _snap(cache)
+            # Draft vide (gate) = step plain : aucun rollback possible -> on
+            # saute le snapshot (61 couches de copies vars(), pur overhead).
+            # Les servants font pareil sur S==1 (voir boucle servant).
+            s = _snap(cache) if draft else None
             _bcast(group, rank, [OP_RUN, len(block), 0] + block)
             vlog, vcaps = fwd(mx.array([block], dtype=mx.int32), cache)
             mx.eval(vlog, *vcaps.values())
