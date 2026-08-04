@@ -40,6 +40,21 @@ import mlx.nn as nn    # noqa: E402
 from mlx_lm.models.base import create_attention_mask  # noqa: E402
 from mlx_lm.models.cache import CacheList              # noqa: E402
 
+# dv_d_drafter + le propose du drafter importent `mlx_lm.models.hyper_connection`,
+# absent du mlx_lm du runner (venv) mais present dans le fork Ivan. Le runner a
+# DEJA importe mlx_lm (venv) au demarrage, donc un simple sys.path ne suffit pas
+# (le package est deja lie a son __path__). On ETEND le __path__ de
+# mlx_lm.models vers les models du fork : les sous-modules MANQUANTS
+# (hyper_connection) s'y resolvent, sans deloger deepseek_v4 deja patche+en
+# cache dans sys.modules. Inoffensif sur les servants (ne l'importent jamais).
+try:
+    import mlx_lm.models as _mlxm  # noqa: E402
+    _ivan_models = os.path.expanduser("~/ivan-mlx-lm/mlx_lm/models")
+    if os.path.isdir(_ivan_models) and _ivan_models not in _mlxm.__path__:
+        _mlxm.__path__.append(_ivan_models)
+except Exception:
+    pass
+
 @dataclass
 class SpecResponse:
     """Duck-type les champs de GenerationResponse que la boucle emit du runner
