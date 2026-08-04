@@ -21,6 +21,7 @@ Le drafter et sa chaine de dequant ne vivent QUE sur rank0 : les imports
 correspondants sont gardes rank0 pour ne pas imposer l'arbre de deps au
 servant (un pur servant target).
 """
+import json
 import os
 import sys
 import time
@@ -228,10 +229,10 @@ def load_dspark_drafter(drafter_dir: str, target_args, dcfg: dict):
 
 
 def load_target_args(target_dir: str):
-    """ModelArgs V4 du target (pour le drafter + le forward). Rank0 only."""
-    import json
-    from deepseek_v4 import ModelArgs as V4Args  # fork Ivan / mlx_models
-    return V4Args.from_dict(json.load(open(os.path.join(target_dir, "config.json"))))
+    """ModelArgs V4 du target (pour le drafter + le forward). Rank0 only.
+    Meme import que le harnais dv_g : le module ds4 du fork Ivan."""
+    import mlx_lm.models.deepseek_v4 as V4  # fork Ivan (PYTHONPATH node)
+    return V4.ModelArgs.from_dict(json.load(open(os.path.join(target_dir, "config.json"))))
 
 
 # ── le generateur drop-in ────────────────────────────────────────────────────
