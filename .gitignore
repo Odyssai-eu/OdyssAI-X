@@ -19,6 +19,7 @@ docs/*
 !docs/README.md
 !docs/GETTING-STARTED.md
 !docs/DEPLOY.md
+!docs/RUNBOOK-argo-v4.md
 !docs/bug-reports/
 audit/
 onepage/
