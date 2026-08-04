@@ -2156,8 +2156,41 @@ def main() -> None:
             log(f"native MTP load failed ({e}) — serving AR only")
             native_mtp = None
 
+    # DSpark speculative distribue (goal drafter, plan P7). Un drafter DSpark
+    # SEPARE (V4DSparkDrafter) charge sur rank0 ; le bloc propose est diffuse
+    # aux servants (all_sum), verify target en lockstep (module spec_dspark,
+    # portage du harnais dv_g PROUVE lossless). Detecte par la config du
+    # drafter qui porte `dspark_block_size`. Contrairement a mlx-lm
+    # stream_generate(draft_model=) (nodes=1 only), ce chemin est multi-rang.
+    #   Detection : size>1 + un draft => TOUJOURS DSpark (le draft mlx-lm est
+    #   nodes=1 only, cf plus haut). Les servants n'ont PAS le dossier drafter
+    #   (seul rank0 l'a) — ils entrent en mode servant sur le seul fait
+    #   size>1+draft, sans lire de config. rank0 charge le drafter ; son ECHEC
+    #   est FATAL (rank0 plain + servants spec = deadlock), donc on laisse
+    #   propager pour faire echouer le load proprement plutot que desync.
+    spec_dspark_ctx = None
+    if draft_repo and size > 1:
+        import spec_dspark
+        if rank == 0:
+            _dpath = Path(draft_repo) if Path(draft_repo).exists() else hf_repo_to_path(draft_repo)
+            _dcfg = json.load(open(Path(_dpath) / "config.json"))
+            if "dspark_block_size" not in _dcfg:
+                raise ValueError(
+                    f"draft {draft_repo} lacks dspark_block_size — multi-rank spec "
+                    f"only supports DSpark drafters")
+            _targs = spec_dspark.load_target_args(str(repo_path))
+            _drafter = spec_dspark.load_dspark_drafter(str(_dpath), _targs, _dcfg)
+            spec_dspark_ctx = {"enabled": True, "drafter": _drafter,
+                               "args": _targs, "dcfg": _dcfg}
+            log(f"DSpark drafter loaded (block={_dcfg.get('dspark_block_size')}, "
+                f"taps={_dcfg.get('dspark_target_layer_ids')}) — multi-rank spec ENABLED")
+        else:
+            spec_dspark_ctx = {"enabled": True, "drafter": None,
+                               "args": None, "dcfg": None}
+            log("DSpark spec pool — servant rank (target-only, no drafter dir)")
+
     emit(rank, {"event": "ready", "rank": rank, "size": size, "load_s": load_s,
-                "speculative": draft_model is not None,
+                "speculative": draft_model is not None or spec_dspark_ctx is not None,
                 "mtp": native_mtp is not None})
 
     # Disk cache: only touch it when explicitly opted in. The 2026-05-18
@@ -2197,7 +2230,8 @@ def main() -> None:
         _run_legacy_main(model, tokenizer, repo, kv_q8_default, stop_requested,
                          rank, draft_model=draft_model,
                          num_draft_tokens=num_draft_tokens, world_size=size,
-                         group=group, native_mtp=native_mtp)
+                         group=group, native_mtp=native_mtp,
+                         spec_dspark_ctx=spec_dspark_ctx)
 
     # Explicit teardown BEFORE the process exits. Two reasons:
     #   1. Drop every model reference so the weights are deallocated, then
@@ -2225,7 +2259,7 @@ def _run_legacy_main(model, tokenizer, repo: str, kv_q8_default: bool,
                      stop_requested: dict, rank: int,
                      draft_model=None, num_draft_tokens: int = 4,
                      world_size: int = 1, group=None,
-                     native_mtp=None) -> None:
+                     native_mtp=None, spec_dspark_ctx=None) -> None:
     # Expanded stop set. `stream_generate` already breaks on
     # tokenizer.eos_token_id, but chat-tuned models often emit a "next-turn"
     # marker first (GLM emits <|user|>, Qwen emits <|im_end|>, etc.). Without
@@ -2438,8 +2472,10 @@ def _run_legacy_main(model, tokenizer, repo: str, kv_q8_default: bool,
         # chemin historique intact.
         _snap_pending = None
         _snap_tokens_pending = None
+        _spec_dspark_on = bool(spec_dspark_ctx and spec_dspark_ctx.get("enabled"))
         if (_SNAP_CACHE_ENABLED
                 and session_id and prompt_cache is not None and draft_model is None
+                and not _spec_dspark_on          # le pool spec fait son propre prefill
                 and not _truncatable_cache(prompt_cache)):
             _pre = (suffix_tokens if cached_cache is not None
                     else prompt_tokens_full)
@@ -2536,6 +2572,19 @@ def _run_legacy_main(model, tokenizer, repo: str, kv_q8_default: bool,
                     {"rid": req_id, "rank": rank, "round": r,
                      "drafted": d, "accepted": n, "sha": s}),
             )
+        elif _spec_dspark_on:
+            # DSpark spec distribue : le generateur fait SON prefill (capture
+            # les taps -> ctx drafter) et pilote la loop propose/verify en
+            # lockstep multi-rang. rank0 yield les tokens acceptes ; les
+            # servants tournent la boucle de reception et ne yieldent rien.
+            import spec_dspark
+            gen_iter = spec_dspark.spec_dspark_stream_generate(
+                model, tokenizer, list(prompt_tokens_full),
+                max_tokens=max_tokens, rank=rank, size=world_size, group=group,
+                drafter=spec_dspark_ctx.get("drafter"),
+                target_args=spec_dspark_ctx.get("args"),
+                dcfg=spec_dspark_ctx.get("dcfg"),
+                stop_ids=_stop_ids)
         else:
             gen_iter = stream_generate(model, tokenizer, gen_input, **gen_kwargs)
 
