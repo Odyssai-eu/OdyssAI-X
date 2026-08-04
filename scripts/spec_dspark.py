@@ -25,7 +25,8 @@ import json
 import os
 import sys
 import time
-from typing import Generator, Optional
+from dataclasses import dataclass
+from typing import Any, Generator, Optional
 
 # Les modeles V4 + le drafter vivent hors du venv mlx-cluster (fork Ivan +
 # checkpoints). Memes chemins que le harnais dv_g, presents sur les nodes.
@@ -39,7 +40,24 @@ import mlx.nn as nn    # noqa: E402
 from mlx_lm.models.base import create_attention_mask  # noqa: E402
 from mlx_lm.models.cache import CacheList              # noqa: E402
 
-from mtp_spec import MTPResponse  # noqa: E402  (reuse le duck-type existant)
+@dataclass
+class SpecResponse:
+    """Duck-type les champs de GenerationResponse que la boucle emit du runner
+    lit (token/text/finish_reason/...). Local : pas de dep sur mtp_spec (absent
+    du ~/mlx-cluster des nodes ; le runner ne l'importe qu'en lazy sous MTP)."""
+    text: str
+    token: int
+    finish_reason: Optional[str] = None
+    prompt_tokens: int = 0
+    prompt_tps: float = 0.0
+    generation_tokens: int = 0
+    generation_tps: float = 0.0
+    peak_memory: float = 0.0
+    from_draft: bool = False
+    logprobs: Any = None
+    accept_rate: float = 0.0
+    round_idx: int = 0
+
 
 MAXS, HDR = 2048, 3          # MAXS couvre le prompt de prefill, pas juste K
 OP_RUN, OP_STOP = 0, 1
@@ -249,7 +267,7 @@ def spec_dspark_stream_generate(
     target_args=None,      # rank0 : ModelArgs V4
     dcfg=None,             # rank0 : config drafter (taps/block/noise)
     stop_ids=None,
-) -> Generator[MTPResponse, None, None]:
+) -> Generator[SpecResponse, None, None]:
     taps = list(dcfg["dspark_target_layer_ids"]) if (rank == 0 and dcfg) else []
     fwd = _make_forward(model, set(taps))
     cache = model.make_cache()
@@ -290,9 +308,9 @@ def spec_dspark_stream_generate(
     accepted_total = 0
     drafted_total = 0
 
-    def _mk(tok: int, finish=None, from_draft=False) -> MTPResponse:
+    def _mk(tok: int, finish=None, from_draft=False) -> SpecResponse:
         detok.add_token(tok)
-        return MTPResponse(
+        return SpecResponse(
             text=detok.last_segment, token=tok, finish_reason=finish,
             prompt_tokens=len(ids),
             generation_tokens=emitted,
