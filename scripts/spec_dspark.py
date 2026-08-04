@@ -77,6 +77,10 @@ class SpecResponse:
 MAXS, HDR = 2048, 3          # MAXS couvre le prompt de prefill, pas juste K
 OP_RUN, OP_STOP = 0, 1
 
+# Seuil du margin-gate du propose (0 = gate off). Marge logit top1-top2 :
+# en dessous, le draft est tronque (moins de rejets = moins de recommits).
+_MARGIN_GATE = float(os.environ.get("SPEC_MARGIN_GATE", "2.0"))
+
 
 # ── ctx-cache drafter (dspartha CtxCache, append-only) — copie dv_g ──────────
 class CtxCache:
@@ -233,7 +237,27 @@ class _DrafterRunner:
             h = hc_expand(x, residual, post, comb)
         last = self.d.layers[2]
         base = lm_head(last.norm(last.hc_head(h)))[0]
-        return [int(x) for x in self.d.sample_block(base, pending).tolist()]
+        drafts = [int(x) for x in self.d.sample_block(base, pending).tolist()]
+        # Margin-gate (calibration Inferencer : sans confidence-gate le spec
+        # PERD sur la prose — chaque rejet coute un recommit-forward). On
+        # tronque le draft a la premiere position peu sure : position gardee
+        # ssi le token choisi == argmax de base ET marge top1-top2 >= seuil.
+        # Draft vide = step plain (1 forward, 1 token) -> plancher ~plain.
+        if _MARGIN_GATE > 0:
+            top2 = mx.topk(base, k=2, axis=-1)          # [K, 2] les 2 plus grands
+            top1_ids = mx.argmax(base, axis=-1)          # [K]
+            margin = mx.abs(top2[:, 0] - top2[:, 1])     # |top1-top2|, ordre indiff.
+            mx.eval(margin, top1_ids)
+            m = [float(x) for x in margin.tolist()]
+            t1 = [int(x) for x in top1_ids.tolist()]
+            keep = 0
+            for i, d in enumerate(drafts):
+                if d == t1[i] and m[i] >= _MARGIN_GATE:
+                    keep += 1
+                else:
+                    break
+            drafts = drafts[:keep]
+        return drafts
 
 
 # ── chargement drafter (rank0 uniquement) — chemin prequantise de dv_g ───────
@@ -361,6 +385,7 @@ def _spec_body(
     rounds = 0
     accepted_total = 0
     drafted_total = 0
+    rollbacks = 0
 
     def _mk(tok: int, finish=None, from_draft=False) -> SpecResponse:
         detok.add_token(tok)
@@ -412,6 +437,7 @@ def _spec_body(
             committed = draft[:n] + [tt[n]]    # lossless : tt[n] = argmax target
             vfused = mx.concatenate([vcaps[t] for t in taps], axis=-1)
             if n < len(draft):                 # rollback + recommit
+                rollbacks += 1
                 _restore(cache, s)
                 recommit = [block[0]] + committed[:-1]
                 _bcast(group, rank, [OP_RUN, len(recommit), 1] + recommit)
@@ -433,5 +459,16 @@ def _spec_body(
         # collectif : les servants attendent sur all_sum -> les libere.
         try:
             _bcast(group, rank, [OP_STOP, 0, 0])
+        except Exception:
+            pass
+        try:
+            _dt = max(time.time() - t0, 1e-9)
+            sys.stderr.write(
+                f"[spec] rounds={rounds} emitted={emitted} "
+                f"accept/round={accepted_total / max(rounds, 1):.2f} "
+                f"rollbacks={rollbacks}/{rounds} "
+                f"drafted={drafted_total} gate={_MARGIN_GATE} "
+                f"tok/s={emitted / _dt:.2f}\n")
+            sys.stderr.flush()
         except Exception:
             pass
