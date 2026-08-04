@@ -2178,7 +2178,8 @@ def main() -> None:
                 raise ValueError(
                     f"draft {draft_repo} lacks dspark_block_size — multi-rank spec "
                     f"only supports DSpark drafters")
-            _targs = spec_dspark.load_target_args(str(repo_path))
+            _tpath = Path(repo) if Path(repo).exists() else hf_repo_to_path(repo)
+            _targs = spec_dspark.load_target_args(str(_tpath))
             _drafter = spec_dspark.load_dspark_drafter(str(_dpath), _targs, _dcfg)
             spec_dspark_ctx = {"enabled": True, "drafter": _drafter,
                                "args": _targs, "dcfg": _dcfg}
