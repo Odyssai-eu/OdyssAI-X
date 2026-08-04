@@ -278,6 +278,45 @@ def spec_dspark_stream_generate(
     rank: int,
     size: int,
     group,
+    drafter=None,
+    target_args=None,
+    dcfg=None,
+    stop_ids=None,
+) -> Generator["SpecResponse", None, None]:
+    """Wrapper : ouvre wired_limit + generation_stream autour de la loop.
+
+    LE fix perf (la nuit du 04->05/08, ~90x) : sans wired_limit, macOS
+    compresse/pagine les poids froids entre les forwards (la bulle pipeline
+    laisse le temps de re-compresser) -> chaque forward re-faulte ses experts
+    -> coput fixe ~2,1s/rang/forward INDEPENDANT de S. stream_generate (8,1
+    tok/s plain, memes nodes) enveloppe TOUTE la generation dans wired_limit ;
+    mtp_spec.py documente le meme mur (~4,5s/forward, paging-bound). Le limit
+    est global : il epingle aussi le drafter de rank0."""
+    try:
+        from mlx_lm.generate import wired_limit as _wl, generation_stream as _gs
+    except Exception:
+        import contextlib
+        _gs = mx.default_stream(mx.default_device())
+
+        def _wl(_m, _s):  # no-op fallback (meme pattern que mtp_spec)
+            return contextlib.nullcontext()
+
+    with _wl(model, [_gs]), mx.stream(_gs):
+        yield from _spec_body(
+            model, tokenizer, prompt_ids, max_tokens=max_tokens, rank=rank,
+            size=size, group=group, drafter=drafter, target_args=target_args,
+            dcfg=dcfg, stop_ids=stop_ids)
+
+
+def _spec_body(
+    model,
+    tokenizer,
+    prompt_ids,
+    *,
+    max_tokens: int,
+    rank: int,
+    size: int,
+    group,
     drafter=None,          # rank0 : V4DSparkDrafter ; servants : None
     target_args=None,      # rank0 : ModelArgs V4
     dcfg=None,             # rank0 : config drafter (taps/block/noise)
