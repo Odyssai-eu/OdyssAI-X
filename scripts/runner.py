@@ -2736,23 +2736,12 @@ def _run_legacy_main(model, tokenizer, repo: str, kv_q8_default: bool,
         # avec le prompt_cache inutilise du chemin plain.
         if session_id and prompt_cache is not None and not _spec_dspark_on:
             cumulative = list(prompt_tokens_full) + gen_token_ids
-            # FIX fast-prefill (2026-08-05) : re-snapshotter APRES la
-            # generation. Le snap pre-gen ne contenait que le PROMPT -> la
-            # reponse generee (la partie qui S'ACCUMULE) etait re-prefillee a
-            # chaque tour (cached=66/234 observe : seul le prompt system+user
-            # etait cache). On re-capture ici l'etat cache COMPLET
-            # [prompt + reponse] avec snap_tokens = cumulative, pour que le
-            # tour suivant ne re-prefille QUE le nouveau message. Round-trip
-            # token requis (gen_ids == retok du texte) ; sinon le snap-hit
-            # echoue proprement et on retombe sur l'ancien comportement.
-            if (_SNAP_CACHE_ENABLED and draft_model is None
-                    and not _truncatable_cache(prompt_cache) and gen_token_ids):
-                try:
-                    mx.eval(*_cache_state_arrays(prompt_cache))
-                    _snap_pending = _snap_cache(prompt_cache)
-                    _snap_tokens_pending = list(cumulative)
-                except Exception as _e:
-                    log(f"post-gen snapshot failed ({_e}); keeping prompt snap")
+            # NB (2026-08-05) : on stocke le snap du PROMPT (deterministe,
+            # pris avant gen). Tenter de snapshotter prompt+reponse cassait le
+            # hit (non-truncatable) : le re-tokenize de la reponse depuis le
+            # texte != gen_ids (round-trip instable) -> le prefixe diverge des
+            # la 1re reponse. Cacher la reponse generee exige un round-trip
+            # stable OU un cache trimmable (V4 PoolingCache ne l'est pas).
             _session_store_after_gen(session_id, repo, prompt_cache, cumulative,
                                      rank=rank, world=world_size,
                                      snap=_snap_pending,
