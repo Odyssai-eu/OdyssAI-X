@@ -72,6 +72,7 @@ class PoolingCache(_BaseCache):
                 ]
             self.remainder = new_remainder
 
+            self._pending = (r_kv, r_gate) if r_kv.size else None
             return r_kv, r_gate, r_base
 
         # Decode mode
@@ -89,6 +90,7 @@ class PoolingCache(_BaseCache):
                 r_gate = mx.zeros((B, 0, D2), dtype=gate.dtype)
                 r_base = 0
 
+            self._pending = (r_kv, r_gate) if r_kv.size else None
             return r_kv, r_gate, r_base
 
     def update_and_fetch(self, px: mx.array):
@@ -101,6 +103,19 @@ class PoolingCache(_BaseCache):
             self.pooled = px
         else:
             self.pooled = mx.concatenate([self.pooled, px], axis=1)
+        # Record per-window raw (kv, gate) paired with each appended pooled
+        # entry, so trim() can un-fold rejected speculative windows losslessly.
+        pend = getattr(self, "_pending", None)
+        if pend is not None and px.shape[1] > 0:
+            wr = getattr(self, "_wraw", None)
+            if wr is None:
+                wr = self._wraw = []
+            for w in range(px.shape[1]):
+                wr.append((pend[0][:, w * self.ratio:(w + 1) * self.ratio],
+                           pend[1][:, w * self.ratio:(w + 1) * self.ratio]))
+            if len(wr) > 16:
+                del wr[:len(wr) - 16]
+        self._pending = None
         return self.pooled
 
     def make_mask(self, L: int = 1, offset: int = 0):
@@ -143,11 +158,41 @@ class PoolingCache(_BaseCache):
         self.ratio = v
 
     def is_trimmable(self):
+        # Unchanged from stock: the plain / distributed-spec / fast-prefill
+        # paths must see the same value (they never trim the pool). The
+        # un-fold trim() below is invoked DIRECTLY by the single-node spec
+        # rollback (trim_all), never gated by is_trimmable — so leaving this
+        # at the stock value keeps every existing path byte-for-byte identical.
         return self.pooled is None
 
     def trim(self, n):
-        n = min(self.remainder, n)
-        self.remainder -= n
+        # Lossless rollback of the last `n` tokens (Inferencer-style un-fold):
+        # rejected tokens still in the remainder buffer are dropped directly;
+        # rejected tokens that were folded into pooled windows have those
+        # windows popped and their retained raw re-buffered (`_wraw`).
+        cur = 0 if self.pooled is None else self.pooled.shape[1]
+        total = cur * self.ratio + self.remainder
+        keep = max(0, total - n)
+        nw, nr = keep // self.ratio, keep % self.ratio
+        if nw >= cur:
+            self.remainder = nr
+            return n
+        pop = cur - nw
+        wr = getattr(self, "_wraw", [])
+        if pop <= len(wr) and nr > 0:
+            st = wr[-pop]
+            if self.buf_kv is None:
+                B = st[0].shape[0]
+                self.buf_kv = mx.zeros((B, self.ratio, st[0].shape[-1]),
+                                       dtype=st[0].dtype)
+                self.buf_gate = mx.zeros((B, self.ratio, st[1].shape[-1]),
+                                         dtype=st[1].dtype)
+            self.buf_kv[:, :nr] = st[0][:, :nr]
+            self.buf_gate[:, :nr] = st[1][:, :nr]
+        self.remainder = nr
+        self.pooled = self.pooled[:, :nw] if nw > 0 else None
+        if pop <= len(wr):
+            del wr[len(wr) - pop:]
         return n
 
     def size(self):

@@ -2169,8 +2169,20 @@ def main() -> None:
     # draft REPLICATED on every rank — validation of the multi-rank
     # accept-alignment invariant only, never a prod default.
     spec_multirank = os.environ.get("RUNNER_SPEC_MULTIRANK", "0") == "1"
+    # DSpark drafters (config carries `dspark_block_size`) use the dedicated
+    # spec_dspark path — single-node trimmable-pool OR multi-rank lockstep —
+    # NOT mlx-lm's generic stream_generate(draft_model=). Detect early so the
+    # generic draft load below skips them (loading a DSpark drafter as a plain
+    # causal model would fail / mis-load).
+    _draft_is_dspark = False
+    if draft_repo:
+        try:
+            _dp = Path(draft_repo) if Path(draft_repo).exists() else hf_repo_to_path(draft_repo)
+            _draft_is_dspark = "dspark_block_size" in json.load(open(Path(_dp) / "config.json"))
+        except Exception:
+            _draft_is_dspark = False
     draft_model = None
-    if draft_repo and (size == 1 or spec_multirank):
+    if draft_repo and not _draft_is_dspark and (size == 1 or spec_multirank):
         try:
             t_draft = time.time()
             draft_path = Path(draft_repo) if Path(draft_repo).exists() else hf_repo_to_path(draft_repo)
@@ -2219,25 +2231,24 @@ def main() -> None:
     #   est FATAL (rank0 plain + servants spec = deadlock), donc on laisse
     #   propager pour faire echouer le load proprement plutot que desync.
     spec_dspark_ctx = None
-    if draft_repo and size > 1:
+    if draft_repo and _draft_is_dspark:
         import spec_dspark
         if rank == 0:
             _dpath = Path(draft_repo) if Path(draft_repo).exists() else hf_repo_to_path(draft_repo)
             _dcfg = json.load(open(Path(_dpath) / "config.json"))
-            if "dspark_block_size" not in _dcfg:
-                raise ValueError(
-                    f"draft {draft_repo} lacks dspark_block_size — multi-rank spec "
-                    f"only supports DSpark drafters")
             _tpath = Path(repo) if Path(repo).exists() else hf_repo_to_path(repo)
             _targs = spec_dspark.load_target_args(str(_tpath))
             _drafter = spec_dspark.load_dspark_drafter(str(_dpath), _targs, _dcfg)
             spec_dspark_ctx = {"enabled": True, "drafter": _drafter,
-                               "args": _targs, "dcfg": _dcfg}
+                               "args": _targs, "dcfg": _dcfg,
+                               "single_node": size == 1}
             log(f"DSpark drafter loaded (block={_dcfg.get('dspark_block_size')}, "
-                f"taps={_dcfg.get('dspark_target_layer_ids')}) — multi-rank spec ENABLED")
+                f"taps={_dcfg.get('dspark_target_layer_ids')}) — "
+                f"{'single-node trimmable-pool' if size == 1 else 'multi-rank'} spec ENABLED")
         else:
+            # servants exist only in multi-rank; single-node is rank0-only.
             spec_dspark_ctx = {"enabled": True, "drafter": None,
-                               "args": None, "dcfg": None}
+                               "args": None, "dcfg": None, "single_node": False}
             log("DSpark spec pool — servant rank (target-only, no drafter dir)")
 
     emit(rank, {"event": "ready", "rank": rank, "size": size, "load_s": load_s,
@@ -2267,6 +2278,8 @@ def main() -> None:
     # BatchGenerator cache exposes a non-scalar offset → `mx.arange(offset+S)`
     # TypeError in MiniMaxM3Model.__call__. B>1 batched M3 is phase-2 scope.
     use_batched = (size == 1) and _BATCH_AVAILABLE and (draft_model is None) and (
+        spec_dspark_ctx is None                # single-node DSpark spec -> legacy
+    ) and (
         os.environ.get("RUNNER_BATCH", "1") == "1"
     ) and ("minimax-m3" not in repo.lower())
     if use_batched:
@@ -2624,6 +2637,18 @@ def _run_legacy_main(model, tokenizer, repo: str, kv_q8_default: bool,
                     {"rid": req_id, "rank": rank, "round": r,
                      "drafted": d, "accepted": n, "sha": s}),
             )
+        elif _spec_dspark_on and world_size == 1:
+            # Single-node DSpark : rollback par TRIM du pool (un-fold), zero
+            # re-forward -> ~1.2-1.4x sur code, lossless. Pas de collectives,
+            # drafter in-process. Le generateur fait son propre prefill.
+            import spec_dspark
+            gen_iter = spec_dspark.single_node_spec_stream_generate(
+                model, tokenizer, list(prompt_tokens_full),
+                max_tokens=max_tokens,
+                drafter=spec_dspark_ctx.get("drafter"),
+                target_args=spec_dspark_ctx.get("args"),
+                dcfg=spec_dspark_ctx.get("dcfg"),
+                stop_ids=_stop_ids, stats_out=_spec_stats)
         elif _spec_dspark_on:
             # DSpark spec distribue : le generateur fait SON prefill (capture
             # les taps -> ctx drafter) et pilote la loop propose/verify en

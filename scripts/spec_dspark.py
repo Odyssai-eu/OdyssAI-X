@@ -689,3 +689,165 @@ def _spec_body(
             sys.stderr.flush()
         except Exception:
             pass
+
+
+# ── Single-node trimmable-pool spec (Inferencer-style, NO re-forward) ─────────
+# world_size==1 path: drafter in-process, verify a block, accept the longest
+# greedy prefix, and roll back by TRIMMING the rejected tail (trimmable pool
+# un-fold + wrap-safe rotating slice) instead of restore+recommit. The re-forward
+# was the whole tax (85% of rounds) that pinned the distributed/naive path to
+# ~1.0x; trimming keeps the verify K/V, giving ~1.2-1.4x on code, lossless.
+# Requires a 512G node (target 182G + drafter bf16 54G, both wired).
+def _make_forward_single(model, taps):
+    """Single-node forward: iterate ALL layers locally (no pipeline attrs).
+    The distributed `_make_forward` needs mm.pipeline_layers/start_idx set by
+    `model.model.pipeline(group)`, which single-node mode never calls. Taps are
+    global ids and == local index j here (start_idx == 0). Mirrors dv_i.py."""
+    mm = model.model
+
+    def fwd(inputs, cache):
+        h = mm.embed_tokens(inputs)
+        h = mx.broadcast_to(
+            h[:, :, None, :],
+            (h.shape[0], h.shape[1], mm.args.hc_mult, h.shape[2]))
+        h = mx.contiguous(h)
+        fc = cache[0]
+        mc = fc[0] if isinstance(fc, CacheList) else fc
+        mask = create_attention_mask(
+            h[:, :, 0, :], mc, window_size=mm.args.sliding_window,
+            return_array=True)
+        caps = {}
+        for j, (layer, lc) in enumerate(zip(mm.layers, cache)):
+            h = layer(h, mask, lc, inputs)
+            if j in taps:
+                caps[j] = _collapse_mean(h)
+        return model.lm_head(mm.norm(mm.hc_head(h))), caps
+
+    return fwd
+
+
+def _trim_leaf(leaf, n):
+    if type(leaf).__name__ == "RotatingKVCache":
+        # Spec forwards are always S>1 -> _update_concat keeps keys temporally
+        # ordered, so slicing the tail is wrap-safe (unlike stock offset-=n).
+        if getattr(leaf, "keys", None) is None:
+            return
+        L = leaf.keys.shape[2]
+        m = min(n, L)
+        leaf.keys = leaf.keys[..., :L - m, :]
+        leaf.values = leaf.values[..., :L - m, :]
+        leaf.offset -= m
+        leaf._idx = leaf.keys.shape[2]
+    elif hasattr(leaf, "trim"):
+        leaf.trim(n)          # PoolingCache un-fold (dsv4_cache), KVCache, ...
+
+
+def _trim_all(cache, n):
+    if n <= 0:
+        return
+    for c in cache:
+        leaves = c.caches if hasattr(c, "caches") else [c]
+        for leaf in leaves:
+            _trim_leaf(leaf, n)
+
+
+def single_node_spec_stream_generate(
+    model, tokenizer, prompt_ids, *, max_tokens, drafter, target_args, dcfg,
+    stop_ids=None, stats_out=None,
+):
+    try:
+        from mlx_lm.generate import wired_limit as _wl, generation_stream as _gs
+    except Exception:
+        import contextlib
+        _gs = mx.default_stream(mx.default_device())
+
+        def _wl(_m, _s):
+            return contextlib.nullcontext()
+
+    taps = list(dcfg["dspark_target_layer_ids"])
+    fwd = _make_forward_single(model, taps)
+    K = int(dcfg["dspark_block_size"])
+    MASK = int(dcfg["dspark_noise_token_id"])
+    R = _DrafterRunner(drafter, target_args)
+    embed, lm_head = model.model.embed_tokens, model.lm_head
+    eos = set(stop_ids or [])
+    _e = getattr(tokenizer, "eos_token_id", None)
+    if _e is not None:
+        eos.add(int(_e))
+    ids = list(prompt_ids)
+    detok = tokenizer.detokenizer
+    if stats_out is not None:
+        stats_out["cached_tokens"] = 0
+
+    t0 = time.time()
+    emitted = 0
+    rounds = accepted_total = drafted_total = rollbacks = 0
+
+    def _mk(tok, finish=None, from_draft=False):
+        detok.add_token(tok)
+        return SpecResponse(
+            text=detok.last_segment, token=tok, finish_reason=finish,
+            prompt_tokens=len(ids), generation_tokens=emitted,
+            generation_tps=emitted / max(time.time() - t0, 1e-9),
+            peak_memory=mx.get_peak_memory() / 1e9, from_draft=from_draft,
+            accept_rate=(accepted_total / drafted_total) if drafted_total else 0.0,
+            round_idx=rounds)
+
+    with _wl(model, [_gs]), mx.stream(_gs):
+        cache = model.make_cache()
+        ctx = R.make_ctx()
+        # prefill
+        lp, cp = fwd(mx.array([ids], dtype=mx.int32), cache)
+        mx.eval(lp, *cp.values())
+        R.update_ctx(mx.concatenate([cp[t] for t in taps], axis=-1), ctx)
+        pending = int(mx.argmax(lp[:, -1, :]).item())
+        emitted += 1
+        finish = "stop" if pending in eos else (
+            "length" if emitted >= max_tokens else None)
+        yield _mk(pending, finish=finish)
+
+        cold = since_probe = 0
+        while finish is None:
+            if cold >= _COLD_AFTER and since_probe < _COLD_PROBE:
+                draft = []
+                since_probe += 1
+            else:
+                draft = R.propose(pending, ctx, embed, lm_head, K, MASK)
+                since_probe = 0
+                cold = 0 if draft else cold + 1
+            drafted_total += len(draft)
+            block = [pending] + draft
+            vlog, vcaps = fwd(mx.array([block], dtype=mx.int32), cache)
+            mx.eval(vlog, *vcaps.values())
+            tt = [int(x) for x in mx.argmax(vlog[0], axis=-1).tolist()]
+            n = 0
+            while n < len(draft) and draft[n] == tt[n]:
+                n += 1
+            committed = draft[:n] + [tt[n]]      # lossless : tt[n]=argmax target
+            vfused = mx.concatenate([vcaps[t] for t in taps], axis=-1)
+            if n < len(draft):
+                rollbacks += 1
+                _trim_all(cache, len(draft) - n)   # keep verify K/V — NO re-forward
+            R.update_ctx(vfused[:, : n + 1, :], ctx)
+            rounds += 1
+            accepted_total += len(committed)
+            for tok in committed:
+                emitted += 1
+                finish = "stop" if tok in eos else (
+                    "length" if emitted >= max_tokens else None)
+                yield _mk(tok, finish=finish, from_draft=(tok != committed[-1]))
+                if finish is not None:
+                    break
+            pending = committed[-1]
+
+    try:
+        _dt = max(time.time() - t0, 1e-9)
+        _r = max(rounds, 1)
+        sys.stderr.write(
+            f"[spec-single] rounds={rounds} emitted={emitted} "
+            f"accept/round={accepted_total / _r:.2f} "
+            f"rollbacks={rollbacks}/{rounds} drafted={drafted_total} "
+            f"tok/s={emitted / _dt:.2f}\n")
+        sys.stderr.flush()
+    except Exception:
+        pass
