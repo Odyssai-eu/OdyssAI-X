@@ -2736,12 +2736,15 @@ def _run_legacy_main(model, tokenizer, repo: str, kv_q8_default: bool,
         # avec le prompt_cache inutilise du chemin plain.
         if session_id and prompt_cache is not None and not _spec_dspark_on:
             cumulative = list(prompt_tokens_full) + gen_token_ids
-            # NB (2026-08-05) : on stocke le snap du PROMPT (deterministe,
-            # pris avant gen). Tenter de snapshotter prompt+reponse cassait le
-            # hit (non-truncatable) : le re-tokenize de la reponse depuis le
-            # texte != gen_ids (round-trip instable) -> le prefixe diverge des
-            # la 1re reponse. Cacher la reponse generee exige un round-trip
-            # stable OU un cache trimmable (V4 PoolingCache ne l'est pas).
+            # NB (2026-08-05) : snap du PROMPT (pris avant gen). Cache TOUT
+            # l'historique jusqu'au dernier message (88% mesure en prod
+            # Companion) car le round-trip token EST stable -> l'histo entier
+            # reste un prefixe deterministe. Les ~12% non-caches = la DERNIERE
+            # reponse assistant (posterieure au snap) + le nouveau message.
+            # Un snap POST-gen les capturerait (faisable, round-trip stable)
+            # mais la 1re implementation buggait (match exact snap-hit
+            # divergeait sur le dernier token tronque) et le gain marginal
+            # (~12%) ne justifie pas le risque sur les 88% qui marchent.
             _session_store_after_gen(session_id, repo, prompt_cache, cumulative,
                                      rank=rank, world=world_size,
                                      snap=_snap_pending,
