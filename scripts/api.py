@@ -1770,6 +1770,7 @@ def remote_cmd(node: dict, nodes: list[dict], model: str, mode: str, port: int,
         "RUNNER_USE_AP": "1" if use_ap else "0",
         "RUNNER_KV_Q8": "1" if kv_q8 else "0",
         "RUNNER_EMIT_BATCH": str(emit_batch),
+        "SPEC_SESS_DEBUG": os.environ.get("SPEC_SESS_DEBUG", ""),
     }
     if backend == "ring":
         # #40 WU4 — ring/TCP transport: MLX ring hostfile ([["ip:port"], ...]
@@ -5034,7 +5035,7 @@ def _initial_default_config() -> Optional[dict]:
 #   major (1.7.2 → 2.0.0) — breaking API or topology change
 #
 # Use `./scripts/bump-version.sh patch|minor|major` to bump + auto-commit.
-APP_VERSION = "1.29.0"
+APP_VERSION = "1.29.2"
 
 app = FastAPI(
     title="OdyssAI-X (odyssai.eu)",

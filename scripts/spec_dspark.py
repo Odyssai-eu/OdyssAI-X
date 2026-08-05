@@ -234,6 +234,11 @@ class _DrafterRunner:
         self.d = drafter
         self.a = a
         self.hc = a.hidden_size
+        # Per-instance gate thresholds (default = module globals for the
+        # distributed path). The single-node trim path sets these to 0: with a
+        # free trim rollback the gates only cost speculation depth, no benefit.
+        self.conf_gate = _CONF_GATE
+        self.margin_gate = _MARGIN_GATE
 
     def make_ctx(self):
         return [CtxCache() for _ in self.d.layers]
@@ -294,7 +299,7 @@ class _DrafterRunner:
         # sigmoid = P(step accepte) ; on tronque a la PREMIERE position sous
         # le seuil. Remplace le proxy margin (signal appris et calibre —
         # reliability diagrams DeepSpec — vs marge logit aveugle).
-        if _CONF_GATE > 0 and getattr(last, "confidence_head", None) is not None:
+        if self.conf_gate > 0 and getattr(last, "confidence_head", None) is not None:
             prev = mx.array([[pending] + drafts[:-1]], dtype=mx.int32)
             feats = mx.concatenate(
                 [hid, last.markov_head.prev_embeddings(prev).astype(hid.dtype)],
@@ -304,14 +309,14 @@ class _DrafterRunner:
             probs = [float(x) for x in p.tolist()]
             keep = 0
             for i in range(len(drafts)):
-                if probs[i] < _CONF_GATE:
+                if probs[i] < self.conf_gate:
                     break
                 keep += 1
             drafts = drafts[:keep]
         # Margin-gate (fallback si pas de tete de confiance) : position gardee
         # ssi le token choisi == argmax de base ET marge top1-top2 >= seuil.
         # Draft vide = step plain (1 forward, 1 token) -> plancher ~plain.
-        elif _MARGIN_GATE > 0:
+        elif self.margin_gate > 0:
             top2 = mx.topk(base, k=2, axis=-1)          # [K, 2] les 2 plus grands
             top1_ids = mx.argmax(base, axis=-1)          # [K]
             margin = mx.abs(top2[:, 0] - top2[:, 1])     # |top1-top2|, ordre indiff.
@@ -320,7 +325,7 @@ class _DrafterRunner:
             t1 = [int(x) for x in top1_ids.tolist()]
             keep = 0
             for i, d in enumerate(drafts):
-                if d == t1[i] and m[i] >= _MARGIN_GATE:
+                if d == t1[i] and m[i] >= self.margin_gate:
                     keep += 1
                 else:
                     break
@@ -754,6 +759,8 @@ def _trim_all(cache, n):
 def single_node_spec_stream_generate(
     model, tokenizer, prompt_ids, *, max_tokens, drafter, target_args, dcfg,
     stop_ids=None, stats_out=None,
+    session_id=None, model_id=None, session_get=None, session_put=None,
+    restore_from_snap=None,
 ):
     try:
         from mlx_lm.generate import wired_limit as _wl, generation_stream as _gs
@@ -769,6 +776,11 @@ def single_node_spec_stream_generate(
     K = int(dcfg["dspark_block_size"])
     MASK = int(dcfg["dspark_noise_token_id"])
     R = _DrafterRunner(drafter, target_args)
+    # Gates OFF by default on the trim path: the free trim rollback makes the
+    # confidence/margin gate pure loss (it only shortens speculation, with no
+    # recommit to avoid). Distinct env from the distributed SPEC_CONF_GATE.
+    R.conf_gate = float(os.environ.get("SPEC_SINGLE_CONF_GATE", "0"))
+    R.margin_gate = float(os.environ.get("SPEC_SINGLE_MARGIN_GATE", "0"))
     embed, lm_head = model.model.embed_tokens, model.lm_head
     eos = set(stop_ids or [])
     _e = getattr(tokenizer, "eos_token_id", None)
@@ -776,8 +788,22 @@ def single_node_spec_stream_generate(
         eos.add(int(_e))
     ids = list(prompt_ids)
     detok = tokenizer.detokenizer
+
+    # ── fast-prefill : lookup session (snap-cache), meme design que _spec_body
+    # (single-rank -> pas de consensus all_sum). Hit ssi snap_tokens est un
+    # prefixe de ids ET laisse >=2 tokens de suffixe (prefill en 2 temps).
+    _entry = None
+    use_hit = False
+    if session_id and session_get is not None and restore_from_snap is not None:
+        _entry = session_get(session_id, model_id)
+        if _entry and _entry.get("snap") and _entry.get("snap_tokens"):
+            _st = _entry["snap_tokens"]
+            if len(_st) <= len(ids) - 2 and ids[:len(_st)] == list(_st):
+                use_hit = True
+    suffix = ids[len(_entry["snap_tokens"]):] if use_hit else ids
+    cached_n = len(ids) - len(suffix) if use_hit else 0
     if stats_out is not None:
-        stats_out["cached_tokens"] = 0
+        stats_out["cached_tokens"] = cached_n
 
     t0 = time.time()
     emitted = 0
@@ -793,61 +819,105 @@ def single_node_spec_stream_generate(
             accept_rate=(accepted_total / drafted_total) if drafted_total else 0.0,
             round_idx=rounds)
 
-    with _wl(model, [_gs]), mx.stream(_gs):
-        cache = model.make_cache()
-        ctx = R.make_ctx()
-        # prefill
-        lp, cp = fwd(mx.array([ids], dtype=mx.int32), cache)
-        mx.eval(lp, *cp.values())
-        R.update_ctx(mx.concatenate([cp[t] for t in taps], axis=-1), ctx)
-        pending = int(mx.argmax(lp[:, -1, :]).item())
-        emitted += 1
-        finish = "stop" if pending in eos else (
-            "length" if emitted >= max_tokens else None)
-        yield _mk(pending, finish=finish)
-
-        cold = since_probe = 0
-        while finish is None:
-            if cold >= _COLD_AFTER and since_probe < _COLD_PROBE:
-                draft = []
-                since_probe += 1
-            else:
-                draft = R.propose(pending, ctx, embed, lm_head, K, MASK)
-                since_probe = 0
-                cold = 0 if draft else cold + 1
-            drafted_total += len(draft)
-            block = [pending] + draft
-            vlog, vcaps = fwd(mx.array([block], dtype=mx.int32), cache)
-            mx.eval(vlog, *vcaps.values())
-            tt = [int(x) for x in mx.argmax(vlog[0], axis=-1).tolist()]
-            n = 0
-            while n < len(draft) and draft[n] == tt[n]:
-                n += 1
-            committed = draft[:n] + [tt[n]]      # lossless : tt[n]=argmax target
-            vfused = mx.concatenate([vcaps[t] for t in taps], axis=-1)
-            if n < len(draft):
-                rollbacks += 1
-                _trim_all(cache, len(draft) - n)   # keep verify K/V — NO re-forward
-            R.update_ctx(vfused[:, : n + 1, :], ctx)
-            rounds += 1
-            accepted_total += len(committed)
-            for tok in committed:
-                emitted += 1
-                finish = "stop" if tok in eos else (
-                    "length" if emitted >= max_tokens else None)
-                yield _mk(tok, finish=finish, from_draft=(tok != committed[-1]))
-                if finish is not None:
-                    break
-            pending = committed[-1]
-
+    _prompt_snap = None
+    _ctx_snap = None
+    cache = None
     try:
-        _dt = max(time.time() - t0, 1e-9)
-        _r = max(rounds, 1)
-        sys.stderr.write(
-            f"[spec-single] rounds={rounds} emitted={emitted} "
-            f"accept/round={accepted_total / _r:.2f} "
-            f"rollbacks={rollbacks}/{rounds} drafted={drafted_total} "
-            f"tok/s={emitted / _dt:.2f}\n")
-        sys.stderr.flush()
-    except Exception:
-        pass
+        with _wl(model, [_gs]), mx.stream(_gs):
+            cache = (restore_from_snap(_entry["cache"], _entry["snap"])
+                     if use_hit else model.make_cache())
+            ctx = R.make_ctx()
+            if use_hit and _entry.get("spec_ctx"):
+                ctx = []
+                for (ck, cv) in _entry["spec_ctx"]:
+                    c = CtxCache()
+                    c.k, c.v = ck, cv
+                    ctx.append(c)
+            # prefill en 2 temps : snapshot a suffix[:-1] (= ids[:-1] au total),
+            # dernier token forwarde a part (sa position bouge au tour suivant).
+            _pre = suffix[:-1]
+            _last = suffix[-1]
+            if _pre:
+                lp, cp = fwd(mx.array([_pre], dtype=mx.int32), cache)
+                # eval-isolation : etat POOLE complet materialise avant snapshot
+                mx.eval(lp, *cp.values(), *_cache_arrays(cache))
+                R.update_ctx(mx.concatenate([cp[t] for t in taps], axis=-1), ctx)
+            _prompt_snap = _snap(cache)
+            _ctx_snap = [(c.k, c.v) for c in ctx]
+            # Store EAGER (pas dans le finally) : le runner casse la boucle sur
+            # finish sans fermer ce generateur single-node (pas de servants a
+            # OP_STOP comme en distribue) -> le finally serait differe/saute et
+            # la session ne persisterait jamais (store_keys vide). Le snap
+            # fin-de-prompt est deja fige ici ; le cache stocke = porteur de
+            # classes pour le restore. Idempotent, re-store en finally en filet.
+            try:
+                if session_id and session_put is not None:
+                    session_put(session_id, model_id, cache, ids,
+                                _prompt_snap, ids[:-1], spec_ctx=_ctx_snap)
+            except Exception as _e:
+                sys.stderr.write(f"[spec-single] eager store failed: {_e!r}\n")
+                sys.stderr.flush()
+            ll, cl = fwd(mx.array([[_last]], dtype=mx.int32), cache)
+            mx.eval(ll, *cl.values())
+            R.update_ctx(mx.concatenate([cl[t] for t in taps], axis=-1), ctx)
+            pending = int(mx.argmax(ll[:, -1, :]).item())
+            emitted += 1
+            finish = "stop" if pending in eos else (
+                "length" if emitted >= max_tokens else None)
+            yield _mk(pending, finish=finish)
+
+            cold = since_probe = 0
+            while finish is None:
+                if cold >= _COLD_AFTER and since_probe < _COLD_PROBE:
+                    draft = []
+                    since_probe += 1
+                else:
+                    draft = R.propose(pending, ctx, embed, lm_head, K, MASK)
+                    since_probe = 0
+                    cold = 0 if draft else cold + 1
+                drafted_total += len(draft)
+                block = [pending] + draft
+                vlog, vcaps = fwd(mx.array([block], dtype=mx.int32), cache)
+                mx.eval(vlog, *vcaps.values())
+                tt = [int(x) for x in mx.argmax(vlog[0], axis=-1).tolist()]
+                n = 0
+                while n < len(draft) and draft[n] == tt[n]:
+                    n += 1
+                committed = draft[:n] + [tt[n]]   # lossless : tt[n]=argmax target
+                vfused = mx.concatenate([vcaps[t] for t in taps], axis=-1)
+                if n < len(draft):
+                    rollbacks += 1
+                    _trim_all(cache, len(draft) - n)  # keep verify K/V — NO re-forward
+                R.update_ctx(vfused[:, : n + 1, :], ctx)
+                rounds += 1
+                accepted_total += len(committed)
+                for tok in committed:
+                    emitted += 1
+                    finish = "stop" if tok in eos else (
+                        "length" if emitted >= max_tokens else None)
+                    yield _mk(tok, finish=finish, from_draft=(tok != committed[-1]))
+                    if finish is not None:
+                        break
+                pending = committed[-1]
+    finally:
+        # store la session (snap fin-de-prompt + ctx drafter) — vaut aussi sur
+        # disconnect client (GeneratorExit) : le snap fin-de-prompt reste valide.
+        try:
+            if (session_id and session_put is not None
+                    and _prompt_snap is not None and cache is not None):
+                session_put(session_id, model_id, cache, ids,
+                            _prompt_snap, ids[:-1], spec_ctx=_ctx_snap)
+        except Exception as _e:
+            sys.stderr.write(f"[spec-single] session store failed: {_e!r}\n")
+            sys.stderr.flush()
+        try:
+            _dt = max(time.time() - t0, 1e-9)
+            _r = max(rounds, 1)
+            sys.stderr.write(
+                f"[spec-single] rounds={rounds} emitted={emitted} "
+                f"accept/round={accepted_total / _r:.2f} "
+                f"rollbacks={rollbacks}/{rounds} drafted={drafted_total} "
+                f"cached={cached_n} tok/s={emitted / _dt:.2f}\n")
+            sys.stderr.flush()
+        except Exception:
+            pass

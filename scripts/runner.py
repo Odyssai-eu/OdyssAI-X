@@ -2648,7 +2648,14 @@ def _run_legacy_main(model, tokenizer, repo: str, kv_q8_default: bool,
                 drafter=spec_dspark_ctx.get("drafter"),
                 target_args=spec_dspark_ctx.get("args"),
                 dcfg=spec_dspark_ctx.get("dcfg"),
-                stop_ids=_stop_ids, stats_out=_spec_stats)
+                stop_ids=_stop_ids, stats_out=_spec_stats,
+                # fast-prefill (snap-cache) hooks — meme store byte-budgete que
+                # le chemin distribue ; restore via les constructeurs frais.
+                session_id=session_id if _SNAP_CACHE_ENABLED else None,
+                model_id=repo,
+                session_get=_spec_session_get,
+                session_put=_spec_session_put,
+                restore_from_snap=_restore_from_snap)
         elif _spec_dspark_on:
             # DSpark spec distribue : le generateur fait SON prefill (capture
             # les taps -> ctx drafter) et pilote la loop propose/verify en
