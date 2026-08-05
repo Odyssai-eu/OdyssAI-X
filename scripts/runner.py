@@ -1236,6 +1236,41 @@ def _session_lookup(session_id: str, model_id: str, prompt_tokens: list[int]):
         return cache, prompt_tokens[common:], kind
 
 
+def _spec_session_get(session_id: str, model_id: str):
+    """Hook A (spec+snap) : entree session brute pour le chemin spec.
+    Chaque rang tient SA copie (SPMD) ; la coherence inter-rangs est garantie
+    par la barriere all_sum du generateur, pas ici."""
+    if not session_id:
+        return None
+    with _session_lock:
+        entry = _session_store.get(session_id)
+        if not entry or entry.get("model_id") != model_id:
+            return None
+        entry["last_used"] = time.time()
+        return entry
+
+
+def _spec_session_put(session_id: str, model_id: str, cache, tokens,
+                      snap, snap_tokens, spec_ctx=None) -> None:
+    """Hook A (spec+snap) : persiste le cache+snapshot du chemin spec dans le
+    MEME store byte-budgete que le chemin plain. `spec_ctx` (rank0 only) =
+    refs (k,v) du CtxCache drafter au point du prompt."""
+    if not session_id or cache is None:
+        return
+    with _session_lock:
+        _session_store[session_id] = {
+            "cache": cache,
+            "tokens": list(tokens),
+            "model_id": model_id,
+            "last_used": time.time(),
+            "bytes": _cache_size_bytes(cache),
+            "snap": snap,
+            "snap_tokens": list(snap_tokens) if snap_tokens else None,
+            "spec_ctx": spec_ctx,
+        }
+    _evict_sessions()
+
+
 def _session_store_after_gen(session_id: str, model_id: str, cache,
                              all_tokens: list[int],
                              rank: int = 0, world: int = 1,
@@ -2474,6 +2509,7 @@ def _run_legacy_main(model, tokenizer, repo: str, kv_q8_default: bool,
         _snap_pending = None
         _snap_tokens_pending = None
         _spec_dspark_on = bool(spec_dspark_ctx and spec_dspark_ctx.get("enabled"))
+        _spec_stats: dict = {}
         if (_SNAP_CACHE_ENABLED
                 and session_id and prompt_cache is not None and draft_model is None
                 and not _spec_dspark_on          # le pool spec fait son propre prefill
@@ -2585,7 +2621,16 @@ def _run_legacy_main(model, tokenizer, repo: str, kv_q8_default: bool,
                 drafter=spec_dspark_ctx.get("drafter"),
                 target_args=spec_dspark_ctx.get("args"),
                 dcfg=spec_dspark_ctx.get("dcfg"),
-                stop_ids=_stop_ids)
+                stop_ids=_stop_ids,
+                # A (spec+snap) : hooks session — lookup/restore/store du store
+                # byte-budgete du runner ; restore via les constructeurs frais
+                # prouves du chemin plain (1.24.0).
+                session_id=session_id if _SNAP_CACHE_ENABLED else None,
+                model_id=repo,
+                session_get=_spec_session_get,
+                session_put=_spec_session_put,
+                restore_from_snap=_restore_from_snap,
+                stats_out=_spec_stats)
         else:
             gen_iter = stream_generate(model, tokenizer, gen_input, **gen_kwargs)
 
@@ -2671,7 +2716,10 @@ def _run_legacy_main(model, tokenizer, repo: str, kv_q8_default: bool,
         # resume mid-prompt. The cache currently holds K/V for
         # `prompt_tokens_full` + `gen_token_ids`; that's the cumulative
         # token list we store as the session prefix.
-        if session_id and prompt_cache is not None:
+        # Le chemin spec gere SA persistence de session DANS le generateur
+        # (il possede le cache) — l'outer store ne doit pas ecraser son entree
+        # avec le prompt_cache inutilise du chemin plain.
+        if session_id and prompt_cache is not None and not _spec_dspark_on:
             cumulative = list(prompt_tokens_full) + gen_token_ids
             _session_store_after_gen(session_id, repo, prompt_cache, cumulative,
                                      rank=rank, world=world_size,
@@ -2689,6 +2737,9 @@ def _run_legacy_main(model, tokenizer, repo: str, kv_q8_default: bool,
             if (cached_cache is not None and suffix_tokens is not None)
             else 0
         )
+        if _spec_dspark_on:
+            # A (spec+snap) : le generateur publie son hit via stats_out.
+            cached_count = int(_spec_stats.get("cached_tokens") or 0)
         done_event = {
             "event": "done",
             "id": req_id,

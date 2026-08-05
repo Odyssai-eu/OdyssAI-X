@@ -74,7 +74,7 @@ class SpecResponse:
     round_idx: int = 0
 
 
-MAXS, HDR = 2048, 3          # MAXS couvre le prompt de prefill, pas juste K
+MAXS, HDR = 8192, 3          # MAXS couvre le prompt de prefill, pas juste K
 OP_RUN, OP_STOP = 0, 1
 
 # Seuil du confidence-gate P2 (0 = off) : sigmoid de la tete de confiance
@@ -113,6 +113,44 @@ class CtxCache:
 
 def _collapse_mean(t):        # 4D HC state -> 2D
     return t.mean(axis=-2)
+
+
+def _cache_arrays(cache) -> list:
+    """Aplatit tout mx.array vivant du prompt cache (eval-isolation, lecon
+    1.24.0) : l'etat POOLE de PoolingCache n'est pas ancetre des logits, donc
+    un eval des seuls logits le laisse lazy — snapshotte puis restaure, son
+    graphe rejouerait les collectives HORS lockstep au tour suivant. On
+    materialise tout avant de snapshotter."""
+    out: list = []
+
+    def _pull(c) -> None:
+        got = False
+        st = getattr(c, "state", None)
+        if st is not None:
+            stack = [st]
+            while stack:
+                x = stack.pop()
+                if isinstance(x, mx.array):
+                    out.append(x); got = True
+                elif isinstance(x, (list, tuple)):
+                    stack.extend(x)
+                elif isinstance(x, dict):
+                    stack.extend(x.values())
+        if not got:
+            try:
+                for v in vars(c).values():
+                    if isinstance(v, mx.array):
+                        out.append(v)
+            except TypeError:
+                pass
+
+    for c in cache:
+        if isinstance(c, CacheList):
+            for sub in c.caches:
+                _pull(sub)
+        else:
+            _pull(c)
+    return out
 
 
 # ── forward target distribue avec capture de taps (copie dv_g make_forward) ──
@@ -336,6 +374,12 @@ def spec_dspark_stream_generate(
     target_args=None,
     dcfg=None,
     stop_ids=None,
+    session_id=None,
+    model_id=None,
+    session_get=None,
+    session_put=None,
+    restore_from_snap=None,
+    stats_out=None,
 ) -> Generator["SpecResponse", None, None]:
     """Wrapper : ouvre wired_limit + generation_stream autour de la loop.
 
@@ -359,7 +403,10 @@ def spec_dspark_stream_generate(
         yield from _spec_body(
             model, tokenizer, prompt_ids, max_tokens=max_tokens, rank=rank,
             size=size, group=group, drafter=drafter, target_args=target_args,
-            dcfg=dcfg, stop_ids=stop_ids)
+            dcfg=dcfg, stop_ids=stop_ids,
+            session_id=session_id, model_id=model_id,
+            session_get=session_get, session_put=session_put,
+            restore_from_snap=restore_from_snap, stats_out=stats_out)
 
 
 def _spec_body(
@@ -375,6 +422,12 @@ def _spec_body(
     target_args=None,      # rank0 : ModelArgs V4
     dcfg=None,             # rank0 : config drafter (taps/block/noise)
     stop_ids=None,
+    session_id=None,       # A (spec+snap) : cle session (None = pas de cache)
+    model_id=None,
+    session_get=None,      # hooks runner : store byte-budgete partage
+    session_put=None,
+    restore_from_snap=None,  # constructeurs frais prouves (chemin plain 1.24.0)
+    stats_out=None,        # dict mutable : cached_tokens publie au done event
 ) -> Generator[SpecResponse, None, None]:
     taps = list(dcfg["dspark_target_layer_ids"]) if (rank == 0 and dcfg) else []
     fwd = _make_forward(model, set(taps))
@@ -383,10 +436,39 @@ def _spec_body(
     _e = getattr(tokenizer, "eos_token_id", None)
     if _e is not None:
         eos.add(int(_e))
+    ids = list(prompt_ids)
+
+    # ── A (spec+snap) : lookup session par rang + CONSENSUS all_sum ──
+    # Chaque rang decide LOCALEMENT (son store, ses tailles d'entrees — un
+    # evicteur peut diverger entre rangs), puis une barriere all_sum 1-int
+    # verifie l'unanimite : hit seulement si TOUS les rangs ont le hit
+    # (sinon repli miss partout). C'est le design P6/A.2 du plan v2.3 :
+    # tous calculent, la collective est la barriere de divergence.
+    _entry = None
+    _local_hit = 0
+    if session_id and session_get is not None and restore_from_snap is not None:
+        _entry = session_get(session_id, model_id)
+        if _entry and _entry.get("snap") and _entry.get("snap_tokens"):
+            _st = _entry["snap_tokens"]
+            if (len(_st) < len(ids) and ids[:len(_st)] == list(_st)):
+                _local_hit = 1
+    _consensus = mx.distributed.all_sum(
+        mx.array([_local_hit], dtype=mx.int32), group=group)
+    mx.eval(_consensus)
+    use_hit = int(_consensus.item()) == size
+    suffix = ids[len(_entry["snap_tokens"]):] if use_hit else ids
+    cached_n = len(ids) - len(suffix) if use_hit else 0
+    if use_hit:
+        cache = restore_from_snap(_entry["cache"], _entry["snap"])
+    if stats_out is not None:
+        stats_out["cached_tokens"] = cached_n
 
     # ── servants : boucle de reception, aucun yield ──
     if rank != 0:
         servant_snap = None
+        _prompt_snap = None
+        _prompt_len = 0
+        first_forward = True
         while True:
             v = _bcast(group, rank)
             op, S, flag = v[0], v[1], v[2]
@@ -394,14 +476,26 @@ def _spec_body(
                 break
             if flag:
                 _restore(cache, servant_snap)
-            elif S > 1:
+            elif S > 1 and not first_forward:
                 # S==1 flag=0 = step plain (draft vide) : pas de rollback
                 # possible -> pas de snapshot (miroir du skip rank0). Un
                 # recommit (flag=1) ne suit jamais qu'un verify S>1, donc
-                # servant_snap est toujours frais quand il sert.
+                # servant_snap est toujours frais quand il sert. Le PREMIER
+                # forward (prefill) n'est jamais rollback -> pas de snap.
                 servant_snap = _snap(cache)
             o, _ = fwd(mx.array([v[HDR:HDR + S]], dtype=mx.int32), cache)
-            mx.eval(o)
+            if first_forward:
+                # Fin de prompt : eval de l'ETAT COMPLET (isolation cross-
+                # requete, lecon 1.24.0) puis snapshot inerte pour la session.
+                mx.eval(o, *_cache_arrays(cache))
+                _prompt_snap = _snap(cache)
+                _prompt_len = cached_n + S
+                first_forward = False
+            else:
+                mx.eval(o)
+        if session_id and session_put is not None and _prompt_snap is not None:
+            session_put(session_id, model_id, cache, ids,
+                        _prompt_snap, ids[:_prompt_len])
         return
 
     # ── rank0 : drive ──
@@ -439,15 +533,33 @@ def _spec_body(
     # consommateur -> GeneratorExit, exception), on DOIT leur envoyer OP_STOP
     # sinon ils hangent et wedgent le pool. Exactement UN OP_STOP par sortie.
     finish = None
+    _prompt_snap = None
+    _ctx_snap = None
+    t_prop = t_ver = 0.0
     try:
-        # ── prefill : forward complet, capture taps -> ctx drafter ──
-        _bcast(group, rank, [OP_RUN, len(ids), 0] + ids)
-        logits, caps = fwd(mx.array([ids], dtype=mx.int32), cache)
-        # eval-isolation : logits ET caps materialises ensemble, sinon un pull
-        # lazy (chaine ctx du propose) rejoue les collectives hors lockstep.
-        mx.eval(logits, *caps.values())
+        if len(suffix) > MAXS:
+            raise ValueError(
+                f"spec prefill: suffix {len(suffix)} tokens > MAXS {MAXS} — "
+                f"prompt trop long pour le transport bcast")
+        # ── A : restauration du ctx drafter sur hit (rank0 only) ──
+        if use_hit and _entry.get("spec_ctx"):
+            ctx = []
+            for (ck, cv) in _entry["spec_ctx"]:
+                c = CtxCache()
+                c.k, c.v = ck, cv
+                ctx.append(c)
+        # ── prefill : forward (suffixe seul sur hit), taps -> ctx drafter ──
+        _bcast(group, rank, [OP_RUN, len(suffix), 0] + suffix)
+        logits, caps = fwd(mx.array([suffix], dtype=mx.int32), cache)
+        # eval-isolation : logits + caps + ETAT COMPLET du cache materialises
+        # ensemble (lecon 1.24.0 : l'etat poole lazy rejouerait les
+        # collectives hors lockstep au tour suivant via le snapshot).
+        mx.eval(logits, *caps.values(), *_cache_arrays(cache))
         fused = mx.concatenate([caps[t] for t in taps], axis=-1)
         R.update_ctx(fused, ctx)
+        # Snapshot fin-de-prompt (target + ctx drafter) — stocke en fin de gen.
+        _prompt_snap = _snap(cache)
+        _ctx_snap = [(c.k, c.v) for c in ctx]
         pending = int(mx.argmax(logits[:, -1, :]).item())
 
         # Le prefill argmax EST le 1er token genere (parite AR / mlx-lm).
@@ -463,7 +575,9 @@ def _spec_body(
                 draft = []            # round froid : pas de propose du tout
                 since_probe += 1
             else:
+                _tp = time.time()
                 draft = R.propose(pending, ctx, embed, lm_head, K, MASK)
+                t_prop += time.time() - _tp
                 since_probe = 0
                 if draft:
                     cold = 0
@@ -475,9 +589,11 @@ def _spec_body(
             # saute le snapshot (61 couches de copies vars(), pur overhead).
             # Les servants font pareil sur S==1 (voir boucle servant).
             s = _snap(cache) if draft else None
+            _tv = time.time()
             _bcast(group, rank, [OP_RUN, len(block), 0] + block)
             vlog, vcaps = fwd(mx.array([block], dtype=mx.int32), cache)
             mx.eval(vlog, *vcaps.values())
+            t_ver += time.time() - _tv
             tt = [int(x) for x in mx.argmax(vlog[0], axis=-1).tolist()]
             n = 0
             while n < len(draft) and draft[n] == tt[n]:
@@ -509,13 +625,25 @@ def _spec_body(
             _bcast(group, rank, [OP_STOP, 0, 0])
         except Exception:
             pass
+        # A : persiste la session rank0 (snap fin-de-prompt + ctx drafter).
+        # Sur disconnect client, le snap reste valide (fin-de-prompt) ; le
+        # cache vivant ne sert que de porteur de classes pour le restore.
+        try:
+            if session_id and session_put is not None and _prompt_snap is not None:
+                session_put(session_id, model_id, cache, ids,
+                            _prompt_snap, ids, spec_ctx=_ctx_snap)
+        except Exception:
+            pass
         try:
             _dt = max(time.time() - t0, 1e-9)
+            _r = max(rounds, 1)
             sys.stderr.write(
                 f"[spec] rounds={rounds} emitted={emitted} "
-                f"accept/round={accepted_total / max(rounds, 1):.2f} "
+                f"accept/round={accepted_total / _r:.2f} "
                 f"rollbacks={rollbacks}/{rounds} "
-                f"drafted={drafted_total} conf_gate={_CONF_GATE} margin={_MARGIN_GATE} "
+                f"drafted={drafted_total} conf_gate={_CONF_GATE} "
+                f"cached={cached_n} "
+                f"prop_ms={t_prop / _r * 1000:.0f} ver_ms={t_ver / _r * 1000:.0f} "
                 f"tok/s={emitted / _dt:.2f}\n")
             sys.stderr.flush()
         except Exception:
