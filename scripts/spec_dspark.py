@@ -77,7 +77,11 @@ class SpecResponse:
 MAXS, HDR = 2048, 3          # MAXS couvre le prompt de prefill, pas juste K
 OP_RUN, OP_STOP = 0, 1
 
-# Seuil du margin-gate du propose (0 = gate off). Marge logit top1-top2 :
+# Seuil du confidence-gate P2 (0 = off) : sigmoid de la tete de confiance
+# APPRISE du drafter (DeepSpec) — tronque le draft a la premiere position
+# dont P(accept) < seuil. Prioritaire sur le margin-gate quand la tete existe.
+_CONF_GATE = float(os.environ.get("SPEC_CONF_GATE", "0.7"))
+# Seuil du margin-gate fallback (0 = off). Marge logit top1-top2 :
 # en dessous, le draft est tronque (moins de rejets = moins de recommits).
 _MARGIN_GATE = float(os.environ.get("SPEC_MARGIN_GATE", "1.2"))
 # Cold-skip : apres N proposes consecutifs gates a vide (passage "froid",
@@ -242,14 +246,34 @@ class _DrafterRunner:
             x = blk.ffn(blk.ffn_norm(x), noise)
             h = hc_expand(x, residual, post, comb)
         last = self.d.layers[2]
-        base = lm_head(last.norm(last.hc_head(h)))[0]
+        hid = last.norm(last.hc_head(h))             # [1,K,H] pre-lm_head
+        base = lm_head(hid)[0]
         drafts = [int(x) for x in self.d.sample_block(base, pending).tolist()]
-        # Margin-gate (calibration Inferencer : sans confidence-gate le spec
-        # PERD sur la prose — chaque rejet coute un recommit-forward). On
-        # tronque le draft a la premiere position peu sure : position gardee
+        # Confidence-gate P2 (semantique DeepSpec, eval/dspark/draft_ops.py
+        # `_confident_prefix_length`) : la tete APPRISE du checkpoint —
+        # features = concat([hidden pre-lm_head, markov_w1(prev_ids)]) avec
+        # prev_ids = [pending] + drafts[:-1] — un logit par position ;
+        # sigmoid = P(step accepte) ; on tronque a la PREMIERE position sous
+        # le seuil. Remplace le proxy margin (signal appris et calibre —
+        # reliability diagrams DeepSpec — vs marge logit aveugle).
+        if _CONF_GATE > 0 and getattr(last, "confidence_head", None) is not None:
+            prev = mx.array([[pending] + drafts[:-1]], dtype=mx.int32)
+            feats = mx.concatenate(
+                [hid, last.markov_head.prev_embeddings(prev).astype(hid.dtype)],
+                axis=-1)                              # [1,K,H+rank]
+            p = mx.sigmoid(last.confidence_head.proj(feats))[0, :, 0]
+            mx.eval(p)
+            probs = [float(x) for x in p.tolist()]
+            keep = 0
+            for i in range(len(drafts)):
+                if probs[i] < _CONF_GATE:
+                    break
+                keep += 1
+            drafts = drafts[:keep]
+        # Margin-gate (fallback si pas de tete de confiance) : position gardee
         # ssi le token choisi == argmax de base ET marge top1-top2 >= seuil.
         # Draft vide = step plain (1 forward, 1 token) -> plancher ~plain.
-        if _MARGIN_GATE > 0:
+        elif _MARGIN_GATE > 0:
             top2 = mx.topk(base, k=2, axis=-1)          # [K, 2] les 2 plus grands
             top1_ids = mx.argmax(base, axis=-1)          # [K]
             margin = mx.abs(top2[:, 0] - top2[:, 1])     # |top1-top2|, ordre indiff.
@@ -491,7 +515,7 @@ def _spec_body(
                 f"[spec] rounds={rounds} emitted={emitted} "
                 f"accept/round={accepted_total / max(rounds, 1):.2f} "
                 f"rollbacks={rollbacks}/{rounds} "
-                f"drafted={drafted_total} gate={_MARGIN_GATE} "
+                f"drafted={drafted_total} conf_gate={_CONF_GATE} margin={_MARGIN_GATE} "
                 f"tok/s={emitted / _dt:.2f}\n")
             sys.stderr.flush()
         except Exception:
