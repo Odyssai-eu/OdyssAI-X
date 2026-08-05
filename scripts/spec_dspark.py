@@ -450,12 +450,31 @@ def _spec_body(
         _entry = session_get(session_id, model_id)
         if _entry and _entry.get("snap") and _entry.get("snap_tokens"):
             _st = _entry["snap_tokens"]
-            if (len(_st) < len(ids) and ids[:len(_st)] == list(_st)):
+            # suffixe >= 2 : le prefill en 2 temps (prompt[:-1] snapshotte +
+            # dernier token forwarde) exige _pre non vide. Condition IDENTIQUE
+            # sur tous les rangs (memes ids, meme _st) -> consensus preserve.
+            if (len(_st) <= len(ids) - 2 and ids[:len(_st)] == list(_st)):
                 _local_hit = 1
     _consensus = mx.distributed.all_sum(
         mx.array([_local_hit], dtype=mx.int32), group=group)
     mx.eval(_consensus)
     use_hit = int(_consensus.item()) == size
+    if os.environ.get("SPEC_SESS_DEBUG"):
+        _st_dbg = _entry["snap_tokens"] if (_entry and _entry.get("snap_tokens")) else None
+        _snl = len(_st_dbg) if _st_dbg else -1
+        _cpl = -1
+        if _st_dbg:
+            _cpl = 0
+            for _a, _b in zip(ids, _st_dbg):
+                if _a != _b:
+                    break
+                _cpl += 1
+        sys.stderr.write(
+            f"[spec-sess] r{rank} sid={str(session_id)[:8]} entry={_entry is not None} "
+            f"has_snap={bool(_entry and _entry.get('snap'))} "
+            f"local_hit={_local_hit} consensus={int(_consensus.item())}/{size} "
+            f"use_hit={use_hit} snaplen={_snl} idslen={len(ids)} common_prefix={_cpl}\n")
+        sys.stderr.flush()
     suffix = ids[len(_entry["snap_tokens"]):] if use_hit else ids
     cached_n = len(ids) - len(suffix) if use_hit else 0
     if use_hit:
@@ -493,9 +512,13 @@ def _spec_body(
                 first_forward = False
             else:
                 mx.eval(o)
-        if session_id and session_put is not None and _prompt_snap is not None:
-            session_put(session_id, model_id, cache, ids,
-                        _prompt_snap, ids[:_prompt_len])
+        try:
+            if session_id and session_put is not None and _prompt_snap is not None:
+                session_put(session_id, model_id, cache, ids,
+                            _prompt_snap, ids[:_prompt_len])
+        except Exception as _e:
+            sys.stderr.write(f"[spec-sess] r{rank} SERVANT STORE FAILED: {_e!r}\n")
+            sys.stderr.flush()
         return
 
     # ── rank0 : drive ──
@@ -548,19 +571,30 @@ def _spec_body(
                 c = CtxCache()
                 c.k, c.v = ck, cv
                 ctx.append(c)
-        # ── prefill : forward (suffixe seul sur hit), taps -> ctx drafter ──
-        _bcast(group, rank, [OP_RUN, len(suffix), 0] + suffix)
-        logits, caps = fwd(mx.array([suffix], dtype=mx.int32), cache)
-        # eval-isolation : logits + caps + ETAT COMPLET du cache materialises
-        # ensemble (lecon 1.24.0 : l'etat poole lazy rejouerait les
-        # collectives hors lockstep au tour suivant via le snapshot).
-        mx.eval(logits, *caps.values(), *_cache_arrays(cache))
-        fused = mx.concatenate([caps[t] for t in taps], axis=-1)
-        R.update_ctx(fused, ctx)
-        # Snapshot fin-de-prompt (target + ctx drafter) — stocke en fin de gen.
+        # ── prefill en DEUX temps (aligne sur le chemin plain) : le snapshot
+        # est pris a prompt[:-1] et le DERNIER token du prompt est forwarde a
+        # part. Raison (bug 05/08) : le dernier token (debut-assistant) N'EST
+        # PAS a la meme position au tour suivant (common_prefix = len-1), donc
+        # snap_tokens = ids[:-1] pour que le match tienne, et le cache
+        # snapshotte doit correspondre = etat a prompt[:-1].
+        _pre = suffix[:-1]
+        _last = suffix[-1]
+        if _pre:
+            _bcast(group, rank, [OP_RUN, len(_pre), 0] + _pre)
+            lp, cp = fwd(mx.array([_pre], dtype=mx.int32), cache)
+            # eval-isolation : etat COMPLET materialise avant le snapshot
+            # (lecon 1.24.0 : l'etat poole lazy rejouerait les collectives).
+            mx.eval(lp, *cp.values(), *_cache_arrays(cache))
+            R.update_ctx(mx.concatenate([cp[t] for t in taps], axis=-1), ctx)
+        # Snapshot fin-de-prompt-moins-un (target + ctx drafter).
         _prompt_snap = _snap(cache)
         _ctx_snap = [(c.k, c.v) for c in ctx]
-        pending = int(mx.argmax(logits[:, -1, :]).item())
+        # Forward du DERNIER token du prompt -> premier pending.
+        _bcast(group, rank, [OP_RUN, 1, 0, _last])
+        ll, cl = fwd(mx.array([[_last]], dtype=mx.int32), cache)
+        mx.eval(ll, *cl.values())
+        R.update_ctx(mx.concatenate([cl[t] for t in taps], axis=-1), ctx)
+        pending = int(mx.argmax(ll[:, -1, :]).item())
 
         # Le prefill argmax EST le 1er token genere (parite AR / mlx-lm).
         emitted += 1
@@ -630,10 +664,17 @@ def _spec_body(
         # cache vivant ne sert que de porteur de classes pour le restore.
         try:
             if session_id and session_put is not None and _prompt_snap is not None:
+                # snap_tokens = ids[:-1] : le snapshot est a prompt[:-1] (le
+                # dernier token est re-prefille au tour suivant, cf prefill).
                 session_put(session_id, model_id, cache, ids,
-                            _prompt_snap, ids, spec_ctx=_ctx_snap)
-        except Exception:
-            pass
+                            _prompt_snap, ids[:-1], spec_ctx=_ctx_snap)
+                if os.environ.get("SPEC_SESS_DEBUG"):
+                    sys.stderr.write(
+                        f"[spec-sess] r{rank} STORED sid={str(session_id)[:8]} "
+                        f"snaptok={len(ids) - 1}\n"); sys.stderr.flush()
+        except Exception as _e:
+            sys.stderr.write(f"[spec-sess] r{rank} STORE FAILED: {_e!r}\n")
+            sys.stderr.flush()
         try:
             _dt = max(time.time() - t0, 1e-9)
             _r = max(rounds, 1)

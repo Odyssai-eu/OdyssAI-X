@@ -1244,6 +1244,15 @@ def _spec_session_get(session_id: str, model_id: str):
         return None
     with _session_lock:
         entry = _session_store.get(session_id)
+        if os.environ.get("SPEC_SESS_DEBUG"):
+            _keys = list(_session_store.keys())
+            _mid = entry.get("model_id") if entry else None
+            sys.stderr.write(
+                f"[spec-sess] GET r{os.environ.get('MLX_RANK','?')} "
+                f"sid={str(session_id)[:8]} found={entry is not None} "
+                f"store_keys={[k[:8] for k in _keys]} "
+                f"stored_mid={str(_mid)[:40]} want_mid={str(model_id)[:40]}\n")
+            sys.stderr.flush()
         if not entry or entry.get("model_id") != model_id:
             return None
         entry["last_used"] = time.time()
@@ -1263,7 +1272,13 @@ def _spec_session_put(session_id: str, model_id: str, cache, tokens,
             "tokens": list(tokens),
             "model_id": model_id,
             "last_used": time.time(),
-            "bytes": _cache_size_bytes(cache),
+            # A : le cache spec est deja compte dans la RAM modele (ref vivante,
+            # pas une copie) ; le snapshot ne garde que le KV au point du
+            # prompt. On force bytes=0 pour l'evicteur byte-budget — sinon
+            # _cache_size_bytes surevalue le shard bas (12 couches) et
+            # auto-evince la seule entree des le store (bug servant 05/08).
+            # Le count-cap (_SESSION_MAX) borne toujours le nombre d'entrees.
+            "bytes": 0,
             "snap": snap,
             "snap_tokens": list(snap_tokens) if snap_tokens else None,
             "spec_ctx": spec_ctx,
