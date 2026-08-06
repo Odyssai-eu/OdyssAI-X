@@ -2509,9 +2509,15 @@ def _run_legacy_main(model, tokenizer, repo: str, kv_q8_default: bool,
 
         # Prefix cache lookup BEFORE building a fresh cache. On a hit we reuse
         # the existing populated cache and feed only the suffix tokens.
+        # SKIP for the DSpark spec pool: its generator owns the session store
+        # (session_get/put hooks + its own snapshot restore). The plain
+        # _session_lookup here would DELETE the spec-managed entry on its
+        # divergent/fresh/non-truncatable branches → the spec fast-prefill saw
+        # an empty store every turn (bug 2026-08-06: store 1→0 between requests).
+        _spec_on_here = bool(spec_dspark_ctx and spec_dspark_ctx.get("enabled"))
         cached_cache, suffix_tokens, hit_kind = _session_lookup(
             session_id, repo, prompt_tokens_full,
-        ) if session_id else (None, None, "no-session")
+        ) if (session_id and not _spec_on_here) else (None, None, "no-session")
 
         if cached_cache is not None:
             prompt_cache = cached_cache
