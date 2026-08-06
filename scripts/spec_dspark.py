@@ -89,26 +89,51 @@ _MARGIN_GATE = float(os.environ.get("SPEC_MARGIN_GATE", "1.2"))
 # PROBE rounds — le round froid devient ~un step plain. Reset des qu'un
 # draft survit au gate.
 _COLD_AFTER = int(os.environ.get("SPEC_COLD_AFTER", "3"))
+# Drafter context window (2026-08-06 root-cause fix). The drafter's per-layer
+# CtxCache used to grow UNBOUNDED (mx.concatenate every round over the whole
+# generation), so its self-attention was O(gen_len): progressive slowdown then
+# a hard stall/blowup past ~10k tokens (bench C freeze). Bounding it to the last
+# W target-hidden entries caps the cost. LOSSLESS-SAFE: the drafter only
+# PROPOSES — the target verify is authoritative — so windowing can only affect
+# accept-rate/speed, never correctness. W>=typical response length => zero
+# behavior change for normal chat; only pathological long gens get bounded.
+# 0 disables the window (legacy unbounded behavior).
+_DRAFTER_CTX_WINDOW = int(os.environ.get("SPEC_DRAFTER_CTX_WINDOW", "2048"))
 _COLD_PROBE = int(os.environ.get("SPEC_COLD_PROBE", "3"))
 
 
 # ── ctx-cache drafter (dspartha CtxCache, append-only) — copie dv_g ──────────
 class CtxCache:
-    __slots__ = ("k", "v")
+    # `_abs` = absolute count of appended entries (the rope offset), tracked
+    # separately from the (possibly windowed) stored k/v so rope stays correct
+    # after the sliding-window drop — q@abs and k@abs keep true relative
+    # positions. See _DRAFTER_CTX_WINDOW.
+    __slots__ = ("k", "v", "_abs")
 
     def __init__(self):
         self.k = self.v = None
+        self._abs = 0
 
     def append(self, k, v):
+        self._abs += k.shape[2]
         if self.k is None:
             self.k, self.v = k, v
         else:
             self.k = mx.concatenate([self.k, k], axis=2)
             self.v = mx.concatenate([self.v, v], axis=2)
+        # Sliding window: keep only the last W entries. Bounds the drafter's
+        # self-attention cost (root-cause fix for the long-gen stall). k/v are
+        # already rope-baked at absolute positions, so dropping the oldest is a
+        # correct sliding-window truncation. Lossless: drafter only proposes.
+        W = _DRAFTER_CTX_WINDOW
+        if W > 0 and self.k.shape[2] > W:
+            self.k = self.k[:, :, -W:, :]
+            self.v = self.v[:, :, -W:, :]
 
     @property
     def length(self):
-        return 0 if self.k is None else self.k.shape[2]
+        # ABSOLUTE position (rope offset), NOT the windowed store size.
+        return self._abs
 
 
 def _collapse_mean(t):        # 4D HC state -> 2D
@@ -572,9 +597,10 @@ def _spec_body(
         # ── A : restauration du ctx drafter sur hit (rank0 only) ──
         if use_hit and _entry.get("spec_ctx"):
             ctx = []
-            for (ck, cv) in _entry["spec_ctx"]:
+            for _t in _entry["spec_ctx"]:
                 c = CtxCache()
-                c.k, c.v = ck, cv
+                c.k, c.v = _t[0], _t[1]
+                c._abs = _t[2] if len(_t) > 2 else (0 if c.k is None else c.k.shape[2])
                 ctx.append(c)
         # ── prefill en DEUX temps (aligne sur le chemin plain) : le snapshot
         # est pris a prompt[:-1] et le DERNIER token du prompt est forwarde a
@@ -593,7 +619,7 @@ def _spec_body(
             R.update_ctx(mx.concatenate([cp[t] for t in taps], axis=-1), ctx)
         # Snapshot fin-de-prompt-moins-un (target + ctx drafter).
         _prompt_snap = _snap(cache)
-        _ctx_snap = [(c.k, c.v) for c in ctx]
+        _ctx_snap = [(c.k, c.v, c._abs) for c in ctx]
         # Forward du DERNIER token du prompt -> premier pending.
         _bcast(group, rank, [OP_RUN, 1, 0, _last])
         ll, cl = fwd(mx.array([[_last]], dtype=mx.int32), cache)
@@ -776,11 +802,15 @@ def single_node_spec_stream_generate(
     K = int(dcfg["dspark_block_size"])
     MASK = int(dcfg["dspark_noise_token_id"])
     R = _DrafterRunner(drafter, target_args)
-    # Gates OFF by default on the trim path: the free trim rollback makes the
-    # confidence/margin gate pure loss (it only shortens speculation, with no
-    # recommit to avoid). Distinct env from the distributed SPEC_CONF_GATE.
-    R.conf_gate = float(os.environ.get("SPEC_SINGLE_CONF_GATE", "0"))
-    R.margin_gate = float(os.environ.get("SPEC_SINGLE_MARGIN_GATE", "0"))
+    # Gate ON by default (STABILITY). Gate-off wins ~+5% on PREDICTABLE code,
+    # but on prose/unpredictable content the drafter proposes 5 tokens/round all
+    # rejected (~99% rollback) → thrash at ~0.45× plain + runaway generations →
+    # instability (bench crash 2026-08-05: 12795-tok gen, 99.5% rollback,
+    # 12.75 tok/s). The gate truncates uncertain drafts → empty → cold-skip →
+    # ~plain floor; the code gain survives. Set SPEC_SINGLE_CONF_GATE=0 to force
+    # gate-off for pure-code workloads.
+    R.conf_gate = float(os.environ.get("SPEC_SINGLE_CONF_GATE", "0.7"))
+    R.margin_gate = float(os.environ.get("SPEC_SINGLE_MARGIN_GATE", "1.2"))
     embed, lm_head = model.model.embed_tokens, model.lm_head
     eos = set(stop_ids or [])
     _e = getattr(tokenizer, "eos_token_id", None)
@@ -829,9 +859,10 @@ def single_node_spec_stream_generate(
             ctx = R.make_ctx()
             if use_hit and _entry.get("spec_ctx"):
                 ctx = []
-                for (ck, cv) in _entry["spec_ctx"]:
+                for _t in _entry["spec_ctx"]:
                     c = CtxCache()
-                    c.k, c.v = ck, cv
+                    c.k, c.v = _t[0], _t[1]
+                    c._abs = _t[2] if len(_t) > 2 else (0 if c.k is None else c.k.shape[2])
                     ctx.append(c)
             # prefill en 2 temps : snapshot a suffix[:-1] (= ids[:-1] au total),
             # dernier token forwarde a part (sa position bouge au tour suivant).
@@ -843,7 +874,7 @@ def single_node_spec_stream_generate(
                 mx.eval(lp, *cp.values(), *_cache_arrays(cache))
                 R.update_ctx(mx.concatenate([cp[t] for t in taps], axis=-1), ctx)
             _prompt_snap = _snap(cache)
-            _ctx_snap = [(c.k, c.v) for c in ctx]
+            _ctx_snap = [(c.k, c.v, c._abs) for c in ctx]
             # Store EAGER (pas dans le finally) : le runner casse la boucle sur
             # finish sans fermer ce generateur single-node (pas de servants a
             # OP_STOP comme en distribue) -> le finally serait differe/saute et
