@@ -382,6 +382,23 @@ def _cluster_config_txn():
         _save_cluster_config(cfg)
 
 
+def _drafter_for_model(model_abspath: str) -> Optional[dict]:
+    """Per-model drafter association — a model's drafter is a PROPERTY OF THE
+    MODEL, not a per-load UI choice. Stored in cluster-config under
+    `model_drafters`: {"<model_abspath>": {"draft_model": "<drafter_abspath>",
+    "num_draft_tokens": int}}. When a model that has an association is loaded
+    WITHOUT an explicit draft, the loader auto-attaches its drafter → the model
+    serves as a spec pool from a single dashboard Load click, no draft field, no
+    API trick. Returns None for models with no registered drafter (they load
+    plain, as expected)."""
+    m = (_load_cluster_config().get("model_drafters") or {})
+    if not isinstance(m, dict):
+        return None
+    p = (model_abspath or "").rstrip("/")
+    a = m.get(model_abspath) or m.get(p)
+    return a if isinstance(a, dict) else None
+
+
 def models_dir_for(cluster: str) -> str:
     cfg = _load_cluster_config()
     return cfg.get(cluster, {}).get("models_dir", DEFAULT_MODELS_DIR)
@@ -3211,6 +3228,87 @@ class VLMPool:
         self.runners.clear()
 
 
+class DFlashPool:
+    """A single-node `mlx-dspark serve --mode dflash` server, engine-managed and
+    proxied under a cluster as a TEXT pool (B1, 2026-08-06).
+
+    Same shape as VLMPool (a single-node OpenAI server duck-typed onto the pool
+    surface, chat routed via internal http-proxy, unload = kill the process),
+    with two differences:
+      * ``is_vlm = False`` — a dflash-dense target (e.g. Gemma-4-31B) is a TEXT
+        model, so it routes through normal chat (NOT the vision-only guard that
+        rejects VL models as text) and is badged as a spec text pool, not "vlm".
+      * carries the DFlash ``drafter`` path (the relaunch on restore needs it).
+
+    Replaces the standalone dspartha (`mlx-dspark serve` on .42, proxied but
+    uncontrolled) so OdyssAI-X owns the process lifecycle: load / unload /
+    restore / dashboard. Runs in the SAME mlx-vlm venv (mlx-dspark's deps are a
+    subset already present there)."""
+
+    is_vlm = False
+    is_dflash = True
+
+    def __init__(self, model_path: str, cluster: str, alias: str,
+                 node_indices: list[int], upstream: str, port: int,
+                 ssh_target: str, host: str, drafter: str,
+                 max_draft: int = 4, pid: Optional[str] = None):
+        self.model = model_path
+        self.model_path = model_path
+        self.cluster = cluster
+        self.alias = alias or cluster
+        self.node_indices: Optional[list[int]] = list(node_indices) if node_indices else None
+        self.nodes_count = 1
+        self.mode = "dflash"
+        self.use_ap = False
+        self.kv_q8 = False
+        # draft_model duck-types the RunnerPool field the views read; drafter is
+        # the concrete path the relaunch needs.
+        self.draft_model: Optional[str] = drafter
+        self.drafter = drafter
+        self.max_draft = int(max_draft)
+        self.num_draft_tokens = int(max_draft)
+        self.runners: list = []
+        self.upstream = (upstream or "").rstrip("/")
+        self.port = int(port)
+        self.pid = pid
+        self.ssh_target = ssh_target
+        self.host = host
+        try:
+            self.nodes = build_topology_from_indices(cluster, list(node_indices))
+        except Exception:
+            self.nodes = [{"rank": 0, "ssh": ssh_target, "host": host, "rdma": None}]
+        self.started_at: Optional[float] = time.time()
+        self.load_s: Optional[float] = None
+        self.last_used_at: float = time.time()
+        self.last_token_at: float = time.monotonic()
+        self.ttl_seconds: int = 0
+        self.backend: str = "http-proxy"
+        self.degraded: bool = False
+        self.degraded_reason: Optional[str] = None
+        self.degraded_at: Optional[float] = None
+
+    def alive_count(self) -> int:
+        """No local runner children — the mlx-dspark server is external. Report
+        1 so the dead-pool sweeper never mistakes it for a crashed pool (mirror
+        VLMPool.alive_count)."""
+        return 1
+
+    async def stop(self):
+        """Kill the mlx-dspark serve on this pool's node (SIGTERM → grace →
+        SIGKILL, so Metal wired pages release). Mirror VLMPool.stop."""
+        try:
+            await asyncio.to_thread(
+                _ssh_exec, self.ssh_target,
+                _dflash_kill_cmd(self.port, self.model_path), 30,
+            )
+        except Exception as e:
+            sys.stderr.write(
+                f"[dflash-pool] {self.cluster}[{self.alias}] kill on "
+                f"{self.ssh_target} failed: {e}\n"
+            )
+        self.runners.clear()
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # State + metrics
 # ──────────────────────────────────────────────────────────────────────────────
@@ -3314,6 +3412,23 @@ def save_cluster_state_v2(cluster_id: str, *,
                 "upstream": pool.upstream,
                 "ssh": pool.ssh_target,
                 "host": pool.host,
+            })
+            continue
+        # dflash pool (B1): a single-node mlx-dspark serve proxied as a TEXT
+        # pool. Persist the drafter + port so the startup restore relaunches it.
+        if getattr(pool, "is_dflash", False):
+            pools_payload.append({
+                "alias": alias,
+                "model": pool.model,
+                "is_dflash": True,
+                "node_indices": indices,
+                "nodes": 1,
+                "port": pool.port,
+                "upstream": pool.upstream,
+                "ssh": pool.ssh_target,
+                "host": pool.host,
+                "drafter": pool.drafter,
+                "max_draft": pool.max_draft,
             })
             continue
         pools_payload.append({
@@ -4355,6 +4470,13 @@ async def lifespan(app: FastAPI):
                     if vpool is not None:
                         set_pool(cid, alias, vpool)
                     continue
+                # dflash pool (B1): relaunch the single-node mlx-dspark serve and
+                # re-register a DFlashPool (TEXT proxy pool). Never a RunnerPool.
+                if entry.get("is_dflash"):
+                    dfpool = await _restore_dflash_pool(cid, alias, entry, indices)
+                    if dfpool is not None:
+                        set_pool(cid, alias, dfpool)
+                    continue
                 pool = RunnerPool(
                     model=entry["model"],
                     mode=entry.get("mode", "pipeline"),
@@ -5119,7 +5241,7 @@ def _initial_default_config() -> Optional[dict]:
 #   major (1.7.2 → 2.0.0) — breaking API or topology change
 #
 # Use `./scripts/bump-version.sh patch|minor|major` to bump + auto-commit.
-APP_VERSION = "1.30.0"
+APP_VERSION = "1.32.1"
 
 app = FastAPI(
     title="OdyssAI-X (odyssai.eu)",
@@ -8532,7 +8654,11 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
     # The text hot path below (RunnerProc generation) is untouched.
     # VLMDistPool sets vlm_proxy=False: it is served by the normal
     # pool.submit() path below (its ranks ARE RunnerProcs), not the proxy.
-    if getattr(pool, "is_vlm", False) and getattr(pool, "vlm_proxy", True):
+    # dflash pool (B1) is ALSO a single-node OpenAI server proxied via
+    # http-proxy — same relay path, but it's a TEXT pool (is_vlm=False) so it
+    # skips the vision-only guard below and routes as normal chat.
+    if (getattr(pool, "is_vlm", False) and getattr(pool, "vlm_proxy", True)) \
+            or getattr(pool, "is_dflash", False):
         body = req.model_dump(exclude_none=True)
         return await _vlm_pool_proxy_chat_completion(pool, body, bool(req.stream))
     # Request classification + per-cluster acceptance. Replaces the older
@@ -12069,9 +12195,17 @@ class ArgoLoadRequest(BaseModel):
     # the load auto-detects and serves it single-node via mlx_vlm.server as a
     # VL pool under this cluster. These optional fields tune that launch; they
     # are IGNORED for text (distributed) loads.
-    vlm_port: Optional[int] = None        # default VLM_DEFAULT_PORT (8080)
-    venv: Optional[str] = None            # default VLM_DEFAULT_VENV
+    vlm_port: Optional[int] = None        # default VLM_DEFAULT_PORT (8080) — reused as the dflash port too
+    venv: Optional[str] = None            # default VLM_DEFAULT_VENV (mlx-dspark lives here too)
     ready_timeout_s: Optional[float] = None  # default VLM_READY_TIMEOUT_S
+    # B1 dflash-dense (2026-08-06). Explicit opt-in: serve a DENSE target (e.g.
+    # Gemma-4-31B) single-node via `mlx-dspark serve --mode dflash` with the
+    # DFlash block-diffusion drafter `draft`, registered as a TEXT proxy pool
+    # under this cluster (replaces standalone dspartha). Ignored for normal
+    # text/VL loads. `draft` is required when dflash=True.
+    dflash: bool = False
+    draft: Optional[str] = None            # DFlash drafter path/id (rel to models_dir or abs)
+    dflash_max_draft: Optional[int] = None  # default DFLASH_MAX_DRAFT
 
 
 @app.get("/admin/clusters/{cluster_id}/load-options")
@@ -12289,11 +12423,102 @@ async def admin_cluster_load(cluster_id: str, req: ArgoLoadRequest):
     base_dir = topo[0].get("models_dir") or models_dir_for(cluster_id)
     model_abspath = _resolve_model_abspath(req.model, base_dir)
 
+    # Model→drafter association (2026-08-06): a model whose drafter is registered
+    # in cluster-config `model_drafters` loads WITH its drafter AUTOMATICALLY — the
+    # drafter is a property of the model, not a per-load UI choice. One dashboard
+    # Load click serves with the drafter: no draft field, no API trick. Handles
+    # BOTH kinds — DSpark spec via `draft_model` (e.g. DSV4-Flash) and dense DFlash
+    # via `dflash`+`draft` (e.g. Gemma). Applied only when the request specified
+    # neither (an explicit choice always wins).
+    if (not req.draft_model and not getattr(req, "dflash", False)
+            and not getattr(req, "draft", None)):
+        _assoc = _drafter_for_model(model_abspath)
+        if _assoc and _assoc.get("dflash") and _assoc.get("draft"):
+            req.dflash = True
+            req.draft = _assoc["draft"]
+            if _assoc.get("num_draft_tokens"):
+                req.dflash_max_draft = int(_assoc["num_draft_tokens"])
+            sys.stderr.write(
+                f"[load] auto-attached DFlash drafter for {req.model} → {req.draft}\n")
+        elif _assoc and _assoc.get("draft_model"):
+            req.draft_model = _assoc["draft_model"]
+            if _assoc.get("num_draft_tokens"):
+                req.num_draft_tokens = int(_assoc["num_draft_tokens"])
+            sys.stderr.write(
+                f"[load] auto-attached drafter for {req.model} → {req.draft_model}\n")
+
     # Mode/architecture preflight: reject combinations the model can't do
     # (tensor on a pipeline-only model_type, KV-heads not divisible by N,
     # pipeline with more nodes than layers) BEFORE spawning runners that would
     # just die at the barrier. Independent of the RAM check below.
     arch = await get_model_arch_meta(rank0_ssh, model_abspath)
+
+    # B1 dflash-dense (2026-08-06). Explicit opt-in, checked BEFORE the is_vision
+    # auto-detect (a gemma-4 text checkpoint may otherwise trip the VL path).
+    # Serve a DENSE target single-node via `mlx-dspark serve --mode dflash` with
+    # a DFlash drafter, registered as a TEXT proxy pool under this cluster
+    # (replaces standalone dspartha; chat routes internally via http-proxy).
+    if getattr(req, "dflash", False):
+        if not getattr(req, "draft", None):
+            raise HTTPException(400, "dflash load requires `draft` (DFlash drafter path/id)")
+        df_index = node_indices[0]
+        df_topo = build_topology_from_indices(cluster_id, [df_index])
+        df_ssh = df_topo[0]["ssh"]
+        df_host = df_topo[0].get("host") or _host_id_from_ssh(df_ssh)
+        df_port = int(getattr(req, "vlm_port", None) or DFLASH_DEFAULT_PORT)
+        df_model_path = _vlm_resolve_model_path(req.model, base_dir)
+        df_drafter_path = _vlm_resolve_model_path(req.draft, base_dir)
+        df_max_draft = int(getattr(req, "dflash_max_draft", None) or DFLASH_MAX_DRAFT)
+        df_ip = _vlm_ip_from_ssh(df_ssh)
+        df_upstream = f"http://{df_ip}:{df_port}"
+        log_id = _dflash_pool_log_id(cluster_id, alias)
+        if await _vlm_probe_ready(df_ip, df_port) is True:
+            raise HTTPException(
+                409,
+                f"{df_ip}:{df_port} already serving — unload the dflash pool first "
+                f"(POST /admin/clusters/{cluster_id}/unload?alias={alias}) or pick another port",
+            )
+        df_size_bytes = await get_model_size_bytes(df_ssh, df_model_path)
+        df_estimated_s = estimate_load_s(req.model, df_size_bytes, cluster_id, 1)
+        df_loading_state = _loading_state_for(cluster_id)
+        _begin_loading(df_loading_state, req.model, 1, df_size_bytes, df_estimated_s)
+        _t_launch = time.time()
+        try:
+            async with get_admin_lock(cluster_id):
+                ready, launched_pid, tail = await _launch_dflash_server(
+                    df_ssh, log_id, df_model_path, df_drafter_path, df_port,
+                    (getattr(req, "venv", None) or VLM_DEFAULT_VENV), df_max_draft,
+                    float(getattr(req, "ready_timeout_s", None) or VLM_READY_TIMEOUT_S),
+                )
+                if not ready:
+                    raise HTTPException(
+                        503,
+                        f"mlx-dspark serve (dflash) did not become ready on "
+                        f"{df_upstream} (node {df_host}). Log tail:\n{tail}",
+                    )
+                dfpool = DFlashPool(
+                    model_path=df_model_path, cluster=cluster_id, alias=alias,
+                    node_indices=[df_index], upstream=df_upstream, port=df_port,
+                    ssh_target=df_ssh, host=df_host, drafter=df_drafter_path,
+                    max_draft=df_max_draft, pid=launched_pid,
+                )
+                dfpool.load_s = time.time() - _t_launch
+                set_pool(cluster_id, alias, dfpool)
+                save_cluster_state_v2(cluster_id)
+        finally:
+            _end_loading(df_loading_state)
+        return {
+            "loaded": True, "cluster": cluster_id, "alias": alias,
+            "is_dflash": True, "dispatched": "dflash-pool",
+            "model": df_model_path, "drafter": df_drafter_path,
+            "upstream": df_upstream, "node": df_host, "node_index": df_index,
+            "pid": launched_pid,
+            "note": (
+                f"{req.model} served single-node by mlx-dspark serve --mode dflash "
+                f"(drafter {req.draft}) on {df_host}, registered as dflash TEXT pool "
+                f"'{alias}' under {cluster_id} (chat routes internally)."
+            ),
+        }
 
     # Argo-VLM fold (2026-07-02). Unified load auto-detect. The distributed
     # text runner can't run a vision model — VL models serve single-node via
@@ -14352,6 +14577,131 @@ async def _restore_vlm_pool(cluster_id: str, alias: str, entry: dict,
         model_path=model_path, cluster=cluster_id, alias=alias,
         node_indices=indices, upstream=upstream, port=port,
         ssh_target=ssh_target, host=host, pid=pid,
+    )
+
+
+# ── B1 dflash-dense managed pool (2026-08-06) ──────────────────────────────────
+# `mlx-dspark serve --mode dflash` is a single-node OpenAI server (like
+# mlx_vlm.server) that runs a DENSE target + a DFlash block-diffusion drafter.
+# These helpers mirror the VLM-fold ones so the engine owns the process
+# lifecycle (replaces standalone dspartha). It lives in the SAME mlx-vlm venv.
+DFLASH_MAX_DRAFT = int(env_get("DFLASH_MAX_DRAFT", "4") or "4")
+DFLASH_DEFAULT_PORT = int(env_get("DFLASH_PORT", "8091") or "8091")
+
+
+def _dflash_launch_cmd(vlm_id: str, venv: str, model_path: str,
+                       drafter_path: str, port: int, max_draft: int) -> str:
+    """nohup `mlx-dspark serve --mode dflash` with a full exported env — mirrors
+    _vlm_launch_cmd. Echoes VLM_PID=$! for the caller to capture."""
+    venv_bin = f"{venv.rstrip('/')}/bin"
+    server_bin = f"{venv_bin}/mlx-dspark"
+    log = _vlm_log_path(vlm_id)
+    return (
+        f"export HOME=/Users/admin USER=admin TMPDIR=/tmp "
+        f"PATH={shlex.quote(venv_bin)}:/usr/bin:/bin:/usr/sbin:/sbin && "
+        f"nohup {shlex.quote(server_bin)} serve "
+        f"--model {shlex.quote(model_path)} "
+        f"--mode dflash --drafter {shlex.quote(drafter_path)} "
+        f"--max-draft {int(max_draft)} "
+        f"--host 0.0.0.0 --port {int(port)} "
+        f"> {log} 2>&1 & "
+        f"echo VLM_PID=$!"
+    )
+
+
+def _dflash_kill_cmd(port: int, model_path: str) -> str:
+    """SIGTERM → grace → SIGKILL of the mlx-dspark serve for THIS port — mirrors
+    _vlm_kill_cmd. Matches `mlx-dspark serve.*--port <port>` (the ` ` after the
+    port token keeps 8091 from matching 80911)."""
+    pattern = shlex.quote(f"mlx-dspark serve.*--port {int(port)}( |$)")
+    return (
+        f"if pgrep -f {pattern} >/dev/null 2>&1; then "
+        f"  pkill -TERM -f {pattern} 2>/dev/null; "
+        f"  for i in $(seq 1 {_SWEEP_GRACE_ITERS}); do "
+        f"    pgrep -f {pattern} >/dev/null 2>&1 || break; "
+        f"    sleep 0.5; "
+        f"  done; "
+        f"  if pgrep -f {pattern} >/dev/null 2>&1; then "
+        f"    pkill -9 -f {pattern}; echo 'killed (SIGKILL)'; "
+        f"  else echo 'cleaned (SIGTERM)'; fi; "
+        f"else echo 'no process'; fi"
+    )
+
+
+def _dflash_pool_log_id(cluster_id: str, alias: str) -> str:
+    """Per-(cluster, alias) log slug for a dflash pool's server, in the same
+    [a-z0-9-] shape _vlm_log_path expects."""
+    raw = f"{cluster_id}-{alias}-dflash"
+    return re.sub(r"[^a-z0-9-]", "-", raw.lower())[:41].strip("-") or "dflash"
+
+
+async def _launch_dflash_server(
+    ssh_target: str, log_id: str, model_path: str, drafter_path: str,
+    port: int, venv: str, max_draft: int, ready_timeout: float,
+) -> tuple[bool, Optional[str], str]:
+    """Launch mlx-dspark serve dflash on a node, poll /v1/models until ready.
+    Mirrors _launch_vlm_server; reuses _vlm_probe_ready + _vlm_log_tail. Returns
+    (ready, launched_pid, log_tail)."""
+    ip = _vlm_ip_from_ssh(ssh_target)
+    launch = _dflash_launch_cmd(log_id, venv, model_path, drafter_path, port, max_draft)
+    launched_pid: Optional[str] = None
+    rc, out, err = await asyncio.to_thread(_ssh_exec, ssh_target, launch, 20)
+    if rc != 0:
+        return False, None, (err or out or "").strip()[-4000:]
+    for line in (out or "").splitlines():
+        if line.startswith("VLM_PID="):
+            launched_pid = line.split("=", 1)[1].strip()
+    deadline = time.time() + ready_timeout
+    while time.time() < deadline:
+        if await _vlm_probe_ready(ip, port) is True:
+            return True, launched_pid, ""
+        await asyncio.sleep(3.0)
+    tail = await _vlm_log_tail(ssh_target, log_id)
+    return False, launched_pid, tail
+
+
+async def _restore_dflash_pool(cluster_id: str, alias: str, entry: dict,
+                               indices: list[int]) -> Optional["DFlashPool"]:
+    """Startup restore for a persisted dflash pool: relaunch mlx-dspark serve on
+    the saved node and rebuild the DFlashPool. Adopt in place if already up.
+    Mirrors _restore_vlm_pool."""
+    model_path = entry["model"]
+    drafter = entry.get("drafter")
+    port = int(entry.get("port") or DFLASH_DEFAULT_PORT)
+    max_draft = int(entry.get("max_draft") or DFLASH_MAX_DRAFT)
+    topo = build_topology_from_indices(cluster_id, indices)
+    ssh_target = entry.get("ssh") or topo[0]["ssh"]
+    host = entry.get("host") or topo[0].get("host") or _host_id_from_ssh(ssh_target)
+    ip = _vlm_ip_from_ssh(ssh_target)
+    upstream = entry.get("upstream") or f"http://{ip}:{port}"
+    pid = None
+    if await _vlm_probe_ready(ip, port) is True:
+        sys.stderr.write(
+            f"[api] dflash pool restore ({cluster_id}:{alias}): {upstream} "
+            f"already serving — adopting in place\n"
+        )
+    else:
+        if not drafter:
+            sys.stderr.write(
+                f"[api] dflash pool restore ({cluster_id}:{alias}) skipped — "
+                f"no drafter persisted\n"
+            )
+            return None
+        ready, pid, tail = await _launch_dflash_server(
+            ssh_target, _dflash_pool_log_id(cluster_id, alias), model_path,
+            drafter, port, VLM_DEFAULT_VENV, max_draft, VLM_READY_TIMEOUT_S,
+        )
+        if not ready:
+            sys.stderr.write(
+                f"[api] dflash pool restore ({cluster_id}:{alias}) failed — "
+                f"server did not become ready. Log tail:\n{tail}\n"
+            )
+            return None
+    return DFlashPool(
+        model_path=model_path, cluster=cluster_id, alias=alias,
+        node_indices=indices, upstream=upstream, port=port,
+        ssh_target=ssh_target, host=host, drafter=drafter,
+        max_draft=max_draft, pid=pid,
     )
 
 
