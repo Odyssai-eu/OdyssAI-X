@@ -4454,6 +4454,87 @@ def _apply_default_ttl_to_pools() -> None:
         pool.ttl_seconds = ttl
 
 
+# Auto-reload self-healing (2026-08-06). A single-node runner dies whenever its
+# holding SSH session drops — a transient node network blip (Power Nap, an
+# interface reset) kills the ssh child, the runner exits, the sweeper purges the
+# pool, and every request then hangs on a dead node until an operator reloads by
+# hand. `.29` dropped the flash-spec runner twice in 12h this way. This makes a
+# liveness-purged pool RELOAD itself from desired-state once the node is back.
+_AUTO_RELOAD_RETRIES: dict = {}     # (cid, alias) -> failed attempts while node WAS up
+_AUTO_RELOAD_MAX = 5
+
+
+async def _node_reachable(ssh_target: str) -> bool:
+    """Quick SSH liveness probe. Distinguishes a still-down node (wait, don't
+    burn a retry) from a node that is back but whose reload failed (real retry)."""
+    def _probe():
+        try:
+            r = subprocess.run(
+                ["ssh", "-o", "ConnectTimeout=4", "-o", "BatchMode=yes",
+                 _safe_ssh_target(ssh_target), "true"],
+                capture_output=True, timeout=8)
+            return r.returncode == 0
+        except Exception:
+            return False
+    return await asyncio.to_thread(_probe)
+
+
+async def _auto_reload_purged(cid: str, purged: list) -> None:
+    """Reload liveness-purged pools from desired-state so they self-recover.
+    Guards: (a) never resurrect an alias the operator explicitly unloaded (gone
+    from desired-state); (b) skip while a node is unreachable — retry next sweep,
+    no retry burned; (c) cap real failures so a permanently-broken node doesn't
+    reload-loop; (d) RunnerPool text pools only (VLM restore lives elsewhere)."""
+    if not purged or cid in _WATCHDOG_RECOVERY_BY_CLUSTER:
+        return
+    try:
+        desired = {e.get("alias"): e for e in load_cluster_state_v2(cid)}
+    except Exception:
+        return
+    cd_nodes = (get_cluster_def(cid) or {}).get("nodes") or []
+    live_aliases = {a for a, _ in list_pools(cid)}
+    for alias in purged:
+        entry = desired.get(alias)
+        if entry is None or alias in live_aliases:
+            continue
+        if entry.get("is_vlm") or entry.get("vlm_distributed"):
+            continue
+        key = (cid, alias)
+        if _AUTO_RELOAD_RETRIES.get(key, 0) >= _AUTO_RELOAD_MAX:
+            continue
+        indices = entry.get("node_indices") or list(range(int(entry.get("nodes") or 1)))
+        ssh_targets = [cd_nodes[i].get("ssh") for i in indices
+                       if 0 <= i < len(cd_nodes) and cd_nodes[i].get("ssh")]
+        reach = [await _node_reachable(s) for s in ssh_targets]
+        if ssh_targets and not all(reach):
+            continue                          # node(s) still down → wait, no retry burned
+        try:
+            async with get_admin_lock(cid):
+                if alias in {a for a, _ in list_pools(cid)}:
+                    _AUTO_RELOAD_RETRIES.pop(key, None)
+                    continue
+                pool = RunnerPool(
+                    model=entry["model"], mode=entry.get("mode", "pipeline"),
+                    use_ap=bool(entry.get("use_ap", True)), nodes_count=len(indices),
+                    cluster=cid, kv_q8=bool(entry.get("kv_q8", False)),
+                    draft_model=entry.get("draft_model"),
+                    num_draft_tokens=int(entry.get("num_draft_tokens") or 4),
+                    mtp=entry.get("mtp"), alias=alias, node_indices=indices,
+                    backend=entry.get("backend"))
+                await pool.start()
+                set_pool(cid, alias, pool)
+            _AUTO_RELOAD_RETRIES.pop(key, None)
+            sys.stderr.write(
+                f"[auto-reload] {cid}[{alias}]: pool self-recovered after runner "
+                f"death (node back up)\n"); sys.stderr.flush()
+        except Exception as e:
+            _AUTO_RELOAD_RETRIES[key] = _AUTO_RELOAD_RETRIES.get(key, 0) + 1
+            sys.stderr.write(
+                f"[auto-reload] {cid}[{alias}] reload failed "
+                f"(retry {_AUTO_RELOAD_RETRIES[key]}/{_AUTO_RELOAD_MAX}): {e}\n")
+            sys.stderr.flush()
+
+
 async def _dead_pool_sweeper() -> None:
     """Every 30s, scan every cluster for pools whose runners have all
     died and drop them. Same purge as the at-load path (#5 issue), just
@@ -4484,6 +4565,9 @@ async def _dead_pool_sweeper() -> None:
                         f"[dead-pool-sweeper] {cid}: purged {len(purged)} "
                         f"dead pool(s): {', '.join(purged)}\n"
                     )
+                    # Self-heal: reload the purged pools from desired-state once
+                    # the node is back (transient drop recovery). See helper.
+                    await _auto_reload_purged(cid, purged)
         except asyncio.CancelledError:
             return
         except Exception as e:
@@ -5035,7 +5119,7 @@ def _initial_default_config() -> Optional[dict]:
 #   major (1.7.2 → 2.0.0) — breaking API or topology change
 #
 # Use `./scripts/bump-version.sh patch|minor|major` to bump + auto-commit.
-APP_VERSION = "1.29.4"
+APP_VERSION = "1.30.0"
 
 app = FastAPI(
     title="OdyssAI-X (odyssai.eu)",
