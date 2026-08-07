@@ -99,6 +99,16 @@ _COLD_AFTER = int(os.environ.get("SPEC_COLD_AFTER", "3"))
 # behavior change for normal chat; only pathological long gens get bounded.
 # 0 disables the window (legacy unbounded behavior).
 _DRAFTER_CTX_WINDOW = int(os.environ.get("SPEC_DRAFTER_CTX_WINDOW", "2048"))
+# Diag mémoire opt-in : log [mem] (active/cache/peak) tous les 500 rounds.
+# Sert à confirmer que le pooled reste borné (cf fix _cache_arrays dans la boucle
+# de décode). OFF par défaut — n'affecte pas le serving.
+_SPEC_MEM_DEBUG = os.environ.get("SPEC_MEM_DEBUG", "0") not in ("0", "", "false")
+# Filet mx.clear_cache() périodique — OFF par défaut. La racine du crash
+# metal::malloc à ~12k tokens était l'accumulation lazy de l'état pooled de
+# PoolingCache (jamais matérialisé dans la boucle), pas le pool de buffers ;
+# corrigée en évaluant *_cache_arrays(cache) chaque round. clear_cache reste
+# dispo comme filet mais inutile avec le vrai fix.
+_CLEAR_CACHE_EVERY = int(os.environ.get("SPEC_CLEAR_CACHE_EVERY", "0")) or 10**9
 _COLD_PROBE = int(os.environ.get("SPEC_COLD_PROBE", "3"))
 
 
@@ -909,7 +919,16 @@ def single_node_spec_stream_generate(
                 drafted_total += len(draft)
                 block = [pending] + draft
                 vlog, vcaps = fwd(mx.array([block], dtype=mx.int32), cache)
-                mx.eval(vlog, *vcaps.values())
+                # Fix 2026-08-06 (racine du crash metal::malloc à ~12k tokens) :
+                # l'etat POOLE de PoolingCache n'est PAS ancetre des logits (cf
+                # _cache_arrays, lecon 1.24.0). Sans le materialiser ici, chaque
+                # round empile un mx.concatenate lazy sur pooled ; la chaine
+                # grossit avec l'offset (active reste plat car lazy != alloue)
+                # puis se materialise d'un coup a haut offset -> pic ~275G >
+                # limite 499G -> runner mort. On force la materialisation de
+                # tout l'etat cache CHAQUE round (borne la chaine a 1 niveau),
+                # meme pattern qu'au snapshot fin-de-prompt.
+                mx.eval(vlog, *vcaps.values(), *_cache_arrays(cache))
                 tt = [int(x) for x in mx.argmax(vlog[0], axis=-1).tolist()]
                 n = 0
                 while n < len(draft) and draft[n] == tt[n]:
@@ -922,6 +941,23 @@ def single_node_spec_stream_generate(
                 R.update_ctx(vfused[:, : n + 1, :], ctx)
                 rounds += 1
                 accepted_total += len(committed)
+                if rounds % _CLEAR_CACHE_EVERY == 0:
+                    try:
+                        mx.clear_cache()
+                    except Exception:
+                        pass
+                if _SPEC_MEM_DEBUG and rounds % 500 == 0:  # diag mémoire opt-in
+                    try:
+                        _cm = getattr(mx, "get_cache_memory", lambda: 0)()
+                        sys.stderr.write(
+                            f"[mem] emit={emitted} "
+                            f"active={mx.get_active_memory()/1e9:.1f}G "
+                            f"cache={_cm/1e9:.1f}G "
+                            f"peak={mx.get_peak_memory()/1e9:.1f}G\n")
+                        sys.stderr.flush()
+                        mx.reset_peak_memory()
+                    except Exception:
+                        pass
                 for tok in committed:
                     emitted += 1
                     finish = "stop" if tok in eos else (
