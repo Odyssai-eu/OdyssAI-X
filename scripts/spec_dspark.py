@@ -80,7 +80,7 @@ OP_RUN, OP_STOP = 0, 1
 # Seuil du confidence-gate P2 (0 = off) : sigmoid de la tete de confiance
 # APPRISE du drafter (DeepSpec) — tronque le draft a la premiere position
 # dont P(accept) < seuil. Prioritaire sur le margin-gate quand la tete existe.
-_CONF_GATE = float(os.environ.get("SPEC_CONF_GATE", "0.7"))
+_CONF_GATE = float(os.environ.get("SPEC_CONF_GATE", "0.6"))
 # Seuil du margin-gate fallback (0 = off). Marge logit top1-top2 :
 # en dessous, le draft est tronque (moins de rejets = moins de recommits).
 _MARGIN_GATE = float(os.environ.get("SPEC_MARGIN_GATE", "1.2"))
@@ -374,9 +374,49 @@ def load_dspark_drafter(drafter_dir: str, target_args, dcfg: dict):
     squelette puis load_weights (evite la chaine dequant FP8/FP4 -- pic RAM +
     dependance pipenetwork -- payee sinon a chaque load)."""
     from dv_d_drafter import V4DSparkDrafter  # rank0 only (arbre de deps)
+    from mlx.utils import tree_flatten
     import json
     drafter = V4DSparkDrafter(target_args, dcfg)
-    if dcfg.get("prequantized"):
+    qcfg = dcfg.get("quantization") or {}
+    per_tensor = {k: v for k, v in qcfg.items() if isinstance(v, dict)}
+    if per_tensor:
+        # Checkpoint PUBLIE par InferencerLabs : deja mlx-quantized per-tensor
+        # (weight uint32 + .scales uint8, mode mxfp8/mxfp4 par tenseur, defaut
+        # affine gs64). Ni le path `prequantized` (nn.quantize UNIFORME Q8) ni
+        # `load_drafter_weights` (dequant FP8/FP4 RAW, format DIFFERENT) ne le
+        # chargent. Ici : nn.quantize per-tensor depuis LEUR dict + remap
+        # blocks.N->layers.N + wo_a flat->grouped. Bind prouve 115/115 (.29).
+        default_gs = int(qcfg.get("group_size", 64))
+        default_bits = int(qcfg.get("bits", 8))
+        o_groups = int(target_args.o_groups)
+
+        def _predicate(path, module):
+            # module tree en layers.N.* ; leur config en blocks.N.*
+            ck = ("blocks." + path[len("layers."):]) if path.startswith("layers.") else path
+            return per_tensor.get(ck, False)
+
+        nn.quantize(drafter, group_size=default_gs, bits=default_bits,
+                    class_predicate=_predicate)
+
+        raw = mx.load(os.path.join(drafter_dir, "model.safetensors"))
+        remapped = {}
+        for k, v in raw.items():
+            # embed.weight/head.weight = ceux du TARGET (le drafter n'a pas
+            # d'embed_tokens, il reutilise celui de la base) -> pas des params.
+            if k in ("embed.weight", "head.weight"):
+                continue
+            nk = k.replace("blocks.", "layers.", 1) if k.startswith("blocks.") else k
+            nk = nk.replace(".ffn.gate.bias", ".ffn.gate.e_score_correction_bias")
+            # wo_a : ckpt FLAT [o_groups*rank, H] -> module GROUPED. Meme 1re
+            # dim factorisee sur weight ET scales/biases.
+            if ".attn.wo_a." in nk and v.ndim == 2 and (
+                nk.endswith(".weight") or nk.endswith(".scales") or nk.endswith(".biases")
+            ):
+                v = v.reshape(o_groups, -1, v.shape[-1])
+            remapped[nk] = v
+        drafter.load_weights(list(remapped.items()), strict=False)
+        mx.eval(drafter.parameters())
+    elif dcfg.get("prequantized"):
         qb = int(dcfg["quantization"]["bits"])
         qg = int(dcfg["quantization"]["group_size"])
         nn.quantize(drafter, group_size=qg, bits=qb)
@@ -819,7 +859,7 @@ def single_node_spec_stream_generate(
     # 12.75 tok/s). The gate truncates uncertain drafts → empty → cold-skip →
     # ~plain floor; the code gain survives. Set SPEC_SINGLE_CONF_GATE=0 to force
     # gate-off for pure-code workloads.
-    R.conf_gate = float(os.environ.get("SPEC_SINGLE_CONF_GATE", "0.7"))
+    R.conf_gate = float(os.environ.get("SPEC_SINGLE_CONF_GATE", "0.6"))
     R.margin_gate = float(os.environ.get("SPEC_SINGLE_MARGIN_GATE", "1.2"))
     embed, lm_head = model.model.embed_tokens, model.lm_head
     eos = set(stop_ids or [])
