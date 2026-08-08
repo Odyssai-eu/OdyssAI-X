@@ -37,7 +37,11 @@ DROP_PREFIXES = ("vision_tower.", "mm_projector.")
 Q_BITS, Q_GROUP = 6, 64          # everything Moonshot left in bf16
 GATE_BITS, GATE_GROUP = 8, 64    # the MoE router stays finer, as in kimi_linear
 MXFP4 = {"group_size": 32, "bits": 4, "mode": "mxfp4"}
-Q3 = {"group_size": 32, "bits": 3, "mode": "affine"}
+# g64, not g32: affine carries fp16 scale+bias PER GROUP, so g32 costs a full
+# extra bit (3+1 = 4.0 bpw) and barely shrinks the model — measured live as
+# 14.2 GiB shards where 12.5 were expected. g64 lands at 3.5 bpw: experts
+# 2.72T x 3.5/8 = 1108 GiB, total ~1151 GiB, ~193 GiB per 256-node rank.
+Q3 = {"group_size": 64, "bits": 3, "mode": "affine"}
 
 # Source config values the loader's maths depends on. A silent change upstream
 # would produce a checkpoint that loads and generates garbage, so assert.
