@@ -1024,7 +1024,7 @@ const state = {
   pending_form: {
     default_model: null, default_mode: "pipeline", default_use_ap: true, default_nodes: 3, default_kv_q8: false,
     default_backend: "",   // "" = cluster default | "jaccl" | "ring" (per-load transport, #40 WU4)
-    default_draft: "", default_num_draft: 4,
+    default_draft: "", default_num_draft: 4, default_dflash: false,
     default_targets: {},
     // Multi-pool "+ Add pool" inline form (2026-05-19). When open=true,
     // shown below the Pools list. default_add_indices is a Set<number>
@@ -4962,6 +4962,25 @@ function renderFormRow2(f, busy, presence, fitCheck) {
             <span class="check-text">Enable MTP</span>
             <span class="check-hint">sidecar present</span>
           </label>` : ""}
+          <label data-act="form-default-dflash" title="DFlash-dense speculative decoding — serve a dense target (e.g. Gemma-4-31B) single-node via mlx-dspark --mode dflash with the DFlash drafter set in Draft. Replaces standalone dspartha.">
+            <div class="box ${f.default_dflash?"on":""}">${f.default_dflash?Icon.check:""}</div>
+            <span class="check-text">dflash</span>
+            <span class="check-hint">dense DSpark · uses Draft</span>
+          </label>
+        </div>
+      </div>
+      <div class="field">
+        <div class="field-label">Draft <span style="font-weight:400;color:var(--ink-3)">— drafter (required for dflash; = DSpark spec draft otherwise)</span></div>
+        <div class="field-shell">
+          <select class="text" data-act="form-default-draft" style="font-family:var(--font-mono);flex:1;border:none;background:transparent;outline:none">
+            <option value="">— none —</option>
+            ${(state.default_models||[]).filter(m => /draft|dspark|dflash|backbone/i.test(m.id)).map(m => {
+              const sel = m.id === f.default_draft ? "selected" : "";
+              const sz = m.size_bytes ? ` — ${(m.size_bytes/1024**3).toFixed(1)} GB` : "";
+              return `<option value="${escapeHtml(m.id)}" ${sel}>${escapeHtml(truncatePath(m.id, 56))}${sz}</option>`;
+            }).join("")}
+          </select>
+          ${Icon.chevDown}
         </div>
       </div>
       <div style="flex:1"></div>
@@ -4991,6 +5010,7 @@ function isLoadConfigChanged(a, f) {
     Boolean(f.default_kv_q8) !== Boolean(a.kv_q8) ||
     Boolean(f.default_mtp) !== Boolean(a.mtp && a.mtp.enabled) ||
     (f.default_draft || "") !== (a.draft_model || "") ||
+    Boolean(f.default_dflash) !== (a.mode === "dflash") ||
     // Transport: "" = cluster default (no change contribution). A concrete
     // pick counts as a change when it differs from the pool's backend — or
     // when the status doesn't expose one (worst case: button enabled).
@@ -6740,6 +6760,8 @@ async function handleAct(e) {
   if (act === "form-default-ap")   { if (e.type==="click") { f.default_use_ap = !f.default_use_ap; render(); } return; }
   if (act === "form-default-kv-q8"){ if (e.type==="click") { f.default_kv_q8 = !f.default_kv_q8; render(); } return; }
   if (act === "form-default-mtp")  { if (e.type==="click") { f.default_mtp = !f.default_mtp; render(); } return; }
+  if (act === "form-default-dflash"){ if (e.type==="click") { f.default_dflash = !f.default_dflash; render(); } return; }
+  if (act === "form-default-draft") { f.default_draft = el.value || ""; if (e.type === "change") render(); return; }
   if (act === "form-default-nodes"){ if (e.type==="click") {
     f.default_nodes = parseInt(v);
     f.default_nodes_user_picked = true;  // respect this choice on next model change
@@ -6804,7 +6826,14 @@ async function handleAct(e) {
     try {
       const body = { model, mode: f.default_mode, use_ap: f.default_use_ap, nodes: f.default_nodes, kv_q8: f.default_kv_q8 };
       if (f.default_backend) body.backend = f.default_backend;  // "" = cluster default
-      if (f.default_draft && f.default_draft.trim()) {
+      if (f.default_dflash) {
+        // dflash-dense (B1): serve a dense target single-node via mlx-dspark
+        // --mode dflash with a DFlash drafter, as a managed TEXT proxy pool.
+        // Uses `draft` + the `dflash` flag (NOT draft_model — that's the
+        // distributed/single-node DSpark spec path).
+        body.dflash = true;
+        if (f.default_draft && f.default_draft.trim()) body.draft = f.default_draft.trim();
+      } else if (f.default_draft && f.default_draft.trim()) {
         body.draft_model = f.default_draft.trim();
         body.num_draft_tokens = f.default_num_draft || 4;
       }
@@ -6821,7 +6850,9 @@ async function handleAct(e) {
       // old `r.load_s.toFixed(1)` crashed on a VL load and mis-reported the
       // (successful) load as failed via the catch below.
       const secs = (typeof r.load_s === "number") ? ` in ${r.load_s.toFixed(1)}s` : "";
-      toast(r.is_vlm
+      toast(r.is_dflash
+        ? `dflash '${r.alias || "dflash"}' loaded on ${r.node || ("node " + (r.node_index ?? 0))}${secs}`
+        : r.is_vlm
         ? `VLM '${r.alias || "vlm"}' loaded on ${r.node || ("node " + (r.node_index ?? 0))}${secs}`
         : `${r.alias || "Default"} · ${r.nodes || "?"}-node loaded${secs}`, "ok");
     } catch(err) { toast("default load failed: " + err.message, "err"); }
