@@ -2759,7 +2759,8 @@ class RunnerPool:
                      session_id: Optional[str] = None,
                      request_id: Optional[str] = None,
                      reasoning_effort: Optional[str] = None,
-                     anti_loop: bool = True) -> AsyncIterator[dict]:
+                     anti_loop: bool = True,
+                     context_limit: Optional[int] = None) -> AsyncIterator[dict]:
         # Concurrent submits are allowed: the runner side handles serialisation
         # (single-rank uses BatchGenerator for true parallelism; multi-rank
         # serialises in the gen loop but tokens are routed by req_id).
@@ -2788,6 +2789,11 @@ class RunnerPool:
         # Anti-loop detect-and-stop (runner-side, default ON). Identical on
         # every rank via the broadcast, so multi-rank pools break in lockstep.
         req["anti_loop"] = bool(anti_loop)
+        # Context-limit: per-request hard cap on prompt + generated tokens
+        # (server-wide default RUNNER_CONTEXT_LIMIT if unset). Runner enforces
+        # per-step and flags `context_limit` on the done event.
+        if context_limit:
+            req["context_limit"] = int(context_limit)
         # reasoning_effort: forwarded as a chat-template kwarg (Step-3.7 reads
         # it). Only set when non-empty so models that don't read it are untouched.
         # Remapped onto the model's accepted vocabulary first (Hy3 release
@@ -4082,6 +4088,10 @@ class ChatCompletionRequest(BaseModel):
     # Anti-loop detect-and-stop (runner-side). Default ON; `false` disables
     # detection for this request (legitimately repetitive output).
     anti_loop: Optional[bool] = None
+    # Context-limit: hard cap on prompt + generated tokens for THIS request,
+    # independent of max_tokens. None → server default (RUNNER_CONTEXT_LIMIT,
+    # off by default). Runner enforces per-step; finish_reason stays "length".
+    context_limit: Optional[int] = None
 
     @model_validator(mode="after")
     def _alias_max_completion_tokens(self) -> "ChatCompletionRequest":
@@ -5241,7 +5251,7 @@ def _initial_default_config() -> Optional[dict]:
 #   major (1.7.2 → 2.0.0) — breaking API or topology change
 #
 # Use `./scripts/bump-version.sh patch|minor|major` to bump + auto-commit.
-APP_VERSION = "1.32.2"
+APP_VERSION = "1.33.0"
 
 app = FastAPI(
     title="OdyssAI-X (odyssai.eu)",
@@ -8729,6 +8739,7 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
         try:
             async for ev in pool.submit(None, req.max_tokens or 512, req.enable_thinking,
                                         anti_loop=(req.anti_loop is not False),
+                                        context_limit=req.context_limit,
                                         messages=messages, tools=req.tools,
                                         session_id=session_id,
                                         request_id=completion_id,
@@ -8876,6 +8887,7 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
             }
             async for ev in pool.submit(None, req.max_tokens or 512, req.enable_thinking,
                                         anti_loop=(req.anti_loop is not False),
+                                        context_limit=req.context_limit,
                                         messages=messages, tools=req.tools,
                                         session_id=session_id,
                                         request_id=completion_id,

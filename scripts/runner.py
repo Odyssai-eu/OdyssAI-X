@@ -530,6 +530,16 @@ ANTI_LOOP_MAX_PERIOD = 64    # longest repeating block considered
 ANTI_LOOP_MIN_REPEATS = 4    # and repeat at least this many times
 ANTI_LOOP_WINDOW = 640       # ids scanned (>= MAX_PERIOD * (MIN_REPEATS + 1))
 
+# ── Context-limit — hard cap on total context (prompt + generated) ──────────
+# Server-wide guard, INDEPENDENT of the client's per-request max_tokens. When
+# prompt + generated tokens reach this cap, the turn ends cleanly with a
+# `context_limit` flag on the done event (finish_reason stays "length" for
+# OpenAI-compat clients). Prevents a runaway generation from saturating the
+# worker / OOMing before max_tokens. 0 = off. Per-request override via the
+# `context_limit` field. Inspired by Inferencer 2.3.1's contextLimit; enforced
+# per-step here, not just at enqueue (a long prefill can already exceed).
+_CONTEXT_LIMIT = int(os.environ.get("RUNNER_CONTEXT_LIMIT", "0"))
+
 
 def _detect_loop(ids: list) -> Optional[tuple]:
     """(period, repeats) when the tail of `ids` is a degenerate loop, else None.
@@ -2277,11 +2287,21 @@ def main() -> None:
     # block-gather (OdyssAI-X#53) assume a SCALAR cache offset (B=1). The
     # BatchGenerator cache exposes a non-scalar offset → `mx.arange(offset+S)`
     # TypeError in MiniMaxM3Model.__call__. B>1 batched M3 is phase-2 scope.
+    # deepseek_v4 (+ dspark) force the legacy single-slot path: its PoolingCache
+    # (compressed-attention pooled KV, variable-length per request) has no
+    # batched merge — mlx_lm's BatchGenerator._merge_caches calls
+    # PoolingCache.merge -> `BatchPoolingCache` which isn't defined, so a plain
+    # (no-drafter) load crashes with NameError at bg.next(). Single-user is the
+    # supported mode; with a DSpark drafter it already takes the legacy path.
+    # Batched pooled cache (B>1 concurrent) is phase-2 scope, like minimax_m3.
+    _mt = (model_config or {}).get("model_type") or ""
     use_batched = (size == 1) and _BATCH_AVAILABLE and (draft_model is None) and (
         spec_dspark_ctx is None                # single-node DSpark spec -> legacy
     ) and (
         os.environ.get("RUNNER_BATCH", "1") == "1"
-    ) and ("minimax-m3" not in repo.lower())
+    ) and ("minimax-m3" not in repo.lower()) and (
+        _mt not in ("deepseek_v4", "deepseek_v4_dspark")
+    )
     if use_batched:
         log("entering batched main loop (BatchGenerator)")
         _run_batched_main(model, tokenizer, repo, kv_q8_default, stop_requested,
@@ -2694,6 +2714,11 @@ def _run_legacy_main(model, tokenizer, repo: str, kv_q8_default: bool,
         cancelled_mid_gen = False
         loop_detected = False
         anti_loop = bool(req.get("anti_loop", True))
+        # Context-limit: per-request override else the server default. Enforced
+        # per-step in the loop below (prompt + generated tokens).
+        context_limit = int(req.get("context_limit", 0) or _CONTEXT_LIMIT)
+        context_limit_hit = False
+        _prompt_n = len(prompt_tokens_full)
         # stream_generate's LAST response carries finish_reason ("stop" on an
         # eos_token_ids hit, "length" on the max_tokens cap). Capture it so the
         # done event can tell the API layer which one it was.
@@ -2726,6 +2751,16 @@ def _run_legacy_main(model, tokenizer, repo: str, kv_q8_default: bool,
                                       "ntoks": ntoks + 1,
                                       "sha": canary_sha.hexdigest()[:16]})
             ntoks += 1
+            # Context-limit: hard cap on prompt + generated. Deterministic on
+            # ntoks so multi-rank pools break in lockstep (same as anti-loop /
+            # _stop_ids). finish_reason stays "length"; the done event carries
+            # the distinct `context_limit` flag.
+            if context_limit and _prompt_n + ntoks >= context_limit:
+                context_limit_hit = True
+                gen_finish = "length"
+                log(f"req {req_id}: context-limit stop "
+                    f"(prompt={_prompt_n} gen={ntoks} limit={context_limit})")
+                break
             if len(buf) >= emit_batch_n:
                 emit(rank, {"event": "token", "id": req_id, "text": "".join(buf)})
                 buf.clear()
@@ -2820,6 +2855,8 @@ def _run_legacy_main(model, tokenizer, repo: str, kv_q8_default: bool,
                 "length" if ntoks >= max_tokens else "stop")
         if loop_detected:
             done_event["loop_detected"] = True
+        if context_limit_hit:
+            done_event["context_limit"] = True
         if tool_calls:
             done_event["tool_calls"] = tool_calls
         if session_id:
