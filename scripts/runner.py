@@ -541,6 +541,42 @@ ANTI_LOOP_WINDOW = 640       # ids scanned (>= MAX_PERIOD * (MIN_REPEATS + 1))
 _CONTEXT_LIMIT = int(os.environ.get("RUNNER_CONTEXT_LIMIT", "0"))
 
 
+# Large-period companion (2026-08-09, MiMo c02): multi-paragraph self-doubt
+# cycles ("Actually, let me reconsider…" + code block — ~450-token period
+# repeated 378× VERBATIM) sit far above ANTI_LOOP_MAX_PERIOD=64, invisible to
+# _detect_loop by construction. Same contract: pure function of token ids →
+# identical verdict on every rank (multi-rank lockstep safe). The anchor trick
+# keeps it cheap: a period-p loop implies ids[-1] == ids[-1-p], so we slice-
+# verify only anchored candidates; checked every 64 tokens, not 16.
+ANTI_LOOP_L_CHECK_EVERY = 64    # tokens between large-period checks
+ANTI_LOOP_L_MAX_PERIOD = 1024   # longest repeating block considered
+ANTI_LOOP_L_MIN_REPEATS = 4     # 4 EXACT reps of a 65+-token block = stuck
+ANTI_LOOP_L_WINDOW = ANTI_LOOP_L_MAX_PERIOD * (ANTI_LOOP_L_MIN_REPEATS + 1)
+
+
+def _detect_loop_large(ids: list) -> Optional[tuple]:
+    """(period, repeats) when the tail loops with period 65..1024 tokens —
+    the multi-paragraph regime _detect_loop cannot see. 4+ exact repetitions
+    of a 65+-token block does not happen in legitimate output (three identical
+    consecutive code stubs is the worst realistic case; four is pathological)."""
+    n = len(ids)
+    if n < (ANTI_LOOP_MAX_PERIOD + 1) * ANTI_LOOP_L_MIN_REPEATS:
+        return None
+    tail = ids[-ANTI_LOOP_L_WINDOW:]
+    n = len(tail)
+    last = tail[-1]
+    for p in range(ANTI_LOOP_MAX_PERIOD + 1, min(ANTI_LOOP_L_MAX_PERIOD, n // 2) + 1):
+        if tail[-1 - p] != last:
+            continue
+        r = 1
+        while (n - (r + 1) * p >= 0
+               and tail[n - (r + 1) * p: n - r * p] == tail[n - r * p: n - (r - 1) * p]):
+            r += 1
+        if r >= ANTI_LOOP_L_MIN_REPEATS:
+            return p, r
+    return None
+
+
 def _detect_loop(ids: list) -> Optional[tuple]:
     """(period, repeats) when the tail of `ids` is a degenerate loop, else None.
 
@@ -2774,6 +2810,8 @@ def _run_legacy_main(model, tokenizer, repo: str, kv_q8_default: bool,
             # construction as the _stop_ids break above).
             if anti_loop and ntoks % ANTI_LOOP_CHECK_EVERY == 0:
                 _hit = _detect_loop(gen_token_ids)
+                if _hit is None and ntoks % ANTI_LOOP_L_CHECK_EVERY == 0:
+                    _hit = _detect_loop_large(gen_token_ids)
                 if _hit:
                     loop_detected = True
                     gen_finish = "stop"
@@ -3279,6 +3317,8 @@ def _run_batched_main(model, tokenizer, repo: str, kv_q8_default: bool,
                 if (s["anti_loop"]
                         and s["ntoks"] % ANTI_LOOP_CHECK_EVERY == 0):
                     _hit = _detect_loop(s["gen_token_ids"])
+                    if _hit is None and s["ntoks"] % ANTI_LOOP_L_CHECK_EVERY == 0:
+                        _hit = _detect_loop_large(s["gen_token_ids"])
                     if _hit:
                         s["loop_detected"] = True
                         log(f"req {s['req_id']}: anti-loop stop "
