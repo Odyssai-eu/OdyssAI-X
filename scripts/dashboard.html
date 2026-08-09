@@ -1025,6 +1025,7 @@ const state = {
     default_model: null, default_mode: "pipeline", default_use_ap: true, default_nodes: 3, default_kv_q8: false,
     default_backend: "",   // "" = cluster default | "jaccl" | "ring" (per-load transport, #40 WU4)
     default_draft: "", default_num_draft: 4, default_dflash: false,
+    default_use_drafter: true,   // toggle: auto-attach du drafter enregistré (model_drafters)
     default_targets: {},
     // Multi-pool "+ Add pool" inline form (2026-05-19). When open=true,
     // shown below the Pools list. default_add_indices is a Set<number>
@@ -4967,6 +4968,11 @@ function renderFormRow2(f, busy, presence, fitCheck) {
             <span class="check-text">dflash</span>
             <span class="check-hint">dense DSpark · uses Draft</span>
           </label>
+          <label data-act="form-default-use-drafter" title="Auto-attach the drafter registered for this model (cluster-config model_drafters). ON = the model loads WITH its registered drafter (spec decoding). OFF = plain load even when a drafter is registered — one click to A/B spec vs plain, no config editing.">
+            <div class="box ${f.default_use_drafter?"on":""}">${f.default_use_drafter?Icon.check:""}</div>
+            <span class="check-text">use drafter</span>
+            <span class="check-hint">auto-attach si enregistré</span>
+          </label>
         </div>
       </div>
       <div class="field">
@@ -6761,6 +6767,7 @@ async function handleAct(e) {
   if (act === "form-default-kv-q8"){ if (e.type==="click") { f.default_kv_q8 = !f.default_kv_q8; render(); } return; }
   if (act === "form-default-mtp")  { if (e.type==="click") { f.default_mtp = !f.default_mtp; render(); } return; }
   if (act === "form-default-dflash"){ if (e.type==="click") { f.default_dflash = !f.default_dflash; render(); } return; }
+  if (act === "form-default-use-drafter"){ if (e.type==="click") { f.default_use_drafter = !f.default_use_drafter; render(); } return; }
   if (act === "form-default-draft") { f.default_draft = el.value || ""; if (e.type === "change") render(); return; }
   if (act === "form-default-nodes"){ if (e.type==="click") {
     f.default_nodes = parseInt(v);
@@ -6826,6 +6833,7 @@ async function handleAct(e) {
     try {
       const body = { model, mode: f.default_mode, use_ap: f.default_use_ap, nodes: f.default_nodes, kv_q8: f.default_kv_q8 };
       if (f.default_backend) body.backend = f.default_backend;  // "" = cluster default
+      body.use_drafter = !!f.default_use_drafter;  // toggle auto-attach model_drafters (explicit bool)
       if (f.default_dflash) {
         // dflash-dense (B1): serve a dense target single-node via mlx-dspark
         // --mode dflash with a DFlash drafter, as a managed TEXT proxy pool.

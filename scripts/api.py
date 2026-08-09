@@ -2899,6 +2899,19 @@ class RunnerPool:
                     ev = await asyncio.wait_for(q.get(), timeout=wait)
                 except asyncio.TimeoutError:
                     if not self._rank0_alive():
+                        # Fix #2 (2026-08-09): a spontaneous rank-0 death
+                        # mid-generation (native ring/JACCL abort, wedge kill)
+                        # previously raised WITHOUT flipping degraded — the
+                        # sweeper then purged and auto-reload resurrected the
+                        # pool onto possibly-poisoned nodes. Mark pool+cluster
+                        # degraded first so the gates catch the cascade; the
+                        # reset ladder / operator clears it after inspection.
+                        self.degraded = True
+                        self.degraded_reason = "rank-0 died mid-generation"
+                        self.degraded_at = time.time()
+                        _mark_cluster_degraded(
+                            self.cluster, "rank-0 died mid-generation",
+                            {"alias": self.alias, "request_id": req_id})
                         raise RuntimeError(
                             "runner died mid-generation "
                             "(no events and rank-0 process is gone)"
@@ -4336,6 +4349,12 @@ _JACCL_ERROR_PATTERNS = (
     "errno=96",
     "ibv_",
     "rdma",
+    # Ring-backend native aborts (2026-08-09, fix #2). When one rank wedges or
+    # dies, its ring peers print this and abort() in C++ — an uncontrolled
+    # transport-level death that must flip the degraded bit exactly like a
+    # JACCL QP failure, so the load gate + auto-reload gate see the cascade.
+    "Too many send/recv errors",
+    "[ring]",
 )
 
 
@@ -4618,6 +4637,17 @@ async def _auto_reload_purged(cid: str, purged: list) -> None:
     no retry burned; (c) cap real failures so a permanently-broken node doesn't
     reload-loop; (d) RunnerPool text pools only (VLM restore lives elsewhere)."""
     if not purged or cid in _WATCHDOG_RECOVERY_BY_CLUSTER:
+        return
+    # Degraded gate (2026-08-09, fix #1 of the cascade review). Without it, a
+    # pool purged BECAUSE the cluster is sick gets reloaded onto the same sick
+    # nodes -> immediate re-wedge -> re-purge -> reload loop (the observed
+    # crash-loop of the macOS 26.5 wedge week). Degraded means "an operator or
+    # the reset ladder must clear first"; the manual-load path already 409s on
+    # it — the self-healing path must respect the same gate.
+    if _cluster_is_degraded(cid):
+        sys.stderr.write(
+            f"[auto-reload] {cid}: cluster degraded — reload of {purged} "
+            f"withheld until reset\n"); sys.stderr.flush()
         return
     try:
         desired = {e.get("alias"): e for e in load_cluster_state_v2(cid)}
@@ -5251,7 +5281,7 @@ def _initial_default_config() -> Optional[dict]:
 #   major (1.7.2 → 2.0.0) — breaking API or topology change
 #
 # Use `./scripts/bump-version.sh patch|minor|major` to bump + auto-commit.
-APP_VERSION = "1.33.0"
+APP_VERSION = "1.34.0"
 
 app = FastAPI(
     title="OdyssAI-X (odyssai.eu)",
@@ -12218,6 +12248,12 @@ class ArgoLoadRequest(BaseModel):
     dflash: bool = False
     draft: Optional[str] = None            # DFlash drafter path/id (rel to models_dir or abs)
     dflash_max_draft: Optional[int] = None  # default DFLASH_MAX_DRAFT
+    # Toggle "use drafter" (2026-08-09). Gates the `model_drafters` auto-attach:
+    # None/True = attach the registered drafter when one exists (historic
+    # behavior); False = load PLAIN even when an association is registered.
+    # The dashboard checkbox sends the explicit bool, so switching between
+    # spec and plain is one click — no more editing cluster-config to disable.
+    use_drafter: Optional[bool] = None
 
 
 @app.get("/admin/clusters/{cluster_id}/load-options")
@@ -12442,7 +12478,8 @@ async def admin_cluster_load(cluster_id: str, req: ArgoLoadRequest):
     # BOTH kinds — DSpark spec via `draft_model` (e.g. DSV4-Flash) and dense DFlash
     # via `dflash`+`draft` (e.g. Gemma). Applied only when the request specified
     # neither (an explicit choice always wins).
-    if (not req.draft_model and not getattr(req, "dflash", False)
+    if (req.use_drafter is not False
+            and not req.draft_model and not getattr(req, "dflash", False)
             and not getattr(req, "draft", None)):
         _assoc = _drafter_for_model(model_abspath)
         if _assoc and _assoc.get("dflash") and _assoc.get("draft"):
