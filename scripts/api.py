@@ -5308,7 +5308,7 @@ def _initial_default_config() -> Optional[dict]:
 #   major (1.7.2 → 2.0.0) — breaking API or topology change
 #
 # Use `./scripts/bump-version.sh patch|minor|major` to bump + auto-commit.
-APP_VERSION = "1.35.0"
+APP_VERSION = "1.35.1"
 
 app = FastAPI(
     title="OdyssAI-X (odyssai.eu)",
@@ -10420,12 +10420,26 @@ _SYNC_MATRIX_TTL_S = 60.0
 
 
 def _ssh_exec(ssh_target: str, cmd: str, timeout: int = 12) -> tuple[int, str, str]:
-    """Shared SSH helper for the matrix endpoint."""
-    p = subprocess.run(
-        ["ssh", "-o", "ConnectTimeout=4", "-o", "BatchMode=yes", _safe_ssh_target(ssh_target), cmd],
-        capture_output=True, text=True, timeout=timeout,
-    )
-    return p.returncode, p.stdout, p.stderr
+    """Shared SSH helper. Hardened 2026-08-09 against a hung remote command —
+    THE root of the recurring "load stuck at 95%, must restart": `ConnectTimeout`
+    bounds only the TCP connect, and `subprocess.run(timeout=)` with
+    `capture_output` can still hang forever in the post-timeout pipe drain when
+    the remote leaves a process holding the pipe. That froze this ssh (called in
+    the load preflight) → the load coroutine + its admin lock never released.
+    Fixes: ServerAlive* makes ssh self-terminate if the node sends nothing for
+    ~15s (silent/hung remote), stdin=DEVNULL stops a grandchild holding stdin,
+    and TimeoutExpired returns a clean 124 verdict instead of propagating."""
+    try:
+        p = subprocess.run(
+            ["ssh", "-o", "ConnectTimeout=4", "-o", "BatchMode=yes",
+             "-o", "ServerAliveInterval=5", "-o", "ServerAliveCountMax=3",
+             _safe_ssh_target(ssh_target), cmd],
+            capture_output=True, text=True, timeout=timeout,
+            stdin=subprocess.DEVNULL,
+        )
+        return p.returncode, p.stdout, p.stderr
+    except subprocess.TimeoutExpired:
+        return 124, "", f"ssh command timeout after {timeout}s to {ssh_target}"
 
 
 async def _probe_host(host: dict) -> dict:
