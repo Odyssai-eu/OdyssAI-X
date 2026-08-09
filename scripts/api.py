@@ -1242,6 +1242,24 @@ def _validate_load_fits(model_size_bytes: int, cluster: str,
 # sections so the UI sees consistent values).
 _nautilus_loading: dict = {"in_progress": False}
 _loading_state: dict[str, dict] = {}
+# Self-heal floor for a leaked loading flag (2026-08-09). A real load runs
+# _end_loading on EVERY exit (success/error/cancel via try/finally), but a
+# request coroutine dropped without its finally (client disconnect mid-load,
+# a uvicorn-config-dependent asyncio path) leaves `in_progress` stuck → the
+# status endpoint shows a phantom "95%" forever and the operator must restart
+# the container. `_loading_snapshot` treats a flag older than
+# max(estimate*MULT, FLOOR) as stale and clears it. Generous so a genuinely
+# slow load (huge model, cold rsync) is never mis-cleared — a real load either
+# completes near its estimate or errors long before this.
+_LOADING_STALE_MIN_S = 120.0      # never clear a flag younger than 2 min (safety)
+_LOADING_STALE_MULT = 5.0         # clear past 5x the estimate (scales with model)
+# Cap on stopping the OLD pool before a hot-swap load. The stop ladder
+# (SIGTERM→grace→SIGKILL→sweep) does SSH calls that can hang if a node is slow/
+# unreachable — and it runs INSIDE the load's admin lock, so a hang there blocks
+# every future load on the cluster (the "must restart the container" symptom).
+# Bound it: on timeout, proceed anyway — the new pool's own orphan sweep reaps
+# any survivors. Worst case is a brief double-set of runners, not a dead cluster.
+_OLD_STOP_TIMEOUT_S = 150.0
 
 
 def _loading_state_for(cluster_id: str) -> dict:
@@ -1274,6 +1292,15 @@ def _loading_snapshot(state: dict) -> Optional[dict]:
         return None
     elapsed = time.time() - state.get("started_at", time.time())
     est = max(state.get("estimated_s") or 1.0, 1.0)
+    # Self-heal a leaked flag: past max(est*MULT, FLOOR) the load's finally never
+    # ran (dropped coroutine) — clear it so the UI stops showing a phantom 95%
+    # and the next load isn't confused. Idempotent, cheap (runs on status polls).
+    if elapsed > max(est * _LOADING_STALE_MULT, _LOADING_STALE_MIN_S):
+        sys.stderr.write(
+            f"[load] stale loading flag for {state.get('model')} "
+            f"(elapsed {elapsed:.0f}s >> est {est:.0f}s) — auto-cleared\n")
+        _end_loading(state)
+        return None
     # Cap at 95 % until completion — last 5 % reserved for the success snap.
     pct = min(95.0, (elapsed / est) * 100.0)
     return {
@@ -5281,7 +5308,7 @@ def _initial_default_config() -> Optional[dict]:
 #   major (1.7.2 → 2.0.0) — breaking API or topology change
 #
 # Use `./scripts/bump-version.sh patch|minor|major` to bump + auto-commit.
-APP_VERSION = "1.34.0"
+APP_VERSION = "1.35.0"
 
 app = FastAPI(
     title="OdyssAI-X (odyssai.eu)",
@@ -12755,7 +12782,12 @@ async def admin_cluster_load(cluster_id: str, req: ArgoLoadRequest):
                 sys.stderr.write(
                     f"[load] {cluster_id}[{alias}]: stopping old pool before starting new\n"
                 )
-                await old.stop()
+                try:
+                    await asyncio.wait_for(old.stop(), timeout=_OLD_STOP_TIMEOUT_S)
+                except asyncio.TimeoutError:
+                    sys.stderr.write(
+                        f"[load] {cluster_id}[{alias}]: old-pool stop timed out after "
+                        f"{_OLD_STOP_TIMEOUT_S:.0f}s — proceeding, orphan sweep will reap\n")
                 old = None
                 del_pool(cluster_id, alias)
             new_pool = RunnerPool(

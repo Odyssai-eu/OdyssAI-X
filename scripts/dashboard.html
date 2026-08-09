@@ -6741,6 +6741,13 @@ async function handleAct(e) {
   if (act === "form-default-model"){
     // Both `change` and `input` fire on <select>; either gives us el.value.
     f.default_model = el.value;
+    // A drafter/dflash choice belongs to the PREVIOUS model — reset it, else a
+    // stale draft_model (e.g. the DeepSeek-V4 DSpark drafter) rides along to a
+    // model that can't use it (Kimi-Linear → V4DSparkDrafter crash, 2026-08-09).
+    // The model_drafters auto-attach (use-drafter toggle) stays the clean path
+    // for models that HAVE a registered drafter.
+    f.default_draft = "";
+    f.default_dflash = false;
     // Pull the authoritative load-options for the newly-picked model.
     fetchLoadOptions(state.selected_cluster, f.default_model);
     // Snap nodes to the smallest topology that fits the new model, but
