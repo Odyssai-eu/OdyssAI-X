@@ -3728,6 +3728,15 @@ _THINK_MARKERS = {
     # The stray <|close|>think<|sep|> lands in reasoning; the trailing envelope
     # tags are removed by _THINK_STRIP.
     "kimi-k3": ("<|open|>think<|sep|>", "<|open|>response<|sep|>"),
+    # Inkling (thinking-machines) envelope, emitted by the model itself:
+    #   <|content_thinking|>REASONING<|end_message|>
+    #   <|message_model|><|content_text|>ANSWER<|end_message|>
+    # Open = the thinking tag; close = the first <|end_message|> (thinking end).
+    # The answer's envelope tags (<|message_model|>/<|content_text|>) + its
+    # trailing <|end_message|> are removed by _THINK_STRIP. The model emits its
+    # OWN open tag (not template-prefilled), so _seed_in_think returns False for
+    # it — otherwise a no-think reply (no thinking block) would ghost.
+    "inkling": ("<|content_thinking|>", "<|end_message|>"),
 }
 
 
@@ -3736,6 +3745,10 @@ _THINK_MARKERS = {
 _THINK_STRIP = {
     "kimi-k3": ("<|close|>response<|sep|>", "<|close|>message<|sep|>",
                 "<|close|>think<|sep|>"),
+    # Inkling answer-envelope tags + any residual thinking tag / trailing
+    # end-message that the (open, close) pair doesn't consume.
+    "inkling": ("<|message_model|>", "<|content_text|>",
+                "<|content_thinking|>", "<|end_message|>"),
 }
 
 
@@ -3766,6 +3779,12 @@ def _seed_in_think(model_id: Optional[str], enable_thinking) -> bool:
     """
     if "minimax-m3" in (model_id or "").lower():
         return enable_thinking is True
+    # Inkling emits its OWN <|content_thinking|> open tag (not template-prefilled),
+    # in both thinking and no-think replies. Seeding True would trap a no-think
+    # answer in reasoning until the trailing <|end_message|> (ghost). Let the
+    # filter catch the literal open tag instead.
+    if "inkling" in (model_id or "").lower():
+        return False
     return True
 
 # Models whose chat_template auto-prefills `<think>\n` at the end of the
@@ -3789,7 +3808,7 @@ def _seed_in_think(model_id: Optional[str], enable_thinking) -> bool:
 # Qwen3.5/3.6 -> goes HERE only, NOT in _MODELS_IGNORE_ENABLE_THINKING_FLAG.
 # Substring "glm-5.2" matches the concrete HF path (kernelpool/GLM-5.2-*, all quants).
 _MODELS_AUTO_OPEN_THINK = ("minimax", "qwen3.5", "qwen3.6", "step-3.7", "step3p7", "glm-5.2",
-                           "kimi-k3")
+                           "kimi-k3", "inkling")
 # Subset of _MODELS_AUTO_OPEN_THINK that IGNORES the `enable_thinking`
 # kwarg and always wraps reasoning in <think>...</think>. Per MiniMax M2
 # docs (2026-05-20 update): "The model's reasoning is wrapped in <think>
@@ -3814,7 +3833,12 @@ _MODELS_IGNORE_ENABLE_THINKING_FLAG = ("minimax-m2", "step-3.7", "step3p7",
                                        # K3 is always-thinking by design (reasoning_effort,
                                        # not enable_thinking) and emits its response envelope
                                        # in every mode — the filter must stay on to strip it.
-                                       "kimi-k3")
+                                       "kimi-k3",
+                                       # Inkling likewise always thinks: verified 2026-08-09
+                                       # that enable_thinking=false STILL emits its
+                                       # <|content_thinking|> envelope, so the filter must stay
+                                       # on in every mode to route it + strip the envelope tags.
+                                       "inkling")
 
 # Models whose chat template reads a `reasoning_effort` system directive
 # (OpenAI o-series convention: minimal/low/medium/high). Step-3.7-Flash is a
@@ -5308,7 +5332,7 @@ def _initial_default_config() -> Optional[dict]:
 #   major (1.7.2 → 2.0.0) — breaking API or topology change
 #
 # Use `./scripts/bump-version.sh patch|minor|major` to bump + auto-commit.
-APP_VERSION = "1.35.1"
+APP_VERSION = "1.36.0"
 
 app = FastAPI(
     title="OdyssAI-X (odyssai.eu)",

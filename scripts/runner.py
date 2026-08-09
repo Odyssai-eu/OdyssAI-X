@@ -2294,13 +2294,17 @@ def main() -> None:
     # (no-drafter) load crashes with NameError at bg.next(). Single-user is the
     # supported mode; with a DSpark drafter it already takes the legacy path.
     # Batched pooled cache (B>1 concurrent) is phase-2 scope, like minimax_m3.
+    # inkling_mm_model shares the constraint: its LayerCache (KVCache + 4 short-
+    # conv ConvCaches per layer) has no batched merge, so BatchGenerator's
+    # _merge_caches raises "does not yet support batching with history". Single-
+    # stream is the supported text-only v1 mode (batched conv-state cache = later).
     _mt = (model_config or {}).get("model_type") or ""
     use_batched = (size == 1) and _BATCH_AVAILABLE and (draft_model is None) and (
         spec_dspark_ctx is None                # single-node DSpark spec -> legacy
     ) and (
         os.environ.get("RUNNER_BATCH", "1") == "1"
     ) and ("minimax-m3" not in repo.lower()) and (
-        _mt not in ("deepseek_v4", "deepseek_v4_dspark")
+        _mt not in ("deepseek_v4", "deepseek_v4_dspark", "inkling_mm_model")
     )
     if use_batched:
         log("entering batched main loop (BatchGenerator)")
