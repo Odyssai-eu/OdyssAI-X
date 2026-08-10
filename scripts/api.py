@@ -1045,9 +1045,26 @@ def _cluster_total_ram_bytes(cluster: str, nodes_count: int) -> tuple[int, list[
             ram = int(h["ram_total_bytes"])
         if h and h.get("wired_limit_mb"):
             wired_limit = int(h["wired_limit_mb"]) * 1024 * 1024
-        # No static RAM map here: hardware belongs in telemetry or
-        # topology/config, not in source. Unknown RAM degrades to a warning
-        # path in _validate_load_fits instead of guessing.
+        # Fallback when telemetry hasn't probed this node yet (e.g. right after
+        # a reboot — the exact window a 2-node K3 load hit on 2026-08-10: no
+        # per-rank RAM → the capacity-aware split silently degraded to an EVEN
+        # split → the 256 GB rank OOM'd at 82% with no traceback). Probe the
+        # node's real iogpu.wired_limit_mb + hw.memsize directly over ssh. Cheap
+        # (once per load), and it's the ACTUAL Metal ceiling the split needs.
+        if (not ram or not wired_limit) and ssh:
+            try:
+                rc, out, _ = _ssh_exec(
+                    ssh, "sysctl -n iogpu.wired_limit_mb hw.memsize", 8)
+                if rc == 0:
+                    parts = (out or "").split()
+                    if len(parts) >= 2:
+                        wl_mb = int(parts[0]); mem = int(parts[1])
+                        if not wired_limit and wl_mb > 0:
+                            wired_limit = wl_mb * 1024 * 1024
+                        if not ram and mem > 0:
+                            ram = mem
+            except Exception:
+                pass
         if not ram:
             ram = 0
         total += ram
@@ -5417,7 +5434,7 @@ def _initial_default_config() -> Optional[dict]:
 #   major (1.7.2 → 2.0.0) — breaking API or topology change
 #
 # Use `./scripts/bump-version.sh patch|minor|major` to bump + auto-commit.
-APP_VERSION = "1.38.0"
+APP_VERSION = "1.38.1"
 
 app = FastAPI(
     title="OdyssAI-X (odyssai.eu)",

@@ -19,7 +19,7 @@
 # Vision (MoonViT-V2) is deliberately out of scope: the converter drops those
 # weights, so nothing here references them.
 
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 from typing import Any, Dict, List, Optional, Tuple
 
 import mlx.core as mx
@@ -77,6 +77,20 @@ class ModelArgs(BaseModelArgs):
     attn_res_block_size: Optional[int] = None
     routed_expert_hidden_size: Optional[int] = None
     latent_moe_use_norm: bool = False
+
+    @classmethod
+    def from_dict(cls, params):
+        # Multimodal-wrapper configs (KimiK3ForConditionalGeneration — the REAP
+        # variants ship one) nest the text params under `text_config`; the
+        # checkpoint itself is text-only (REAP prunes the vision weights, only a
+        # vestigial vision_config remains). Flatten so the text ModelArgs gets its
+        # fields. Original single-config K3 has no text_config → falls through.
+        # `quantization` stays top-level (mlx_lm reads it there for nn.quantize).
+        src = params.get("text_config") or params
+        names = {f.name for f in fields(cls)}
+        kw = {k: v for k, v in src.items() if k in names}
+        kw.setdefault("model_type", params.get("model_type", "kimi_k3"))
+        return cls(**kw)
 
 
 # ── SiTU-GLU ─────────────────────────────────────────────────────────────────
