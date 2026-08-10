@@ -800,6 +800,15 @@ FORCE_NO_AP_MODEL_TYPES = frozenset({
     "deepseek_v4",
 })
 
+# Model types that carry a (vestigial) vision_config but which we serve TEXT-ONLY
+# via our own mlx_lm adapter — they must NOT route to mlx_vlm.server (which has
+# no loader for them). Inkling (thinkingmachines) is a natively-multimodal
+# checkpoint served text-first by scripts/mlx_models/inkling_mm_model.py; the
+# is_vision detection would otherwise send a `default load` (no force=true) into
+# the mlx_vlm.server flow → 503. TEMPORARY: drop the entry once the multimodal
+# InklingPool (vision tower) lands, so images route to that server instead.
+TEXT_ONLY_DESPITE_VISION_CONFIG = frozenset({"inkling_mm_model"})
+
 # Inverse guard: model types whose ONLY working multi-node path is
 # auto_parallel. glm_moe_dsa's DSA patch (Option A) declares Indexer params on
 # every layer, including the `shared` layers whose indexer weights don't exist
@@ -889,8 +898,9 @@ async def get_model_arch_meta(ssh: str, abspath: str) -> dict:
     # distributed text runner (which can't run them).
     _mt = (cfg.get("model_type") or cfg.get("text_config", {}).get("model_type") or "").lower()
     is_vision = bool(
-        "_vl" in _mt or "_vision" in _mt or "vision" in _mt
-        or "vision_config" in cfg or "vision_tower_config" in cfg
+        ("_vl" in _mt or "_vision" in _mt or "vision" in _mt
+         or "vision_config" in cfg or "vision_tower_config" in cfg)
+        and _mt not in TEXT_ONLY_DESPITE_VISION_CONFIG
     )
     return {
         "model_type": cfg.get("model_type"),
@@ -5342,7 +5352,7 @@ def _initial_default_config() -> Optional[dict]:
 #   major (1.7.2 → 2.0.0) — breaking API or topology change
 #
 # Use `./scripts/bump-version.sh patch|minor|major` to bump + auto-commit.
-APP_VERSION = "1.37.0"
+APP_VERSION = "1.37.1"
 
 app = FastAPI(
     title="OdyssAI-X (odyssai.eu)",
@@ -5723,9 +5733,13 @@ def _enrich_caps_from_config(caps: dict, config: dict) -> None:
     caps["family"] = mt or None
 
     # Vision: model_type pattern OR presence of vision_config / image processors.
-    is_vision = ("_vl" in mt or "_vision" in mt or "vision" in mt
+    # Same TEXT_ONLY_DESPITE_VISION_CONFIG carve-out as the load path (inkling
+    # is served text-only for now) so /v1/models doesn't advertise vision it
+    # can't yet do.
+    is_vision = (("_vl" in mt or "_vision" in mt or "vision" in mt
               or "vision_config" in config
               or "vision_tower_config" in config)
+              and mt not in TEXT_ONLY_DESPITE_VISION_CONFIG)
     if is_vision:
         caps["supports_vision"] = True
         caps["modalities"] = sorted(set((caps.get("modalities") or []) + ["text", "image"]))
