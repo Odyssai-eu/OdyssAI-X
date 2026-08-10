@@ -800,14 +800,12 @@ FORCE_NO_AP_MODEL_TYPES = frozenset({
     "deepseek_v4",
 })
 
-# Model types that carry a (vestigial) vision_config but which we serve TEXT-ONLY
-# via our own mlx_lm adapter — they must NOT route to mlx_vlm.server (which has
-# no loader for them). Inkling (thinkingmachines) is a natively-multimodal
-# checkpoint served text-first by scripts/mlx_models/inkling_mm_model.py; the
-# is_vision detection would otherwise send a `default load` (no force=true) into
-# the mlx_vlm.server flow → 503. TEMPORARY: drop the entry once the multimodal
-# InklingPool (vision tower) lands, so images route to that server instead.
-TEXT_ONLY_DESPITE_VISION_CONFIG = frozenset({"inkling_mm_model"})
+# Model types that carry a vision_config but must NOT route to mlx_vlm.server.
+# Inkling was here (text-only 1.37.1) but now routes to its OWN native
+# multimodal server (InklingPool, 1.38.0) inside the is_vision branch — so it
+# STAYS is_vision=True and this carve-out is empty again. Kept as the hook for
+# any future "text-only despite vision_config" model.
+TEXT_ONLY_DESPITE_VISION_CONFIG: frozenset = frozenset()
 
 # Inverse guard: model types whose ONLY working multi-node path is
 # auto_parallel. glm_moe_dsa's DSA patch (Option A) declares Indexer params on
@@ -3372,6 +3370,73 @@ class DFlashPool:
         self.runners.clear()
 
 
+class InklingPool:
+    """A single-node native Inkling server (scripts/inkling_server.py), engine-
+    managed and proxied under a cluster as a MULTIMODAL pool (2026-08-10).
+
+    Inkling (thinkingmachines) can't be served by the distributed text runner
+    (the mlx_lm-adapter path ran <0.2 tok/s — short-conv + custom cache forced
+    through mlx_lm.generate) nor by mlx_vlm.server (no loader for
+    inkling_mm_model). Its own `inkling_mlx` package IS the fast path (native
+    25 tok/s text + working vision tower, validated 2026-08-10). This wraps that
+    package in an OpenAI server we own the lifecycle of — same shape as VLMPool
+    (single-node, chat via http-proxy, unload = kill), `is_vlm=True` so it gets
+    the vision badge + the proxy routing branch."""
+
+    is_vlm = True
+    is_inkling = True
+
+    def __init__(self, model_path: str, cluster: str, alias: str,
+                 node_indices: list[int], upstream: str, port: int,
+                 ssh_target: str, host: str, pid: Optional[str] = None):
+        self.model = model_path
+        self.model_path = model_path
+        self.cluster = cluster
+        self.alias = alias or cluster
+        self.node_indices: Optional[list[int]] = list(node_indices) if node_indices else None
+        self.nodes_count = 1
+        self.mode = "inkling"
+        self.use_ap = False
+        self.kv_q8 = False
+        self.draft_model: Optional[str] = None
+        self.num_draft_tokens = 4
+        self.runners: list = []
+        self.upstream = (upstream or "").rstrip("/")
+        self.port = int(port)
+        self.pid = pid
+        self.ssh_target = ssh_target
+        self.host = host
+        try:
+            self.nodes = build_topology_from_indices(cluster, list(node_indices))
+        except Exception:
+            self.nodes = [{"rank": 0, "ssh": ssh_target, "host": host, "rdma": None}]
+        self.started_at: Optional[float] = time.time()
+        self.load_s: Optional[float] = None
+        self.last_used_at: float = time.time()
+        self.last_token_at: float = time.monotonic()
+        self.ttl_seconds: int = 0
+        self.backend: str = "http-proxy"
+        self.degraded: bool = False
+        self.degraded_reason: Optional[str] = None
+        self.degraded_at: Optional[float] = None
+
+    def alive_count(self) -> int:
+        return 1
+
+    async def stop(self):
+        try:
+            await asyncio.to_thread(
+                _ssh_exec, self.ssh_target,
+                _inkling_kill_cmd(self.port, self.model_path), 30,
+            )
+        except Exception as e:
+            sys.stderr.write(
+                f"[inkling-pool] {self.cluster}[{self.alias}] kill on "
+                f"{self.ssh_target} failed: {e}\n"
+            )
+        self.runners.clear()
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # State + metrics
 # ──────────────────────────────────────────────────────────────────────────────
@@ -5352,7 +5417,7 @@ def _initial_default_config() -> Optional[dict]:
 #   major (1.7.2 → 2.0.0) — breaking API or topology change
 #
 # Use `./scripts/bump-version.sh patch|minor|major` to bump + auto-commit.
-APP_VERSION = "1.37.1"
+APP_VERSION = "1.38.0"
 
 app = FastAPI(
     title="OdyssAI-X (odyssai.eu)",
@@ -12671,6 +12736,66 @@ async def admin_cluster_load(cluster_id: str, req: ArgoLoadRequest):
     # attempt a (doomed) text load anyway. Multi-node VL requests collapse to
     # a single node (the first requested index, else index 0 = master).
     if arch.get("is_vision") and not getattr(req, "force", False):
+        # Inkling (inkling_mm_model): OUR native multimodal server, not
+        # mlx_vlm.server (no loader) nor the slow mlx_lm text adapter. Native
+        # inkling_mlx: 25 tok/s text + working vision tower (validated 2026-08-10).
+        if (arch.get("model_type") or "").lower() == "inkling_mm_model":
+            ink_index = node_indices[0]
+            ink_topo = build_topology_from_indices(cluster_id, [ink_index])
+            ink_ssh = ink_topo[0]["ssh"]
+            ink_host = ink_topo[0].get("host") or _host_id_from_ssh(ink_ssh)
+            ink_port = int(getattr(req, "vlm_port", None) or INKLING_DEFAULT_PORT)
+            ink_model_path = _vlm_resolve_model_path(req.model, base_dir)
+            ink_ip = _vlm_ip_from_ssh(ink_ssh)
+            ink_upstream = f"http://{ink_ip}:{ink_port}"
+            log_id = _inkling_pool_log_id(cluster_id, alias)
+            ink_size = await get_model_size_bytes(ink_ssh, ink_model_path)
+            ink_est = estimate_load_s(req.model, ink_size, cluster_id, 1)
+            ink_state = _loading_state_for(cluster_id)
+            _begin_loading(ink_state, req.model, 1, ink_size, ink_est)
+            _t_ink = time.time()
+            pid = None
+            try:
+                async with get_admin_lock(cluster_id):
+                    if await _vlm_probe_ready(ink_ip, ink_port) is not True:
+                        ready, pid, tail = await _launch_inkling_server(
+                            ink_ssh, log_id, ink_model_path, ink_port,
+                            (getattr(req, "venv", None) or VLM_DEFAULT_VENV),
+                            float(getattr(req, "ready_timeout_s", None) or VLM_READY_TIMEOUT_S),
+                        )
+                        if not ready:
+                            raise HTTPException(
+                                503,
+                                f"inkling_server did not become ready on {ink_upstream} "
+                                f"(node {ink_host}). Log tail:\n{tail}",
+                            )
+                    old = get_pool(cluster_id, alias)
+                    if old is not None:
+                        try:
+                            await old.stop()
+                        except Exception:
+                            pass
+                    ipool = InklingPool(
+                        model_path=ink_model_path, cluster=cluster_id, alias=alias,
+                        node_indices=[ink_index], upstream=ink_upstream, port=ink_port,
+                        ssh_target=ink_ssh, host=ink_host, pid=pid,
+                    )
+                    ipool.load_s = time.time() - _t_ink
+                    set_pool(cluster_id, alias, ipool)
+                    save_cluster_state_v2(cluster_id)
+            finally:
+                _end_loading(ink_state)
+            return {
+                "loaded": True, "cluster": cluster_id, "alias": alias,
+                "is_vlm": True, "is_inkling": True, "dispatched": "inkling-pool",
+                "model": ink_model_path, "upstream": ink_upstream,
+                "node": ink_host, "node_index": ink_index, "pid": pid,
+                "note": (
+                    f"{req.model} served MULTIMODAL by native inkling_server on "
+                    f"{ink_host} (25 tok/s text + vision), registered as pool "
+                    f"'{alias}' under {cluster_id} (chat routes internally)."
+                ),
+            }
         # Distributed VL path (feature-flagged). With VLM_DISTRIBUTED_ENABLED
         # and an explicit multi-node request, spawn tensor-parallel
         # vlm_runner.py ranks over ring/TCP instead of clamping to one node.
@@ -13123,7 +13248,14 @@ async def _telemak_proxy_chat_completion(
                 msg = choice.get("message") or {}
                 raw = msg.get("content") or ""
                 _om, _cm = _model_think_markers(upstream_model)
-                state = {"in_think": not raw.lstrip().startswith(_om),
+                # Seed in_think only when the model auto-opens AND the raw output
+                # doesn't already start with its own open tag. `_seed_in_think`
+                # is False for models that emit their own open (inkling, whose
+                # no-think reply starts with the DIFFERENT `<|content_text|>`
+                # envelope tag → the old `not startswith(open)` heuristic alone
+                # wrongly seeded True and trapped the whole answer in reasoning).
+                state = {"in_think": (_seed_in_think(upstream_model, body.get("enable_thinking"))
+                                      and not raw.lstrip().startswith(_om)),
                          "carry": "", "open": _om, "close": _cm,
                          "strip": _model_think_strips(upstream_model)}
                 vis, reas = _split_think_stream(raw, state)
@@ -13383,7 +13515,14 @@ async def _vlm_pool_proxy_chat_completion(pool, body: dict, stream: bool):
                 msg = choice.get("message") or {}
                 raw = msg.get("content") or ""
                 _om, _cm = _model_think_markers(upstream_model)
-                state = {"in_think": not raw.lstrip().startswith(_om),
+                # Seed in_think only when the model auto-opens AND the raw output
+                # doesn't already start with its own open tag. `_seed_in_think`
+                # is False for models that emit their own open (inkling, whose
+                # no-think reply starts with the DIFFERENT `<|content_text|>`
+                # envelope tag → the old `not startswith(open)` heuristic alone
+                # wrongly seeded True and trapped the whole answer in reasoning).
+                state = {"in_think": (_seed_in_think(upstream_model, body.get("enable_thinking"))
+                                      and not raw.lstrip().startswith(_om)),
                          "carry": "", "open": _om, "close": _cm,
                          "strip": _model_think_strips(upstream_model)}
                 vis, reas = _split_think_stream(raw, state)
@@ -14778,6 +14917,82 @@ def _dflash_pool_log_id(cluster_id: str, alias: str) -> str:
     [a-z0-9-] shape _vlm_log_path expects."""
     raw = f"{cluster_id}-{alias}-dflash"
     return re.sub(r"[^a-z0-9-]", "-", raw.lower())[:41].strip("-") or "dflash"
+
+
+# ── Inkling native multimodal server (2026-08-10) ─────────────────────────────
+# scripts/inkling_server.py wraps pipenetwork's `inkling_mlx` package (its HF
+# card's prescribed path) as an OpenAI server. Deployed on each serving node at
+# ~/mlx-cluster/inkling_server.py; runs in the SAME mlx-vlm venv (has fastapi/
+# uvicorn/scipy/PIL). Engine owns the lifecycle exactly like dflash/vlm.
+INKLING_DEFAULT_PORT = int(env_get("INKLING_PORT", "8080") or "8080")
+INKLING_SERVER_REMOTE = env_get("INKLING_SERVER_REMOTE",
+                                "/Users/admin/mlx-cluster/inkling_server.py")
+INKLING_WIRED_LIMIT_GB = float(env_get("INKLING_WIRED_LIMIT_GB", "460") or "460")
+
+
+def _inkling_launch_cmd(vlm_id: str, venv: str, model_path: str, port: int) -> str:
+    """nohup the native inkling_server.py with the mlx-vlm venv python. Echoes
+    VLM_PID=$! for the caller to capture (reuses the VLM launch/probe helpers)."""
+    venv_bin = f"{venv.rstrip('/')}/bin"
+    py = f"{venv_bin}/python"
+    log = _vlm_log_path(vlm_id)
+    return (
+        f"export HOME=/Users/admin USER=admin TMPDIR=/tmp "
+        f"PATH={shlex.quote(venv_bin)}:/usr/bin:/bin:/usr/sbin:/sbin && "
+        f"nohup {shlex.quote(py)} {shlex.quote(INKLING_SERVER_REMOTE)} "
+        f"--model {shlex.quote(model_path)} "
+        f"--host 0.0.0.0 --port {int(port)} "
+        f"--wired-limit-gb {INKLING_WIRED_LIMIT_GB} "
+        f"> {log} 2>&1 & "
+        f"echo VLM_PID=$!"
+    )
+
+
+def _inkling_kill_cmd(port: int, model_path: str) -> str:
+    """SIGTERM → grace → SIGKILL of inkling_server.py for THIS port — mirrors
+    _dflash_kill_cmd so Metal wired pages release."""
+    pattern = shlex.quote(f"inkling_server.py.*--port {int(port)}( |$)")
+    return (
+        f"if pgrep -f {pattern} >/dev/null 2>&1; then "
+        f"  pkill -TERM -f {pattern} 2>/dev/null; "
+        f"  for i in $(seq 1 {_SWEEP_GRACE_ITERS}); do "
+        f"    pgrep -f {pattern} >/dev/null 2>&1 || break; "
+        f"    sleep 0.5; "
+        f"  done; "
+        f"  if pgrep -f {pattern} >/dev/null 2>&1; then "
+        f"    pkill -9 -f {pattern}; echo 'killed (SIGKILL)'; "
+        f"  else echo 'cleaned (SIGTERM)'; fi; "
+        f"else echo 'no process'; fi"
+    )
+
+
+def _inkling_pool_log_id(cluster_id: str, alias: str) -> str:
+    raw = f"{cluster_id}-{alias}-inkling"
+    return re.sub(r"[^a-z0-9-]", "-", raw.lower())[:41].strip("-") or "inkling"
+
+
+async def _launch_inkling_server(
+    ssh_target: str, log_id: str, model_path: str, port: int,
+    venv: str, ready_timeout: float,
+) -> tuple[bool, Optional[str], str]:
+    """Launch inkling_server.py on a node, poll /v1/models until ready. Mirrors
+    _launch_dflash_server; reuses _vlm_probe_ready + _vlm_log_tail."""
+    ip = _vlm_ip_from_ssh(ssh_target)
+    launch = _inkling_launch_cmd(log_id, venv, model_path, port)
+    launched_pid: Optional[str] = None
+    rc, out, err = await asyncio.to_thread(_ssh_exec, ssh_target, launch, 20)
+    if rc != 0:
+        return False, None, (err or out or "").strip()[-4000:]
+    for line in (out or "").splitlines():
+        if line.startswith("VLM_PID="):
+            launched_pid = line.split("=", 1)[1].strip()
+    deadline = time.time() + ready_timeout
+    while time.time() < deadline:
+        if await _vlm_probe_ready(ip, port) is True:
+            return True, launched_pid, ""
+        await asyncio.sleep(3.0)
+    tail = await _vlm_log_tail(ssh_target, log_id)
+    return False, launched_pid, tail
 
 
 async def _launch_dflash_server(
