@@ -1844,6 +1844,22 @@ _HY3_ARG_PAIR = re.compile(
     re.DOTALL,
 )
 
+# LongCat format: <longcat_tool_call>NAME\n<longcat_arg_key>K</longcat_arg_key>
+# <longcat_arg_value>V</longcat_arg_value>…</longcat_tool_call>
+# Observed on meituan-longcat/LongCat-Flash-Lite. The name is the first line
+# (before any newline or tag); args are interleaved key/value pairs. Mirrors
+# the model's own parse_model_response.py: value = json.loads() when decodable
+# (numbers/bools/objects), else the raw string.
+_TOOL_CALL_LONGCAT = re.compile(
+    r"<longcat_tool_call>\s*(.*?)\s*</longcat_tool_call>", re.DOTALL,
+)
+_LONGCAT_NAME = re.compile(r"([^\n<]+)")
+_LONGCAT_ARG_PAIR = re.compile(
+    r"<longcat_arg_key>\s*(.*?)\s*</longcat_arg_key>\s*"
+    r"<longcat_arg_value>\s*(.*?)\s*</longcat_arg_value>",
+    re.DOTALL,
+)
+
 
 def parse_tool_calls(text: str) -> tuple[list[dict], str]:
     """Extract OpenAI-shaped tool_calls from a generated string.
@@ -1852,6 +1868,8 @@ def parse_tool_calls(text: str) -> tuple[list[dict], str]:
       - Hermes JSON (Qwen3, GLM-4): `<tool_call>{"name":..,"arguments":..}</tool_call>`
       - Hermes JSON list: `<tool_calls>[ {…}, … ]</tool_calls>`
       - Qwen3-Coder XML: `<tool_call><function=NAME><parameter=KEY>VAL</parameter>…</function></tool_call>`
+      - Hy3 XML: `<tool_call>NAME<tool_sep><arg_key>K</arg_key><arg_value>V</arg_value>…</tool_call>`
+      - LongCat: `<longcat_tool_call>NAME<longcat_arg_key>K</longcat_arg_key><longcat_arg_value>V</longcat_arg_value>…</longcat_tool_call>`
 
     Returns (tool_calls, content_without_calls). Each call:
       `{"id": "call_xxx", "type": "function", "function": {"name", "arguments"}}`.
@@ -1920,6 +1938,25 @@ def parse_tool_calls(text: str) -> tuple[list[dict], str]:
         body = m.group(2)
         args: dict = {}
         for pm in _HY3_ARG_PAIR.finditer(body):
+            key = pm.group(1).strip()
+            raw = pm.group(2).strip()
+            try:
+                args[key] = json.loads(raw)
+            except Exception:
+                args[key] = raw
+        add_call(name, args)
+        cleaned = cleaned.replace(m.group(0), "")
+
+    # Pass 5: LongCat format (`<longcat_tool_call>NAME<longcat_arg_key>…</…>`)
+    # Name is the first line; args are <longcat_arg_key>/<longcat_arg_value> pairs.
+    for m in _TOOL_CALL_LONGCAT.finditer(text):
+        body = m.group(1)
+        name_m = _LONGCAT_NAME.match(body.strip())
+        if not name_m:
+            continue
+        name = name_m.group(1).strip()
+        args: dict = {}
+        for pm in _LONGCAT_ARG_PAIR.finditer(body):
             key = pm.group(1).strip()
             raw = pm.group(2).strip()
             try:
