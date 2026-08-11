@@ -5434,7 +5434,7 @@ def _initial_default_config() -> Optional[dict]:
 #   major (1.7.2 → 2.0.0) — breaking API or topology change
 #
 # Use `./scripts/bump-version.sh patch|minor|major` to bump + auto-commit.
-APP_VERSION = "1.38.1"
+APP_VERSION = "1.38.2"
 
 app = FastAPI(
     title="OdyssAI-X (odyssai.eu)",
@@ -8752,13 +8752,16 @@ async def coeos_resolve(req, request) -> tuple:
 _TOOL_BLOCK_RE = [
     re.compile(r"<tool_call>.*?</tool_call>", re.DOTALL),
     re.compile(r"<tool_calls>.*?</tool_calls>", re.DOTALL),
+    # LongCat native format (meituan-longcat/LongCat-Flash-Lite) — parsed into
+    # structured tool_calls by runner.parse_tool_calls; strip from content too.
+    re.compile(r"<longcat_tool_call>.*?</longcat_tool_call>", re.DOTALL),
 ]
 
 
 def _strip_tool_calls_from_text(text: str) -> str:
     """Remove `<tool_call>...</tool_call>` (and `<tool_calls>...`) blocks from
     the user-visible content, since we surface them as structured `tool_calls`.
-    Handles both Hermes JSON and Qwen3-Coder XML inner forms.
+    Handles Hermes JSON, Qwen3-Coder XML, Hy3 XML and LongCat inner forms.
     """
     out = text
     for pat in _TOOL_BLOCK_RE:
