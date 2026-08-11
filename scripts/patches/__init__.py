@@ -1,4 +1,5 @@
 from .bailing_hybrid_alias import apply_bailing_hybrid
+from .g9v3_alias import apply_g9v3
 from .glm_moe_dsa_model import apply_glm_dsa
 from .longcat2_pipeline import apply_longcat2_pipeline
 from .minimax_m3_alias import apply_minimax_m3
@@ -24,5 +25,6 @@ def apply_mlx_patches() -> None:
     apply_mimo_v2_alias()
     apply_bailing_hybrid()
     apply_minimax_m3()
+    apply_g9v3()
     apply_glm_dsa()
     apply_longcat2_pipeline()
