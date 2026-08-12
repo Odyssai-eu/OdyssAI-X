@@ -1053,10 +1053,10 @@ def _cluster_total_ram_bytes(cluster: str, nodes_count: int) -> tuple[int, list[
         # (once per load), and it's the ACTUAL Metal ceiling the split needs.
         if (not ram or not wired_limit) and ssh:
             try:
-                rc, out, _ = _ssh_exec(
+                rc, probe_out, _ = _ssh_exec(
                     ssh, "sysctl -n iogpu.wired_limit_mb hw.memsize", 8)
                 if rc == 0:
-                    parts = (out or "").split()
+                    parts = (probe_out or "").split()
                     if len(parts) >= 2:
                         wl_mb = int(parts[0]); mem = int(parts[1])
                         if not wired_limit and wl_mb > 0:
