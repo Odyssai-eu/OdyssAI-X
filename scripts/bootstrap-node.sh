@@ -74,6 +74,18 @@ echo "[1/5] Checking SSH + Python on $NODE…"
 # still verified; only UNKNOWN hosts are added.
 SSH_OPTS="-o BatchMode=yes -o StrictHostKeyChecking=accept-new"
 
+# Resolve REMOTE_DIR to an ABSOLUTE remote path up front. It may carry a
+# literal `$HOME` (the default) which the remote SHELL expands fine inside
+# an ssh command — but `scp`/SFTP does NOT run a shell, so a `$HOME/...`
+# destination lands as a literal directory and every sync fails with
+# "No such file or directory". Expand it once on the node so both the
+# ssh heredocs and the scp destinations use a real path.
+REMOTE_DIR="$(ssh $SSH_OPTS "$NODE" "eval echo \"$REMOTE_DIR\"")"
+if [ -z "$REMOTE_DIR" ]; then
+  echo "ERROR: could not resolve remote cluster dir on $NODE" >&2
+  exit 1
+fi
+
 ssh $SSH_OPTS "$NODE" "
   set -e
   hostname
