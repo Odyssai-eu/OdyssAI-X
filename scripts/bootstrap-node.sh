@@ -137,11 +137,23 @@ echo "[4/5] Installing custom model modules on $NODE…"
 "$REPO_ROOT/scripts/install-model-modules.sh" "$NODE"
 
 # 5. Smoke test
-echo "[5/5] Smoke test on $NODE…"
+echo "[5/6] Smoke test on $NODE…"
 ssh $SSH_OPTS "$NODE" "
   cd $REMOTE_DIR
   ./.venv/bin/python -c 'import mlx.core; import mlx_lm; print(\"OK\", mlx.core.__version__, mlx_lm.__version__)'
 "
+
+# 6. VLM serving venv (mlx-vlm at ~/.venvs/mlx-vlm) so this node can serve
+# vision_config models via mlx_vlm.server. Optional-but-default: a node WITHOUT
+# it silently fails every VLM load — "mlx_vlm.server: No such file or directory",
+# the dashboard load sticks at 95% (hit on ultra-96b/ultra-96, 2026-08-12).
+# install-mlx-vlm.sh requires python3.12; ensure it first. Best-effort — LM
+# serving already works, so a VLM-install failure warns instead of aborting.
+echo "[6/6] Installing mlx-vlm VLM venv on $NODE…"
+ssh $SSH_OPTS "$NODE" "command -v python3.12 >/dev/null 2>&1 || [ -x /opt/homebrew/bin/python3.12 ] || (export PATH=/opt/homebrew/bin:\$PATH; brew install -q python@3.12)" || true
+if ! "$REPO_ROOT/scripts/install-mlx-vlm.sh" "$NODE"; then
+  echo "  ⚠ mlx-vlm install failed on $NODE — LM serving works, but VLM (vision_config) models will not load until it's fixed." >&2
+fi
 
 echo
 echo "✓ $NODE bootstrapped."
