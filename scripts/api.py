@@ -10029,6 +10029,11 @@ class LoadRequest(BaseModel):
     # "depth": int, "sidecar": str?, "hidden_source": "post_norm"|"pre_norm",
     # "quantize": bool}. Default None = pure AR, zero behavior change.
     mtp: Optional[dict] = None
+    # Bypass is_vision routing and load through the text path anyway
+    # (e.g. a vision_config checkpoint whose quant scheme the node's
+    # mlx-vlm can't apply, served text-only). The load handler already
+    # reads this via getattr — the field was simply missing here.
+    force: bool = False
     # Hot-swap: when False (default since 2026-05-18 audit), the old pool
     # is stopped BEFORE the new one starts — no double-allocation in RAM.
     # Set True to overlap the load with the old serving (faster cutover,
