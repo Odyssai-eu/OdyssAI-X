@@ -11830,6 +11830,103 @@ async def admin_cluster_get(cluster_id: str):
     }
 
 
+async def _read_raw_config(ssh: str, abspath: str) -> dict:
+    """Raw config.json of a model dir (preflight needs the full dict — quant,
+    vision_config — not just get_model_arch_meta's distilled fields)."""
+    cmd = f"cat {shlex.quote(abspath.rstrip('/') + '/config.json')} 2>/dev/null"
+    try:
+        out = await asyncio.to_thread(
+            subprocess.run,
+            ["ssh", "-o", "ConnectTimeout=5", "-o", "BatchMode=yes", ssh, cmd],
+            capture_output=True, text=True, timeout=15)
+        cfg = json.loads(out.stdout or "{}")
+        return cfg if isinstance(cfg, dict) else {}
+    except Exception:
+        return {}
+
+
+async def _vlm_venv_present(ssh: str) -> bool:
+    """Does the node carry the mlx-vlm serving venv? Its absence is why a
+    vision load silently sticks at 95% (mlx_vlm.server: No such file)."""
+    binp = f"{VLM_DEFAULT_VENV}/bin/mlx_vlm.server"
+    cmd = f"test -x {shlex.quote(binp)} && echo yes || echo no"
+    try:
+        out = await asyncio.to_thread(
+            subprocess.run,
+            ["ssh", "-o", "ConnectTimeout=5", "-o", "BatchMode=yes", ssh, cmd],
+            capture_output=True, text=True, timeout=10)
+        return (out.stdout or "").strip() == "yes"
+    except Exception:
+        return False
+
+
+async def _coresidence_free_by_index(cluster_id: str, per_node: list[dict],
+                                     rank0_ssh: str, base_dir: str) -> dict:
+    """Free wired bytes per node index = ceiling − what loaded pools already
+    hold on that node. This is what makes "add a second pool" honest: the
+    planner picks a node with room (or refuses) instead of the silent 409.
+    A pool's footprint = its model size (du) split across its ranks."""
+    free = {}
+    for i, nd in enumerate(per_node):
+        free[i] = int(nd.get("wired_limit_bytes") or (nd.get("ram_bytes", 0) * 0.75))
+    for _alias, pool in list_pools(cluster_id):
+        ranks = (getattr(pool, "node_indices", None)
+                 or list(range(len(getattr(pool, "nodes", []) or [0]))))
+        mp = getattr(pool, "model", None)
+        if not mp or not ranks:
+            continue
+        try:
+            sz = await get_model_size_bytes(rank0_ssh, _resolve_model_abspath(mp, base_dir))
+        except Exception:
+            sz = 0
+        if not sz:
+            continue
+        per_rank = int(sz * 1.10 / max(len(ranks), 1))   # +activations headroom
+        for r in ranks:
+            if r in free:
+                free[r] = max(0, free[r] - per_rank)
+    return free
+
+
+async def _gather_preflight(cluster_id: str, model: str,
+                            draft: Optional[str] = None) -> dict:
+    """Gather the facts + run the pure evaluator. Read-only, no GPU."""
+    import preflight
+    detail = await admin_cluster_get(cluster_id)
+    cap = detail.get("capacity_by_nodes", {})
+    max_nodes = int(detail.get("max_nodes", 1) or 1)
+    per_node = (cap.get(str(max_nodes)) or {}).get("per_node") or []
+    base_dir = models_dir_for(cluster_id)
+    rank0 = rank0_ssh_for_cluster(cluster_id, 1)
+    abspath = _resolve_model_abspath(model, base_dir)
+    cfg = await _read_raw_config(rank0, abspath)
+    size = await get_model_size_bytes(rank0, abspath)
+    is_vision = bool(cfg.get("vision_config") or "vision" in (cfg.get("model_type") or "").lower())
+    vlm_present = await _vlm_venv_present(rank0) if is_vision else None
+    draft_cfg = draft_size = None
+    if draft:
+        d_abs = _resolve_model_abspath(draft, base_dir)
+        draft_cfg = await _read_raw_config(rank0, d_abs)
+        draft_size = await get_model_size_bytes(rank0, d_abs)
+    free_by_index = await _coresidence_free_by_index(cluster_id, per_node, rank0, base_dir)
+    return preflight.evaluate(
+        config=cfg, size_bytes=size, capacity_by_nodes=cap, max_nodes=max_nodes,
+        per_node=per_node, free_by_index=free_by_index,
+        vlm_venv_present=vlm_present,
+        draft_config=draft_cfg, draft_size_bytes=draft_size or 0)
+
+
+@app.get("/admin/clusters/{cluster_id}/preflight")
+async def admin_cluster_preflight(cluster_id: str, model: str,
+                                  draft: Optional[str] = None):
+    """Pro-loader pre-flight: verdict + node plan BEFORE loading. Read-only.
+    The dashboard calls this on model pick to auto-select nodes + show the
+    verdict; admin_cluster_load calls the same evaluator as a gate."""
+    if not cluster_exists(cluster_id):
+        raise HTTPException(404, f"unknown cluster {cluster_id}")
+    return await _gather_preflight(cluster_id, model, draft)
+
+
 @app.put("/admin/clusters/{cluster_id}")
 async def admin_cluster_update(cluster_id: str, req: ClusterConfigUpdate):
     """Update editable cluster settings.
@@ -12527,6 +12624,27 @@ async def admin_cluster_load(cluster_id: str, req: ArgoLoadRequest):
     if cd.get("kind") == "telemak":
         await _telemak_reconcile_models_dir(cluster_id, cd)
         return await _telemak_proxy_load(cluster_id, cd, req)
+    # ── Pre-flight gate (pro loader) ──────────────────────────────────────
+    # Evaluate size / format / support / vision-venv / capacity BEFORE
+    # committing — refuse a load that will 100% fail (model absent from the
+    # node, won't fit any topology, VLM venv missing → the stuck-at-95%) instead
+    # of grinding for minutes then dying. Read-only, ~1s. force=true bypasses.
+    # Fail-OPEN: any error in the evaluator must never block a real load.
+    if not getattr(req, "force", False):
+        try:
+            _pf = await _gather_preflight(cluster_id, req.model,
+                                          getattr(req, "draft_model", None))
+        except Exception:
+            _pf = None
+        if _pf and not _pf.get("ok"):
+            raise HTTPException(422, {
+                "error": "preflight_refused",
+                "summary": _pf.get("summary"),
+                "blockers": _pf.get("blockers"),
+                "warnings": _pf.get("warnings"),
+                "plan": _pf.get("plan"),
+                "hint": "corrige la cause, ou relance avec force=true pour outrepasser",
+            })
     # Block reload if the cluster is currently flagged degraded — a JACCL
     # queue-pair stuck in TIME_WAIT or a wired-memory leak makes the next
     # load almost certain to crash the same way. Operator runs
