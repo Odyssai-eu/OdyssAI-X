@@ -1167,6 +1167,7 @@ async function refreshAll() {
       supports_vision: !!c.supports_vision,
       color: "blue",
       enabled: c.enabled !== false,
+      max_nodes: c.max_nodes || (Array.isArray(c.nodes) ? c.nodes.length : 0) || 1,
     }));
     // If the user's selected cluster vanished from topology, snap to the
     // first enabled one (or null if none).
@@ -2288,15 +2289,14 @@ function renderSettingsClusters() {
             <div class="stack">
               <div class="name-row">
                 <div class="name">${c.name}</div>
-                <div class="kind-pill ${escapeHtml(c.kind)}">${c.kind}</div>
+                <div class="kind-pill ${escapeHtml(c.kind)}">${c.kind === "mlx-distributed" && (c.max_nodes||1) <= 1 ? "mlx" : c.kind}</div>
                 ${vlmPill(c.id)}
               </div>
               <div class="meta">${escapeHtml(summary(c.id))}</div>
             </div>
           </div>
         `).join("")}
-        <button class="add-cluster-btn" data-act="settings-add-cluster">${Icon.plus}<span>Add cluster</span></button>
-        <button class="add-cluster-btn" data-act="settings-add-telemak" style="margin-top:4px">${Icon.plus}<span>Add Telemak</span></button>
+        <button class="add-cluster-btn" data-act="settings-add-cluster">${Icon.plus}<span>Add Argo</span></button>
       </div>
       ${state.telemak_form?.open ? renderTelemakForm() : renderClusterEditor(sel)}
     </div>
@@ -3598,7 +3598,7 @@ function renderRibbon() {
       ${tabs}
       <button class="tab add" data-act="add-cluster">
         ${Icon.plus}
-        <span class="name">Add cluster</span>
+        <span class="name">Add Argo</span>
       </button>
     </div>
   `;
