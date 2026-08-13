@@ -128,9 +128,15 @@ class _Engine:
             content = m.get("content")
             entry: dict[str, Any] = {"role": role}
             # passthrough of agent fields the harmony template understands
-            for k in ("reasoning_content", "tool_calls", "tool_call_id", "name", "recipient"):
+            for k in ("reasoning_content", "tool_call_id", "name", "recipient"):
                 if m.get(k) is not None:
                     entry[k] = m[k]
+            # The ATEM template requires tool_call.function.arguments to be a
+            # dict (it raises on a JSON string — "cannot be parsed in the HF
+            # jinja sandbox"). Callers/harnesses send OpenAI-standard string
+            # arguments in prior-turn tool_calls, so normalise string → dict.
+            if m.get("tool_calls") is not None:
+                entry["tool_calls"] = _normalize_tool_calls(m["tool_calls"])
             if isinstance(content, str) or content is None:
                 entry["content"] = content or ""
                 out.append(entry)
@@ -269,6 +275,26 @@ class _Engine:
         finish = "tool_calls" if tool_calls else ("stop" if n_out < max_tokens else "length")
         self._last = {"prompt_tokens": prompt_len, "completion_tokens": n_out,
                       "finish": finish, "tool_calls": tool_calls}
+
+
+def _normalize_tool_calls(tool_calls: list) -> list:
+    """Return tool_calls with each function.arguments as a dict (parsing a JSON
+    string when needed). The ATEM chat template raises on string arguments."""
+    out = []
+    for tc in tool_calls or []:
+        fn = dict((tc.get("function") or {}))
+        args = fn.get("arguments")
+        if isinstance(args, str):
+            try:
+                fn["arguments"] = json.loads(args) if args.strip() else {}
+            except Exception:
+                fn["arguments"] = {}
+        elif args is None:
+            fn["arguments"] = {}
+        ntc = dict(tc)
+        ntc["function"] = fn
+        out.append(ntc)
+    return out
 
 
 def _expand_image_placeholders(ids: list[int], image_token_id: int,
