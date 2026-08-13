@@ -3538,6 +3538,73 @@ class InklingPool:
         self.runners.clear()
 
 
+class MuseGlimmerPool:
+    """A single-node native Muse-Glimmer server (scripts/muse_glimmer_server.py),
+    engine-managed and proxied under a cluster as a MULTIMODAL pool (2026-08-13).
+
+    Muse-Glimmer-30B (pipenetwork / meta-models) is a harmony/"ATEM" VLM whose
+    `muse_glimmer` arch no released mlx-vlm or mlx-lm can load — PipeNetwork's
+    `muse_glimmer_mlx` package IS its runtime. This wraps that package in our
+    own OpenAI server (native decode with channel-aware harmony parsing:
+    reasoning→reasoning_content, final→content, ATEM→tool_calls; vision tower
+    spliced in). Same shape as InklingPool/VLMPool — single-node, chat via
+    http-proxy, unload = kill — `is_vlm=True` for the vision badge + the proxy
+    routing branch (and so it survives a container restart, adopted in place)."""
+
+    is_vlm = True
+    is_muse = True
+
+    def __init__(self, model_path: str, cluster: str, alias: str,
+                 node_indices: list[int], upstream: str, port: int,
+                 ssh_target: str, host: str, pid: Optional[str] = None):
+        self.model = model_path
+        self.model_path = model_path
+        self.cluster = cluster
+        self.alias = alias or cluster
+        self.node_indices: Optional[list[int]] = list(node_indices) if node_indices else None
+        self.nodes_count = 1
+        self.mode = "muse"
+        self.use_ap = False
+        self.kv_q8 = False
+        self.draft_model: Optional[str] = None
+        self.num_draft_tokens = 4
+        self.runners: list = []
+        self.upstream = (upstream or "").rstrip("/")
+        self.port = int(port)
+        self.pid = pid
+        self.ssh_target = ssh_target
+        self.host = host
+        try:
+            self.nodes = build_topology_from_indices(cluster, list(node_indices))
+        except Exception:
+            self.nodes = [{"rank": 0, "ssh": ssh_target, "host": host, "rdma": None}]
+        self.started_at: Optional[float] = time.time()
+        self.load_s: Optional[float] = None
+        self.last_used_at: float = time.time()
+        self.last_token_at: float = time.monotonic()
+        self.ttl_seconds: int = 0
+        self.backend: str = "http-proxy"
+        self.degraded: bool = False
+        self.degraded_reason: Optional[str] = None
+        self.degraded_at: Optional[float] = None
+
+    def alive_count(self) -> int:
+        return 1
+
+    async def stop(self):
+        try:
+            await asyncio.to_thread(
+                _ssh_exec, self.ssh_target,
+                _muse_kill_cmd(self.port, self.model_path), 30,
+            )
+        except Exception as e:
+            sys.stderr.write(
+                f"[muse-pool] {self.cluster}[{self.alias}] kill on "
+                f"{self.ssh_target} failed: {e}\n"
+            )
+        self.runners.clear()
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # State + metrics
 # ──────────────────────────────────────────────────────────────────────────────
@@ -5518,7 +5585,7 @@ def _initial_default_config() -> Optional[dict]:
 #   major (1.7.2 → 2.0.0) — breaking API or topology change
 #
 # Use `./scripts/bump-version.sh patch|minor|major` to bump + auto-commit.
-APP_VERSION = "1.39.1"
+APP_VERSION = "1.40.0"
 
 app = FastAPI(
     title="OdyssAI-X (odyssai.eu)",
@@ -13026,6 +13093,67 @@ async def admin_cluster_load(cluster_id: str, req: ArgoLoadRequest):
                     f"'{alias}' under {cluster_id} (chat routes internally)."
                 ),
             }
+        # Muse-Glimmer (muse_glimmer): OUR native harmony/ATEM multimodal server
+        # (muse_glimmer_mlx runtime), not mlx_vlm.server (no loader). Native
+        # ~14 tok/s text + reasoning-split + ATEM tool_calls + vision tower.
+        if (arch.get("model_type") or "").lower() == "muse_glimmer":
+            mg_index = node_indices[0]
+            mg_topo = build_topology_from_indices(cluster_id, [mg_index])
+            mg_ssh = mg_topo[0]["ssh"]
+            mg_host = mg_topo[0].get("host") or _host_id_from_ssh(mg_ssh)
+            mg_port = int(getattr(req, "vlm_port", None) or MUSE_DEFAULT_PORT)
+            mg_model_path = _vlm_resolve_model_path(req.model, base_dir)
+            mg_ip = _vlm_ip_from_ssh(mg_ssh)
+            mg_upstream = f"http://{mg_ip}:{mg_port}"
+            log_id = _muse_pool_log_id(cluster_id, alias)
+            mg_size = await get_model_size_bytes(mg_ssh, mg_model_path)
+            mg_est = estimate_load_s(req.model, mg_size, cluster_id, 1)
+            mg_state = _loading_state_for(cluster_id)
+            _begin_loading(mg_state, req.model, 1, mg_size, mg_est)
+            _t_mg = time.time()
+            pid = None
+            try:
+                async with get_admin_lock(cluster_id):
+                    if await _vlm_probe_ready(mg_ip, mg_port) is not True:
+                        ready, pid, tail = await _launch_muse_glimmer_server(
+                            mg_ssh, log_id, mg_model_path, mg_port,
+                            (getattr(req, "venv", None) or VLM_DEFAULT_VENV),
+                            float(getattr(req, "ready_timeout_s", None) or VLM_READY_TIMEOUT_S),
+                        )
+                        if not ready:
+                            raise HTTPException(
+                                503,
+                                f"muse_glimmer_server did not become ready on "
+                                f"{mg_upstream} (node {mg_host}). Log tail:\n{tail}",
+                            )
+                    old = get_pool(cluster_id, alias)
+                    if old is not None:
+                        try:
+                            await old.stop()
+                        except Exception:
+                            pass
+                    mgpool = MuseGlimmerPool(
+                        model_path=mg_model_path, cluster=cluster_id, alias=alias,
+                        node_indices=[mg_index], upstream=mg_upstream, port=mg_port,
+                        ssh_target=mg_ssh, host=mg_host, pid=pid,
+                    )
+                    mgpool.load_s = time.time() - _t_mg
+                    set_pool(cluster_id, alias, mgpool)
+                    save_cluster_state_v2(cluster_id)
+            finally:
+                _end_loading(mg_state)
+            return {
+                "loaded": True, "cluster": cluster_id, "alias": alias,
+                "is_vlm": True, "is_muse": True, "dispatched": "muse-pool",
+                "model": mg_model_path, "upstream": mg_upstream,
+                "node": mg_host, "node_index": mg_index, "pid": pid,
+                "note": (
+                    f"{req.model} served MULTIMODAL by native muse_glimmer_server "
+                    f"on {mg_host} (harmony reasoning + ATEM tools + vision), "
+                    f"registered as pool '{alias}' under {cluster_id} "
+                    f"(chat routes internally)."
+                ),
+            }
         # Distributed VL path (feature-flagged). With VLM_DISTRIBUTED_ENABLED
         # and an explicit multi-node request, spawn tensor-parallel
         # vlm_runner.py ranks over ring/TCP instead of clamping to one node.
@@ -15212,6 +15340,83 @@ async def _launch_inkling_server(
     _launch_dflash_server; reuses _vlm_probe_ready + _vlm_log_tail."""
     ip = _vlm_ip_from_ssh(ssh_target)
     launch = _inkling_launch_cmd(log_id, venv, model_path, port)
+    launched_pid: Optional[str] = None
+    rc, out, err = await asyncio.to_thread(_ssh_exec, ssh_target, launch, 20)
+    if rc != 0:
+        return False, None, (err or out or "").strip()[-4000:]
+    for line in (out or "").splitlines():
+        if line.startswith("VLM_PID="):
+            launched_pid = line.split("=", 1)[1].strip()
+    deadline = time.time() + ready_timeout
+    while time.time() < deadline:
+        if await _vlm_probe_ready(ip, port) is True:
+            return True, launched_pid, ""
+        await asyncio.sleep(3.0)
+    tail = await _vlm_log_tail(ssh_target, log_id)
+    return False, launched_pid, tail
+
+
+# ── Muse-Glimmer native multimodal server (2026-08-13) ────────────────────────
+# scripts/muse_glimmer_server.py wraps pipenetwork's `muse_glimmer_mlx` package
+# (its HF card's prescribed runtime) as an OpenAI server. Deployed on each
+# serving node at ~/mlx-cluster/muse_glimmer_server.py; runs in the SAME mlx-vlm
+# venv (has fastapi/uvicorn/PIL + muse_glimmer_mlx pip-installed). Engine owns
+# the lifecycle exactly like inkling/dflash/vlm. Mirrors the inkling helpers.
+MUSE_DEFAULT_PORT = int(env_get("MUSE_PORT", "8081") or "8081")
+MUSE_SERVER_REMOTE = env_get("MUSE_SERVER_REMOTE",
+                             "/Users/admin/mlx-cluster/muse_glimmer_server.py")
+MUSE_WIRED_LIMIT_GB = float(env_get("MUSE_WIRED_LIMIT_GB", "200") or "200")
+
+
+def _muse_launch_cmd(vlm_id: str, venv: str, model_path: str, port: int) -> str:
+    """nohup the native muse_glimmer_server.py with the mlx-vlm venv python.
+    Echoes VLM_PID=$! for the caller (reuses the VLM launch/probe helpers)."""
+    venv_bin = f"{venv.rstrip('/')}/bin"
+    py = f"{venv_bin}/python"
+    log = _vlm_log_path(vlm_id)
+    return (
+        f"export HOME=/Users/admin USER=admin TMPDIR=/tmp "
+        f"PATH={shlex.quote(venv_bin)}:/usr/bin:/bin:/usr/sbin:/sbin && "
+        f"nohup {shlex.quote(py)} {shlex.quote(MUSE_SERVER_REMOTE)} "
+        f"--model {shlex.quote(model_path)} "
+        f"--host 0.0.0.0 --port {int(port)} "
+        f"--wired-limit-gb {MUSE_WIRED_LIMIT_GB} "
+        f"> {log} 2>&1 & "
+        f"echo VLM_PID=$!"
+    )
+
+
+def _muse_kill_cmd(port: int, model_path: str) -> str:
+    """SIGTERM → grace → SIGKILL of muse_glimmer_server.py for THIS port —
+    mirrors _inkling_kill_cmd so Metal wired pages release."""
+    pattern = shlex.quote(f"muse_glimmer_server.py.*--port {int(port)}( |$)")
+    return (
+        f"if pgrep -f {pattern} >/dev/null 2>&1; then "
+        f"  pkill -TERM -f {pattern} 2>/dev/null; "
+        f"  for i in $(seq 1 {_SWEEP_GRACE_ITERS}); do "
+        f"    pgrep -f {pattern} >/dev/null 2>&1 || break; "
+        f"    sleep 0.5; "
+        f"  done; "
+        f"  if pgrep -f {pattern} >/dev/null 2>&1; then "
+        f"    pkill -9 -f {pattern}; echo 'killed (SIGKILL)'; "
+        f"  else echo 'cleaned (SIGTERM)'; fi; "
+        f"else echo 'no process'; fi"
+    )
+
+
+def _muse_pool_log_id(cluster_id: str, alias: str) -> str:
+    raw = f"{cluster_id}-{alias}-muse"
+    return re.sub(r"[^a-z0-9-]", "-", raw.lower())[:41].strip("-") or "muse"
+
+
+async def _launch_muse_glimmer_server(
+    ssh_target: str, log_id: str, model_path: str, port: int,
+    venv: str, ready_timeout: float,
+) -> tuple[bool, Optional[str], str]:
+    """Launch muse_glimmer_server.py on a node, poll /v1/models until ready.
+    Mirrors _launch_inkling_server; reuses _vlm_probe_ready + _vlm_log_tail."""
+    ip = _vlm_ip_from_ssh(ssh_target)
+    launch = _muse_launch_cmd(log_id, venv, model_path, port)
     launched_pid: Optional[str] = None
     rc, out, err = await asyncio.to_thread(_ssh_exec, ssh_target, launch, 20)
     if rc != 0:
