@@ -5518,7 +5518,7 @@ def _initial_default_config() -> Optional[dict]:
 #   major (1.7.2 → 2.0.0) — breaking API or topology change
 #
 # Use `./scripts/bump-version.sh patch|minor|major` to bump + auto-commit.
-APP_VERSION = "1.39.0"
+APP_VERSION = "1.39.1"
 
 app = FastAPI(
     title="OdyssAI-X (odyssai.eu)",
@@ -8834,8 +8834,11 @@ async def coeos_resolve(req, request) -> tuple:
 
 
 _TOOL_BLOCK_RE = [
-    re.compile(r"<tool_call>.*?</tool_call>", re.DOTALL),
-    re.compile(r"<tool_calls>.*?</tool_calls>", re.DOTALL),
+    # `(?::\w+)?` tolerates the per-tag suffix some Hunyuan checkpoints emit
+    # (odyssai/Hy3-mlx-8bit: `<tool_calls:opensource>` / `<tool_call:opensource>`).
+    # The plural form (DOTALL) also strips the whole wrapper incl. inner blocks.
+    re.compile(r"<tool_call(?::\w+)?>.*?</tool_call(?::\w+)?>", re.DOTALL),
+    re.compile(r"<tool_calls(?::\w+)?>.*?</tool_calls(?::\w+)?>", re.DOTALL),
     # LongCat native format (meituan-longcat/LongCat-Flash-Lite) — parsed into
     # structured tool_calls by runner.parse_tool_calls; strip from content too.
     re.compile(r"<longcat_tool_call>.*?</longcat_tool_call>", re.DOTALL),

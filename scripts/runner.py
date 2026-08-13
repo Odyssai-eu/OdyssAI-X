@@ -1836,11 +1836,18 @@ _QWEN_PARAM = re.compile(r"<parameter=([^>]+)>\s*(.*?)\s*</parameter>", re.DOTAL
 # Hy3 XML: <tool_call>NAME<tool_sep><arg_key>K</arg_key><arg_value>V</arg_value>…</tool_call>
 # Observed on inferencerlabs/Hy3-preview-MLX-9bit and family. The name lives
 # BEFORE <tool_sep>, args are interleaved key/value pairs after.
+# The `(?::\w+)?` tolerates the per-tag suffix some Hunyuan checkpoints emit —
+# odyssai/Hy3-mlx-8bit-headbf16 wraps every tag as `<tool_call:opensource>`,
+# `<tool_sep:opensource>`, `<arg_key:opensource>`, … . Without it the model's
+# real tool call stayed unparsed in content → finish=stop, tool_calls=null →
+# agent benches gated it as non-agent (2026-08-13).
 _TOOL_CALL_HY3_XML = re.compile(
-    r"<tool_call>\s*([^<\s][^<]*?)\s*<tool_sep>(.*?)</tool_call>", re.DOTALL,
+    r"<tool_call(?::\w+)?>\s*([^<\s][^<]*?)\s*<tool_sep(?::\w+)?>(.*?)</tool_call(?::\w+)?>",
+    re.DOTALL,
 )
 _HY3_ARG_PAIR = re.compile(
-    r"<arg_key>\s*(.*?)\s*</arg_key>\s*<arg_value>\s*(.*?)\s*</arg_value>",
+    r"<arg_key(?::\w+)?>\s*(.*?)\s*</arg_key(?::\w+)?>\s*"
+    r"<arg_value(?::\w+)?>\s*(.*?)\s*</arg_value(?::\w+)?>",
     re.DOTALL,
 )
 
