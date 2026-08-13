@@ -4105,6 +4105,31 @@ function renderArgoPoolsList(a) {
   `;
 }
 
+// Pro-loader pre-flight verdict block (shown in the add-pool + load forms).
+// Rendered from GET /admin/clusters/{id}/preflight — verdict + node plan +
+// warnings, BEFORE the operator commits a load.
+function renderPreflightVerdict(pf) {
+  if (!pf) return "";
+  if (pf.loading) return `<div style="font-size:11px;color:var(--ink-3);font-family:var(--font-mono)">évaluation pre-flight…</div>`;
+  if (pf.error) return `<div style="font-size:11px;color:var(--amber-deep)">pre-flight indisponible (chargement direct possible)</div>`;
+  const ok = !!pf.ok;
+  const col = ok ? "var(--green-deep)" : "var(--rust-deep)";
+  const bg = ok ? "rgba(60,160,90,0.10)" : "rgba(180,70,50,0.10)";
+  const plan = pf.plan || {};
+  const opts = (plan.options || []).map(o => `${o.nodes}·${o.mode}`).join("  ");
+  const warn = (pf.warnings || []).map(w => `<div style="color:var(--amber-deep);font-size:11px">⚠ ${escapeHtml(w)}</div>`).join("");
+  const block = (pf.blockers || []).map(b => `<div style="color:var(--rust-deep);font-size:11px">✕ ${escapeHtml(b)}</div>`).join("");
+  const m = pf.model || {};
+  return `
+    <div style="padding:10px 12px;border-radius:8px;background:${bg};border:1px solid ${col}">
+      <div style="font-weight:600;color:${col};font-size:12px">${ok ? "✓ PRE-FLIGHT OK" : "✕ PRE-FLIGHT REFUSÉ"} — ${escapeHtml(pf.summary || "")}</div>
+      ${m.model_type ? `<div style="font-size:11px;color:var(--ink-3);font-family:var(--font-mono);margin-top:3px">${escapeHtml(m.model_type)} · ${m.size_gb} GB · ${(m.quant&&m.quant.bits)?m.quant.bits+"-bit":"?"}${m.is_vision?" · vision":""}${m.num_key_value_heads?" · kv="+m.num_key_value_heads:""}</div>` : ""}
+      ${ok && opts ? `<div style="font-size:11px;color:var(--ink-2);margin-top:3px">plan : <b>${plan.nodes} node${plan.nodes>1?"s":""} · ${plan.mode}</b> (nodes pré-sélectionnés) — options : ${escapeHtml(opts)}</div>` : ""}
+      ${pf.draft && pf.draft.reason ? `<div style="font-size:11px;color:${pf.draft.ok?'var(--green-deep)':'var(--rust-deep)'};margin-top:2px">draft : ${escapeHtml(pf.draft.reason)}</div>` : ""}
+      ${block}${warn}
+    </div>`;
+}
+
 // Inline "+ Add pool" form. Lives under the Pools list when toggled.
 // Disjoint node subset chips show which indices are free (clickable)
 // vs occupied (disabled). On submit, POST /admin/default/load with the
@@ -4163,6 +4188,7 @@ function renderArgoAddPoolForm(a, freeIndices) {
         <div class="field-label">Nodes (pick from free)</div>
         <div class="seg-nodes">${chips.join("")}</div>
       </div>
+      ${renderPreflightVerdict(f.default_add_preflight)}
       <div style="display:flex;align-items:center;gap:14px;flex-wrap:wrap">
         <button class="btn btn-primary" data-act="default-add-submit" ${(canSubmit && !f.default_add_loading)?"":"disabled"}>
           ${f.default_add_loading ? Icon.spinner || "…" : Icon.check}<span>${f.default_add_loading ? "Loading…" : "Load pool"}</span>
@@ -4219,8 +4245,15 @@ function renderLoadingBanner(p, clusterId) {
   if (!loading) return "";
   const pct = Math.max(2, Math.min(100, loading.progress_pct || 0));
   const elapsed = loading.elapsed_s || 0;
-  const eta = Math.max(0, (loading.estimated_s || 0) - elapsed);
-  const sizeGb = loading.size_bytes ? (loading.size_bytes / (1024**3)).toFixed(1) : null;
+  // Observable path: real ETA from throughput; fallback to est-based.
+  const eta = (loading.eta_s != null) ? loading.eta_s
+              : Math.max(0, (loading.estimated_s || 0) - elapsed);
+  const sizeGb = loading.size_gb != null ? loading.size_gb
+                 : (loading.size_bytes ? (loading.size_bytes / (1024**3)).toFixed(1) : null);
+  const loadedGb = loading.loaded_gb;                 // real bytes materialized
+  const tput = loading.throughput_gbs;                // GB/s
+  const stalled = !!loading.stalled;
+  const phase = loading.phase || "";
   const model = (loading.model || "—").split("/").pop();
   // Try to surface the latest meaningful loading log line as the "stage"
   const stages = (state.logs || []).filter(l => {
@@ -4245,13 +4278,16 @@ function renderLoadingBanner(p, clusterId) {
           <div class="lb-model">${escapeHtml(model)}</div>
         </div>
         <div class="lb-stats">
+          ${loadedGb != null ? `<div class="lb-stat"><div class="cap">Loaded</div><div class="val">${loadedGb} / ${sizeGb} GB</div></div>` : ""}
+          ${tput != null ? `<div class="lb-stat"><div class="cap">Throughput</div><div class="val">${Number(tput).toFixed(2)} GB/s</div></div>` : ""}
           <div class="lb-stat"><div class="cap">Elapsed</div><div class="val">${elapsed.toFixed(0)} s</div></div>
-          <div class="lb-stat"><div class="cap">ETA</div><div class="val">${eta.toFixed(0)} s</div></div>
+          <div class="lb-stat"><div class="cap">ETA</div><div class="val">${eta != null ? Number(eta).toFixed(0)+" s" : "—"}</div></div>
         </div>
       </div>
+      ${stalled ? `<div style="margin:8px 0 0;padding:6px 10px;border-radius:6px;background:rgba(180,70,50,0.22);color:#fff;font-size:12px;font-weight:600">⚠ STALLED — la mémoire ne progresse plus (~12s). Rang bloqué / OOM imminent ? Vérifier les logs.</div>` : ""}
       <div class="lb-bar">
-        <div class="lb-track"><div class="lb-fill" style="width:${pct}%"></div></div>
-        <div class="lb-pct">${pct.toFixed(0)}%</div>
+        <div class="lb-track"><div class="lb-fill" style="width:${pct}%;${stalled?'background:var(--rust-deep)':''}"></div></div>
+        <div class="lb-pct">${pct.toFixed(0)}%${phase?` · ${escapeHtml(phase)}`:""}</div>
       </div>
       ${Array.isArray(loading.ranks) && loading.ranks.length > 0 ? `
         <div style="display:flex;flex-direction:row;gap:8px;margin-top:8px;flex-wrap:wrap">
@@ -6928,6 +6964,26 @@ async function handleAct(e) {
       if (suggested) f.default_add_alias = suggested;
     }
     state.form_interaction_at = Date.now();
+    // Pro-loader pre-flight: evaluate the pick and AUTO-SELECT the nodes
+    // (co-residence of already-loaded pools deducted). Shows OK/REFUSÉ +
+    // the node plan before the operator commits.
+    const _cid = state.selected_cluster;
+    if (_cid && f.default_add_model) {
+      f.default_add_preflight = { loading: true };
+      fetch(`/admin/clusters/${encodeURIComponent(_cid)}/preflight?model=${encodeURIComponent(f.default_add_model)}`)
+        .then(r => r.json())
+        .then(pf => {
+          f.default_add_preflight = pf;
+          const chosen = (pf.selection && pf.selection.chosen)
+                         || (pf.plan && pf.plan.indices) || [];
+          if (chosen.length) {
+            const idx = {}; chosen.forEach(i => { idx[i] = true; });
+            f.default_add_indices = idx;
+          }
+          render();
+        })
+        .catch(() => { f.default_add_preflight = { error: true }; render(); });
+    }
     render(); return;
   }
   if (act === "default-add-idx") {
