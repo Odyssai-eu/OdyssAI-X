@@ -42,7 +42,8 @@ PIPELINE_CAPABLE = frozenset({
 KNOWN_MODEL_TYPES = PIPELINE_CAPABLE | frozenset({
     "qwen2", "qwen3", "qwen3_moe", "llama", "mistral", "mixtral", "gemma2",
     "gemma3", "gemma4", "phi3", "cohere", "mimo_v2", "mimo_v2_flash",
-    "kimi_linear", "inkling_mm_model", "minimax_m2", "minimax_m3_vl", "laguna",
+    "kimi_linear", "inkling_mm_model", "muse_glimmer", "minimax_m2",
+    "minimax_m3_vl", "laguna",
 })
 
 DEFAULT_ACTIVATION_FACTOR = 1.10   # KV cache + activations headroom over weights
