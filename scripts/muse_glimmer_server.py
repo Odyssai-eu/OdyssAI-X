@@ -77,11 +77,21 @@ def _parse_atem(text: str) -> list[dict]:
 
 # ── model + tokenizer (loaded once at startup) ────────────────────────────────
 class _Engine:
-    def __init__(self, model_path: str, wired_limit_gb: float):
+    def __init__(self, model_path: str, wired_limit_gb: float,
+                 cache_limit_gb: float = 8.0):
+        # Right-size residency for a ~33GB model: wired_limit holds the weights
+        # (+ KV + activations) resident without paging, and cache_limit bounds
+        # MLX's freed-buffer cache so it RETURNS memory instead of hoarding up
+        # to the wired ceiling. Without the cache bound, a long bench run climbs
+        # to fill the wired allowance (191GB wired for a 33GB model, 2026-08-13).
         try:
             mx.set_wired_limit(int(wired_limit_gb * 1e9))
         except Exception as e:
             sys.stderr.write(f"[muse] set_wired_limit: {e}\n")
+        try:
+            mx.set_cache_limit(int(cache_limit_gb * 1e9))
+        except Exception as e:
+            sys.stderr.write(f"[muse] set_cache_limit: {e}\n")
 
         from muse_glimmer_mlx.load import load
         from muse_glimmer_mlx.image import preprocess, image_placeholder_tokens
@@ -440,11 +450,12 @@ def main():
     ap.add_argument("--model", required=True)
     ap.add_argument("--host", default="0.0.0.0")
     ap.add_argument("--port", type=int, default=8081)
-    ap.add_argument("--wired-limit-gb", type=float, default=200.0)
+    ap.add_argument("--wired-limit-gb", type=float, default=64.0)
+    ap.add_argument("--cache-limit-gb", type=float, default=8.0)
     args = ap.parse_args()
 
     import uvicorn
-    engine = _Engine(args.model, args.wired_limit_gb)
+    engine = _Engine(args.model, args.wired_limit_gb, args.cache_limit_gb)
     app = build_app(engine)
     uvicorn.run(app, host=args.host, port=args.port, log_level="warning")
 

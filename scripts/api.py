@@ -15365,7 +15365,11 @@ async def _launch_inkling_server(
 MUSE_DEFAULT_PORT = int(env_get("MUSE_PORT", "8081") or "8081")
 MUSE_SERVER_REMOTE = env_get("MUSE_SERVER_REMOTE",
                              "/Users/admin/mlx-cluster/muse_glimmer_server.py")
-MUSE_WIRED_LIMIT_GB = float(env_get("MUSE_WIRED_LIMIT_GB", "200") or "200")
+# Right-sized for the ~33GB 8-bit model: wired holds it resident without paging,
+# cache_limit bounds MLX's freed-buffer cache so it doesn't climb to fill the
+# wired allowance under a long run (191GB wired for a 33GB model, 2026-08-13).
+MUSE_WIRED_LIMIT_GB = float(env_get("MUSE_WIRED_LIMIT_GB", "64") or "64")
+MUSE_CACHE_LIMIT_GB = float(env_get("MUSE_CACHE_LIMIT_GB", "8") or "8")
 
 
 def _muse_launch_cmd(vlm_id: str, venv: str, model_path: str, port: int) -> str:
@@ -15381,6 +15385,7 @@ def _muse_launch_cmd(vlm_id: str, venv: str, model_path: str, port: int) -> str:
         f"--model {shlex.quote(model_path)} "
         f"--host 0.0.0.0 --port {int(port)} "
         f"--wired-limit-gb {MUSE_WIRED_LIMIT_GB} "
+        f"--cache-limit-gb {MUSE_CACHE_LIMIT_GB} "
         f"> {log} 2>&1 & "
         f"echo VLM_PID=$!"
     )
