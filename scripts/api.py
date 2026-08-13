@@ -1326,16 +1326,100 @@ def _loading_snapshot(state: dict) -> Optional[dict]:
             f"(elapsed {elapsed:.0f}s >> est {est:.0f}s) — auto-cleared\n")
         _end_loading(state)
         return None
-    # Cap at 95 % until completion — last 5 % reserved for the success snap.
-    pct = min(95.0, (elapsed / est) * 100.0)
-    return {
+    total = state.get("size_bytes") or 0
+    loaded = state.get("loaded_bytes")
+    base = {
         "model": state.get("model"),
         "nodes": state.get("nodes"),
-        "size_bytes": state.get("size_bytes"),
+        "size_bytes": total,
+        "size_gb": round(total / 1024**3, 1),
         "elapsed_s": round(elapsed, 2),
         "estimated_s": round(est, 2),
-        "progress_pct": round(pct, 1),
     }
+    # Observable path: real bytes materialized on the ranks (poller-fed) →
+    # true %, throughput, ETA, per-rank, stall — not a time-based frozen 95 %.
+    if loaded is not None and total:
+        pct = min(99.0, loaded / total * 100.0)
+        tp = float(state.get("throughput_bps") or 0)
+        base.update({
+            "progress_pct": round(pct, 1),
+            "phase": "materializing weights",
+            "loaded_bytes": loaded,
+            "loaded_gb": round(loaded / 1024**3, 1),
+            "throughput_gbs": round(tp / 1024**3, 2),
+            "eta_s": state.get("eta_s"),
+            "stalled": bool(state.get("stalled")),
+            "per_rank_gb": [round(b / 1024**3, 1)
+                            for b in (state.get("per_rank_bytes") or [])],
+        })
+        return base
+    # Fallback (no poller / early): time-based, capped at 95 %.
+    base["progress_pct"] = round(min(95.0, (elapsed / est) * 100.0), 1)
+    base["phase"] = "starting"
+    return base
+
+
+# ── observable-load progress poller ─────────────────────────────────────
+_progress_pollers: dict = {}
+
+
+async def _poll_load_progress(cluster_id: str, state: dict,
+                              ssh_targets: list, total_bytes: int) -> None:
+    """While a load is in progress, read each rank's runner memory footprint
+    (bytes materialized) so the UI shows TRUE progress + throughput + ETA +
+    stall detection instead of a frozen elapsed/estimated 95 %. Self-terminates
+    when the load's in_progress flag clears (set by _end_loading)."""
+    match = RUNNER_MATCH_PATTERN
+    cmd = (f"ps -Ao rss,command | grep {shlex.quote(match)} "
+           "| grep -v grep | awk '{s+=$1} END{print s+0}'")
+
+    async def _rss(ssh: str) -> int:
+        try:
+            out = await asyncio.to_thread(
+                subprocess.run,
+                ["ssh", "-o", "ConnectTimeout=4", "-o", "BatchMode=yes", ssh, cmd],
+                capture_output=True, text=True, timeout=8)
+            return int((out.stdout or "0").strip() or 0) * 1024   # KB → B
+        except Exception:
+            return 0
+
+    last_bytes, last_t, stall_ticks = 0, time.time(), 0
+    await asyncio.sleep(2)
+    try:
+        while state.get("in_progress"):
+            per_rank = list(await asyncio.gather(*[_rss(s) for s in ssh_targets]))
+            loaded = sum(per_rank)
+            now = time.time()
+            dt = max(now - last_t, 0.1)
+            rate = (loaded - last_bytes) / dt
+            stall_ticks = stall_ticks + 1 if (loaded - last_bytes) < 50 * 1024**2 else 0
+            state["loaded_bytes"] = loaded
+            state["per_rank_bytes"] = per_rank
+            state["throughput_bps"] = max(rate, 0.0)
+            state["eta_s"] = (round((total_bytes - loaded) / rate, 1)
+                              if rate > 1e6 and total_bytes > loaded else None)
+            state["stalled"] = stall_ticks >= 4          # ~12 s flat
+            last_bytes, last_t = loaded, now
+            await asyncio.sleep(3)
+    except asyncio.CancelledError:
+        pass
+    finally:
+        _progress_pollers.pop(cluster_id, None)
+
+
+def _start_progress_poller(cluster_id: str, state: dict,
+                           ssh_targets: list, total_bytes: int) -> None:
+    """Spawn the observable-load poller for a load (no-op without targets)."""
+    if not ssh_targets or not total_bytes:
+        return
+    old = _progress_pollers.get(cluster_id)
+    if old and not old.done():
+        old.cancel()
+    try:
+        _progress_pollers[cluster_id] = asyncio.create_task(
+            _poll_load_progress(cluster_id, state, list(ssh_targets), int(total_bytes)))
+    except RuntimeError:
+        pass   # no running loop (shouldn't happen inside a request)
 
 # ──────────────────────────────────────────────────────────────────────────────
 # HF model downloader (runs `hf download` on configured hosts via SSH)
@@ -13108,6 +13192,9 @@ async def admin_cluster_load(cluster_id: str, req: ArgoLoadRequest):
     loading_state = _loading_state_for(cluster_id)
     async with get_admin_lock(cluster_id):
         _begin_loading(loading_state, req.model, nodes_count, size_bytes, estimated_s)
+        _start_progress_poller(cluster_id, loading_state,
+                               [n.get("ssh") for n in topo if n.get("ssh")],
+                               size_bytes)
         try:
             old = get_pool(cluster_id, alias)
             if old is not None and not req.force_hot_swap:
