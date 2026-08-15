@@ -158,11 +158,25 @@ def detect_native_mtp(model_dir: str | Path,
     if family is None:
         return None
     # qwen3's VL-wrapper config nests the trunk depth under text_config.
+    tcfg = config.get("text_config") or config
     n_layers = int(config.get("num_hidden_layers")
-                   or (config.get("text_config") or {}).get("num_hidden_layers")
+                   or tcfg.get("num_hidden_layers")
                    or 0)
     if not n_layers:
         return None
+
+    # Rollback guard: native-MTP speculative decoding trims the trunk cache to
+    # roll back rejected drafts. A HYBRID linear-attention trunk (Qwen3.5's
+    # Mamba/GatedDeltaNet layers) uses ArraysCache, whose recurrent state has
+    # NO .trim — the rollback silently corrupts it (correct prefill token, then
+    # garbage from round 1). Refuse → clean AR. Full-attention-only (interval 1)
+    # is trimmable and fine. Verified 2026-08-15: ArraysCache.trim → AttributeError.
+    if family == "qwen3":
+        fai = int(tcfg.get("full_attention_interval") or 1)
+        if fai > 1:
+            _log(f"native MTP unsupported on hybrid linear-attn trunk "
+                 f"(full_attention_interval={fai}, non-trimmable Mamba cache) — AR only")
+            return None
     prefix = f"model.layers.{n_layers}."
 
     # 1. Conversion kept the MTP tensors in the model dir itself.

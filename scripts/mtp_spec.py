@@ -103,8 +103,16 @@ def native_mtp_stream_generate(
     trunk_cache = prompt_cache if prompt_cache is not None else make_prompt_cache(model)
     mtp_cache = mtp.make_cache()
 
-    inner = model.model            # dsv32-style inner: returns POST-norm hidden
-    lm_head = model.lm_head
+    # Family-aware trunk resolution: qwen3 wraps the text model one level down
+    # under .language_model (VL config); deepseek/hy_v3 expose it at the top.
+    # `inner(tokens, cache)` must return the POST-norm hidden; lm_head projects.
+    if getattr(mtp, "family", "") == "qwen3":
+        _lm = model.language_model
+        inner = _lm.model
+        lm_head = _lm.lm_head
+    else:
+        inner = model.model            # dsv32-style inner: returns POST-norm hidden
+        lm_head = model.lm_head
 
     # D8 "pre_norm" A/B: wrap the final norm to record its INPUT while
     # returning the normal output — one mechanism for every mlx-lm family.

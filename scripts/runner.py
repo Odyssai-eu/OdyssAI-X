@@ -2380,6 +2380,8 @@ def main() -> None:
     # stream is the supported text-only v1 mode (batched conv-state cache = later).
     _mt = (model_config or {}).get("model_type") or ""
     use_batched = (size == 1) and _BATCH_AVAILABLE and (draft_model is None) and (
+        native_mtp is None                     # native MTP needs the legacy path
+    ) and (
         spec_dspark_ctx is None                # single-node DSpark spec -> legacy
     ) and (
         os.environ.get("RUNNER_BATCH", "1") == "1"
