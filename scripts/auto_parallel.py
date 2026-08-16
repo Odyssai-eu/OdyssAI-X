@@ -641,12 +641,22 @@ def patch_pipeline_model(model: _ModelT, group: mx.distributed.Group) -> _ModelT
             "cache", None
         )
 
-        # Add dependency to last cache entry to ensure distributed ops are evaluated
+        # Add a dependency onto a cache entry to force the distributed ops to
+        # evaluate. Hybrid trunks (qwen3.5 / qwen3-next) mix KVCache (full attn)
+        # with ArraysCache (Mamba/GatedDeltaNet) — the latter has no real .keys
+        # and `dep.keys` raises std::bad_cast, so pick the LAST entry that
+        # actually carries keys (a KVCache) and guard the access. Pure-KV models
+        # take cache[-1] first → unchanged behaviour.
         if cache is not None and len(cache) > 0:  # type: ignore
-            last = cache[-1]  # type: ignore
-            dep_cache = last[0] if hasattr(last, "caches") else last  # type: ignore
-            if hasattr(dep_cache, "keys") and dep_cache.keys is not None:  # type: ignore
-                dep_cache.keys = mx.depends(dep_cache.keys, logits)  # type: ignore
+            for entry in reversed(cache):  # type: ignore
+                dep = entry[0] if hasattr(entry, "caches") else entry
+                try:
+                    keys = getattr(dep, "keys", None)
+                    if keys is not None:
+                        dep.keys = mx.depends(dep.keys, logits)  # type: ignore
+                        break
+                except Exception:
+                    continue
 
         return logits
 

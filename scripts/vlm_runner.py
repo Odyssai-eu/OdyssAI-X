@@ -198,6 +198,57 @@ def _shard_fused_gate_up_inplace(sl, group):
             setattr(sl, name, slice_fused(getattr(sl, name)))
 
 
+# Model types served PIPELINE-parallel (layer-split) instead of the MiniMax-M3
+# tensor-parallel path. The TP sharder (_shard_lm_replicated_indexer) is
+# MiniMax-only (MSA indexer, block_sparse_moe/switch_mlp) and its forward has
+# no all_sum collectives; qwen3.5-MoE is a HYBRID (self_attn + linear_attn
+# GatedDeltaNet) with num_kv_heads=2 (won't divide 3/4 nodes). Pipeline needs
+# neither head-divisibility nor forward collectives — each rank runs full local
+# layers + send/recv. Reuses the exo pipeline machinery (auto_parallel).
+_PIPELINE_MODEL_TYPES = frozenset({"qwen3_5_moe"})
+
+
+def _shard_lm_pipeline(model, group, num_layers: int):
+    """Pipeline-shard a VLM's language model across ranks (layer split).
+
+    Slices inner.layers to this rank's [start,end), wraps the ends with
+    Pipeline{First,Last}Layer (recv/send), materialises only local layers.
+    auto_parallel recomputes fa_idx/ssm_idx for the stock mlx-lm hybrid class
+    but NOT for the mlx-vlm Qwen3_5MoeModel — do it here (shard-LOCAL indices,
+    else cache[fa_idx] points at the wrong local layer's cache)."""
+    from auto_parallel import pipeline_auto_parallel
+    from exo_stubs import PipelineShardMetadata
+    rank, size = group.rank(), group.size()
+    bounds_env = os.environ.get("RUNNER_LAYER_BOUNDS", "")
+    if bounds_env:
+        b = [int(x) for x in bounds_env.split(",")]
+    else:
+        per = num_layers // size
+        b = [0] + [per * i for i in range(1, size)] + [num_layers]
+    start, end = b[rank], b[rank + 1]
+    log(f"rank {rank} pipeline shard layers [{start}, {end}) of {num_layers}")
+    # Pass the LanguageModel WRAPPER: get_inner_model() resolves .model ->
+    # Qwen3_5MoeModel (the one carrying .layers) and mutates it in place.
+    meta = PipelineShardMetadata(device_rank=rank, world_size=size,
+                                 start_layer=start, end_layer=end)
+    gen = pipeline_auto_parallel(model.language_model, group, meta)
+    while True:
+        try:
+            next(gen)
+        except StopIteration:
+            break
+    # LOCAL hybrid indices (auto_parallel's isinstance misses the mlx-vlm class).
+    inner = model.language_model.model            # sliced+wrapped in place
+    fa = [i for i, l in enumerate(inner.layers)
+          if not getattr(l, "is_linear", True)]
+    ssm = [i for i, l in enumerate(inner.layers)
+           if getattr(l, "is_linear", False)]
+    inner.fa_idx = fa[0] if fa else 0
+    inner.ssm_idx = ssm[0] if ssm else 0
+    log(f"rank {rank} local fa_idx={inner.fa_idx} ssm_idx={inner.ssm_idx} "
+        f"({len(inner.layers)} local layers)")
+
+
 def sharded_vlm_load(path: str, group):
     from mlx_vlm.utils import (get_model_path, load_image_processor,
                                load_model, load_processor)
@@ -211,13 +262,22 @@ def sharded_vlm_load(path: str, group):
     image_processor = load_image_processor(model_path)
     if image_processor is not None:
         processor.image_processor = image_processor
+    model_type = config.get("model_type") or ""
+    use_pipeline = (shard_mode == "pipeline"
+                    or model_type in _PIPELINE_MODEL_TYPES)
     if group is not None and group.size() > 1:
-        log(f"rank {group.rank()} sharding language_model "
-            f"(tensor, {shard_mode})")
-        if shard_mode == "upstream":
-            model.language_model.shard(group)
+        if use_pipeline:
+            log(f"rank {group.rank()} sharding language_model "
+                f"(pipeline, {model_type})")
+            n_layers = len(model.language_model.model.layers)
+            _shard_lm_pipeline(model, group, n_layers)
         else:
-            _shard_lm_replicated_indexer(model.language_model, group)
+            log(f"rank {group.rank()} sharding language_model "
+                f"(tensor, {shard_mode})")
+            if shard_mode == "upstream":
+                model.language_model.shard(group)
+            else:
+                _shard_lm_replicated_indexer(model.language_model, group)
     mx.eval(model.language_model.parameters())
     log("materializing vision tower + projector (replicated)")
     mx.eval(model.parameters())
@@ -490,6 +550,19 @@ def main() -> None:
                 + (" · CANCELLED" if cancelled_mid_gen else ""))
         except ImageExtractionError as e:
             log(f"req {req_id}: image extraction failed: {e}")
+            emit(rank, {"event": "done", "id": req_id, "ntoks": 0,
+                        "prompt_tokens": 0, "cached_tokens": 0,
+                        "elapsed_s": 0.0, "tps": 0.0,
+                        "finish_reason": "error", "error": str(e)})
+        except Exception as e:
+            import traceback as _tb
+            _t = _tb.format_exc()
+            try:
+                with open(f"/tmp/vlm_err_rank{rank}.log", "a") as _f:
+                    _f.write(f"=== req {req_id} ===\n{_t}\n")
+            except Exception:
+                pass
+            log(f"req {req_id}: GEN ERROR: {e}")
             emit(rank, {"event": "done", "id": req_id, "ntoks": 0,
                         "prompt_tokens": 0, "cached_tokens": 0,
                         "elapsed_s": 0.0, "tps": 0.0,
