@@ -5585,7 +5585,7 @@ def _initial_default_config() -> Optional[dict]:
 #   major (1.7.2 → 2.0.0) — breaking API or topology change
 #
 # Use `./scripts/bump-version.sh patch|minor|major` to bump + auto-commit.
-APP_VERSION = "1.40.1"
+APP_VERSION = "1.40.2"
 
 app = FastAPI(
     title="OdyssAI-X (odyssai.eu)",
@@ -12928,11 +12928,34 @@ async def admin_cluster_load(cluster_id: str, req: ArgoLoadRequest):
                 used.add(i)
     overlap = set(node_indices) & used
     if overlap:
-        raise HTTPException(
-            409,
-            f"{cluster_id}: requested nodes {sorted(overlap)} are already in use by "
-            f"another loaded pool. Pick a disjoint subset."
+        # SINGLE-node pools can CO-RESIDE on one node — they're independent
+        # runner processes, RAM-gated by the operator / pro-loader (e.g. two
+        # 30B-A3B 6-bit ≈ 24GB each on a 96GB node). Only DISTRIBUTED pools
+        # (nodes>1: pipeline/tensor sharding + ring/jaccl collectives) need
+        # EXCLUSIVE nodes — two of them on one node would collide. So refuse
+        # the overlap only when the new pool OR an overlapping loaded pool is
+        # multi-node. (Regression fix: the blanket 409 broke the long-standing
+        # 2-pools-on-one-node setup.)
+        def _pool_indices(p):
+            out = set()
+            for _n in getattr(p, "nodes", []) or []:
+                _i = _host_to_index(cluster_id, _n.get("host")) if _n.get("host") else None
+                if _i is not None:
+                    out.add(_i)
+            return out
+        overlapping_multinode = any(
+            len(_pool_indices(p)) > 1
+            for a, p in list_pools(cluster_id)
+            if a != alias and (_pool_indices(p) & overlap)
         )
+        if nodes_count > 1 or overlapping_multinode:
+            raise HTTPException(
+                409,
+                f"{cluster_id}: requested nodes {sorted(overlap)} are already in use "
+                f"by a DISTRIBUTED pool (or this load is multi-node) — distributed "
+                f"pools need exclusive nodes. Pick a disjoint subset."
+            )
+        # else: single-node co-residence — allowed (capacity is the operator's).
 
     topo = build_topology_from_indices(cluster_id, node_indices)
 
