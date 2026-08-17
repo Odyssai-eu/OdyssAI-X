@@ -5585,7 +5585,7 @@ def _initial_default_config() -> Optional[dict]:
 #   major (1.7.2 → 2.0.0) — breaking API or topology change
 #
 # Use `./scripts/bump-version.sh patch|minor|major` to bump + auto-commit.
-APP_VERSION = "1.40.0"
+APP_VERSION = "1.40.1"
 
 app = FastAPI(
     title="OdyssAI-X (odyssai.eu)",
@@ -12043,15 +12043,37 @@ async def _coresidence_free_by_index(cluster_id: str, per_node: list[dict],
 
 
 async def _gather_preflight(cluster_id: str, model: str,
-                            draft: Optional[str] = None) -> dict:
-    """Gather the facts + run the pure evaluator. Read-only, no GPU."""
+                            draft: Optional[str] = None,
+                            nodes: Optional[int] = None) -> dict:
+    """Gather the facts + run the pure evaluator. Read-only, no GPU.
+
+    `nodes`: intended pool size. The model/config probe runs on the node the
+    pool would ACTUALLY land on (the first auto-selected FREE node), not always
+    rank0 — a co-resident pool targets free nodes that carry the model while
+    rank0 (busy with another pool) may not even have it rsynced. Without this
+    the preflight reported 'config absent' against the wrong node."""
     import preflight
     detail = await admin_cluster_get(cluster_id)
     cap = detail.get("capacity_by_nodes", {})
     max_nodes = int(detail.get("max_nodes", 1) or 1)
     per_node = (cap.get(str(max_nodes)) or {}).get("per_node") or []
     base_dir = models_dir_for(cluster_id)
+    # Probe the intended target node (first free one for `nodes`), else rank0.
     rank0 = rank0_ssh_for_cluster(cluster_id, 1)
+    if nodes:
+        _used = set()
+        for _a, _p in list_pools(cluster_id):
+            for _n in _p.nodes:
+                _h = _n.get("host")
+                _i = _host_to_index(cluster_id, _h) if _h else None
+                if _i is not None:
+                    _used.add(_i)
+        _free = [i for i in range(max_nodes) if i not in _used]
+        _target = (_free[:nodes] if len(_free) >= nodes else list(range(nodes)))
+        try:
+            rank0 = build_topology_from_indices(cluster_id, _target)[0]["ssh"]
+        except Exception:
+            pass
     abspath = _resolve_model_abspath(model, base_dir)
     cfg = await _read_raw_config(rank0, abspath)
     size = await get_model_size_bytes(rank0, abspath)
@@ -12072,13 +12094,16 @@ async def _gather_preflight(cluster_id: str, model: str,
 
 @app.get("/admin/clusters/{cluster_id}/preflight")
 async def admin_cluster_preflight(cluster_id: str, model: str,
-                                  draft: Optional[str] = None):
+                                  draft: Optional[str] = None,
+                                  nodes: Optional[int] = None):
     """Pro-loader pre-flight: verdict + node plan BEFORE loading. Read-only.
     The dashboard calls this on model pick to auto-select nodes + show the
-    verdict; admin_cluster_load calls the same evaluator as a gate."""
+    verdict; admin_cluster_load calls the same evaluator as a gate. Pass
+    `nodes` for a co-resident pool so the probe hits the target free node,
+    not rank0 (which may be busy with another pool and lack the model)."""
     if not cluster_exists(cluster_id):
         raise HTTPException(404, f"unknown cluster {cluster_id}")
-    return await _gather_preflight(cluster_id, model, draft)
+    return await _gather_preflight(cluster_id, model, draft, nodes=nodes)
 
 
 @app.put("/admin/clusters/{cluster_id}")
@@ -12853,7 +12878,21 @@ async def admin_cluster_load(cluster_id: str, req: ArgoLoadRequest):
                 400,
                 f"{cluster_id}: unsupported nodes={req.nodes} (available: {avail}, max={effective_max})"
             )
-        node_indices = list(range(req.nodes))
+        # Auto-select FREE nodes (skip indices held by other loaded pools) so a
+        # co-resident pool doesn't blindly collide on node 0. `list(range(N))`
+        # started at 0 → a 2nd pool always 409'd against a pool on node 0 even
+        # when other nodes were free. Falls back to [0..N-1] when nothing frees
+        # up enough (the disjoint-subset 409 below then fires with the real hint).
+        _used_now = set()
+        for _a, _p in list_pools(cluster_id):
+            for _n in _p.nodes:
+                _h = _n.get("host")
+                _idx = _host_to_index(cluster_id, _h) if _h else None
+                if _idx is not None:
+                    _used_now.add(_idx)
+        _free = [i for i in range(effective_max) if i not in _used_now]
+        node_indices = (_free[:req.nodes] if len(_free) >= req.nodes
+                        else list(range(req.nodes)))
         nodes_count = req.nodes
 
     # Purge any pool whose runners have all died (OOM, panic, node reboot).
