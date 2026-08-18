@@ -172,6 +172,51 @@ def plan_nodes(meta: dict, capacity_by_nodes: dict, max_nodes: int) -> dict:
                       f"(marge {best['headroom_gb']} GB)"}
 
 
+def _plan_vlm_nodes(meta: dict, free_by_index: Optional[dict],
+                    per_node: Optional[list[dict]], max_nodes: int) -> dict:
+    """Node plan for a VISION model, co-residence + kv-heads aware.
+
+    A VLM is single-node mlx_vlm.server when it fits ONE free node, else it is
+    distributed (vlm_runner tensor/pipeline). Find the smallest node count N
+    whose N FREEST nodes each hold the even shard; for the tensor-parallel VLM
+    path (minimax_m3_vl and any non-pipeline VLM) kv_heads must divide N. Picks
+    the actual free node indices — never a blind [0] (the old hard-code sent a
+    327GB distributed VLM at node 0, which was busy AND too small)."""
+    size = meta["size_bytes"]
+    kvh = meta.get("num_key_value_heads")
+    npn = len(per_node) if per_node else max_nodes
+    free = free_by_index or {}
+    # Free RAM per index; fall back to the node's ceiling (per_node) when the
+    # co-residence map is absent so a fresh cluster still plans.
+    def _free(i: int) -> int:
+        if i in free:
+            return int(free[i])
+        if per_node and i < len(per_node):
+            return int(per_node[i].get("wired_limit_bytes")
+                       or per_node[i].get("ram_bytes") or 0)
+        return 0
+    order = sorted(range(npn), key=lambda i: -_free(i))
+    tensor_only = not meta.get("pipeline_capable")
+    for n in range(1, min(max_nodes, npn) + 1):
+        if kvh and n > 1 and tensor_only and kvh % n != 0:
+            continue                                   # kv must divide world size
+        chosen = order[:n]
+        shard = size / n
+        if all(_free(i) >= shard for i in chosen):
+            mode = "vlm" if n == 1 else "vlm-dist"
+            reason = ("modèle vision → mlx_vlm.server single-node" if n == 1
+                      else f"VLM distribué {n} nodes (vision, "
+                           f"{'kv=%d' % kvh if kvh else 'tensor/pipeline'})")
+            return {"ok": True, "nodes": n, "mode": mode, "indices": chosen,
+                    "options": [{"nodes": n, "mode": mode}], "reason": reason}
+    kv_hint = (f" ; tensor-only kv_heads={kvh} limite N aux diviseurs de {kvh}"
+               if kvh and tensor_only else "")
+    return {"ok": False, "nodes": None, "mode": None, "indices": None,
+            "options": [],
+            "reason": (f"VLM {meta['size_gb']} GB ne tient sur aucune topologie "
+                       f"de nodes LIBRES (jusqu'à {max_nodes}){kv_hint}")}
+
+
 def select_concrete_nodes(indices: list[int], per_node: list[dict],
                           size_bytes: int, mode: str,
                           free_by_index: Optional[dict] = None) -> dict:
@@ -242,17 +287,21 @@ def evaluate(*, config: dict, size_bytes: int, capacity_by_nodes: dict,
             blockers.append(
                 "modèle vision (mlx_vlm.server) mais le venv mlx-vlm est ABSENT "
                 "du node cible — le load resterait bloqué à 95%")
-        # vision = single-node mlx_vlm.server path
-        plan = {"ok": vlm_venv_present is not False, "nodes": 1, "mode": "vlm",
-                "indices": [0], "options": [{"nodes": 1, "mode": "vlm"}],
-                "reason": "modèle vision → mlx_vlm.server single-node"}
+        # VLM node plan: single-node mlx_vlm.server if it fits ONE free node,
+        # else distributed — co-residence + kv-heads aware, picks free nodes
+        # (NOT a blind [0]). Fixes: a 327GB MiniMax planned at busy node 0.
+        plan = _plan_vlm_nodes(meta, free_by_index, per_node, max_nodes)
+        if not plan["ok"]:
+            blockers.append(plan["reason"])
+        elif vlm_venv_present is False:
+            plan["ok"] = False
     else:
         plan = plan_nodes(meta, capacity_by_nodes, max_nodes)
         if not plan["ok"]:
             blockers.append(plan["reason"])
 
     selection = None
-    if plan.get("ok") and per_node and not meta["is_vision"]:
+    if plan.get("ok") and per_node:
         selection = select_concrete_nodes(plan["indices"], per_node,
                                            meta["size_bytes"], plan["mode"],
                                            free_by_index)
