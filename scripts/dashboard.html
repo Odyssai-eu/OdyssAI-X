@@ -1167,6 +1167,9 @@ async function refreshAll() {
       supports_vision: !!c.supports_vision,
       color: "blue",
       enabled: c.enabled !== false,
+      // Auto-reload toggles (default ON) — surfaced in Cluster settings.
+      reload_on_restart: c.reload_on_restart !== false,
+      reload_on_reboot: c.reload_on_reboot !== false,
       max_nodes: c.max_nodes || (Array.isArray(c.nodes) ? c.nodes.length : 0) || 1,
     }));
     // If the user's selected cluster vanished from topology, snap to the
@@ -2493,6 +2496,19 @@ function renderMlxClusterEditorBody(id, draft, cfg, poolLoaded, kindOpts, backen
     <div class="field" style="margin-bottom:14px">
       <div class="field-label">Models directory <span style="font-weight:400;color:var(--ink-3)">(shared path — every node in this cluster reads models from here)</span></div>
       <input class="ce-input mono" data-act="cluster-edit-models-dir" data-cluster="${id}" value="${escapeHtml(draft.models_dir || "")}" placeholder="/Volumes/models/odysseus"/>
+    </div>
+    <div class="field" style="margin-bottom:14px">
+      <div class="field-label">Auto-reload <span style="font-weight:400;color:var(--ink-3)">(automatically re-load this cluster's last-loaded pools)</span></div>
+      <div style="display:flex;flex-direction:column;gap:8px;margin-top:6px">
+        <label style="display:flex;align-items:center;gap:8px;font-size:13px;cursor:pointer">
+          <input type="checkbox" data-act="cluster-toggle-reload-restart" data-cluster="${id}" ${cfg.reload_on_restart !== false ? "checked" : ""}/>
+          <span>On container <b>restart</b> <span style="color:var(--ink-3)">— redeploy / crash → restore the pools that were loaded</span></span>
+        </label>
+        <label style="display:flex;align-items:center;gap:8px;font-size:13px;cursor:pointer">
+          <input type="checkbox" data-act="cluster-toggle-reload-reboot" data-cluster="${id}" ${cfg.reload_on_reboot !== false ? "checked" : ""}/>
+          <span>On node <b>reboot</b> <span style="color:var(--ink-3)">— Reboot all → wait for nodes up → reload the pools</span></span>
+        </label>
+      </div>
     </div>
     <div>
       <div style="display:flex;justify-content:space-between;align-items:center;padding-bottom:14px">
@@ -5952,6 +5968,30 @@ async function handleAct(e) {
       const saved = await r.json();
       state.cluster_defs[cid] = saved;
       toast(`${cid} ${next ? 'enabled' : 'disabled'}`, "ok");
+      render();
+    } catch (err) {
+      toast(`Toggle failed: ${err.message || err}`, "err");
+    }
+    return;
+  }
+  if (act === "cluster-toggle-reload-restart" || act === "cluster-toggle-reload-reboot") {
+    const cid = el.dataset.cluster;
+    const cfg = state.cluster_defs?.[cid];
+    if (!cfg) return;
+    const field = act === "cluster-toggle-reload-restart"
+      ? "reload_on_restart" : "reload_on_reboot";
+    const next = !(cfg[field] !== false);   // default ON, so first click turns OFF
+    try {
+      const r = await fetch(`/admin/clusters/${encodeURIComponent(cid)}`, {
+        method: "PUT",
+        headers: { "content-type": "application/json", ...authHeaders() },
+        body: JSON.stringify({ [field]: next }),
+      });
+      if (!r.ok) { const t = await r.text(); throw new Error(t.slice(0, 300)); }
+      const saved = await r.json();
+      state.cluster_defs[cid] = saved;
+      const label = field === "reload_on_restart" ? "restart" : "reboot";
+      toast(`${cid}: auto-reload on ${label} ${next ? "ON" : "OFF"}`, "ok");
       render();
     } catch (err) {
       toast(`Toggle failed: ${err.message || err}`, "err");

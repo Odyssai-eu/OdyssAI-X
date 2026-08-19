@@ -456,7 +456,7 @@ def get_cluster_def(cluster_id: str) -> dict:
     default = DEFAULT_CLUSTER_DEFS.get(cluster_id, {})
     overlay = cfg.get(cluster_id, {})
     merged = json.loads(json.dumps(default))  # deep copy
-    for k in ("name", "kind", "backend", "max_nodes", "models_dir", "enabled", "upstream", "supports_vision", "_vlm_managed", "_vlm_port", "_vlm_model_path", "_vlm_pid"):
+    for k in ("name", "kind", "backend", "max_nodes", "models_dir", "enabled", "reload_on_restart", "reload_on_reboot", "upstream", "supports_vision", "_vlm_managed", "_vlm_port", "_vlm_model_path", "_vlm_pid"):
         if k in overlay:
             merged[k] = overlay[k]
     if "nodes" in overlay and overlay["nodes"]:
@@ -532,6 +532,22 @@ def _cluster_enabled(cluster_id: str) -> bool:
     """True unless cluster-config.json explicitly stored enabled=false for this
     cluster. Default True so existing config (no `enabled` field) keeps working."""
     return get_cluster_def(cluster_id).get("enabled", True) is not False
+
+
+def _reload_on_restart(cluster_id: str) -> bool:
+    """True (default) unless the cluster stored reload_on_restart=false. Gates the
+    container-startup desired-state restore, so an operator can stop a cluster's
+    last-loaded pools from auto-reloading when the odyssai-odysseus container
+    restarts (redeploy, crash). Default True preserves the historical behavior."""
+    return get_cluster_def(cluster_id).get("reload_on_restart", True) is not False
+
+
+def _reload_on_reboot(cluster_id: str) -> bool:
+    """True (default) unless the cluster stored reload_on_reboot=false. When on,
+    POST /admin/clusters/{id}/reboot-all schedules a background task that waits
+    for the nodes to come back SSH-up, sweeps orphans, then re-loads the pools
+    that were loaded before the reboot."""
+    return get_cluster_def(cluster_id).get("reload_on_reboot", True) is not False
 
 
 def save_cluster_def(cluster_id: str, updates: dict) -> None:
@@ -4692,6 +4708,95 @@ def _clear_cluster_degraded(cluster_id: str) -> None:
         sys.stderr.write(f"[degraded] {cluster_id} → cleared\n")
 
 
+async def _restore_cluster_pools(cid: str, leaked_hosts: Optional[set] = None) -> list[str]:
+    """Restore a cluster's persisted desired-state pools (state-<cid>.json v2).
+
+    Shared by the container-startup restore (reload_on_restart) and the
+    reboot-all reload (reload_on_reboot). Returns the aliases actually restored.
+    `leaked_hosts`: nodes the post-sweep wired guard flagged — pools touching
+    them are skipped (they need a reboot before a fresh pool can land). A failed
+    entry KEEPS its desired-state (never removed here) so a later restore
+    re-attempts it — one dead pool must never erase the intent to serve it."""
+    leaked_hosts = leaked_hosts or set()
+    restored: list[str] = []
+    saved_pools = load_cluster_state_v2(cid)
+    if not saved_pools:
+        return restored
+    saved_pools.sort(key=lambda p: 0 if p.get("alias") == DEFAULT_ALIAS else 1)
+    for entry in saved_pools:
+        alias = entry.get("alias", DEFAULT_ALIAS)
+        try:
+            indices = entry.get("node_indices") or list(range(int(entry.get("nodes") or 1)))
+            # Wired-guard: never respawn onto a node the sweep left leaked.
+            if leaked_hosts:
+                _cd_nodes = (get_cluster_def(cid) or {}).get("nodes") or []
+                _entry_hosts = {_cd_nodes[i].get("host") for i in indices
+                                if 0 <= i < len(_cd_nodes)}
+                _bad = _entry_hosts & leaked_hosts
+                if _bad:
+                    sys.stderr.write(
+                        f"[api] skipping restore of {cid}:{alias} — node(s) "
+                        f"{sorted(_bad)} hold leaked wired memory (needs reboot)\n")
+                    continue
+            # Distributed VLM pool: restore through VLMDistPool.start()
+            # (ssh-spawned ranks). Gated on the same feature flag as the load
+            # path — with the flag off the entry is skipped, never mis-restored
+            # as a text RunnerPool.
+            if entry.get("is_vlm_dist"):
+                if not VLM_DISTRIBUTED_ENABLED:
+                    sys.stderr.write(
+                        f"[api] skipping vlm-dist restore ({cid}:{alias}) — "
+                        f"VLM_DISTRIBUTED_ENABLED is off\n")
+                    continue
+                vdpool = VLMDistPool(
+                    model=entry["model"], cluster=cid, alias=alias,
+                    node_indices=indices,
+                )
+                await vdpool.start()
+                set_pool(cid, alias, vdpool)
+                restored.append(alias)
+                continue
+            # VL pool (Argo-VLM fold): relaunch the single-node mlx_vlm.server
+            # and re-register a VLMPool. Never a RunnerPool (the distributed
+            # text runner can't serve a vision model).
+            if entry.get("is_vlm"):
+                vpool = await _restore_vlm_pool(cid, alias, entry, indices)
+                if vpool is not None:
+                    set_pool(cid, alias, vpool)
+                    restored.append(alias)
+                continue
+            # dflash pool (B1): relaunch the single-node mlx-dspark serve and
+            # re-register a DFlashPool (TEXT proxy pool). Never a RunnerPool.
+            if entry.get("is_dflash"):
+                dfpool = await _restore_dflash_pool(cid, alias, entry, indices)
+                if dfpool is not None:
+                    set_pool(cid, alias, dfpool)
+                    restored.append(alias)
+                continue
+            pool = RunnerPool(
+                model=entry["model"],
+                mode=entry.get("mode", "pipeline"),
+                use_ap=bool(entry.get("use_ap", True)),
+                nodes_count=len(indices),
+                cluster=cid,
+                kv_q8=bool(entry.get("kv_q8", False)),
+                draft_model=entry.get("draft_model"),
+                num_draft_tokens=int(entry.get("num_draft_tokens") or 4),
+                mtp=entry.get("mtp"),
+                alias=alias,
+                node_indices=indices,
+                backend=entry.get("backend"),
+            )
+            await pool.start()
+            set_pool(cid, alias, pool)
+            restored.append(alias)
+        except Exception as e:
+            sys.stderr.write(
+                f"[api] restore ({cid}:{alias}) failed: {e} — "
+                f"desired-state entry kept for retry\n")
+    return restored
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global _pool
@@ -4753,86 +4858,19 @@ async def lifespan(app: FastAPI):
         except Exception as e:
             sys.stderr.write(f"[api] startup load (nautilus) failed: {e}\n")
             _pool = None
-    # Multi-pool restore (state file v2): iterate every cluster declared in
-    # topology.yaml, restore whatever pools were running at last shutdown.
-    # Within a cluster, sort the default alias first so any extra-alias load
-    # that depended on it sees a clean baseline.
+    # Multi-pool restore (state file v2): per cluster, restore whatever pools
+    # were running at last shutdown — GATED by reload_on_restart (default True).
+    # A cluster with the toggle OFF keeps its desired-state persisted (so a
+    # later reboot-reload or a manual load can still use it) but is NOT
+    # auto-restored here. Extracted to _restore_cluster_pools so the reboot-all
+    # reload path reuses the exact same logic.
     for cid in DEFAULT_CLUSTER_DEFS.keys():
-        saved_pools = load_cluster_state_v2(cid)
-        if not saved_pools:
+        if not _reload_on_restart(cid):
+            sys.stderr.write(
+                f"[api] reload_on_restart=false ({cid}) — skipping startup "
+                f"restore of its pools (desired-state kept)\n")
             continue
-        saved_pools.sort(key=lambda p: 0 if p.get("alias") == DEFAULT_ALIAS else 1)
-        for entry in saved_pools:
-            alias = entry.get("alias", DEFAULT_ALIAS)
-            try:
-                indices = entry.get("node_indices") or list(range(int(entry.get("nodes") or 1)))
-                # Wired-guard: never respawn onto a node the sweep left leaked.
-                if _leaked_hosts:
-                    _cd_nodes = (get_cluster_def(cid) or {}).get("nodes") or []
-                    _entry_hosts = {_cd_nodes[i].get("host") for i in indices
-                                    if 0 <= i < len(_cd_nodes)}
-                    _bad = _entry_hosts & _leaked_hosts
-                    if _bad:
-                        sys.stderr.write(
-                            f"[api] skipping restore of {cid}:{alias} — node(s) "
-                            f"{sorted(_bad)} hold leaked wired memory (needs reboot)\n")
-                        continue
-                # Distributed VLM pool: restore through VLMDistPool.start()
-                # (ssh-spawned ranks). Gated on the same feature flag as the
-                # load path — with the flag off the entry is skipped, never
-                # mis-restored as a text RunnerPool.
-                if entry.get("is_vlm_dist"):
-                    if not VLM_DISTRIBUTED_ENABLED:
-                        sys.stderr.write(
-                            f"[api] skipping vlm-dist restore ({cid}:{alias}) — "
-                            f"VLM_DISTRIBUTED_ENABLED is off\n"
-                        )
-                        continue
-                    vdpool = VLMDistPool(
-                        model=entry["model"], cluster=cid, alias=alias,
-                        node_indices=indices,
-                    )
-                    await vdpool.start()
-                    set_pool(cid, alias, vdpool)
-                    continue
-                # VL pool (Argo-VLM fold): relaunch the single-node
-                # mlx_vlm.server and re-register a VLMPool. Never a RunnerPool
-                # (the distributed text runner can't serve a vision model).
-                if entry.get("is_vlm"):
-                    vpool = await _restore_vlm_pool(cid, alias, entry, indices)
-                    if vpool is not None:
-                        set_pool(cid, alias, vpool)
-                    continue
-                # dflash pool (B1): relaunch the single-node mlx-dspark serve and
-                # re-register a DFlashPool (TEXT proxy pool). Never a RunnerPool.
-                if entry.get("is_dflash"):
-                    dfpool = await _restore_dflash_pool(cid, alias, entry, indices)
-                    if dfpool is not None:
-                        set_pool(cid, alias, dfpool)
-                    continue
-                pool = RunnerPool(
-                    model=entry["model"],
-                    mode=entry.get("mode", "pipeline"),
-                    use_ap=bool(entry.get("use_ap", True)),
-                    nodes_count=len(indices),
-                    cluster=cid,
-                    kv_q8=bool(entry.get("kv_q8", False)),
-                    draft_model=entry.get("draft_model"),
-                    num_draft_tokens=int(entry.get("num_draft_tokens") or 4),
-                    mtp=entry.get("mtp"),
-                    alias=alias,
-                    node_indices=indices,
-                    backend=entry.get("backend"),
-                )
-                await pool.start()
-                set_pool(cid, alias, pool)
-            except Exception as e:
-                # F3: a failed restore KEEPS the desired-state entry (we never
-                # remove it here) so a later restart / recovery re-attempts it.
-                # Never let one dead pool erase the intent to serve it.
-                sys.stderr.write(
-                    f"[api] startup restore ({cid}:{alias}) failed: {e} — "
-                    f"desired-state entry kept for retry\n")
+        await _restore_cluster_pools(cid, _leaked_hosts)
     # Apply persisted default TTL to any pool that just started up.
     _apply_default_ttl_to_pools()
     # Background TTL sweeper — auto-unloads pools idle for > ttl_seconds.
@@ -5585,7 +5623,7 @@ def _initial_default_config() -> Optional[dict]:
 #   major (1.7.2 → 2.0.0) — breaking API or topology change
 #
 # Use `./scripts/bump-version.sh patch|minor|major` to bump + auto-commit.
-APP_VERSION = "1.40.3"
+APP_VERSION = "1.41.0"
 
 app = FastAPI(
     title="OdyssAI-X (odyssai.eu)",
@@ -11772,6 +11810,11 @@ class ClusterConfigUpdate(BaseModel):
     # Soft-disable a cluster without removing its definition. Disabled clusters
     # refuse load via the admin API and are hidden from the dashboard.
     enabled: Optional[bool] = None
+    # Auto-reload toggles (per cluster, default True). reload_on_restart gates
+    # the container-startup desired-state restore; reload_on_reboot makes
+    # reboot-all re-load the pools once the nodes come back up.
+    reload_on_restart: Optional[bool] = None
+    reload_on_reboot: Optional[bool] = None
 
 
 def _pool_for_cluster(cluster_id: str):
@@ -11910,6 +11953,8 @@ async def admin_clusters_list():
             "backend": cd.get("backend"),
             "upstream": cd.get("upstream") or None,
             "enabled": _cluster_enabled(cid),
+            "reload_on_restart": _reload_on_restart(cid),
+            "reload_on_reboot": _reload_on_reboot(cid),
             "master_host": master.get("host"),
             "master_ssh": master.get("ssh"),
             "node_count": len(nodes),
@@ -11979,6 +12024,10 @@ async def admin_cluster_get(cluster_id: str):
         "upstream": cd.get("upstream"),
         "fallback": cd.get("fallback") or None,
         "enabled": _cluster_enabled(cluster_id),
+        # Auto-reload toggles (default True) — the dashboard renders a switch
+        # for each in Cluster settings.
+        "reload_on_restart": _reload_on_restart(cluster_id),
+        "reload_on_reboot": _reload_on_reboot(cluster_id),
         "capacity_by_nodes": capacity_by_nodes,
         "model_overhead_factor": _model_load_overhead_factor(),
     }
@@ -12200,6 +12249,10 @@ async def admin_cluster_update(cluster_id: str, req: ClusterConfigUpdate):
         if req.enabled is False and pool is not None and getattr(pool, "loaded", False):
             raise HTTPException(409, f"{cluster_id} is loaded — unload first to disable")
         persist["enabled"] = bool(req.enabled)
+    if req.reload_on_restart is not None:
+        persist["reload_on_restart"] = bool(req.reload_on_restart)
+    if req.reload_on_reboot is not None:
+        persist["reload_on_reboot"] = bool(req.reload_on_reboot)
     if req.upstream is not None: persist["upstream"] = candidate["upstream"]
     if req.fallback is not None:
         # Empty string clears the fallback; non-empty validates against published cloud aliases.
@@ -12239,9 +12292,72 @@ async def admin_cluster_delete(cluster_id: str):
     return {"ok": True, "removed": cluster_id}
 
 
+async def _wait_nodes_up(cluster_id: str, timeout_s: int = 420,
+                         interval_s: int = 10) -> bool:
+    """Poll every host in the cluster until all answer SSH (`echo up`) or the
+    timeout elapses. Used by the reboot-reload path to know the machines are
+    back before re-launching runners."""
+    member_ids = _cluster_host_ids(cluster_id)
+    hosts = [_resolve_host(hid) for hid in member_ids]
+    hosts = [h for h in hosts if h]
+    if not hosts:
+        return False
+
+    async def _up(h) -> bool:
+        try:
+            rc, out, _ = await asyncio.to_thread(_ssh_exec, h["ssh"], "echo up", 8)
+            return rc == 0 and "up" in out
+        except Exception:
+            return False
+
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        oks = await asyncio.gather(*[_up(h) for h in hosts])
+        if all(oks):
+            return True
+        await asyncio.sleep(interval_s)
+    return False
+
+
+async def _reboot_reload_after(cluster_id: str) -> None:
+    """Background task scheduled by reboot-all when reload_on_reboot is on: wait
+    for the cluster's nodes to come back SSH-up, sweep any orphan runners, then
+    re-load the pools that were loaded before the reboot (via the shared
+    _restore_cluster_pools). Best-effort — a failure only logs; the desired
+    state is preserved so a later restart still re-attempts the pools."""
+    try:
+        # Give the machines a moment to actually go DOWN before polling for up,
+        # so we don't read the pre-reboot uptime as "already back".
+        await asyncio.sleep(30)
+        if not await _wait_nodes_up(cluster_id):
+            sys.stderr.write(
+                f"[api] reboot-reload ({cluster_id}): nodes did not return "
+                f"within timeout — skipping reload (desired-state kept)\n")
+            return
+        # Clear dead in-memory pools + orphan runners so the restore is clean
+        # (the reboot killed every rank; their queue pairs must be swept before
+        # JACCL can re-init).
+        try:
+            await _purge_dead_pools(cluster_id)
+        except Exception:
+            pass
+        try:
+            await asyncio.to_thread(_sweep_orphan_runners, cluster_id)
+        except Exception:
+            pass
+        restored = await _restore_cluster_pools(cluster_id)
+        sys.stderr.write(
+            f"[api] reboot-reload ({cluster_id}): restored "
+            f"{restored if restored else 'nothing'}\n")
+    except Exception as e:
+        sys.stderr.write(f"[api] reboot-reload ({cluster_id}) failed: {e}\n")
+
+
 @app.post("/admin/clusters/{cluster_id}/reboot-all")
 async def admin_cluster_reboot_all(cluster_id: str):
-    """Reboot every host in this cluster in parallel."""
+    """Reboot every host in this cluster in parallel. When reload_on_reboot is
+    on (default), schedule a background task that waits for the nodes to return
+    and re-loads the pools that were loaded before the reboot."""
     member_ids = _cluster_host_ids(cluster_id)
     if not member_ids:
         raise HTTPException(404, f"unknown cluster: {cluster_id}")
@@ -12250,7 +12366,12 @@ async def admin_cluster_reboot_all(cluster_id: str):
     if not hosts:
         raise HTTPException(404, "no resolved hosts")
     results = await asyncio.gather(*[_reboot_one(h) for h in hosts])
-    return {"ok": True, "cluster": cluster_id, "results": results}
+    reload_scheduled = False
+    if _reload_on_reboot(cluster_id):
+        asyncio.create_task(_reboot_reload_after(cluster_id))
+        reload_scheduled = True
+    return {"ok": True, "cluster": cluster_id, "results": results,
+            "reload_scheduled": reload_scheduled}
 
 
 class BulkDeleteRequest(BaseModel):
