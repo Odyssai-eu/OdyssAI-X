@@ -5623,7 +5623,7 @@ def _initial_default_config() -> Optional[dict]:
 #   major (1.7.2 → 2.0.0) — breaking API or topology change
 #
 # Use `./scripts/bump-version.sh patch|minor|major` to bump + auto-commit.
-APP_VERSION = "1.41.0"
+APP_VERSION = "1.41.1"
 
 app = FastAPI(
     title="OdyssAI-X (odyssai.eu)",
@@ -6495,6 +6495,48 @@ def _has_quirk(prov_id: str, quirk: str) -> bool:
     return quirk in PROVIDER_QUIRKS.get(prov_id, [])
 
 
+# Idle heartbeat for cloud-proxy SSE streams. Reasoning / OpenRouter models
+# "think" for tens of seconds WITHOUT emitting any bytes; the engine's own
+# streaming read has no idle timeout (read=None), but the DOWNSTREAM client
+# (CodeOS agent, LiteLLM, any SSE reader) applies one and kills the request with
+# "Upstream idle timeout exceeded", stopping the agent mid-turn. Injecting a
+# periodic SSE comment while the upstream is silent keeps the client's idle timer
+# from firing. A `: ` comment line is valid SSE, ignored by OpenAI/Anthropic
+# clients, and is exactly what Anthropic's own API emits as `: ping` keepalives.
+_PROXY_SSE_HEARTBEAT_S = float(env_get("PROXY_SSE_HEARTBEAT_S", "15"))
+
+
+async def _aiter_with_heartbeat(src, heartbeat_s: float = _PROXY_SSE_HEARTBEAT_S):
+    """Relay an async byte-iterator, injecting a `: keepalive` SSE comment
+    whenever `src` stays silent longer than `heartbeat_s`. Upstream errors and
+    end-of-stream propagate unchanged so the caller's error handling is intact."""
+    ait = src.__aiter__()
+    nxt = None
+    try:
+        while True:
+            if nxt is None:
+                nxt = asyncio.ensure_future(ait.__anext__())
+            try:
+                chunk = await asyncio.wait_for(asyncio.shield(nxt), timeout=heartbeat_s)
+            except asyncio.TimeoutError:
+                # Upstream still thinking — keep the client stream alive.
+                yield b": keepalive\n\n"
+                continue
+            except StopAsyncIteration:
+                nxt = None
+                return
+            nxt = None
+            if chunk:
+                yield chunk
+    finally:
+        if nxt is not None and not nxt.done():
+            nxt.cancel()
+            try:
+                await nxt
+            except BaseException:
+                pass
+
+
 async def _proxy_chat_completion(prov_id: str, prov: dict, entry: dict,
                                   body: dict) -> Any:
     """Proxy OpenAI-compat chat completion to an upstream provider.
@@ -6691,7 +6733,7 @@ async def _proxy_chat_completion(prov_id: str, prov: dict, entry: dict,
                         # `cache_read_input_tokens` from Anthropic /v1/messages)
                         # transparent to the client. Companion StatsRow then
                         # surfaces the prefix-cache win without extra work.
-                        async for chunk in r.aiter_bytes():
+                        async for chunk in _aiter_with_heartbeat(r.aiter_bytes()):
                             if chunk:
                                 yield chunk
                 except Exception as e:
@@ -7144,8 +7186,10 @@ async def _proxy_chat_completion_via_anthropic(prov_id: str, prov: dict,
                                              "provider": prov_id}}
                             yield ("data: " + json.dumps(err) + "\n\n").encode()
                             return
-                        async for out_chunk in _translate_anthropic_sse_to_openai(
-                            r.aiter_bytes(), openai_model
+                        async for out_chunk in _aiter_with_heartbeat(
+                            _translate_anthropic_sse_to_openai(
+                                r.aiter_bytes(), openai_model
+                            )
                         ):
                             yield out_chunk
                 except Exception as e:
@@ -7231,7 +7275,7 @@ async def _proxy_anthropic_messages(prov_id: str, prov: dict, entry: dict,
                                              "provider": prov_id}}
                             yield ("event: error\ndata: " + json.dumps(err) + "\n\n").encode()
                             return
-                        async for chunk in r.aiter_bytes():
+                        async for chunk in _aiter_with_heartbeat(r.aiter_bytes()):
                             if chunk:
                                 yield chunk
                 except Exception as e:
