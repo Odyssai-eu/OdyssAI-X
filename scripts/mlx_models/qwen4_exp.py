@@ -4,8 +4,10 @@
 #
 # VENDORISÉ — source : PR ml-explore/mlx-lm#1788 (auteur eauchs), extraite du
 # diff le 2026-08-26, ~1h après ouverture — NON REVIEWÉE upstream à cette date.
-# Garder byte-identique au diff sauf ce bloc. Si la PR merge avec des
-# changements, re-vendoriser depuis la version mergée.
+# Garder byte-identique au diff sauf ce bloc ET le drop mtp.* dans sanitize
+# (delta marque "DELTA vs PR#1788" — la PR ne droppe pas la tete MTP du
+# checkpoint officiel, load strict refuse). Si la PR merge avec des
+# changements, re-vendoriser depuis la version mergée et re-verifier ce point.
 # Cible : Qwen/Qwen3.8-Flash-Next (bf16 officiel). Le sanitize strippe le
 # wrapper language_model., droppe la vision, transpose les conv1d.
 
@@ -813,12 +815,39 @@ class Model(nn.Module):
         for k, v in weights.items():
             if k.startswith("language_model."):
                 k = k[len("language_model.") :]
+            # DELTA vs PR#1788 (2/2) : le checkpoint officiel imbrique le
+            # wrapper SOUS `model.` — `model.language_model.layers...` — que la
+            # regle ci-dessus ne strippe pas. On normalise vers `model.layers...`.
+            if k.startswith("model.language_model."):
+                k = "model." + k[len("model.language_model.") :]
             if k.startswith("vision_tower.") or k.startswith("model.visual."):
                 continue  # text-only pour l'instant
+            # DELTA vs PR#1788 : le checkpoint officiel Qwen/Qwen3.8-Flash-Next
+            # embarque une tete MTP (mtp.layers.0.* — indexer sparse inclus) que
+            # la PR ne droppe pas ; le load strict la refuse. Meme traitement
+            # que laguna.py / le dispatcher qwen3_5_moe : on la droppe.
+            if k.startswith("mtp.") or k.startswith("model.mtp."):
+                continue
             if "conv1d.weight" in k and v.ndim == 3 and v.shape[-1] != 1:
                 # (C, 1, K) torch -> (C, K, 1) mlx
                 if v.shape[1] == 1:
                     v = v.transpose(0, 2, 1)
+            # DELTA vs PR#1788 (3/3) : le checkpoint officiel stocke les experts
+            # FUSIONNES et stackes (`mlp.experts.gate_up_proj` [E, 2*mi, H],
+            # `mlp.experts.down_proj` [E, H, mi]) ; SwitchGLU attend
+            # switch_mlp.{gate,up,down}_proj.weight separes. Split sur dim -2,
+            # gate = premiere moitie — convention Qwen (identique a qwen3_5,
+            # validee sur les quants Q6h16 de la famille).
+            if k.endswith(".mlp.experts.gate_up_proj"):
+                base = k[: -len(".experts.gate_up_proj")]
+                mid = v.shape[-2] // 2
+                out[f"{base}.switch_mlp.gate_proj.weight"] = v[..., :mid, :]
+                out[f"{base}.switch_mlp.up_proj.weight"] = v[..., mid:, :]
+                continue
+            if k.endswith(".mlp.experts.down_proj"):
+                base = k[: -len(".experts.down_proj")]
+                out[f"{base}.switch_mlp.down_proj.weight"] = v
+                continue
             out[k] = v
         return out
 
