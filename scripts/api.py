@@ -2975,6 +2975,17 @@ class RunnerPool:
         # only now that the request is fully built and about to broadcast, so a
         # build-time error can't leak the counter. Released in the finally below.
         await self._acquire_busy()
+        # Ghost-guard (2026-08-26): tracks whether the runner actually finished
+        # this generation. If the consumer stops iterating BEFORE `done` — client
+        # disconnect (bench abort), cancel_event break, handler exception, watchdog
+        # timeout — the async generator closes and the old finally released the
+        # pool WITHOUT telling the runner, which kept grinding its full max_tokens
+        # budget into the void (listener gone). Those ghost generations stacked on
+        # the single-slot runner: every later request shared the GPU with them →
+        # 0.2 tok/s "degraded" on long-gen benches (C03/C04), model-independent,
+        # until a reload killed the runner. The finally now hard-cancels the
+        # request on any early exit so the runner stops at the next token boundary.
+        _gen_finished = False
         try:
             # Tight broadcast window so concurrent submits don't interleave
             # bytes on the runner stdins.
@@ -3079,12 +3090,27 @@ class RunnerPool:
                 if ev.get("event") == "token":
                     last_progress = time.monotonic()
                     seen_token = True
+                if ev.get("event") == "done":
+                    _gen_finished = True
                 yield ev
                 if ev.get("event") == "done":
                     return
         finally:
             self._listeners.pop(req_id, None)
             self._release_busy()
+            # Ghost-guard: consumer left before the runner said `done` → tell
+            # every rank to stop this request NOW. Idempotent with the explicit
+            # /cancel endpoints and the wedge watchdog (same _cancelled_ids set
+            # runner-side). Fire-and-forget so response teardown never blocks
+            # on the broadcast lock.
+            if not _gen_finished and req_id:
+                sys.stderr.write(
+                    f"[pool {self.cluster}:{self.alias}] ghost-guard: consumer "
+                    f"gone before done — hard-cancelling {req_id} on all ranks\n")
+                try:
+                    asyncio.get_running_loop().create_task(self.cancel(req_id))
+                except RuntimeError:
+                    pass  # loop teardown — runner dies with the app anyway
 
     async def cancel(self, request_id: str) -> int:
         """Broadcast a hard-cancel command for `request_id` to every rank.
@@ -5623,7 +5649,7 @@ def _initial_default_config() -> Optional[dict]:
 #   major (1.7.2 → 2.0.0) — breaking API or topology change
 #
 # Use `./scripts/bump-version.sh patch|minor|major` to bump + auto-commit.
-APP_VERSION = "1.41.1"
+APP_VERSION = "1.41.2"
 
 app = FastAPI(
     title="OdyssAI-X (odyssai.eu)",
@@ -9175,6 +9201,14 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
                 # P8.1 — re-stamp per chunk: a long in-flight generation must
                 # keep the unload-guard window open, not just its first 30s.
                 _CLUSTER_LAST_SERVED[pool.cluster] = time.time()
+                # Ghost-guard companion (2026-08-26): the non-stream path never
+                # checked for client disconnect — a bench client timing out
+                # mid-generation left the loop consuming the full max_tokens
+                # budget server-side. Break like the streaming path does; the
+                # submit() finally then hard-cancels the runner.
+                if await request.is_disconnected():
+                    run_status = "disconnected"
+                    break
                 if cancel_event.is_set():
                     run_status = "cancelled"
                     break
