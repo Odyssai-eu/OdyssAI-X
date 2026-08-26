@@ -151,6 +151,20 @@ class RMSNormGated(nn.Module):
 # ------------------------------------------------------------------- rope / helpers
 
 
+def _positions(offset, S: int) -> mx.array:
+    """DELTA vs PR#1788 (5/5) : positions rope tolerantes au batch.
+
+    En chemin stream_generate, `offset` est un int -> [1, S]. En chemin
+    BatchGenerator (le runner maison), `offset` est un mx.array d'offsets PAR
+    SLOT -> [B, S] (mx.arange(array, array) est un TypeError — c'etait la
+    cause du finish=error / 0 token via serveur alors que la generation
+    directe marchait).
+    """
+    if isinstance(offset, mx.array):
+        return offset[:, None] + mx.arange(S)
+    return mx.arange(offset, offset + S)[None]
+
+
 def _rope_partial(x: mx.array, cos: mx.array, sin: mx.array) -> mx.array:
     """Applique le rope sur les `rotary_dim` premières dimensions seulement."""
     d = cos.shape[-1]
@@ -230,8 +244,7 @@ class QSAIndexer(nn.Module):
         cos_k, sin_k = rope(block_starts[None, :])
         pooled = _rope_partial(pooled, cos_k, sin_k)
 
-        q_pos = mx.arange(offset, offset + S)
-        cos_q, sin_q = rope(q_pos[None, :])
+        cos_q, sin_q = rope(_positions(offset, S))
         q = self.q_layernorm(q)
         q = _rope_partial(q, cos_q[:, :, None, :], sin_q[:, :, None, :])
 
@@ -296,7 +309,7 @@ class Attention(nn.Module):
         )
         v = self.v_proj(x).reshape(B, S, self.n_kv_heads, -1).transpose(0, 2, 1, 3)
 
-        cos, sin = rope(mx.arange(offset, offset + S)[None])
+        cos, sin = rope(_positions(offset, S))
         cos, sin = cos[:, None], sin[:, None]
         q, k = _rope_partial(q, cos, sin), _rope_partial(k, cos, sin)
 
