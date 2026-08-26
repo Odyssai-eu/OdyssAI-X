@@ -109,9 +109,15 @@ class RMSNorm(nn.Module):
     le reshape : un poids de taille hc_count*hidden, mais une statistique par flux.
     """
 
+    # DELTA vs PR#1788 (4/4) — LE bug du charabia : les poids RMSNorm du
+    # checkpoint qwen4_exp sont CENTRES SUR ZERO (reference equipe Qwen,
+    # mlx-vlm PR#2028 Qwen4ExpRMSNorm : « checkpoint weights are centered at
+    # zero », application y * (1.0 + weight)). La PR#1788 appliquait
+    # y * weight -> activations multipliees par ~0 des la premiere couche.
+    # La variante Gated (deltanet) reste CLASSIQUE, conforme a la reference.
     def __init__(self, dim: int, group_size: Optional[int] = None, eps: float = 1e-6):
         super().__init__()
-        self.weight = mx.ones(dim)
+        self.weight = mx.zeros(dim)
         self.eps = eps
         self.group_size = group_size
         if group_size is not None and dim % group_size:
@@ -119,11 +125,11 @@ class RMSNorm(nn.Module):
 
     def __call__(self, x: mx.array) -> mx.array:
         if self.group_size is None:
-            return mx.fast.rms_norm(x, self.weight, self.eps)
+            return mx.fast.rms_norm(x, 1.0 + self.weight, self.eps)
         shape = x.shape
         x = x.reshape(*shape[:-1], -1, self.group_size)
         x = mx.fast.rms_norm(x, None, self.eps).reshape(shape)
-        return x * self.weight
+        return x * (1.0 + self.weight)
 
 
 class RMSNormGated(nn.Module):
