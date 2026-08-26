@@ -29,7 +29,7 @@ from .cache import ArraysCache, CacheList, KVCache
 from .deepseek_v32 import DeepseekV32MLP, DeepseekV32MoE
 from .deepseek_v32 import Model as DSV32Model
 from .dsv4_hyper_connection import HyperConnection, hc_expand
-from .gated_delta import gated_delta_update
+from .glm5_gated_delta import gated_delta_update
 from .mla import MultiLinear
 from .rope_utils import initialize_rope
 
