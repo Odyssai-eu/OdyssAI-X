@@ -3031,7 +3031,19 @@ def _run_batched_main(model, tokenizer, repo: str, kv_q8_default: bool,
     # slot is removed and rebuild as soon as the batch is EMPTY, so in-flight
     # requests are never disturbed and the cost lands between requests.
     _bg_rebuild_min_toks = int(os.environ.get("BG_REBUILD_MIN_TOKS", "1000"))
-    bg_state = {"dirty": False}
+    # Force-rebuild guard (2026-08-27b): the empty-batch condition above can
+    # STARVE — with concurrent traffic (bench monitor probes, overlapping
+    # requests) the batch never empties, the dirty flag waits forever, and the
+    # poisoned BG keeps serving everything at ~0.25 tok/s (observed live on
+    # Bench R2 r01: 20 min at 0.25 with uids climbing and zero rebuilds). When
+    # the BG has been dirty for > BG_REBUILD_FORCE_S AND the batch's aggregate
+    # throughput is < BG_REBUILD_FORCE_TPS (i.e. it IS poisoned — a healthy
+    # overlapping batch decodes 10-20+ tok/s and is never touched), finalize
+    # the in-flight slots with finish=error (same contract as the
+    # metal::malloc recovery below — they are crawling anyway) and rebuild.
+    _bg_force_s = float(os.environ.get("BG_REBUILD_FORCE_S", "90"))
+    _bg_force_tps = float(os.environ.get("BG_REBUILD_FORCE_TPS", "2.0"))
+    bg_state = {"dirty": False, "since": 0.0, "toks": 0}
 
     log(f"batched main: completion_batch={bg_kwargs['completion_batch_size']}, "
         f"prefill_batch={bg_kwargs['prefill_batch_size']}, "
@@ -3106,8 +3118,16 @@ def _run_batched_main(model, tokenizer, repo: str, kv_q8_default: bool,
             + (f" · finish={finish_reason}" if finish_reason else ""))
         # Poison guard: a big slot is leaving the BG — schedule a rebuild for
         # the next moment the batch is empty (see the flag's comment above).
-        if s["ntoks"] >= _bg_rebuild_min_toks:
-            bg_state["dirty"] = True
+        # Criterion = TOTAL context (prompt + generated), not just generated:
+        # a huge-prompt test that emits few tokens (Bench P profile) poisons
+        # the BG just as hard as a long generation (observed 2026-08-27: p01/
+        # p02 big-prompt completions < 1000 gen toks → no dirty → p03 and the
+        # whole R2 bench crawled at 0.25 with zero rebuilds).
+        if (len(s["prompt_tokens_full"]) + s["ntoks"]) >= _bg_rebuild_min_toks:
+            if not bg_state["dirty"]:
+                bg_state["dirty"] = True
+                bg_state["since"] = time.time()
+                bg_state["toks"] = 0
         try:
             bg.remove([uid])
         except Exception:
@@ -3117,16 +3137,36 @@ def _run_batched_main(model, tokenizer, repo: str, kv_q8_default: bool,
     while not stop_requested["flag"]:
         # ── Poison guard rebuild ───────────────────────────────────────────
         # Must run BEFORE the drain so the next request inserts into the
-        # fresh BG, never the poisoned one. Only fires when the batch is
-        # empty — in-flight slots are never disturbed.
+        # fresh BG, never the poisoned one. Preferred path: batch is empty —
+        # in-flight slots are never disturbed.
         if bg_state["dirty"] and not slot:
             try:
                 bg = BatchGenerator(model, **bg_kwargs)
-                log(f"BG rebuilt after long-gen removal (poison guard, "
-                    f"ntoks >= {_bg_rebuild_min_toks})")
+                log(f"BG rebuilt after big-slot removal (poison guard, "
+                    f"ctx >= {_bg_rebuild_min_toks})")
             except Exception as e:
                 log(f"BG poison-guard rebuild FAILED: {e}")
             bg_state["dirty"] = False
+        # Force path (starvation guard): the batch never empties (concurrent
+        # probes / overlapping requests keep arriving) AND its aggregate
+        # throughput proves it is poisoned — cull the crawling slots with
+        # finish=error (same contract as the metal::malloc recovery) and
+        # rebuild. A healthy overlapping batch (>= _bg_force_tps aggregate)
+        # is never touched.
+        elif bg_state["dirty"] and slot:
+            _age = time.time() - bg_state["since"]
+            if _age > _bg_force_s and (bg_state["toks"] / max(_age, 1.0)) < _bg_force_tps:
+                log(f"BG FORCE rebuild: dirty {_age:.0f}s, aggregate "
+                    f"{bg_state['toks'] / max(_age, 1.0):.2f} tok/s < {_bg_force_tps} "
+                    f"— culling {len(slot)} crawling slot(s)")
+                for uid in list(slot.keys()):
+                    _emit_done_for(uid, finish_reason="error")
+                try:
+                    bg = BatchGenerator(model, **bg_kwargs)
+                    log("BG rebuilt (force path)")
+                except Exception as e:
+                    log(f"BG force rebuild FAILED: {e}")
+                bg_state["dirty"] = False
         # ── Drain incoming requests (non-blocking) ─────────────────────────
         drained = 0
         while drained < 32:
@@ -3334,6 +3374,7 @@ def _run_batched_main(model, tokenizer, repo: str, kv_q8_default: bool,
             try:
                 bg = BatchGenerator(model, **bg_kwargs)
                 log("BatchGenerator re-initialised after extend-cache failure")
+                bg_state["dirty"] = False  # fresh BG — poison guard satisfied
             except Exception as e2:
                 log(f"BG reinit failed: {e2} — runner will die next iteration")
                 raise
@@ -3365,6 +3406,8 @@ def _run_batched_main(model, tokenizer, repo: str, kv_q8_default: bool,
             if isinstance(tok, int):
                 s["gen_token_ids"].append(tok)
                 s["ntoks"] += 1
+                if bg_state["dirty"]:
+                    bg_state["toks"] += 1  # feeds the force-rebuild rate check
                 # Stream via the slot's stateful detokenizer — handles BPE
                 # merges, multi-byte chars, and special-token suppression
                 # correctly across tokens. Skip stop tokens from user text;
