@@ -2913,7 +2913,9 @@ class RunnerPool:
                      reasoning_effort: Optional[str] = None,
                      anti_loop: bool = True,
                      kv_q8: Optional[bool] = None,
-                     context_limit: Optional[int] = None) -> AsyncIterator[dict]:
+                     context_limit: Optional[int] = None,
+                     ignore_eos: bool = False,
+                     clear_thinking: Optional[bool] = None) -> AsyncIterator[dict]:
         # Concurrent submits are allowed: the runner side handles serialisation
         # (single-rank uses BatchGenerator for true parallelism; multi-rank
         # serialises in the gen loop but tokens are routed by req_id).
@@ -2953,6 +2955,14 @@ class RunnerPool:
         # per-step and flags `context_limit` on the done event.
         if context_limit:
             req["context_limit"] = int(context_limit)
+        # Endurance mode: runner bans stop ids at the logits level and skips
+        # its own stop-seq break — generation runs to max_tokens.
+        if ignore_eos:
+            req["ignore_eos"] = True
+        # clear_thinking: None keeps the runner default (True); an explicit
+        # bool overrides per request (GLM-5.3 template kwarg).
+        if clear_thinking is not None:
+            req["clear_thinking"] = bool(clear_thinking)
         # reasoning_effort: forwarded as a chat-template kwarg (Step-3.7 reads
         # it). Only set when non-empty so models that don't read it are untouched.
         # Remapped onto the model's accepted vocabulary first (Hy3 release
@@ -4155,6 +4165,13 @@ _MODELS_REASONING_EFFORT_DEFAULT = {
 # Values absent from the inner map pass through unchanged.
 _MODELS_REASONING_EFFORT_MAP = {
     "hy3": {"minimal": "low", "medium": "high"},
+    # GLM-5.3-Flash (model card 2026-08): template accepts low/high/max and
+    # treats ANY other value as max — silently. "medium" therefore ran at max
+    # budget (constat bench 27/08: budget 94k mangé par le thinking). Make
+    # the equivalence explicit so it's a decision, not an accident; "minimal"
+    # maps to low. Callers wanting mid-budget must pass "high".
+    "glm-5-3": {"minimal": "low", "medium": "max"},
+    "glm-5.3": {"minimal": "low", "medium": "max"},
 }
 
 
@@ -4451,6 +4468,16 @@ class ChatCompletionRequest(BaseModel):
     # independent of max_tokens. None → server default (RUNNER_CONTEXT_LIMIT,
     # off by default). Runner enforces per-step; finish_reason stays "length".
     context_limit: Optional[int] = None
+    # Endurance probes / benches: ban every stop token at the logits level so
+    # the generation deterministically runs to max_tokens (finish=length).
+    # Added 2026-08-27 to prove the mlx-lm #1662 buffer-leak fix past the
+    # 44.8k-token death wall without relying on prompt luck.
+    ignore_eos: Optional[bool] = None
+    # GLM-5.3 model card: the chat template defaults clear_thinking=false but
+    # chat serving must pass true (strip prior turns' thinking from the
+    # rendered prompt). Runner defaults to True; None here keeps that default,
+    # explicit false opts out for this request.
+    clear_thinking: Optional[bool] = None
 
     @model_validator(mode="after")
     def _alias_max_completion_tokens(self) -> "ChatCompletionRequest":
@@ -5649,7 +5676,7 @@ def _initial_default_config() -> Optional[dict]:
 #   major (1.7.2 → 2.0.0) — breaking API or topology change
 #
 # Use `./scripts/bump-version.sh patch|minor|major` to bump + auto-commit.
-APP_VERSION = "1.41.2"
+APP_VERSION = "1.42.0"
 
 app = FastAPI(
     title="OdyssAI-X (odyssai.eu)",
@@ -9193,6 +9220,8 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
                                         anti_loop=(req.anti_loop is not False),
                                         kv_q8=req.kv_q8,
                                         context_limit=req.context_limit,
+                                        ignore_eos=bool(req.ignore_eos),
+                                        clear_thinking=req.clear_thinking,
                                         messages=messages, tools=req.tools,
                                         session_id=session_id,
                                         request_id=completion_id,
@@ -9350,6 +9379,8 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
                                         anti_loop=(req.anti_loop is not False),
                                         kv_q8=req.kv_q8,
                                         context_limit=req.context_limit,
+                                        ignore_eos=bool(req.ignore_eos),
+                                        clear_thinking=req.clear_thinking,
                                         messages=messages, tools=req.tools,
                                         session_id=session_id,
                                         request_id=completion_id,

@@ -2120,6 +2120,9 @@ def _build_prompt_cache(model, kv_q8: bool):
     try:
         cache = make_prompt_cache(model)
         if not kv_q8 or QuantizedKVCache is None:
+            if _CACHE_PIN_VALUES and cache:
+                _np = _pin_cache_values(cache)
+                sys.stderr.write(f"[runner] cache-pin #1662: {_np} caches wrapped\n")
             return cache
         try:
             from mlx_lm.models.cache import KVCache  # type: ignore
@@ -2138,13 +2141,166 @@ def _build_prompt_cache(model, kv_q8: bool):
                 upgraded.append(c)
         sys.stderr.write(f"[runner] kv_q8: {n_q8}/{len(cache)} layers Q8-quantized "
                          f"(rest kept native)\n")
+        if _CACHE_PIN_VALUES:
+            _np = _pin_cache_values(upgraded)
+            sys.stderr.write(f"[runner] cache-pin #1662: {_np} caches wrapped\n")
         return upgraded
     except Exception as e:
         sys.stderr.write(f"[runner] cache build failed ({e}), letting stream_generate auto-create\n")
         return None
 
 
+# Drain interval (in generated tokens) for the KV caches' lazy graphs.
+# 512 tokens * ~11 leaked buffers/token (glm-5-3-flash) ~ 5.6k buffers max
+# between flushes — two orders of magnitude under Metal's 499k cap. 0 = off.
+_CACHE_FLUSH_EVERY = int(os.environ.get("RUNNER_CACHE_FLUSH_EVERY", "512") or 0)
+
+# Site-level pin (mlx-lm #1662, methode du PR upstream #1790) : ON par defaut.
+_CACHE_PIN_VALUES = os.environ.get("RUNNER_CACHE_PIN", "1") == "1"
+
+
+def _pin_cache_values(caches) -> int:
+    """Fix #1662 au SITE : les modeles hybrides (glm5_next sites L436/L606)
+    jettent le retour `values` d'`update_and_fetch` (astuce K==V / indexer a
+    values de largeur 0). Rien ne lit jamais cache.values → chaque step
+    re-lie `values = slice_update(ancien, nouveau)` en chaine lazy jamais
+    evaluee — un buffer Metal VIVANT par step par cache. Metal plafonne le
+    NOMBRE de buffers (499000) → crash deterministe a ~45k tokens generes.
+
+    On wrappe update_and_fetch de chaque cache (descente recursive dans les
+    CacheList) pour programmer mx.async_eval(values) a chaque appel : la
+    chaine est collapsee en continu, cout nul mesure upstream (le drain du
+    graphe mort rend meme le decode plus rapide). Idempotent (_oxpin).
+    Retourne le nombre de caches wrappes.
+    """
+    n = 0
+    seen: set = set()
+    stack = list(caches or [])
+    while stack:
+        c = stack.pop()
+        if id(c) in seen or isinstance(c, (mx.array, str, bytes, int, float)):
+            continue
+        seen.add(id(c))
+        if isinstance(c, (list, tuple)):
+            stack.extend(c)
+            continue
+        d = getattr(c, "__dict__", None)
+        if not d:
+            continue
+        for v in d.values():
+            if isinstance(v, (list, tuple)):
+                stack.extend(x for x in v if hasattr(x, "__dict__"))
+            elif hasattr(v, "__dict__"):
+                stack.append(v)
+        if callable(getattr(c, "update_and_fetch", None)) and not getattr(c, "_oxpin", False):
+            _orig = c.update_and_fetch
+
+            def _pinned(_k, _v, _o=_orig):
+                _out = _o(_k, _v)
+                try:
+                    mx.async_eval(_out[1])
+                except Exception:
+                    pass
+                return _out
+
+            c.update_and_fetch = _pinned
+            c._oxpin = True
+            n += 1
+        if callable(getattr(c, "advance", None)) and not getattr(c, "_oxpin_adv", False):
+            _oa = c.advance
+
+            def _adv(_N, _c=c, _o=_oa):
+                _r = _o(_N)
+                _p = [a for a in (getattr(_c, "lengths", None),
+                                  getattr(_c, "left_padding", None))
+                      if isinstance(a, mx.array)]
+                if _p:
+                    try:
+                        mx.async_eval(_p)
+                    except Exception:
+                        pass
+                return _r
+
+            c.advance = _adv
+            c._oxpin_adv = True
+    return n
+
+
+def _flush_cache_graph(caches) -> None:
+    """Drain the lazy graphs pinned by the KV caches (mlx-lm #1662).
+
+    During decode, cache fields the logits graph never reads accumulate an
+    unevaluated node chain — one node per generated token — and every node
+    pins a live Metal BUFFER. Metal caps buffer COUNT (`[metal::malloc]
+    Resource limit (499000) exceeded` is a count, not bytes: memory metrics
+    stay flat), so one long enough completion crashes generate_step
+    deterministically. Measured here: glm-5-3-flash Q8 leaks ~11 buffers per
+    generated token -> death at ~44.8k tokens / ~35 min (chatcmpl-78dc661d,
+    2026-08-27). The batched path leaked 47-66/tok -> its 7495-token ceiling.
+
+    Evaluating the caches' stored arrays collapses the dead chains and frees
+    the buffers. Upstream does exactly this on every prefill chunk; the
+    pending upstream fixes (mlx-lm PRs #1780/#1790) do it per decode
+    interval. vars() walk instead of `.state`: state properties can slice
+    (transient copies), and ArraysCache.state omits the leaking metadata
+    fields entirely (left_padding/lengths — mlx-lm #1332).
+    """
+    # Marche RECURSIVE (v2, 2026-08-27 soir) : glm5_next emboite ses vrais
+    # caches (KVCache indexer, ArraysCache SSM, latent MLA) dans des
+    # CacheList (attr `caches` = tuple d'OBJETS cache) — la v1 ne collectait
+    # que les mx.array de premier niveau et n'a draine AUCUNE des chaines
+    # fuyantes (probe 35340f06 morte a ~41.1k, pente inchangee). On descend
+    # dans tout objet a __dict__, cycle-guarded.
+    arrs, seen, stack = [], set(), list(caches or [])
+    while stack:
+        o = stack.pop()
+        if id(o) in seen:
+            continue
+        seen.add(id(o))
+        if isinstance(o, mx.array):
+            arrs.append(o)
+        elif isinstance(o, (list, tuple)):
+            stack.extend(o)
+        elif isinstance(o, dict):
+            stack.extend(o.values())
+        else:
+            d = getattr(o, "__dict__", None)
+            if d:
+                stack.extend(d.values())
+    if arrs:
+        mx.eval(arrs)
+
+
+def _install_death_reporters():
+    """#68 : nomme la CAUSE de toute sortie du runner. Les morts ~35 min
+    sortent proprement (atexit) sans un mot — signal ? EOF stdin ? On logge
+    le déclencheur AVANT de mourir pour que docker logs porte la réponse."""
+    import signal as _sig
+
+    def _mk(name, signum):
+        def h(_s, _f):
+            try:
+                sys.stderr.write(f"[runner] DEATH-REPORT: received {name} "
+                                 f"(signum={signum}) — exiting\n")
+                sys.stderr.flush()
+                try:
+                    faulthandler.dump_traceback(file=sys.stderr)
+                except Exception:
+                    pass
+            finally:
+                _sig.signal(signum, _sig.SIG_DFL)
+                os.kill(os.getpid(), signum)
+        return h
+    for name in ("SIGTERM", "SIGHUP", "SIGINT", "SIGUSR1"):
+        try:
+            signum = getattr(_sig, name)
+            _sig.signal(signum, _mk(name, signum))
+        except Exception:
+            pass
+
+
 def main() -> None:
+    _install_death_reporters()
     repo = os.environ.get("RUNNER_MODEL", "mlx-community/GLM-4.5-Air-4bit")
     mode = os.environ.get("RUNNER_MODE", "pipeline")  # pipeline | tensor | tensor_ap
     use_ap = os.environ.get("RUNNER_USE_AP", "0") == "1"
@@ -2471,6 +2627,9 @@ def _run_legacy_main(model, tokenizer, repo: str, kv_q8_default: bool,
         while not stop_requested["flag"]:
             line = sys.stdin.readline()
             if not line:
+                sys.stderr.write("[runner] DEATH-REPORT: stdin EOF "
+                                 "(parent ssh/RunnerProc gone)\n")
+                sys.stderr.flush()
                 in_q.put(EOF)
                 return
             line = line.strip()
@@ -2583,6 +2742,13 @@ def _run_legacy_main(model, tokenizer, repo: str, kv_q8_default: bool,
         reasoning_effort = req.get("reasoning_effort", None)
         if reasoning_effort:
             chat_kwargs["reasoning_effort"] = reasoning_effort
+        # clear_thinking: GLM-5.3 model card — the template defaults it to
+        # false, but chat serving MUST pass true (strips prior turns'
+        # thinking blocks from the rendered prompt; without it multi-turn
+        # context silently fills with old reasoning). Default ON for every
+        # model — Jinja ignores the kwarg where the template lacks it.
+        # Per-request override via req["clear_thinking"]=false.
+        chat_kwargs["clear_thinking"] = bool(req.get("clear_thinking", True))
         if tools:
             chat_kwargs["tools"] = tools
         def _apply_template_with_fallbacks():
@@ -2720,6 +2886,43 @@ def _run_legacy_main(model, tokenizer, repo: str, kv_q8_default: bool,
             gen_kwargs["sampler"] = _sampler
         if _lp is not None:
             gen_kwargs["logits_processors"] = _lp
+        # Endurance mode (probes longues / bench) : bannit tous les stop ids
+        # au niveau logits — la generation ne PEUT PAS s'arreter avant
+        # max_tokens. Le break _stop_ids plus bas est desactive de meme.
+        # Ajoute 2026-08-27 pour prouver le fix #1662 au-dela du mur ~44.8k.
+        _ignore_eos = bool(req.get("ignore_eos", False))
+        if _ignore_eos:
+            _ban_ids = set(_stop_ids or [])
+            _tk_eos = getattr(tokenizer, "eos_token_ids", None)
+            for _e in (_tk_eos or []):
+                if isinstance(_e, int):
+                    _ban_ids.add(_e)
+            _e1 = getattr(tokenizer, "eos_token_id", None)
+            if isinstance(_e1, int):
+                _ban_ids.add(_e1)
+            if _ban_ids:
+                # Operandes PRE-EVALUES et reutilises (mlx-lm #1332 : un
+                # scalaire Python par step = un buffer Metal retenu par step —
+                # la v1 de ce processor fuyait ~1 buffer/token et avancait la
+                # mort de la probe a 41.1k au lieu de la reculer).
+                _ban_state: dict = {}
+                def _ban_eos_processor(tokens, logits, _st=_ban_state,
+                                       _ids=tuple(sorted(_ban_ids))):
+                    # NB: __eq__ nanobind de mx.Dtype LEVE sur None (TypeError,
+                    # crash instantane de la probe v2 3c02d8e2) au lieu de
+                    # renvoyer NotImplemented — d'ou la garde None AVANT le !=
+                    # (et les Dtype ne sont pas des singletons: pas de `is`).
+                    _dt = _st.get("dt")
+                    if _dt is None or _dt != logits.dtype:
+                        _st["ids"] = mx.array(list(_ids))
+                        _st["neg"] = mx.array(-1e9, dtype=logits.dtype)
+                        mx.eval(_st["ids"], _st["neg"])
+                        _st["dt"] = logits.dtype
+                    logits[..., _st["ids"]] = _st["neg"]
+                    return logits
+                _cur = gen_kwargs.get("logits_processors") or []
+                gen_kwargs["logits_processors"] = list(_cur) + [_ban_eos_processor]
+                log(f"req {req_id}: ignore_eos ON — {len(_ban_ids)} stop ids bannis")
         # Speculative decoding: when a draft_model is loaded, pass it to
         # stream_generate. mlx-lm's stream_generate(draft_model=) draws N
         # tokens from the draft per main-model verify step.
@@ -2852,7 +3055,7 @@ def _run_legacy_main(model, tokenizer, repo: str, kv_q8_default: bool,
             # stream_generate yields the marker as normal text — so we must
             # break BEFORE appending it, or it leaks into the completion
             # (the "391<|role_end|>" bug). See _resolve_eos_token_seqs.
-            if isinstance(tok_id, int) and tok_id in _stop_ids:
+            if isinstance(tok_id, int) and tok_id in _stop_ids and not _ignore_eos:
                 gen_finish = "stop"
                 break
             buf.append(res.text)
@@ -2860,6 +3063,28 @@ def _run_legacy_main(model, tokenizer, repo: str, kv_q8_default: bool,
             if ntoks == 0:
                 try:
                     faulthandler.cancel_dump_traceback_later()  # prefill OK
+                except Exception:
+                    pass
+            # Jalons long-contexte (#68 recadré Sophie 2026-08-27 : les morts
+            # frappent à ~42-43k tokens GÉNÉRÉS / ~35 min, en pleine
+            # génération — pas au prefill). Un jalon tous les 2000 tokens rend
+            # le point de mort visible au token près dans les logs.
+            if ntoks and ntoks % 2000 == 0:
+                try:
+                    import resource as _res
+                    _rss = _res.getrusage(_res.RUSAGE_SELF).ru_maxrss / 1e9
+                except Exception:
+                    _rss = 0
+                _el = time.time() - t_gen
+                log(f"req {req_id}: milestone {ntoks} toks, {_el:.0f}s, "
+                    f"{ntoks/_el:.1f} tok/s, rss~{_rss:.0f}GB")
+            # mlx-lm #1662: sans drain, ~11 buffers Metal vivants par token
+            # genere (modeles hybrides) -> [metal::malloc] Resource limit
+            # (499000) a ~45k tokens — la mort "35 min" de la semaine.
+            if (_CACHE_FLUSH_EVERY and prompt_cache is not None
+                    and ntoks and ntoks % _CACHE_FLUSH_EVERY == 0):
+                try:
+                    _flush_cache_graph(prompt_cache)
                 except Exception:
                     pass
             if isinstance(tok_id, int):
@@ -3032,6 +3257,9 @@ def _run_batched_main(model, tokenizer, repo: str, kv_q8_default: bool,
         while not stop_requested["flag"]:
             line = sys.stdin.readline()
             if not line:
+                sys.stderr.write("[runner] DEATH-REPORT: stdin EOF "
+                                 "(parent ssh/RunnerProc gone)\n")
+                sys.stderr.flush()
                 in_q.put(EOF)
                 return
             line = line.strip()
@@ -3290,6 +3518,8 @@ def _run_batched_main(model, tokenizer, repo: str, kv_q8_default: bool,
             reasoning_effort = req.get("reasoning_effort", None)
             if reasoning_effort:
                 chat_kwargs["reasoning_effort"] = reasoning_effort
+            # clear_thinking: see single-stream branch (GLM-5.3 model card).
+            chat_kwargs["clear_thinking"] = bool(req.get("clear_thinking", True))
             if tools:
                 chat_kwargs["tools"] = tools
             try:
