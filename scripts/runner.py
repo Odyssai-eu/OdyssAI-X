@@ -2379,12 +2379,25 @@ def main() -> None:
     # _merge_caches raises "does not yet support batching with history". Single-
     # stream is the supported text-only v1 mode (batched conv-state cache = later).
     _mt = (model_config or {}).get("model_type") or ""
+    # REVERT 2026-08-27 — RUNNER_BATCH default flipped "1" -> "0" (legacy).
+    # The batched path is the common factor behind a week of production
+    # regressions the legacy loop never exhibits: the BatchGenerator poison
+    # (post-long-gen 0.2-0.35 tok/s crawls needing pool reloads), the MLX
+    # buffer-cache balloon hitting the ~499GB Metal limit (~7495-token
+    # truncations, finish=error), the malloc-failure memory ratchet, and
+    # insert-during-gen slowdowns. Three guard iterations (empty-rebuild,
+    # force-rebuild, periodic clear_cache) each closed one hole and the next
+    # appeared — the component is not production-ready. Single-node pools go
+    # back to the battle-tested legacy single-slot loop (the same loop the
+    # multi-rank path uses); benches are sequential so nothing is lost.
+    # Continuous batching returns via RUNNER_BATCH=1 (explicit opt-in) once
+    # fixed for real on rpi-dev.
     use_batched = (size == 1) and _BATCH_AVAILABLE and (draft_model is None) and (
         native_mtp is None                     # native MTP needs the legacy path
     ) and (
         spec_dspark_ctx is None                # single-node DSpark spec -> legacy
     ) and (
-        os.environ.get("RUNNER_BATCH", "1") == "1"
+        os.environ.get("RUNNER_BATCH", "0") == "1"
     ) and ("minimax-m3" not in repo.lower()) and (
         _mt not in ("deepseek_v4", "deepseek_v4_dspark", "inkling_mm_model")
     )
@@ -3056,8 +3069,14 @@ def _run_batched_main(model, tokenizer, repo: str, kv_q8_default: bool,
     # for both the 7495-token truncation ceiling and (if allocator thrash is
     # the slow path) the post-long-gen crawl. Both OFF by default until
     # measured on a controlled run.
-    _bg_mem_log_every = int(os.environ.get("BG_MEM_LOG_EVERY", "0"))
-    _bg_clear_cache_every = int(os.environ.get("BG_CLEAR_CACHE_EVERY", "0"))
+    # Defaults ON (2026-08-27, bench unblock): the runner gets its env from
+    # remote_cmd's inline assignments — arbitrary new envs don't reach it
+    # without an api.py change + container restart. Baking the defaults here
+    # keeps this a runner-only deploy. clear_cache every 512 generated tokens
+    # bounds the buffer-cache balloon (the ~50MB/tok growth that hits the
+    # 499GB Metal limit at ~7495 toks); mem log every 500 gives the curves.
+    _bg_mem_log_every = int(os.environ.get("BG_MEM_LOG_EVERY", "500"))
+    _bg_clear_cache_every = int(os.environ.get("BG_CLEAR_CACHE_EVERY", "512"))
     _bg_mem_ctr = {"toks": 0, "last_t": time.time(), "last_toks": 0}
 
     log(f"batched main: completion_batch={bg_kwargs['completion_batch_size']}, "
@@ -3157,6 +3176,7 @@ def _run_batched_main(model, tokenizer, repo: str, kv_q8_default: bool,
         if bg_state["dirty"] and not slot:
             try:
                 bg = BatchGenerator(model, **bg_kwargs)
+                mx.clear_cache()
                 log(f"BG rebuilt after big-slot removal (poison guard, "
                     f"ctx >= {_bg_rebuild_min_toks})")
             except Exception as e:
@@ -3178,6 +3198,7 @@ def _run_batched_main(model, tokenizer, repo: str, kv_q8_default: bool,
                     _emit_done_for(uid, finish_reason="error")
                 try:
                     bg = BatchGenerator(model, **bg_kwargs)
+                    mx.clear_cache()
                     log("BG rebuilt (force path)")
                 except Exception as e:
                     log(f"BG force rebuild FAILED: {e}")
@@ -3390,6 +3411,15 @@ def _run_batched_main(model, tokenizer, repo: str, kv_q8_default: bool,
                 bg = BatchGenerator(model, **bg_kwargs)
                 log("BatchGenerator re-initialised after extend-cache failure")
                 bg_state["dirty"] = False  # fresh BG — poison guard satisfied
+                try:
+                    mx.clear_cache()  # release the ballooned buffer cache —
+                    # without this each 499GB-limit cycle RATCHETS process
+                    # memory up until the allocator lives at the ceiling and
+                    # every request crawls (r09 2026-08-27: fresh BG on a
+                    # pinned process still 0.27 tok/s; only a reload cured).
+                    log("mx.clear_cache() after malloc-limit reset")
+                except Exception:
+                    pass
             except Exception as e2:
                 log(f"BG reinit failed: {e2} — runner will die next iteration")
                 raise
