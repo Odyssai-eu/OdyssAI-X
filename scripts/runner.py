@@ -17,6 +17,7 @@ Stdout events (rank 0 only, one JSON per line):
 """
 
 import hashlib
+import faulthandler
 import json
 import os
 import pickle
@@ -2683,6 +2684,21 @@ def _run_legacy_main(model, tokenizer, repo: str, kv_q8_default: bool,
 
         ntoks = 0
         t_gen = time.time()
+        # Auto-radiographie stall (#68, 2026-08-27) : si AUCUN token n'est émis
+        # dans PREFILL_DUMP_S, faulthandler dumpe la stack Python de TOUS les
+        # threads sur stderr → visible dans les logs container ([rank0]) — le
+        # site exact du hang prefill glm5_next se documente tout seul au
+        # prochain stall, sans watcher externe. Annulé au premier token (coût
+        # nul sur les requêtes saines) ; ré-armé à chaque requête (le timer
+        # précédent est remplacé). exit=False : on ne tue rien, on photographie.
+        _dump_s = float(os.environ.get("PREFILL_DUMP_S", "300"))
+        if _dump_s > 0:
+            try:
+                log(f"req {req_id}: stall-radiography armed ({_dump_s:.0f}s)")
+                faulthandler.dump_traceback_later(_dump_s, exit=False,
+                                                  file=sys.stderr)
+            except Exception:
+                pass
         emit_batch_n = int(os.environ.get("RUNNER_EMIT_BATCH", "10"))
         buf: list[str] = []
         full_text_parts: list[str] = []  # accumulate for tool-call parsing
@@ -2841,6 +2857,11 @@ def _run_legacy_main(model, tokenizer, repo: str, kv_q8_default: bool,
                 break
             buf.append(res.text)
             full_text_parts.append(res.text)
+            if ntoks == 0:
+                try:
+                    faulthandler.cancel_dump_traceback_later()  # prefill OK
+                except Exception:
+                    pass
             if isinstance(tok_id, int):
                 gen_token_ids.append(tok_id)
                 if token_canary:
@@ -2889,6 +2910,10 @@ def _run_legacy_main(model, tokenizer, repo: str, kv_q8_default: bool,
                 break
         if buf:
             emit(rank, {"event": "token", "id": req_id, "text": "".join(buf)})
+        try:
+            faulthandler.cancel_dump_traceback_later()
+        except Exception:
+            pass
         elapsed = time.time() - t_gen
         tps = ntoks / elapsed if elapsed > 0 else 0.0
 
