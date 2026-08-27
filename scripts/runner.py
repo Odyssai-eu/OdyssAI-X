@@ -3044,6 +3044,21 @@ def _run_batched_main(model, tokenizer, repo: str, kv_q8_default: bool,
     _bg_force_s = float(os.environ.get("BG_REBUILD_FORCE_S", "90"))
     _bg_force_tps = float(os.environ.get("BG_REBUILD_FORCE_TPS", "2.0"))
     bg_state = {"dirty": False, "since": 0.0, "toks": 0}
+    # ── Upstream instrumentation + candidate source fix (2026-08-27) ──────
+    # AMONT diagnosis: MLX (active+cache) memory grows ~50MB/generated-token
+    # on this path and hits the ~499GB Metal resource limit at ~7495 tokens
+    # (the constant magic number in every truncated run). Suspected: per-step
+    # allocations of ever-growing sizes that the MLX buffer cache cannot
+    # reuse, so cache_memory balloons. Instrumentation logs active/cache mem
+    # + step timing every BG_MEM_LOG_EVERY generated tokens (0 = off) to
+    # confirm; BG_CLEAR_CACHE_EVERY (0 = off) then bounds it by calling
+    # mx.clear_cache() every N generated tokens — the candidate SOURCE fix
+    # for both the 7495-token truncation ceiling and (if allocator thrash is
+    # the slow path) the post-long-gen crawl. Both OFF by default until
+    # measured on a controlled run.
+    _bg_mem_log_every = int(os.environ.get("BG_MEM_LOG_EVERY", "0"))
+    _bg_clear_cache_every = int(os.environ.get("BG_CLEAR_CACHE_EVERY", "0"))
+    _bg_mem_ctr = {"toks": 0, "last_t": time.time(), "last_toks": 0}
 
     log(f"batched main: completion_batch={bg_kwargs['completion_batch_size']}, "
         f"prefill_batch={bg_kwargs['prefill_batch_size']}, "
@@ -3408,6 +3423,30 @@ def _run_batched_main(model, tokenizer, repo: str, kv_q8_default: bool,
                 s["ntoks"] += 1
                 if bg_state["dirty"]:
                     bg_state["toks"] += 1  # feeds the force-rebuild rate check
+                # Upstream instrumentation / candidate fix (see flags above).
+                _bg_mem_ctr["toks"] += 1
+                if (_bg_mem_log_every
+                        and _bg_mem_ctr["toks"] % _bg_mem_log_every == 0):
+                    _now = time.time()
+                    _dt = _now - _bg_mem_ctr["last_t"]
+                    _dtoks = _bg_mem_ctr["toks"] - _bg_mem_ctr["last_toks"]
+                    _bg_mem_ctr["last_t"] = _now
+                    _bg_mem_ctr["last_toks"] = _bg_mem_ctr["toks"]
+                    try:
+                        log(f"[bg-mem] toks={_bg_mem_ctr['toks']} "
+                            f"active={mx.get_active_memory() / 1e9:.1f}GB "
+                            f"cache={mx.get_cache_memory() / 1e9:.1f}GB "
+                            f"peak={mx.get_peak_memory() / 1e9:.1f}GB "
+                            f"rate={_dtoks / max(_dt, 1e-6):.2f} tok/s "
+                            f"cache_kv={bg.prompt_cache_nbytes / 1e9:.1f}GB")
+                    except Exception as e:
+                        log(f"[bg-mem] probe failed: {e}")
+                if (_bg_clear_cache_every
+                        and _bg_mem_ctr["toks"] % _bg_clear_cache_every == 0):
+                    try:
+                        mx.clear_cache()
+                    except Exception:
+                        pass
                 # Stream via the slot's stateful detokenizer — handles BPE
                 # merges, multi-byte chars, and special-token suppression
                 # correctly across tokens. Skip stop tokens from user text;
