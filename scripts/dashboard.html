@@ -1024,7 +1024,8 @@ const state = {
   pending_form: {
     default_model: null, default_mode: "pipeline", default_use_ap: true, default_nodes: 3, default_kv_q8: false,
     default_backend: "",   // "" = cluster default | "jaccl" | "ring" (per-load transport, #40 WU4)
-    default_draft: "", default_num_draft: 4,
+    default_draft: "", default_num_draft: 4, default_dflash: false,
+    default_use_drafter: true,   // toggle: auto-attach du drafter enregistré (model_drafters)
     default_targets: {},
     // Multi-pool "+ Add pool" inline form (2026-05-19). When open=true,
     // shown below the Pools list. default_add_indices is a Set<number>
@@ -1166,6 +1167,10 @@ async function refreshAll() {
       supports_vision: !!c.supports_vision,
       color: "blue",
       enabled: c.enabled !== false,
+      // Auto-reload toggles (default ON) — surfaced in Cluster settings.
+      reload_on_restart: c.reload_on_restart !== false,
+      reload_on_reboot: c.reload_on_reboot !== false,
+      max_nodes: c.max_nodes || (Array.isArray(c.nodes) ? c.nodes.length : 0) || 1,
     }));
     // If the user's selected cluster vanished from topology, snap to the
     // first enabled one (or null if none).
@@ -1645,7 +1650,7 @@ function render() {
 // ─── Settings modal ────────────────────────────────────────────────
 const SETTINGS_TABS = [
   { id: "general",    label: "General" },
-  { id: "clusters",   label: "Clusters" },
+  { id: "clusters",   label: "Argos" },
   { id: "models",     label: "Models" },
   { id: "huggingface", label: "Hugging Face" },
   { id: "providers",  label: "Cloud providers" },
@@ -2287,107 +2292,16 @@ function renderSettingsClusters() {
             <div class="stack">
               <div class="name-row">
                 <div class="name">${c.name}</div>
-                <div class="kind-pill ${escapeHtml(c.kind)}">${c.kind}</div>
+                <div class="kind-pill ${escapeHtml(c.kind)}">${c.kind === "mlx-distributed" && (c.max_nodes||1) <= 1 ? "mlx" : c.kind}</div>
                 ${vlmPill(c.id)}
               </div>
               <div class="meta">${escapeHtml(summary(c.id))}</div>
             </div>
           </div>
         `).join("")}
-        <button class="add-cluster-btn" data-act="settings-add-cluster">${Icon.plus}<span>Add cluster</span></button>
-        <button class="add-cluster-btn" data-act="settings-add-telemak" style="margin-top:4px">${Icon.plus}<span>Add Telemak</span></button>
+        <button class="add-cluster-btn" data-act="settings-add-cluster">${Icon.plus}<span>Add Argo</span></button>
       </div>
-      ${state.telemak_form?.open ? renderTelemakForm() : state.mlx_form?.open ? renderMlxCreateForm() : renderClusterEditor(sel)}
-    </div>
-  `;
-}
-
-// ── Add cluster — create form for a kind=mlx-distributed cluster ─────────
-// Mirrors renderTelemakForm: local form state in state.mlx_form, live
-// validation, PUT /admin/clusters/{id} upsert on submit (same endpoint the
-// telemak flow uses — the server creates when the id doesn't exist yet).
-// Node rows come from the host inventory dropdown or a free-entry custom
-// row, so a Mac that isn't in topology.yaml can still be declared (the
-// server only requires an explicit ssh target in that case).
-function renderMlxCreateForm() {
-  const f = state.mlx_form;
-  const nodes = f.nodes || [];
-  const slugOk = /^[a-z0-9][a-z0-9-]{0,40}$/.test(f.id || "");
-  const labelOk = (f.label || "").trim().length > 0;
-  const sshRe = /^[^@\s]+@[^@\s:]+$/;
-  const nodesOk = nodes.length > 0
-    && nodes.every(n => (n.host || "").trim() && sshRe.test(n.ssh || ""))
-    && nodes.filter(n => n.master).length === 1;
-  const allOk = slugOk && labelOk && nodesOk;
-  const err = f.error;
-  const busy = !!f.busy;
-  const used = new Set(nodes.map(n => n.host));
-  const free = (state.inventory?.hosts || []).filter(h => !used.has(h.id));
-  return `
-    <div class="cluster-editor">
-      <div class="editor-head">
-        <div class="head-left">
-          <div class="dot" style="width:10px;height:10px;border-radius:5px;background:var(--slate-blue)"></div>
-          <h2>+ Add cluster</h2>
-          <span class="kind-pill mlx-distributed">mlx-distributed</span>
-        </div>
-        <div class="head-right">
-          <button class="btn btn-sm" data-act="mlx-cancel">Cancel</button>
-          <button class="btn btn-sm" style="background:var(--blue);color:white;border-color:var(--blue)" ${(!allOk||busy)?"disabled":""} data-act="mlx-create">${busy?"Adding…":"Add"}</button>
-        </div>
-      </div>
-      ${err ? `<div class="editor-error" style="margin:0 16px 12px;padding:10px 12px;background:#fff5f5;border:1px solid var(--rust);border-radius:6px;color:var(--rust);font-size:13px">${escapeHtml(err)}</div>` : ""}
-      <div class="editor-body">
-        <div style="display:grid;gap:14px;max-width:640px">
-          <div class="field">
-            <div class="field-label">Cluster ID <span style="font-weight:400;color:var(--ink-3)">(URL slug — becomes the model prefix, e.g. <span class="mono">id:model</span>)</span></div>
-            <input class="ce-input mono" data-act="mlx-edit-id" value="${escapeHtml(f.id || "")}" placeholder="solo-d"/>
-            <div style="font-size:11px;color:var(--ink-2);margin-top:4px">${slugOk ? '✓ valid' : 'lowercase letters, digits, hyphens — max 41 chars, must start alphanumeric'}</div>
-          </div>
-          <div class="field">
-            <div class="field-label">Display label</div>
-            <input class="ce-input" data-act="mlx-edit-label" value="${escapeHtml(f.label || "")}" placeholder="My cluster"/>
-          </div>
-          <div class="field">
-            <div class="field-label">Backend</div>
-            <select class="ce-input mono" data-act="mlx-edit-backend">
-              <option value="ring" ${f.backend==="ring"?"selected":""}>ring (TCP/IP)</option>
-              <option value="jaccl" ${f.backend==="jaccl"?"selected":""}>jaccl (RDMA over TB5)</option>
-            </select>
-            <div style="font-size:11px;color:var(--ink-2);margin-top:4px">jaccl needs RDMA wiring in topology.yaml between every node pair (single-node clusters are exempt). ring works everywhere.</div>
-          </div>
-          <div class="field">
-            <div class="field-label">Models directory <span style="font-weight:400;color:var(--ink-3)">(shared path on every node — empty keeps the server default)</span></div>
-            <input class="ce-input mono" data-act="mlx-edit-models-dir" value="${escapeHtml(f.models_dir || "")}" placeholder="/Volumes/models/odysseus"/>
-          </div>
-          <div class="field">
-            <div style="display:flex;justify-content:space-between;align-items:center;padding-bottom:8px">
-              <div>
-                <div class="field-label">Member nodes</div>
-                <div style="font-size:12px;color:var(--ink-2);margin-top:2px">Order defines rank · master is rank 0 · exactly 1 master</div>
-              </div>
-              <select class="ce-input" style="width:auto;min-width:170px;padding:6px 8px;font-size:12px" data-act="mlx-node-add">
-                <option value="">+ Add node…</option>
-                ${free.map(h => `<option value="${escapeHtml(h.id)}">${escapeHtml(h.id)}${h.rdma_wired?" · TB5":""}</option>`).join("")}
-                <option value="__custom__">custom host…</option>
-              </select>
-            </div>
-            ${nodes.length === 0
-              ? `<div style="padding:14px;background:var(--ground);border-radius:6px;font-size:12px;color:var(--ink-2)">No nodes yet — pick one from the inventory or add a custom host.</div>`
-              : nodes.map((n, i) => `
-                <div style="display:flex;gap:8px;align-items:center;margin-bottom:6px">
-                  <input class="ce-input mono" style="flex:1" data-act="mlx-node-edit-host" data-idx="${i}" value="${escapeHtml(n.host || "")}" placeholder="host-id"/>
-                  <input class="ce-input mono" style="flex:1.4" data-act="mlx-node-edit-ssh" data-idx="${i}" value="${escapeHtml(n.ssh || "")}" placeholder="admin@192.168.1.50"/>
-                  <label style="display:inline-flex;align-items:center;gap:5px;font-size:12px;color:var(--ink-2);cursor:pointer;white-space:nowrap">
-                    <input type="radio" name="mlx-master" data-act="mlx-node-master" data-idx="${i}" ${n.master?"checked":""}/>master
-                  </label>
-                  <button class="btn btn-xs" data-act="mlx-node-remove" data-idx="${i}" title="Remove node" style="color:var(--rust)">✕</button>
-                </div>
-              `).join("")}
-            <div style="font-size:11px;color:var(--ink-2);margin-top:4px">${nodesOk ? '✓ valid' : 'at least 1 node · every row needs a host id and an ssh target (user@host) · exactly 1 master'}</div>
-          </div>
-        </div>
-      </div>
+      ${state.argo_form?.open ? renderArgoForm() : (state.telemak_form?.open ? renderTelemakForm() : renderClusterEditor(sel))}
     </div>
   `;
 }
@@ -2439,6 +2353,69 @@ function renderTelemakForm() {
             <input class="ce-input mono" data-act="telemak-edit-ssh" value="${escapeHtml(f.ssh || "")}" placeholder="admin@192.168.1.50"/>
             <div style="font-size:11px;color:var(--ink-2);margin-top:4px">${sshOk ? '✓ valid' : 'user@host'}</div>
           </div>
+        </div>
+      </div>
+    </div>
+  `;
+}
+
+// ── Add Argo — register an mlx-distributed cluster from the dashboard ─────
+// An Argo needs kind=mlx-distributed + backend + ≥1 node (the create endpoint
+// requires nodes). This form creates a MINIMAL 1-node (master) Argo; the
+// operator then adds the remaining nodes in the normal cluster editor (which
+// already handles the node table + RDMA wiring for existing clusters).
+function renderArgoForm() {
+  const f = state.argo_form;
+  const slugOk = /^[a-z0-9][a-z0-9-]{0,40}$/.test(f.id || "");
+  const hostOk = /^[a-z0-9][a-z0-9._-]*$/i.test(f.host || "");
+  const sshOk = /^[^@\s]+@[^@\s:]+$/.test(f.ssh || "");
+  const labelOk = (f.label || "").trim().length > 0;
+  const allOk = slugOk && hostOk && sshOk && labelOk;
+  const err = f.error;
+  const busy = !!f.busy;
+  return `
+    <div class="cluster-editor">
+      <div class="editor-head">
+        <div class="head-left">
+          <div class="dot" style="background:var(--slate-blue)"></div>
+          <h2>+ Add Argo</h2>
+          <span class="kind-pill" style="background:var(--slate-blue-soft, #e8ecf5);color:var(--slate-blue, #4a5b8a)">mlx-distributed</span>
+        </div>
+        <div class="head-right">
+          <button class="btn btn-sm" data-act="argo-cancel">Cancel</button>
+          <button class="btn btn-sm" style="background:var(--blue);color:white;border-color:var(--blue)" ${(!allOk||busy)?"disabled":""} data-act="argo-create">${busy?"Adding…":"Add"}</button>
+        </div>
+      </div>
+      ${err ? `<div class="editor-error" style="margin:0 16px 12px;padding:10px 12px;background:#fff5f5;border:1px solid var(--rust);border-radius:6px;color:var(--rust);font-size:13px">${escapeHtml(err)}</div>` : ""}
+      <div class="editor-body">
+        <div style="display:grid;gap:14px;max-width:560px">
+          <div class="field">
+            <div class="field-label">Cluster ID <span style="font-weight:400;color:var(--ink-3)">(URL slug)</span></div>
+            <input class="ce-input mono" data-act="argo-edit-id" value="${escapeHtml(f.id || "")}" placeholder="argo-2"/>
+            <div style="font-size:11px;color:var(--ink-2);margin-top:4px">${slugOk ? '✓ valid' : 'lowercase letters, digits, hyphens — max 41 chars, must start alphanumeric'}</div>
+          </div>
+          <div class="field">
+            <div class="field-label">Display label</div>
+            <input class="ce-input" data-act="argo-edit-label" value="${escapeHtml(f.label || "")}" placeholder="Argo 2"/>
+          </div>
+          <div class="field">
+            <div class="field-label">Backend</div>
+            <select class="ce-input mono" data-act="argo-edit-backend">
+              <option value="ring" ${f.backend!=="jaccl"?"selected":""}>ring (TCP/IP)</option>
+              <option value="jaccl" ${f.backend==="jaccl"?"selected":""}>jaccl (RDMA over TB5)</option>
+            </select>
+          </div>
+          <div class="field">
+            <div class="field-label">Master node — host id <span style="font-weight:400;color:var(--ink-3)">(rank 0)</span></div>
+            <input class="ce-input mono" data-act="argo-edit-host" value="${escapeHtml(f.host || "")}" placeholder="ultra-512"/>
+            <div style="font-size:11px;color:var(--ink-2);margin-top:4px">${hostOk ? '✓ valid' : 'the node identifier (letters, digits, . _ -)'}</div>
+          </div>
+          <div class="field">
+            <div class="field-label">Master node — SSH target</div>
+            <input class="ce-input mono" data-act="argo-edit-ssh" value="${escapeHtml(f.ssh || "")}" placeholder="admin@192.168.86.29"/>
+            <div style="font-size:11px;color:var(--ink-2);margin-top:4px">${sshOk ? '✓ valid' : 'user@host'}</div>
+          </div>
+          <div style="font-size:12px;color:var(--ink-2);line-height:1.5">Crée un Argo à <b>1 node</b> (le master). Ajoute les autres nodes ensuite dans l'éditeur du cluster (table de nodes + wiring RDMA pour jaccl).</div>
         </div>
       </div>
     </div>
@@ -2582,6 +2559,19 @@ function renderMlxClusterEditorBody(id, draft, cfg, poolLoaded, kindOpts, backen
     <div class="field" style="margin-bottom:14px">
       <div class="field-label">Models directory <span style="font-weight:400;color:var(--ink-3)">(shared path — every node in this cluster reads models from here)</span></div>
       <input class="ce-input mono" data-act="cluster-edit-models-dir" data-cluster="${id}" value="${escapeHtml(draft.models_dir || "")}" placeholder="/Volumes/models/odysseus"/>
+    </div>
+    <div class="field" style="margin-bottom:14px">
+      <div class="field-label">Auto-reload <span style="font-weight:400;color:var(--ink-3)">(automatically re-load this cluster's last-loaded pools)</span></div>
+      <div style="display:flex;flex-direction:column;gap:8px;margin-top:6px">
+        <label style="display:flex;align-items:center;gap:8px;font-size:13px;cursor:pointer">
+          <input type="checkbox" data-act="cluster-toggle-reload-restart" data-cluster="${id}" ${cfg.reload_on_restart !== false ? "checked" : ""}/>
+          <span>On container <b>restart</b> <span style="color:var(--ink-3)">— redeploy / crash → restore the pools that were loaded</span></span>
+        </label>
+        <label style="display:flex;align-items:center;gap:8px;font-size:13px;cursor:pointer">
+          <input type="checkbox" data-act="cluster-toggle-reload-reboot" data-cluster="${id}" ${cfg.reload_on_reboot !== false ? "checked" : ""}/>
+          <span>On node <b>reboot</b> <span style="color:var(--ink-3)">— Reboot all → wait for nodes up → reload the pools</span></span>
+        </label>
+      </div>
     </div>
     <div>
       <div style="display:flex;justify-content:space-between;align-items:center;padding-bottom:14px">
@@ -3687,7 +3677,7 @@ function renderRibbon() {
       ${tabs}
       <button class="tab add" data-act="add-cluster">
         ${Icon.plus}
-        <span class="name">Add cluster</span>
+        <span class="name">Add Argo</span>
       </button>
     </div>
   `;
@@ -4172,7 +4162,14 @@ function renderArgoPoolsList(a) {
   const free = [];
   for (let i = 0; i < argoMax; i++) if (!usedIdx.has(i)) free.push(i);
   const f = state.pending_form;
-  const canAdd = free.length > 0;
+  // Co-residence: a new pool can SHARE an occupied node — independent runner
+  // processes, RAM-gated by the pro-loader/preflight (e.g. two 30B-A3B 6-bit
+  // ≈ 24GB each on a 96GB node). So "Add pool" is available as long as the
+  // cluster has ANY node; occupied nodes are selectable in the form and
+  // co-reside when RAM allows. (Was `free.length>0`, which made single-node
+  // clusters + fully-occupied clusters un-addable even though the backend has
+  // supported same-node co-residence since v1.40.2.)
+  const canAdd = argoMax > 0;
   return `
     <div class="section" style="padding-top:0">
       <div class="section-head">
@@ -4180,8 +4177,8 @@ function renderArgoPoolsList(a) {
           <div class="section-title">Pools (${pools.length})</div>
           <div class="section-sub">${
             free.length === 0
-              ? "all nodes occupied — no room for another pool"
-              : `free nodes: ${free.map(i => "#" + i).join(", ")}`
+              ? "all nodes occupied — a new pool will co-reside (RAM permitting)"
+              : `free nodes: ${free.map(i => "#" + i).join(", ")} · occupied nodes can also co-reside`
           }</div>
         </div>
         <button class="btn btn-sm ${canAdd?'':'btn-disabled'}" data-act="default-add-toggle" ${canAdd?'':'disabled'}>${Icon.plus}<span>${f.default_add_open ? 'Cancel add' : 'Add pool'}</span></button>
@@ -4194,10 +4191,58 @@ function renderArgoPoolsList(a) {
   `;
 }
 
+// Pro-loader pre-flight verdict block (shown in the add-pool + load forms).
+// Rendered from GET /admin/clusters/{id}/preflight — verdict + node plan +
+// warnings, BEFORE the operator commits a load.
+function renderPreflightVerdict(pf) {
+  if (!pf) return "";
+  if (pf.loading) return `<div style="font-size:11px;color:var(--ink-3);font-family:var(--font-mono)">évaluation pre-flight…</div>`;
+  if (pf.error) return `<div style="font-size:11px;color:var(--amber-deep)">pre-flight indisponible (chargement direct possible)</div>`;
+  const ok = !!pf.ok;
+  const col = ok ? "var(--green-deep)" : "var(--rust-deep)";
+  const bg = ok ? "rgba(60,160,90,0.10)" : "rgba(180,70,50,0.10)";
+  const plan = pf.plan || {};
+  const opts = (plan.options || []).map(o => `${o.nodes}·${o.mode}`).join("  ");
+  const warn = (pf.warnings || []).map(w => `<div style="color:var(--amber-deep);font-size:11px">⚠ ${escapeHtml(w)}</div>`).join("");
+  const block = (pf.blockers || []).map(b => `<div style="color:var(--rust-deep);font-size:11px">✕ ${escapeHtml(b)}</div>`).join("");
+  const m = pf.model || {};
+  return `
+    <div style="padding:10px 12px;border-radius:8px;background:${bg};border:1px solid ${col}">
+      <div style="font-weight:600;color:${col};font-size:12px">${ok ? "✓ PRE-FLIGHT OK" : "✕ PRE-FLIGHT REFUSÉ"} — ${escapeHtml(pf.summary || "")}</div>
+      ${m.model_type ? `<div style="font-size:11px;color:var(--ink-3);font-family:var(--font-mono);margin-top:3px">${escapeHtml(m.model_type)} · ${m.size_gb} GB · ${(m.quant&&m.quant.bits)?m.quant.bits+"-bit":"?"}${m.is_vision?" · vision":""}${m.num_key_value_heads?" · kv="+m.num_key_value_heads:""}</div>` : ""}
+      ${ok && opts ? `<div style="font-size:11px;color:var(--ink-2);margin-top:3px">plan : <b>${plan.nodes} node${plan.nodes>1?"s":""} · ${plan.mode}</b> (nodes pré-sélectionnés) — options : ${escapeHtml(opts)}</div>` : ""}
+      ${pf.draft && pf.draft.reason ? `<div style="font-size:11px;color:${pf.draft.ok?'var(--green-deep)':'var(--rust-deep)'};margin-top:2px">draft : ${escapeHtml(pf.draft.reason)}</div>` : ""}
+      ${block}${warn}
+    </div>`;
+}
+
+// Run the add-pool pre-flight for the currently-picked model and AUTO-SELECT
+// the planned nodes (co-residence of loaded pools deducted). Shared by the
+// model-change handler AND the form-open handler, so opening the form on a
+// pre-filled model already shows the verdict + node plan.
+function _addPoolPreflight(cid) {
+  const f = state.pending_form;
+  if (!cid || !f.default_add_model) return;
+  f.default_add_preflight = { loading: true };
+  fetch(`/admin/clusters/${encodeURIComponent(cid)}/preflight?model=${encodeURIComponent(f.default_add_model)}`)
+    .then(r => r.json())
+    .then(pf => {
+      f.default_add_preflight = pf;
+      const chosen = (pf.selection && pf.selection.chosen)
+                     || (pf.plan && pf.plan.indices) || [];
+      if (chosen.length) {
+        const idx = {}; chosen.forEach(i => { idx[i] = true; });
+        f.default_add_indices = idx;
+      }
+      render();
+    })
+    .catch(() => { f.default_add_preflight = { error: true }; render(); });
+}
+
 // Inline "+ Add pool" form. Lives under the Pools list when toggled.
-// Disjoint node subset chips show which indices are free (clickable)
-// vs occupied (disabled). On submit, POST /admin/default/load with the
-// alias + node_indices we built.
+// Node chips: green = free, amber = occupied (co-reside, RAM permitting),
+// ink = selected — all clickable. On submit, POST /admin/clusters/{id}/load
+// with the alias + node_indices we built.
 function renderArgoAddPoolForm(a, freeIndices) {
   const f = state.pending_form;
   const models = state.default_models || [];
@@ -4207,10 +4252,12 @@ function renderArgoAddPoolForm(a, freeIndices) {
   const hostsByIdx = ((state.cluster_defs?.default?.nodes) || []).map(n => n.host);
   const aliasOk = /^[a-z0-9][a-z0-9_-]{0,30}$/.test(f.default_add_alias)
                   && f.default_add_alias !== "default";
+  // Co-residence: an occupied node is a VALID pick (shares RAM), so don't
+  // filter picks down to fully-free nodes — keep every in-range selection.
   const chosenIndices = Object.keys(f.default_add_indices || {})
     .filter(k => f.default_add_indices[k])
     .map(k => parseInt(k, 10))
-    .filter(i => freeIndices.includes(i));
+    .filter(i => i >= 0 && i < argoMax);
   const canSubmit = aliasOk && selectedModel && chosenIndices.length > 0;
   const opts = models.map(m => {
     const sel = m.id === selectedModel ? 'selected' : '';
@@ -4222,8 +4269,12 @@ function renderArgoAddPoolForm(a, freeIndices) {
     const occupied = usedIdx.has(i);
     const picked = !!f.default_add_indices[i];
     const host = hostsByIdx[i] || `#${i}`;
-    const cls = occupied ? "pill missing" : picked ? "pill selected" : "pill available";
-    chips.push(`<button class="${cls}" data-act="default-add-idx" data-v="${i}" ${occupied ? 'disabled title="Occupied by another pool"' : ''}>${i}<div class="under"></div><div style="font-size:9px;line-height:10px;margin-top:1px;opacity:0.7">${escapeHtml(host)}</div></button>`);
+    // Occupied nodes are SELECTABLE for co-residence (RAM-gated by preflight),
+    // never disabled. picked → selected (ink); occupied+unpicked → amber
+    // "co-res" hint (.locked); free → green available.
+    const cls = picked ? "pill selected" : occupied ? "pill locked" : "pill available";
+    const tip = occupied ? ' title="Occupied — will co-reside on this node (RAM permitting)"' : '';
+    chips.push(`<button class="${cls}" data-act="default-add-idx" data-v="${i}"${tip}>${i}<div class="under"></div><div style="font-size:9px;line-height:10px;margin-top:1px;opacity:0.7">${escapeHtml(host)}${occupied ? ' • co-res' : ''}</div></button>`);
   }
   return `
     <div style="display:flex;flex-direction:column;gap:12px;margin-top:14px;padding:14px;background:var(--surface);border:1px dashed var(--line);border-radius:8px">
@@ -4249,9 +4300,10 @@ function renderArgoAddPoolForm(a, freeIndices) {
         </div>
       </div>
       <div class="field">
-        <div class="field-label">Nodes (pick from free)</div>
+        <div class="field-label">Nodes (green = free · amber = co-reside)</div>
         <div class="seg-nodes">${chips.join("")}</div>
       </div>
+      ${renderPreflightVerdict(f.default_add_preflight)}
       <div style="display:flex;align-items:center;gap:14px;flex-wrap:wrap">
         <button class="btn btn-primary" data-act="default-add-submit" ${(canSubmit && !f.default_add_loading)?"":"disabled"}>
           ${f.default_add_loading ? Icon.spinner || "…" : Icon.check}<span>${f.default_add_loading ? "Loading…" : "Load pool"}</span>
@@ -4308,8 +4360,15 @@ function renderLoadingBanner(p, clusterId) {
   if (!loading) return "";
   const pct = Math.max(2, Math.min(100, loading.progress_pct || 0));
   const elapsed = loading.elapsed_s || 0;
-  const eta = Math.max(0, (loading.estimated_s || 0) - elapsed);
-  const sizeGb = loading.size_bytes ? (loading.size_bytes / (1024**3)).toFixed(1) : null;
+  // Observable path: real ETA from throughput; fallback to est-based.
+  const eta = (loading.eta_s != null) ? loading.eta_s
+              : Math.max(0, (loading.estimated_s || 0) - elapsed);
+  const sizeGb = loading.size_gb != null ? loading.size_gb
+                 : (loading.size_bytes ? (loading.size_bytes / (1024**3)).toFixed(1) : null);
+  const loadedGb = loading.loaded_gb;                 // real bytes materialized
+  const tput = loading.throughput_gbs;                // GB/s
+  const stalled = !!loading.stalled;
+  const phase = loading.phase || "";
   const model = (loading.model || "—").split("/").pop();
   // Try to surface the latest meaningful loading log line as the "stage"
   const stages = (state.logs || []).filter(l => {
@@ -4334,13 +4393,16 @@ function renderLoadingBanner(p, clusterId) {
           <div class="lb-model">${escapeHtml(model)}</div>
         </div>
         <div class="lb-stats">
+          ${loadedGb != null ? `<div class="lb-stat"><div class="cap">Loaded</div><div class="val">${loadedGb} / ${sizeGb} GB</div></div>` : ""}
+          ${tput != null ? `<div class="lb-stat"><div class="cap">Throughput</div><div class="val">${Number(tput).toFixed(2)} GB/s</div></div>` : ""}
           <div class="lb-stat"><div class="cap">Elapsed</div><div class="val">${elapsed.toFixed(0)} s</div></div>
-          <div class="lb-stat"><div class="cap">ETA</div><div class="val">${eta.toFixed(0)} s</div></div>
+          <div class="lb-stat"><div class="cap">ETA</div><div class="val">${eta != null ? Number(eta).toFixed(0)+" s" : "—"}</div></div>
         </div>
       </div>
+      ${stalled ? `<div style="margin:8px 0 0;padding:6px 10px;border-radius:6px;background:rgba(180,70,50,0.22);color:#fff;font-size:12px;font-weight:600">⚠ STALLED — la mémoire ne progresse plus (~12s). Rang bloqué / OOM imminent ? Vérifier les logs.</div>` : ""}
       <div class="lb-bar">
-        <div class="lb-track"><div class="lb-fill" style="width:${pct}%"></div></div>
-        <div class="lb-pct">${pct.toFixed(0)}%</div>
+        <div class="lb-track"><div class="lb-fill" style="width:${pct}%;${stalled?'background:var(--rust-deep)':''}"></div></div>
+        <div class="lb-pct">${pct.toFixed(0)}%${phase?` · ${escapeHtml(phase)}`:""}</div>
       </div>
       ${Array.isArray(loading.ranks) && loading.ranks.length > 0 ? `
         <div style="display:flex;flex-direction:row;gap:8px;margin-top:8px;flex-wrap:wrap">
@@ -5052,6 +5114,30 @@ function renderFormRow2(f, busy, presence, fitCheck) {
             <span class="check-text">Enable MTP</span>
             <span class="check-hint">sidecar present</span>
           </label>` : ""}
+          <label data-act="form-default-dflash" title="DFlash-dense speculative decoding — serve a dense target (e.g. Gemma-4-31B) single-node via mlx-dspark --mode dflash with the DFlash drafter set in Draft. Replaces standalone dspartha.">
+            <div class="box ${f.default_dflash?"on":""}">${f.default_dflash?Icon.check:""}</div>
+            <span class="check-text">dflash</span>
+            <span class="check-hint">dense DSpark · uses Draft</span>
+          </label>
+          <label data-act="form-default-use-drafter" title="Auto-attach the drafter registered for this model (cluster-config model_drafters). ON = the model loads WITH its registered drafter (spec decoding). OFF = plain load even when a drafter is registered — one click to A/B spec vs plain, no config editing.">
+            <div class="box ${f.default_use_drafter?"on":""}">${f.default_use_drafter?Icon.check:""}</div>
+            <span class="check-text">use drafter</span>
+            <span class="check-hint">auto-attach si enregistré</span>
+          </label>
+        </div>
+      </div>
+      <div class="field">
+        <div class="field-label">Draft <span style="font-weight:400;color:var(--ink-3)">— drafter (required for dflash; = DSpark spec draft otherwise)</span></div>
+        <div class="field-shell">
+          <select class="text" data-act="form-default-draft" style="font-family:var(--font-mono);flex:1;border:none;background:transparent;outline:none">
+            <option value="">— none —</option>
+            ${(state.default_models||[]).filter(m => /draft|dspark|dflash|backbone/i.test(m.id)).map(m => {
+              const sel = m.id === f.default_draft ? "selected" : "";
+              const sz = m.size_bytes ? ` — ${(m.size_bytes/1024**3).toFixed(1)} GB` : "";
+              return `<option value="${escapeHtml(m.id)}" ${sel}>${escapeHtml(truncatePath(m.id, 56))}${sz}</option>`;
+            }).join("")}
+          </select>
+          ${Icon.chevDown}
         </div>
       </div>
       <div style="flex:1"></div>
@@ -5081,6 +5167,7 @@ function isLoadConfigChanged(a, f) {
     Boolean(f.default_kv_q8) !== Boolean(a.kv_q8) ||
     Boolean(f.default_mtp) !== Boolean(a.mtp && a.mtp.enabled) ||
     (f.default_draft || "") !== (a.draft_model || "") ||
+    Boolean(f.default_dflash) !== (a.mode === "dflash") ||
     // Transport: "" = cluster default (no change contribution). A concrete
     // pick counts as a change when it differs from the pool's backend — or
     // when the status doesn't expose one (worst case: button enabled).
@@ -5950,6 +6037,30 @@ async function handleAct(e) {
     }
     return;
   }
+  if (act === "cluster-toggle-reload-restart" || act === "cluster-toggle-reload-reboot") {
+    const cid = el.dataset.cluster;
+    const cfg = state.cluster_defs?.[cid];
+    if (!cfg) return;
+    const field = act === "cluster-toggle-reload-restart"
+      ? "reload_on_restart" : "reload_on_reboot";
+    const next = !(cfg[field] !== false);   // default ON, so first click turns OFF
+    try {
+      const r = await fetch(`/admin/clusters/${encodeURIComponent(cid)}`, {
+        method: "PUT",
+        headers: { "content-type": "application/json", ...authHeaders() },
+        body: JSON.stringify({ [field]: next }),
+      });
+      if (!r.ok) { const t = await r.text(); throw new Error(t.slice(0, 300)); }
+      const saved = await r.json();
+      state.cluster_defs[cid] = saved;
+      const label = field === "reload_on_restart" ? "restart" : "reboot";
+      toast(`${cid}: auto-reload on ${label} ${next ? "ON" : "OFF"}`, "ok");
+      render();
+    } catch (err) {
+      toast(`Toggle failed: ${err.message || err}`, "err");
+    }
+    return;
+  }
   if (act === "cluster-save") {
     const cid = el.dataset.cluster;
     const d = state.cluster_draft?.[cid];
@@ -6432,84 +6543,44 @@ async function handleAct(e) {
     return;
   }
   if (act === "settings-pick-cluster") { state.settings_selected_cluster = v; if (state.pending_form) state.pending_form.default_targets = {}; render(); return; }
-  // ── Add cluster — create a kind=mlx-distributed cluster ──────────────
   if (act === "settings-add-cluster") {
-    state.telemak_form = null;
-    state.mlx_form = { open: true, id: "", label: "", backend: "ring", models_dir: "", nodes: [], error: null, busy: false };
+    state.argo_form = { open: true, id: "", label: "", backend: "ring", host: "", ssh: "", error: null, busy: false };
     render(); return;
   }
-  if (act === "mlx-cancel") {
-    state.mlx_form = null;
-    render(); return;
-  }
-  if (act === "mlx-edit-id") {
-    if (!state.mlx_form) return;
-    state.mlx_form.id = (el.value || "").toLowerCase().replace(/[^a-z0-9-]/g, "");
-    state.mlx_form.error = null;
+  if (act === "argo-cancel") { state.argo_form = null; render(); return; }
+  if (act === "argo-edit-id") {
+    if (!state.argo_form) return;
+    state.argo_form.id = (el.value || "").toLowerCase().replace(/[^a-z0-9-]/g, "");
+    state.argo_form.error = null;
     if (e.type === "change") render();
     return;
   }
-  if (act === "mlx-edit-label") {
-    if (!state.mlx_form) return;
-    state.mlx_form.label = el.value || "";
+  if (act === "argo-edit-label") {
+    if (!state.argo_form) return;
+    state.argo_form.label = el.value || "";
     if (e.type === "change") render();
     return;
   }
-  if (act === "mlx-edit-backend") {
-    if (!state.mlx_form) return;
-    state.mlx_form.backend = el.value === "jaccl" ? "jaccl" : "ring";
+  if (act === "argo-edit-backend") {
+    if (!state.argo_form) return;
+    state.argo_form.backend = el.value || "ring";
     render(); return;
   }
-  if (act === "mlx-edit-models-dir") {
-    if (!state.mlx_form) return;
-    state.mlx_form.models_dir = (el.value || "").trim();
+  if (act === "argo-edit-host") {
+    if (!state.argo_form) return;
+    state.argo_form.host = (el.value || "").trim();
+    state.argo_form.error = null;
     if (e.type === "change") render();
     return;
   }
-  if (act === "mlx-node-add") {
-    const f = state.mlx_form;
-    if (!f || !el.value) return;
-    if (el.value === "__custom__") {
-      f.nodes.push({ host: "", ssh: "", master: f.nodes.length === 0 });
-    } else {
-      const inv = (state.inventory?.hosts || []).find(h => h.id === el.value);
-      f.nodes.push({ host: el.value, ssh: inv?.ssh || "", master: f.nodes.length === 0 });
-    }
-    el.value = "";
-    render(); return;
-  }
-  if (act === "mlx-node-edit-host") {
-    const f = state.mlx_form, i = Number(el.dataset.idx);
-    if (!f || !f.nodes[i]) return;
-    f.nodes[i].host = (el.value || "").trim();
+  if (act === "argo-edit-ssh") {
+    if (!state.argo_form) return;
+    state.argo_form.ssh = (el.value || "").trim();
     if (e.type === "change") render();
     return;
   }
-  if (act === "mlx-node-edit-ssh") {
-    const f = state.mlx_form, i = Number(el.dataset.idx);
-    if (!f || !f.nodes[i]) return;
-    f.nodes[i].ssh = (el.value || "").trim();
-    if (e.type === "change") render();
-    return;
-  }
-  if (act === "mlx-node-master") {
-    const f = state.mlx_form, i = Number(el.dataset.idx);
-    if (!f || !f.nodes[i]) return;
-    f.nodes.forEach((n, j) => { n.master = j === i; });
-    render(); return;
-  }
-  if (act === "mlx-node-remove") {
-    const f = state.mlx_form, i = Number(el.dataset.idx);
-    if (!f || !f.nodes[i]) return;
-    const wasMaster = f.nodes[i].master;
-    f.nodes.splice(i, 1);
-    // Keep the exactly-1-master invariant reachable: removing the master
-    // row promotes the first remaining node rather than leaving zero.
-    if (wasMaster && f.nodes.length) f.nodes[0].master = true;
-    render(); return;
-  }
-  if (act === "mlx-create") {
-    const f = state.mlx_form;
+  if (act === "argo-create") {
+    const f = state.argo_form;
     if (!f) return;
     f.busy = true; f.error = null;
     render();
@@ -6517,10 +6588,9 @@ async function handleAct(e) {
       const body = {
         name: f.label.trim(),
         kind: "mlx-distributed",
-        backend: f.backend === "jaccl" ? "jaccl" : "ring",
-        nodes: f.nodes.map(n => ({ host: n.host.trim(), ssh: n.ssh.trim(), master: !!n.master })),
+        backend: f.backend || "ring",
+        nodes: [{ host: f.host, ssh: f.ssh, master: true }],
       };
-      if ((f.models_dir || "").trim()) body.models_dir = f.models_dir.trim();
       const r = await fetch(`/admin/clusters/${encodeURIComponent(f.id)}`, {
         method: "PUT", headers: { "content-type": "application/json" },
         body: JSON.stringify(body),
@@ -6530,18 +6600,13 @@ async function handleAct(e) {
         throw new Error(t.slice(0, 300));
       }
       const newId = f.id;
-      state.mlx_form = null;
+      state.argo_form = null;
       state.settings_selected_cluster = newId;
-      toast(`Cluster '${newId}' added`, "ok");
+      toast(`Argo '${newId}' ajouté — ajoute les autres nodes dans l'éditeur`, "ok");
       await refreshAll();
     } catch (err) {
-      // The form is nulled on success BEFORE refreshAll — a refresh failure
-      // lands here with the cluster already created, so only re-open the
-      // form (busy/error) when it still exists.
-      if (state.mlx_form) {
-        state.mlx_form.busy = false;
-        state.mlx_form.error = err.message || String(err);
-      }
+      state.argo_form.busy = false;
+      state.argo_form.error = err.message || String(err);
       toast(`Add failed: ${err.message}`, "err");
       render();
     }
@@ -6550,7 +6615,6 @@ async function handleAct(e) {
 
   // ── Add Telemak — register an http-proxy cluster from the dashboard ──
   if (act === "settings-add-telemak") {
-    state.mlx_form = null;
     state.telemak_form = { open: true, id: "", label: "", upstream: "", ssh: "", error: null, busy: false };
     render(); return;
   }
@@ -6920,6 +6984,13 @@ async function handleAct(e) {
   if (act === "form-default-model"){
     // Both `change` and `input` fire on <select>; either gives us el.value.
     f.default_model = el.value;
+    // A drafter/dflash choice belongs to the PREVIOUS model — reset it, else a
+    // stale draft_model (e.g. the DeepSeek-V4 DSpark drafter) rides along to a
+    // model that can't use it (Kimi-Linear → V4DSparkDrafter crash, 2026-08-09).
+    // The model_drafters auto-attach (use-drafter toggle) stays the clean path
+    // for models that HAVE a registered drafter.
+    f.default_draft = "";
+    f.default_dflash = false;
     // Pull the authoritative load-options for the newly-picked model.
     fetchLoadOptions(state.selected_cluster, f.default_model);
     // Snap nodes to the smallest topology that fits the new model, but
@@ -6945,6 +7016,9 @@ async function handleAct(e) {
   if (act === "form-default-ap")   { if (e.type==="click") { f.default_use_ap = !f.default_use_ap; render(); } return; }
   if (act === "form-default-kv-q8"){ if (e.type==="click") { f.default_kv_q8 = !f.default_kv_q8; render(); } return; }
   if (act === "form-default-mtp")  { if (e.type==="click") { f.default_mtp = !f.default_mtp; render(); } return; }
+  if (act === "form-default-dflash"){ if (e.type==="click") { f.default_dflash = !f.default_dflash; render(); } return; }
+  if (act === "form-default-use-drafter"){ if (e.type==="click") { f.default_use_drafter = !f.default_use_drafter; render(); } return; }
+  if (act === "form-default-draft") { f.default_draft = el.value || ""; if (e.type === "change") render(); return; }
   if (act === "form-default-nodes"){ if (e.type==="click") {
     f.default_nodes = parseInt(v);
     f.default_nodes_user_picked = true;  // respect this choice on next model change
@@ -7009,7 +7083,15 @@ async function handleAct(e) {
     try {
       const body = { model, mode: f.default_mode, use_ap: f.default_use_ap, nodes: f.default_nodes, kv_q8: f.default_kv_q8 };
       if (f.default_backend) body.backend = f.default_backend;  // "" = cluster default
-      if (f.default_draft && f.default_draft.trim()) {
+      body.use_drafter = !!f.default_use_drafter;  // toggle auto-attach model_drafters (explicit bool)
+      if (f.default_dflash) {
+        // dflash-dense (B1): serve a dense target single-node via mlx-dspark
+        // --mode dflash with a DFlash drafter, as a managed TEXT proxy pool.
+        // Uses `draft` + the `dflash` flag (NOT draft_model — that's the
+        // distributed/single-node DSpark spec path).
+        body.dflash = true;
+        if (f.default_draft && f.default_draft.trim()) body.draft = f.default_draft.trim();
+      } else if (f.default_draft && f.default_draft.trim()) {
         body.draft_model = f.default_draft.trim();
         body.num_draft_tokens = f.default_num_draft || 4;
       }
@@ -7026,7 +7108,9 @@ async function handleAct(e) {
       // old `r.load_s.toFixed(1)` crashed on a VL load and mis-reported the
       // (successful) load as failed via the catch below.
       const secs = (typeof r.load_s === "number") ? ` in ${r.load_s.toFixed(1)}s` : "";
-      toast(r.is_vlm
+      toast(r.is_dflash
+        ? `dflash '${r.alias || "dflash"}' loaded on ${r.node || ("node " + (r.node_index ?? 0))}${secs}`
+        : r.is_vlm
         ? `VLM '${r.alias || "vlm"}' loaded on ${r.node || ("node " + (r.node_index ?? 0))}${secs}`
         : `${r.alias || "Default"} · ${r.nodes || "?"}-node loaded${secs}`, "ok");
     } catch(err) { toast("default load failed: " + err.message, "err"); }
@@ -7052,6 +7136,14 @@ async function handleAct(e) {
   if (act === "default-add-toggle") {
     f.default_add_open = !f.default_add_open;
     if (f.default_add_open) {
+      // Default the model to the first scanned one so the form opens with a
+      // concrete pick (matching what the <select> shows), then run the
+      // pre-flight to auto-select nodes + show the verdict right away —
+      // co-residence included, so single-node clusters "just work".
+      if (!f.default_add_model) {
+        const models = state.default_models || [];
+        if (models[0]) f.default_add_model = models[0].id;
+      }
       // Suggest an alias derived from the selected model (e.g.
       // 'mlx-community/MiniMax-M2.7-8bit' → 'minimax'). Falls back
       // to 'pool-N' only when no model is picked yet.
@@ -7064,6 +7156,7 @@ async function handleAct(e) {
           f.default_add_alias = `pool-${pools.length + 1}`;
         }
       }
+      _addPoolPreflight(state.selected_cluster);
     }
     state.form_interaction_at = Date.now();
     render(); return;
@@ -7087,6 +7180,10 @@ async function handleAct(e) {
       if (suggested) f.default_add_alias = suggested;
     }
     state.form_interaction_at = Date.now();
+    // Pro-loader pre-flight: evaluate the pick and AUTO-SELECT the nodes
+    // (co-residence of already-loaded pools deducted). Shows OK/REFUSÉ +
+    // the node plan before the operator commits.
+    _addPoolPreflight(state.selected_cluster);
     render(); return;
   }
   if (act === "default-add-idx") {
@@ -7118,7 +7215,13 @@ async function handleAct(e) {
         mode: f.default_add_mode || "pipeline",
         use_ap: f.default_add_use_ap !== false,
         kv_q8: f.default_add_kv_q8,  // null → server default
-        force: true,
+        // force MUST stay false here. Two reasons: (1) co-residence no longer
+        // needs it — single-node co-residence is allowed since v1.40.2, and the
+        // preflight returns OK for a valid second pool; (2) force=true makes the
+        // backend BYPASS vision auto-detection and attempt a doomed TEXT load of
+        // a VLM (jaccl text-runner → reboots — the 397B saga gotcha). Letting
+        // force=false keeps the preflight gate + proper LM/VLM routing intact.
+        force: false,
       });
       toast(`Pool '${r.alias}' loaded on nodes ${r.node_indices.join(",")} (${r.load_s?.toFixed?.(1)}s)`, "ok");
       // Reset the form and hide

@@ -53,18 +53,29 @@ def _log(msg: str) -> None:
 #             norm, mlp.expert_bias lives under router, args.num_experts.
 #             Hidden contract: PRE-norm trunk hidden (vLLM hy_v3_mtp.py) —
 #             prefer hidden_source="pre" at activation.
+#  qwen3    : Qwen3.5/3.8 qwen3_5_mtp head. GQA + q/k-norm, plain KVCache,
+#             dense MLP. The head's single decoder layer is FULL-attention (not
+#             the trunk's Mamba linear_attn) — instantiate DecoderLayer at a
+#             full-attn layer_idx. Trunk lives under model.language_model (VL
+#             wrapper), so args + embed/lm_head resolve one level deeper. The
+#             sidecar ships module-layout keys (fc/norm/pre_fc_norm_*/layers.0)
+#             with the trunk's +1 norm shift already applied (extract script).
 _FAMILY_BY_MODEL_TYPE = {
     "glm_moe_dsa": "deepseek", "deepseek_v32": "deepseek",
     "deepseek_v3": "deepseek", "kimi_k2": "deepseek",
     "hy_v3": "hy_v3",
+    "qwen3_5": "qwen3",
 }
 
 
 def _family_layer_cls(family: str):
     """The trunk decoder-layer class this family's MTP block instantiates.
-    Both share the (args, layer_idx) __init__ signature."""
+    All share the (args, layer_idx) __init__ signature."""
     if family == "hy_v3":
         from mlx_lm.models.hy_v3 import DecoderLayer
+        return DecoderLayer
+    if family == "qwen3":
+        from mlx_lm.models.qwen3_5 import DecoderLayer
         return DecoderLayer
     from mlx_lm.models.deepseek_v32 import DeepseekV32DecoderLayer
     return DeepseekV32DecoderLayer
@@ -72,13 +83,35 @@ def _family_layer_cls(family: str):
 
 def _family_cache_factory(family: str):
     """Per-layer cache shape: dsv32 layers read a CacheList (main + indexer
-    KV); hy_v3's GQA attention consumes a plain KVCache directly."""
+    KV); hy_v3 and qwen3 GQA attention consume a plain KVCache directly."""
     def _factory():
         from mlx_lm.models.cache import CacheList, KVCache
-        if family == "hy_v3":
+        if family in ("hy_v3", "qwen3"):
             return [KVCache()]
         return [CacheList(KVCache(), KVCache())]
     return _factory
+
+
+def _family_mtp_layer_idx(family: str, args: Any, start_layer: int) -> int:
+    """Which layer_idx to build the MTP block at. The idx picks behaviour in
+    families whose DecoderLayer branches on it: qwen3 alternates linear vs full
+    attention by `(idx+1) % full_attention_interval`, and the MTP head is a
+    FULL-attention layer, so land on a full-attn slot. Others ignore the idx
+    beyond identity, so the trunk depth (start_layer) is fine."""
+    if family == "qwen3":
+        interval = int(getattr(args, "full_attention_interval", 4) or 4)
+        return interval - 1                       # (idx+1) % interval == 0 → full attn
+    return start_layer
+
+
+def _family_trunk(family: str, model: Any):
+    """(inner, lm_head, args) for the trunk this family's head shares. qwen3
+    wraps the text model under `.language_model` (VL config); others expose the
+    text trunk at the top level."""
+    if family == "qwen3":
+        lm = model.language_model
+        return lm.model, getattr(lm, "lm_head", None), lm.args
+    return model.model, getattr(model, "lm_head", None), getattr(model, "args", None)
 
 
 class MTPSpec:
@@ -124,9 +157,26 @@ def detect_native_mtp(model_dir: str | Path,
     family = _FAMILY_BY_MODEL_TYPE.get(model_type)
     if family is None:
         return None
-    n_layers = int(config.get("num_hidden_layers") or 0)
+    # qwen3's VL-wrapper config nests the trunk depth under text_config.
+    tcfg = config.get("text_config") or config
+    n_layers = int(config.get("num_hidden_layers")
+                   or tcfg.get("num_hidden_layers")
+                   or 0)
     if not n_layers:
         return None
+
+    # Rollback guard: native-MTP speculative decoding trims the trunk cache to
+    # roll back rejected drafts. A HYBRID linear-attention trunk (Qwen3.5's
+    # Mamba/GatedDeltaNet layers) uses ArraysCache, whose recurrent state has
+    # NO .trim — the rollback silently corrupts it (correct prefill token, then
+    # garbage from round 1). Refuse → clean AR. Full-attention-only (interval 1)
+    # is trimmable and fine. Verified 2026-08-15: ArraysCache.trim → AttributeError.
+    if family == "qwen3":
+        fai = int(tcfg.get("full_attention_interval") or 1)
+        if fai > 1:
+            _log(f"native MTP unsupported on hybrid linear-attn trunk "
+                 f"(full_attention_interval={fai}, non-trimmable Mamba cache) — AR only")
+            return None
     prefix = f"model.layers.{n_layers}."
 
     # 1. Conversion kept the MTP tensors in the model dir itself.
@@ -196,11 +246,10 @@ class NativeMTPModule(nn.Module):
 
     # -- binding ------------------------------------------------------------
     def bind_trunk(self, model: Any) -> None:
-        inner = model.model
+        inner, lm, _ = _family_trunk(self.family, model)
         object.__setattr__(self, "_embed", inner.embed_tokens)
-        # tie_word_embeddings models expose as_linear via embed; GLM/DSv32
+        # tie_word_embeddings models expose as_linear via embed; GLM/DSv32/qwen
         # have a real lm_head.
-        lm = getattr(model, "lm_head", None)
         if lm is None:
             lm = inner.embed_tokens.as_linear
         object.__setattr__(self, "_lm_head", lm)
@@ -251,6 +300,10 @@ class NativeMTPModule(nn.Module):
 
 def _load_source_weights(spec: MTPSpec, model_dir: Path) -> dict[str, mx.array]:
     """Read the raw MTP tensors (bf16 or quantized) for the spec's layer(s)."""
+    # qwen3 ships a module-layout sidecar (fc/norm/pre_fc_norm_*/layers.0.*)
+    # with NO `model.layers.{n}.` prefix — take every tensor in the file.
+    if spec.family == "qwen3":
+        return dict(mx.load(str(spec.source_path)))
     prefix = f"model.layers.{spec.start_layer}."
     raw: dict[str, mx.array] = {}
     if spec.source == "sidecar":
@@ -276,6 +329,25 @@ def _rewrite_weights(raw: dict[str, mx.array], spec: MTPSpec,
     pieces (embed_tokens, shared_head.head/lm_head) are SKIPPED — the module
     references the trunk's.
     """
+    # qwen3: module-layout sidecar → direct rename onto the NativeMTPModule tree.
+    # fc→eh_proj, pre_fc_norm_embedding→enorm, pre_fc_norm_hidden→hnorm,
+    # norm→shared_head_norm, layers.0.*→mtp_block.* . Dense MLP, no MLA/experts.
+    if spec.family == "qwen3":
+        _RENAME = {
+            "pre_fc_norm_embedding": "enorm",
+            "pre_fc_norm_hidden": "hnorm",
+            "fc": "eh_proj",
+            "norm": "shared_head_norm",
+        }
+        out: dict[str, mx.array] = {}
+        for k, v in raw.items():
+            if k.startswith("layers.0."):
+                out["mtp_block." + k[len("layers.0."):]] = v
+                continue
+            head, _, rest = k.partition(".")
+            out[_RENAME.get(head, head) + ("." + rest if rest else "")] = v
+        return out
+
     prefix = f"model.layers.{spec.start_layer}."
     flat: dict[str, mx.array] = {}
     for k, v in raw.items():
@@ -385,7 +457,9 @@ def load_native_mtp(model: Any, model_dir: str | Path, *,
 
     t0 = time.time()
     config = _read_config(model_dir)
-    args = getattr(model, "args", None)
+    # The MTP block is built from the TRUNK's args (qwen3's live one level down
+    # under .language_model); _family_trunk resolves them per family.
+    _, _, args = _family_trunk(spec.family, model)
     if args is None:
         _log("trunk model has no .args — cannot build MTP block")
         return None
@@ -396,7 +470,8 @@ def load_native_mtp(model: Any, model_dir: str | Path, *,
         _log(f"{spec.family} layer import failed ({e})")
         return None
 
-    module = NativeMTPModule(args, layer_cls, spec.start_layer,
+    layer_idx = _family_mtp_layer_idx(spec.family, args, spec.start_layer)
+    module = NativeMTPModule(args, layer_cls, layer_idx,
                              family=spec.family)
     module.bind_trunk(model)
 

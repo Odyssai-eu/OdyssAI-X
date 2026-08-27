@@ -1,0 +1,5 @@
+List the files in the current project that define the cluster topology, and say which one is authoritative.
+---
+Good. Now write a bash one-liner that checks disk space on 5 hosts listed in an env var HOSTS, and prints only those above 80% usage.
+---
+Turn that one-liner into a small script with proper error handling and a --json output mode.

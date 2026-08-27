@@ -8,8 +8,15 @@
 # this repo. If you bump these, re-run bench + at least one multi-node
 # load on a 100B+ MoE before merging.
 
-mlx==0.31.2
+mlx==0.32.0
 mlx-lm==0.31.3
+
+# Tokenizer support for the Kimi family (K2, Kimi-Linear, K3): their
+# tokenizer is tiktoken-based custom code. Without these the model load
+# dies at the tokenizer with a misleading "ranks died" — the failure is
+# not persistent across nodes, so it belongs in this pinned set.
+tiktoken>=0.13
+blobfile>=3.2
 
 # Hugging Face support — used by the runner when loading directly from
 # a repo id (the dashboard's "Download from Hugging Face" path).

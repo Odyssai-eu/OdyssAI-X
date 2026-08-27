@@ -17,6 +17,7 @@ Stdout events (rank 0 only, one JSON per line):
 """
 
 import hashlib
+import faulthandler
 import json
 import os
 import pickle
@@ -152,6 +153,10 @@ except Exception:
     make_prompt_cache = None  # type: ignore
     QuantizedKVCache = None  # type: ignore
     _CACHE_AVAILABLE = False
+try:
+    from mlx_lm.models.cache import CacheList as _CacheListCls  # type: ignore
+except Exception:
+    _CacheListCls = None  # type: ignore
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -172,6 +177,17 @@ except Exception:
 # The runner is single-threaded; the lock is only against the eviction sweep.
 # ──────────────────────────────────────────────────────────────────────────────
 import threading
+
+# Prefix-cache par snapshot pour les caches NON-trimmables (V4 PoolingCache).
+# Defaut ON : le tour-2 pendait parce que le snapshot capturait des arrays
+# ENCORE LAZY (l'etat poole de PoolingCache n'est PAS ancetre des logits
+# courants, donc mx.eval(logits) ne le materialisait pas) — au tour suivant,
+# restaurer puis forward ces arrays re-executait le graphe de collectives
+# distribues du tour precedent HORS lockstep -> deadlock. Corrige :
+# _manual_prefill force desormais l'eval de l'ETAT COMPLET du cache (voir
+# _cache_state_arrays), le snapshot est donc inerte. RUNNER_SNAP_CACHE=0 pour
+# desactiver (repli au re-prefill integral).
+_SNAP_CACHE_ENABLED = os.environ.get("RUNNER_SNAP_CACHE", "1") == "1"
 
 _session_store: dict[str, dict] = {}
 _session_lock = threading.Lock()
@@ -515,6 +531,52 @@ ANTI_LOOP_MAX_PERIOD = 64    # longest repeating block considered
 ANTI_LOOP_MIN_REPEATS = 4    # and repeat at least this many times
 ANTI_LOOP_WINDOW = 640       # ids scanned (>= MAX_PERIOD * (MIN_REPEATS + 1))
 
+# ── Context-limit — hard cap on total context (prompt + generated) ──────────
+# Server-wide guard, INDEPENDENT of the client's per-request max_tokens. When
+# prompt + generated tokens reach this cap, the turn ends cleanly with a
+# `context_limit` flag on the done event (finish_reason stays "length" for
+# OpenAI-compat clients). Prevents a runaway generation from saturating the
+# worker / OOMing before max_tokens. 0 = off. Per-request override via the
+# `context_limit` field. Inspired by Inferencer 2.3.1's contextLimit; enforced
+# per-step here, not just at enqueue (a long prefill can already exceed).
+_CONTEXT_LIMIT = int(os.environ.get("RUNNER_CONTEXT_LIMIT", "0"))
+
+
+# Large-period companion (2026-08-09, MiMo c02): multi-paragraph self-doubt
+# cycles ("Actually, let me reconsider…" + code block — ~450-token period
+# repeated 378× VERBATIM) sit far above ANTI_LOOP_MAX_PERIOD=64, invisible to
+# _detect_loop by construction. Same contract: pure function of token ids →
+# identical verdict on every rank (multi-rank lockstep safe). The anchor trick
+# keeps it cheap: a period-p loop implies ids[-1] == ids[-1-p], so we slice-
+# verify only anchored candidates; checked every 64 tokens, not 16.
+ANTI_LOOP_L_CHECK_EVERY = 64    # tokens between large-period checks
+ANTI_LOOP_L_MAX_PERIOD = 1024   # longest repeating block considered
+ANTI_LOOP_L_MIN_REPEATS = 4     # 4 EXACT reps of a 65+-token block = stuck
+ANTI_LOOP_L_WINDOW = ANTI_LOOP_L_MAX_PERIOD * (ANTI_LOOP_L_MIN_REPEATS + 1)
+
+
+def _detect_loop_large(ids: list) -> Optional[tuple]:
+    """(period, repeats) when the tail loops with period 65..1024 tokens —
+    the multi-paragraph regime _detect_loop cannot see. 4+ exact repetitions
+    of a 65+-token block does not happen in legitimate output (three identical
+    consecutive code stubs is the worst realistic case; four is pathological)."""
+    n = len(ids)
+    if n < (ANTI_LOOP_MAX_PERIOD + 1) * ANTI_LOOP_L_MIN_REPEATS:
+        return None
+    tail = ids[-ANTI_LOOP_L_WINDOW:]
+    n = len(tail)
+    last = tail[-1]
+    for p in range(ANTI_LOOP_MAX_PERIOD + 1, min(ANTI_LOOP_L_MAX_PERIOD, n // 2) + 1):
+        if tail[-1 - p] != last:
+            continue
+        r = 1
+        while (n - (r + 1) * p >= 0
+               and tail[n - (r + 1) * p: n - r * p] == tail[n - r * p: n - (r - 1) * p]):
+            r += 1
+        if r >= ANTI_LOOP_L_MIN_REPEATS:
+            return p, r
+    return None
+
 
 def _detect_loop(ids: list) -> Optional[tuple]:
     """(period, repeats) when the tail of `ids` is a degenerate loop, else None.
@@ -763,6 +825,113 @@ def _truncatable_cache(cache) -> bool:
         return False
     safe = (_KV, QuantizedKVCache) if QuantizedKVCache is not None else (_KV,)
     return all(isinstance(c, safe) for c in cache)
+
+
+def _snap_cache(cache) -> list:
+    """O(1) snapshot de l'etat d'un prompt cache — refs `vars()` par couche.
+
+    Les arrays MLX sont immutables : toute mutation ulterieure (generation)
+    REBIND les attributs des objets cache sur de nouveaux arrays, les refs
+    capturees ici restent l'etat exact du moment. C'est le pattern prouve du
+    rollback spec-decode (dv_c2, saga DSpark) applique au serving : il donne
+    un prefix-cache aux modeles dont le cache n'est PAS trimmable (V4
+    PoolingCache/CacheList) — au tour suivant on RESTAURE au lieu de
+    rembobiner."""
+    out = []
+    for c in cache:
+        if _CacheListCls is not None and isinstance(c, _CacheListCls):
+            out.append(("l", [dict(vars(x)) for x in c.caches]))
+        else:
+            out.append(("o", dict(vars(c))))
+    return out
+
+
+def _restore_from_snap(template_cache, snap) -> list:
+    """Reconstruit une liste de caches NEUFS depuis un snapshot.
+
+    `template_cache` (le cache vivant stocke avec la session) fournit les
+    CLASSES par couche ; le snapshot fournit l'etat. Les objets retournes
+    sont frais : la generation les mute sans toucher ni au snapshot ni au
+    cache stocke — le snapshot est donc reutilisable a chaque tour."""
+    fresh = []
+    for c, (kind, st) in zip(template_cache, snap):
+        if kind == "l":
+            subs = []
+            for sub, d in zip(c.caches, st):
+                obj = sub.__class__.__new__(sub.__class__)
+                obj.__dict__.update(dict(d))
+                subs.append(obj)
+            cl = c.__class__.__new__(c.__class__)
+            cl.__dict__.update(dict(vars(c)))
+            cl.caches = subs
+            fresh.append(cl)
+        else:
+            obj = c.__class__.__new__(c.__class__)
+            obj.__dict__.update(dict(st))
+            fresh.append(obj)
+    return fresh
+
+
+def _cache_state_arrays(cache) -> list:
+    """Aplatit tout mx.array vivant d'un prompt cache, couche par couche et
+    sous-cache de CacheList compris.
+
+    But : forcer l'eval de l'ETAT COMPLET du cache apres un prefill, pas
+    seulement les logits. Un array de cache laisse LAZY porte le graphe des
+    collectives distribues (recv/send/all_gather) du forward courant ; si on le
+    snapshotte puis qu'on le reutilise au tour suivant, son eval re-declenche
+    ces collectives HORS lockstep -> deadlock. En particulier l'etat POOLE de
+    PoolingCache (V4) n'est PAS ancetre des logits courants, donc mx.eval(logits)
+    seul le laisse lazy — d'ou le hang du tour 2. On materialise tout ici."""
+    import mlx.core as _mx  # local — module-level import may be aliased
+    out: list = []
+
+    def _pull(c) -> None:
+        got = False
+        st = getattr(c, "state", None)   # contrat mlx-lm : arrays (possiblement niches)
+        if st is not None:
+            stack = [st]
+            while stack:
+                x = stack.pop()
+                if isinstance(x, _mx.array):
+                    out.append(x); got = True
+                elif isinstance(x, (list, tuple)):
+                    stack.extend(x)
+                elif isinstance(x, dict):
+                    stack.extend(x.values())
+        if not got:                      # repli : scan brut du __dict__
+            try:
+                for v in vars(c).values():
+                    if isinstance(v, _mx.array):
+                        out.append(v)
+            except TypeError:
+                pass
+
+    for c in cache:
+        if _CacheListCls is not None and isinstance(c, _CacheListCls):
+            for sub in c.caches:
+                _pull(sub)
+        else:
+            _pull(c)
+    return out
+
+
+def _manual_prefill(model, cache, tokens: list[int], chunk: int = 2048) -> None:
+    """Prefill explicite de `tokens` dans `cache`, par chunks evalues.
+
+    Reproduit ce que stream_generate fait en interne, mais SOUS NOTRE
+    CONTROLE pour pouvoir snapshotter l'etat exactement en fin de prompt.
+    L'eval par chunk borne la memoire ET sert de lockstep distribue (tous
+    les rangs executent ce meme code sur les memes tokens).
+
+    Eval-isolation (corrige le hang du tour-2, cf _cache_state_arrays) : on
+    materialise logits ET l'etat complet du cache a chaque chunk — sinon l'etat
+    poole reste lazy et son graphe de collectives est rejoue hors lockstep au
+    tour suivant."""
+    for i in range(0, len(tokens), chunk):
+        seg = mx.array(tokens[i:i + chunk], dtype=mx.uint32)[None]
+        logits = model(seg, cache=cache)
+        mx.eval(logits, *_cache_state_arrays(cache))
 
 
 def _truncate_cache_to(cache, target_offset: int) -> None:
@@ -1092,6 +1261,20 @@ def _session_lookup(session_id: str, model_id: str, prompt_tokens: list[int]):
             # The stored tokens went further than what the new prompt agrees
             # with — must rewind. Only safe for plain/quantized KVCache.
             if not _truncatable_cache(cache):
+                # Fallback V4-class : le cache vivant ne se rembobine pas,
+                # mais si un snapshot fin-de-prompt existe et que ses tokens
+                # sont un PREFIXE STRICT du nouveau prompt (garanti quand la
+                # conversation etend l'historique : le prompt du tour N est
+                # prefixe du tour N+1 par determinisme du template), on
+                # restaure des objets frais depuis le snapshot — zero rewind.
+                snap = entry.get("snap") if _SNAP_CACHE_ENABLED else None
+                snap_tokens = entry.get("snap_tokens")
+                if snap and snap_tokens:
+                    sc = _common_prefix_len(snap_tokens, prompt_tokens)
+                    if sc == len(snap_tokens) and sc < len(prompt_tokens):
+                        entry["last_used"] = time.time()
+                        restored = _restore_from_snap(cache, snap)
+                        return restored, prompt_tokens[sc:], "snap-hit"
                 del _session_store[session_id]
                 return None, None, "non-truncatable"
             _truncate_cache_to(cache, common)
@@ -1100,9 +1283,61 @@ def _session_lookup(session_id: str, model_id: str, prompt_tokens: list[int]):
         return cache, prompt_tokens[common:], kind
 
 
+def _spec_session_get(session_id: str, model_id: str):
+    """Hook A (spec+snap) : entree session brute pour le chemin spec.
+    Chaque rang tient SA copie (SPMD) ; la coherence inter-rangs est garantie
+    par la barriere all_sum du generateur, pas ici."""
+    if not session_id:
+        return None
+    with _session_lock:
+        entry = _session_store.get(session_id)
+        if os.environ.get("SPEC_SESS_DEBUG"):
+            _keys = list(_session_store.keys())
+            _mid = entry.get("model_id") if entry else None
+            sys.stderr.write(
+                f"[spec-sess] GET r{os.environ.get('MLX_RANK','?')} "
+                f"sid={str(session_id)[:8]} found={entry is not None} "
+                f"store_keys={[k[:8] for k in _keys]} "
+                f"stored_mid={str(_mid)[:40]} want_mid={str(model_id)[:40]}\n")
+            sys.stderr.flush()
+        if not entry or entry.get("model_id") != model_id:
+            return None
+        entry["last_used"] = time.time()
+        return entry
+
+
+def _spec_session_put(session_id: str, model_id: str, cache, tokens,
+                      snap, snap_tokens, spec_ctx=None) -> None:
+    """Hook A (spec+snap) : persiste le cache+snapshot du chemin spec dans le
+    MEME store byte-budgete que le chemin plain. `spec_ctx` (rank0 only) =
+    refs (k,v) du CtxCache drafter au point du prompt."""
+    if not session_id or cache is None:
+        return
+    with _session_lock:
+        _session_store[session_id] = {
+            "cache": cache,
+            "tokens": list(tokens),
+            "model_id": model_id,
+            "last_used": time.time(),
+            # A : le cache spec est deja compte dans la RAM modele (ref vivante,
+            # pas une copie) ; le snapshot ne garde que le KV au point du
+            # prompt. On force bytes=0 pour l'evicteur byte-budget — sinon
+            # _cache_size_bytes surevalue le shard bas (12 couches) et
+            # auto-evince la seule entree des le store (bug servant 05/08).
+            # Le count-cap (_SESSION_MAX) borne toujours le nombre d'entrees.
+            "bytes": 0,
+            "snap": snap,
+            "snap_tokens": list(snap_tokens) if snap_tokens else None,
+            "spec_ctx": spec_ctx,
+        }
+    _evict_sessions()
+
+
 def _session_store_after_gen(session_id: str, model_id: str, cache,
                              all_tokens: list[int],
-                             rank: int = 0, world: int = 1) -> None:
+                             rank: int = 0, world: int = 1,
+                             snap: Optional[list] = None,
+                             snap_tokens: Optional[list[int]] = None) -> None:
     """Persist the populated cache + cumulative token list under this session.
     Also records the cache byte cost so the byte-budgeted evictor can do its
     job (otherwise it would never know how big each entry is).
@@ -1120,6 +1355,13 @@ def _session_store_after_gen(session_id: str, model_id: str, cache,
             "model_id": model_id,
             "last_used": time.time(),
             "bytes": cache_bytes,
+            # Snapshot fin-de-prompt (modeles non-trimmables, V4) : refs O(1)
+            # vers l'etat du cache AVANT generation. Le tour suivant restaure
+            # ce prefixe garanti au lieu de rembobiner (impossible). Peut
+            # garder en vie ~1 copie des buffers K/V au point du prompt en
+            # plus du cache vivant — assume, c'est le prix du prefix-hit.
+            "snap": snap,
+            "snap_tokens": list(snap_tokens) if snap_tokens else None,
         }
     _evict_sessions()
     # Disk persist — opt-in via RUNNER_CACHE_DISK_ENABLED=1, single-rank only.
@@ -1595,11 +1837,34 @@ _QWEN_PARAM = re.compile(r"<parameter=([^>]+)>\s*(.*?)\s*</parameter>", re.DOTAL
 # Hy3 XML: <tool_call>NAME<tool_sep><arg_key>K</arg_key><arg_value>V</arg_value>…</tool_call>
 # Observed on inferencerlabs/Hy3-preview-MLX-9bit and family. The name lives
 # BEFORE <tool_sep>, args are interleaved key/value pairs after.
+# The `(?::\w+)?` tolerates the per-tag suffix some Hunyuan checkpoints emit —
+# odyssai/Hy3-mlx-8bit-headbf16 wraps every tag as `<tool_call:opensource>`,
+# `<tool_sep:opensource>`, `<arg_key:opensource>`, … . Without it the model's
+# real tool call stayed unparsed in content → finish=stop, tool_calls=null →
+# agent benches gated it as non-agent (2026-08-13).
 _TOOL_CALL_HY3_XML = re.compile(
-    r"<tool_call>\s*([^<\s][^<]*?)\s*<tool_sep>(.*?)</tool_call>", re.DOTALL,
+    r"<tool_call(?::\w+)?>\s*([^<\s][^<]*?)\s*<tool_sep(?::\w+)?>(.*?)</tool_call(?::\w+)?>",
+    re.DOTALL,
 )
 _HY3_ARG_PAIR = re.compile(
-    r"<arg_key>\s*(.*?)\s*</arg_key>\s*<arg_value>\s*(.*?)\s*</arg_value>",
+    r"<arg_key(?::\w+)?>\s*(.*?)\s*</arg_key(?::\w+)?>\s*"
+    r"<arg_value(?::\w+)?>\s*(.*?)\s*</arg_value(?::\w+)?>",
+    re.DOTALL,
+)
+
+# LongCat format: <longcat_tool_call>NAME\n<longcat_arg_key>K</longcat_arg_key>
+# <longcat_arg_value>V</longcat_arg_value>…</longcat_tool_call>
+# Observed on meituan-longcat/LongCat-Flash-Lite. The name is the first line
+# (before any newline or tag); args are interleaved key/value pairs. Mirrors
+# the model's own parse_model_response.py: value = json.loads() when decodable
+# (numbers/bools/objects), else the raw string.
+_TOOL_CALL_LONGCAT = re.compile(
+    r"<longcat_tool_call>\s*(.*?)\s*</longcat_tool_call>", re.DOTALL,
+)
+_LONGCAT_NAME = re.compile(r"([^\n<]+)")
+_LONGCAT_ARG_PAIR = re.compile(
+    r"<longcat_arg_key>\s*(.*?)\s*</longcat_arg_key>\s*"
+    r"<longcat_arg_value>\s*(.*?)\s*</longcat_arg_value>",
     re.DOTALL,
 )
 
@@ -1611,6 +1876,8 @@ def parse_tool_calls(text: str) -> tuple[list[dict], str]:
       - Hermes JSON (Qwen3, GLM-4): `<tool_call>{"name":..,"arguments":..}</tool_call>`
       - Hermes JSON list: `<tool_calls>[ {…}, … ]</tool_calls>`
       - Qwen3-Coder XML: `<tool_call><function=NAME><parameter=KEY>VAL</parameter>…</function></tool_call>`
+      - Hy3 XML: `<tool_call>NAME<tool_sep><arg_key>K</arg_key><arg_value>V</arg_value>…</tool_call>`
+      - LongCat: `<longcat_tool_call>NAME<longcat_arg_key>K</longcat_arg_key><longcat_arg_value>V</longcat_arg_value>…</longcat_tool_call>`
 
     Returns (tool_calls, content_without_calls). Each call:
       `{"id": "call_xxx", "type": "function", "function": {"name", "arguments"}}`.
@@ -1679,6 +1946,25 @@ def parse_tool_calls(text: str) -> tuple[list[dict], str]:
         body = m.group(2)
         args: dict = {}
         for pm in _HY3_ARG_PAIR.finditer(body):
+            key = pm.group(1).strip()
+            raw = pm.group(2).strip()
+            try:
+                args[key] = json.loads(raw)
+            except Exception:
+                args[key] = raw
+        add_call(name, args)
+        cleaned = cleaned.replace(m.group(0), "")
+
+    # Pass 5: LongCat format (`<longcat_tool_call>NAME<longcat_arg_key>…</…>`)
+    # Name is the first line; args are <longcat_arg_key>/<longcat_arg_value> pairs.
+    for m in _TOOL_CALL_LONGCAT.finditer(text):
+        body = m.group(1)
+        name_m = _LONGCAT_NAME.match(body.strip())
+        if not name_m:
+            continue
+        name = name_m.group(1).strip()
+        args: dict = {}
+        for pm in _LONGCAT_ARG_PAIR.finditer(body):
             key = pm.group(1).strip()
             raw = pm.group(2).strip()
             try:
@@ -1834,6 +2120,9 @@ def _build_prompt_cache(model, kv_q8: bool):
     try:
         cache = make_prompt_cache(model)
         if not kv_q8 or QuantizedKVCache is None:
+            if _CACHE_PIN_VALUES and cache:
+                _np = _pin_cache_values(cache)
+                sys.stderr.write(f"[runner] cache-pin #1662: {_np} caches wrapped\n")
             return cache
         try:
             from mlx_lm.models.cache import KVCache  # type: ignore
@@ -1852,13 +2141,166 @@ def _build_prompt_cache(model, kv_q8: bool):
                 upgraded.append(c)
         sys.stderr.write(f"[runner] kv_q8: {n_q8}/{len(cache)} layers Q8-quantized "
                          f"(rest kept native)\n")
+        if _CACHE_PIN_VALUES:
+            _np = _pin_cache_values(upgraded)
+            sys.stderr.write(f"[runner] cache-pin #1662: {_np} caches wrapped\n")
         return upgraded
     except Exception as e:
         sys.stderr.write(f"[runner] cache build failed ({e}), letting stream_generate auto-create\n")
         return None
 
 
+# Drain interval (in generated tokens) for the KV caches' lazy graphs.
+# 512 tokens * ~11 leaked buffers/token (glm-5-3-flash) ~ 5.6k buffers max
+# between flushes — two orders of magnitude under Metal's 499k cap. 0 = off.
+_CACHE_FLUSH_EVERY = int(os.environ.get("RUNNER_CACHE_FLUSH_EVERY", "512") or 0)
+
+# Site-level pin (mlx-lm #1662, methode du PR upstream #1790) : ON par defaut.
+_CACHE_PIN_VALUES = os.environ.get("RUNNER_CACHE_PIN", "1") == "1"
+
+
+def _pin_cache_values(caches) -> int:
+    """Fix #1662 au SITE : les modeles hybrides (glm5_next sites L436/L606)
+    jettent le retour `values` d'`update_and_fetch` (astuce K==V / indexer a
+    values de largeur 0). Rien ne lit jamais cache.values → chaque step
+    re-lie `values = slice_update(ancien, nouveau)` en chaine lazy jamais
+    evaluee — un buffer Metal VIVANT par step par cache. Metal plafonne le
+    NOMBRE de buffers (499000) → crash deterministe a ~45k tokens generes.
+
+    On wrappe update_and_fetch de chaque cache (descente recursive dans les
+    CacheList) pour programmer mx.async_eval(values) a chaque appel : la
+    chaine est collapsee en continu, cout nul mesure upstream (le drain du
+    graphe mort rend meme le decode plus rapide). Idempotent (_oxpin).
+    Retourne le nombre de caches wrappes.
+    """
+    n = 0
+    seen: set = set()
+    stack = list(caches or [])
+    while stack:
+        c = stack.pop()
+        if id(c) in seen or isinstance(c, (mx.array, str, bytes, int, float)):
+            continue
+        seen.add(id(c))
+        if isinstance(c, (list, tuple)):
+            stack.extend(c)
+            continue
+        d = getattr(c, "__dict__", None)
+        if not d:
+            continue
+        for v in d.values():
+            if isinstance(v, (list, tuple)):
+                stack.extend(x for x in v if hasattr(x, "__dict__"))
+            elif hasattr(v, "__dict__"):
+                stack.append(v)
+        if callable(getattr(c, "update_and_fetch", None)) and not getattr(c, "_oxpin", False):
+            _orig = c.update_and_fetch
+
+            def _pinned(_k, _v, _o=_orig):
+                _out = _o(_k, _v)
+                try:
+                    mx.async_eval(_out[1])
+                except Exception:
+                    pass
+                return _out
+
+            c.update_and_fetch = _pinned
+            c._oxpin = True
+            n += 1
+        if callable(getattr(c, "advance", None)) and not getattr(c, "_oxpin_adv", False):
+            _oa = c.advance
+
+            def _adv(_N, _c=c, _o=_oa):
+                _r = _o(_N)
+                _p = [a for a in (getattr(_c, "lengths", None),
+                                  getattr(_c, "left_padding", None))
+                      if isinstance(a, mx.array)]
+                if _p:
+                    try:
+                        mx.async_eval(_p)
+                    except Exception:
+                        pass
+                return _r
+
+            c.advance = _adv
+            c._oxpin_adv = True
+    return n
+
+
+def _flush_cache_graph(caches) -> None:
+    """Drain the lazy graphs pinned by the KV caches (mlx-lm #1662).
+
+    During decode, cache fields the logits graph never reads accumulate an
+    unevaluated node chain — one node per generated token — and every node
+    pins a live Metal BUFFER. Metal caps buffer COUNT (`[metal::malloc]
+    Resource limit (499000) exceeded` is a count, not bytes: memory metrics
+    stay flat), so one long enough completion crashes generate_step
+    deterministically. Measured here: glm-5-3-flash Q8 leaks ~11 buffers per
+    generated token -> death at ~44.8k tokens / ~35 min (chatcmpl-78dc661d,
+    2026-08-27). The batched path leaked 47-66/tok -> its 7495-token ceiling.
+
+    Evaluating the caches' stored arrays collapses the dead chains and frees
+    the buffers. Upstream does exactly this on every prefill chunk; the
+    pending upstream fixes (mlx-lm PRs #1780/#1790) do it per decode
+    interval. vars() walk instead of `.state`: state properties can slice
+    (transient copies), and ArraysCache.state omits the leaking metadata
+    fields entirely (left_padding/lengths — mlx-lm #1332).
+    """
+    # Marche RECURSIVE (v2, 2026-08-27 soir) : glm5_next emboite ses vrais
+    # caches (KVCache indexer, ArraysCache SSM, latent MLA) dans des
+    # CacheList (attr `caches` = tuple d'OBJETS cache) — la v1 ne collectait
+    # que les mx.array de premier niveau et n'a draine AUCUNE des chaines
+    # fuyantes (probe 35340f06 morte a ~41.1k, pente inchangee). On descend
+    # dans tout objet a __dict__, cycle-guarded.
+    arrs, seen, stack = [], set(), list(caches or [])
+    while stack:
+        o = stack.pop()
+        if id(o) in seen:
+            continue
+        seen.add(id(o))
+        if isinstance(o, mx.array):
+            arrs.append(o)
+        elif isinstance(o, (list, tuple)):
+            stack.extend(o)
+        elif isinstance(o, dict):
+            stack.extend(o.values())
+        else:
+            d = getattr(o, "__dict__", None)
+            if d:
+                stack.extend(d.values())
+    if arrs:
+        mx.eval(arrs)
+
+
+def _install_death_reporters():
+    """#68 : nomme la CAUSE de toute sortie du runner. Les morts ~35 min
+    sortent proprement (atexit) sans un mot — signal ? EOF stdin ? On logge
+    le déclencheur AVANT de mourir pour que docker logs porte la réponse."""
+    import signal as _sig
+
+    def _mk(name, signum):
+        def h(_s, _f):
+            try:
+                sys.stderr.write(f"[runner] DEATH-REPORT: received {name} "
+                                 f"(signum={signum}) — exiting\n")
+                sys.stderr.flush()
+                try:
+                    faulthandler.dump_traceback(file=sys.stderr)
+                except Exception:
+                    pass
+            finally:
+                _sig.signal(signum, _sig.SIG_DFL)
+                os.kill(os.getpid(), signum)
+        return h
+    for name in ("SIGTERM", "SIGHUP", "SIGINT", "SIGUSR1"):
+        try:
+            signum = getattr(_sig, name)
+            _sig.signal(signum, _mk(name, signum))
+        except Exception:
+            pass
+
+
 def main() -> None:
+    _install_death_reporters()
     repo = os.environ.get("RUNNER_MODEL", "mlx-community/GLM-4.5-Air-4bit")
     mode = os.environ.get("RUNNER_MODE", "pipeline")  # pipeline | tensor | tensor_ap
     use_ap = os.environ.get("RUNNER_USE_AP", "0") == "1"
@@ -1974,8 +2416,20 @@ def main() -> None:
     # draft REPLICATED on every rank — validation of the multi-rank
     # accept-alignment invariant only, never a prod default.
     spec_multirank = os.environ.get("RUNNER_SPEC_MULTIRANK", "0") == "1"
+    # DSpark drafters (config carries `dspark_block_size`) use the dedicated
+    # spec_dspark path — single-node trimmable-pool OR multi-rank lockstep —
+    # NOT mlx-lm's generic stream_generate(draft_model=). Detect early so the
+    # generic draft load below skips them (loading a DSpark drafter as a plain
+    # causal model would fail / mis-load).
+    _draft_is_dspark = False
+    if draft_repo:
+        try:
+            _dp = Path(draft_repo) if Path(draft_repo).exists() else hf_repo_to_path(draft_repo)
+            _draft_is_dspark = "dspark_block_size" in json.load(open(Path(_dp) / "config.json"))
+        except Exception:
+            _draft_is_dspark = False
     draft_model = None
-    if draft_repo and (size == 1 or spec_multirank):
+    if draft_repo and not _draft_is_dspark and (size == 1 or spec_multirank):
         try:
             t_draft = time.time()
             draft_path = Path(draft_repo) if Path(draft_repo).exists() else hf_repo_to_path(draft_repo)
@@ -2011,8 +2465,41 @@ def main() -> None:
             log(f"native MTP load failed ({e}) — serving AR only")
             native_mtp = None
 
+    # DSpark speculative distribue (goal drafter, plan P7). Un drafter DSpark
+    # SEPARE (V4DSparkDrafter) charge sur rank0 ; le bloc propose est diffuse
+    # aux servants (all_sum), verify target en lockstep (module spec_dspark,
+    # portage du harnais dv_g PROUVE lossless). Detecte par la config du
+    # drafter qui porte `dspark_block_size`. Contrairement a mlx-lm
+    # stream_generate(draft_model=) (nodes=1 only), ce chemin est multi-rang.
+    #   Detection : size>1 + un draft => TOUJOURS DSpark (le draft mlx-lm est
+    #   nodes=1 only, cf plus haut). Les servants n'ont PAS le dossier drafter
+    #   (seul rank0 l'a) — ils entrent en mode servant sur le seul fait
+    #   size>1+draft, sans lire de config. rank0 charge le drafter ; son ECHEC
+    #   est FATAL (rank0 plain + servants spec = deadlock), donc on laisse
+    #   propager pour faire echouer le load proprement plutot que desync.
+    spec_dspark_ctx = None
+    if draft_repo and _draft_is_dspark:
+        import spec_dspark
+        if rank == 0:
+            _dpath = Path(draft_repo) if Path(draft_repo).exists() else hf_repo_to_path(draft_repo)
+            _dcfg = json.load(open(Path(_dpath) / "config.json"))
+            _tpath = Path(repo) if Path(repo).exists() else hf_repo_to_path(repo)
+            _targs = spec_dspark.load_target_args(str(_tpath))
+            _drafter = spec_dspark.load_dspark_drafter(str(_dpath), _targs, _dcfg)
+            spec_dspark_ctx = {"enabled": True, "drafter": _drafter,
+                               "args": _targs, "dcfg": _dcfg,
+                               "single_node": size == 1}
+            log(f"DSpark drafter loaded (block={_dcfg.get('dspark_block_size')}, "
+                f"taps={_dcfg.get('dspark_target_layer_ids')}) — "
+                f"{'single-node trimmable-pool' if size == 1 else 'multi-rank'} spec ENABLED")
+        else:
+            # servants exist only in multi-rank; single-node is rank0-only.
+            spec_dspark_ctx = {"enabled": True, "drafter": None,
+                               "args": None, "dcfg": None, "single_node": False}
+            log("DSpark spec pool — servant rank (target-only, no drafter dir)")
+
     emit(rank, {"event": "ready", "rank": rank, "size": size, "load_s": load_s,
-                "speculative": draft_model is not None,
+                "speculative": draft_model is not None or spec_dspark_ctx is not None,
                 "mtp": native_mtp is not None})
 
     # Disk cache: only touch it when explicitly opted in. The 2026-05-18
@@ -2037,9 +2524,40 @@ def main() -> None:
     # block-gather (OdyssAI-X#53) assume a SCALAR cache offset (B=1). The
     # BatchGenerator cache exposes a non-scalar offset → `mx.arange(offset+S)`
     # TypeError in MiniMaxM3Model.__call__. B>1 batched M3 is phase-2 scope.
+    # deepseek_v4 (+ dspark) force the legacy single-slot path: its PoolingCache
+    # (compressed-attention pooled KV, variable-length per request) has no
+    # batched merge — mlx_lm's BatchGenerator._merge_caches calls
+    # PoolingCache.merge -> `BatchPoolingCache` which isn't defined, so a plain
+    # (no-drafter) load crashes with NameError at bg.next(). Single-user is the
+    # supported mode; with a DSpark drafter it already takes the legacy path.
+    # Batched pooled cache (B>1 concurrent) is phase-2 scope, like minimax_m3.
+    # inkling_mm_model shares the constraint: its LayerCache (KVCache + 4 short-
+    # conv ConvCaches per layer) has no batched merge, so BatchGenerator's
+    # _merge_caches raises "does not yet support batching with history". Single-
+    # stream is the supported text-only v1 mode (batched conv-state cache = later).
+    _mt = (model_config or {}).get("model_type") or ""
+    # REVERT 2026-08-27 — RUNNER_BATCH default flipped "1" -> "0" (legacy).
+    # The batched path is the common factor behind a week of production
+    # regressions the legacy loop never exhibits: the BatchGenerator poison
+    # (post-long-gen 0.2-0.35 tok/s crawls needing pool reloads), the MLX
+    # buffer-cache balloon hitting the ~499GB Metal limit (~7495-token
+    # truncations, finish=error), the malloc-failure memory ratchet, and
+    # insert-during-gen slowdowns. Three guard iterations (empty-rebuild,
+    # force-rebuild, periodic clear_cache) each closed one hole and the next
+    # appeared — the component is not production-ready. Single-node pools go
+    # back to the battle-tested legacy single-slot loop (the same loop the
+    # multi-rank path uses); benches are sequential so nothing is lost.
+    # Continuous batching returns via RUNNER_BATCH=1 (explicit opt-in) once
+    # fixed for real on rpi-dev.
     use_batched = (size == 1) and _BATCH_AVAILABLE and (draft_model is None) and (
-        os.environ.get("RUNNER_BATCH", "1") == "1"
-    ) and ("minimax-m3" not in repo.lower())
+        native_mtp is None                     # native MTP needs the legacy path
+    ) and (
+        spec_dspark_ctx is None                # single-node DSpark spec -> legacy
+    ) and (
+        os.environ.get("RUNNER_BATCH", "0") == "1"
+    ) and ("minimax-m3" not in repo.lower()) and (
+        _mt not in ("deepseek_v4", "deepseek_v4_dspark", "inkling_mm_model")
+    )
     if use_batched:
         log("entering batched main loop (BatchGenerator)")
         _run_batched_main(model, tokenizer, repo, kv_q8_default, stop_requested,
@@ -2052,7 +2570,8 @@ def main() -> None:
         _run_legacy_main(model, tokenizer, repo, kv_q8_default, stop_requested,
                          rank, draft_model=draft_model,
                          num_draft_tokens=num_draft_tokens, world_size=size,
-                         group=group, native_mtp=native_mtp)
+                         group=group, native_mtp=native_mtp,
+                         spec_dspark_ctx=spec_dspark_ctx)
 
     # Explicit teardown BEFORE the process exits. Two reasons:
     #   1. Drop every model reference so the weights are deallocated, then
@@ -2080,7 +2599,7 @@ def _run_legacy_main(model, tokenizer, repo: str, kv_q8_default: bool,
                      stop_requested: dict, rank: int,
                      draft_model=None, num_draft_tokens: int = 4,
                      world_size: int = 1, group=None,
-                     native_mtp=None) -> None:
+                     native_mtp=None, spec_dspark_ctx=None) -> None:
     # Expanded stop set. `stream_generate` already breaks on
     # tokenizer.eos_token_id, but chat-tuned models often emit a "next-turn"
     # marker first (GLM emits <|user|>, Qwen emits <|im_end|>, etc.). Without
@@ -2108,6 +2627,9 @@ def _run_legacy_main(model, tokenizer, repo: str, kv_q8_default: bool,
         while not stop_requested["flag"]:
             line = sys.stdin.readline()
             if not line:
+                sys.stderr.write("[runner] DEATH-REPORT: stdin EOF "
+                                 "(parent ssh/RunnerProc gone)\n")
+                sys.stderr.flush()
                 in_q.put(EOF)
                 return
             line = line.strip()
@@ -2220,6 +2742,13 @@ def _run_legacy_main(model, tokenizer, repo: str, kv_q8_default: bool,
         reasoning_effort = req.get("reasoning_effort", None)
         if reasoning_effort:
             chat_kwargs["reasoning_effort"] = reasoning_effort
+        # clear_thinking: GLM-5.3 model card — the template defaults it to
+        # false, but chat serving MUST pass true (strips prior turns'
+        # thinking blocks from the rendered prompt; without it multi-turn
+        # context silently fills with old reasoning). Default ON for every
+        # model — Jinja ignores the kwarg where the template lacks it.
+        # Per-request override via req["clear_thinking"]=false.
+        chat_kwargs["clear_thinking"] = bool(req.get("clear_thinking", True))
         if tools:
             chat_kwargs["tools"] = tools
         def _apply_template_with_fallbacks():
@@ -2266,14 +2795,20 @@ def _run_legacy_main(model, tokenizer, repo: str, kv_q8_default: bool,
 
         # Prefix cache lookup BEFORE building a fresh cache. On a hit we reuse
         # the existing populated cache and feed only the suffix tokens.
+        # SKIP for the DSpark spec pool: its generator owns the session store
+        # (session_get/put hooks + its own snapshot restore). The plain
+        # _session_lookup here would DELETE the spec-managed entry on its
+        # divergent/fresh/non-truncatable branches → the spec fast-prefill saw
+        # an empty store every turn (bug 2026-08-06: store 1→0 between requests).
+        _spec_on_here = bool(spec_dspark_ctx and spec_dspark_ctx.get("enabled"))
         cached_cache, suffix_tokens, hit_kind = _session_lookup(
             session_id, repo, prompt_tokens_full,
-        ) if session_id else (None, None, "no-session")
+        ) if (session_id and not _spec_on_here) else (None, None, "no-session")
 
         if cached_cache is not None:
             prompt_cache = cached_cache
             gen_input = suffix_tokens
-            cache_label = "session-HIT"
+            cache_label = "session-HIT" if hit_kind != "snap-hit" else "snap-HIT"
         else:
             # Build a per-request prompt cache. Q8 quantized cache halves memory
             # for long contexts (Qwen3-Coder-Next 32k, GLM-5.1, Hy3-preview).
@@ -2283,6 +2818,30 @@ def _run_legacy_main(model, tokenizer, repo: str, kv_q8_default: bool,
                 f"·{hit_kind}" if session_id else ""
             )
 
+        # Snapshot fin-de-prompt pour les caches NON-trimmables (V4 :
+        # PoolingCache). Sans lui, chaque tour de conversation diverge en fin
+        # de prefixe (la reponse generee est re-templatisee differemment), le
+        # rewind est impossible -> re-prefill INTEGRAL a chaque tour (TTFT
+        # 20s+ observe en prod sur Pro). On prefill nous-memes tout sauf le
+        # dernier token, on snapshotte (O(1), arrays immutables), et le tour
+        # suivant restaure ce prefixe garanti. Modeles a cache trimmable :
+        # chemin historique intact.
+        _snap_pending = None
+        _snap_tokens_pending = None
+        _spec_dspark_on = bool(spec_dspark_ctx and spec_dspark_ctx.get("enabled"))
+        _spec_stats: dict = {}
+        if (_SNAP_CACHE_ENABLED
+                and session_id and prompt_cache is not None and draft_model is None
+                and not _spec_dspark_on          # le pool spec fait son propre prefill
+                and not _truncatable_cache(prompt_cache)):
+            _pre = (suffix_tokens if cached_cache is not None
+                    else prompt_tokens_full)
+            if len(_pre) > 1:
+                _manual_prefill(model, prompt_cache, _pre[:-1])
+            _snap_pending = _snap_cache(prompt_cache)
+            _snap_tokens_pending = prompt_tokens_full[:-1]
+            gen_input = prompt_tokens_full[-1:]
+
         if rank == 0:
             log(f"req {req_id}: session={session_id or '-'} "
                 f"cache={cache_label} "
@@ -2291,6 +2850,21 @@ def _run_legacy_main(model, tokenizer, repo: str, kv_q8_default: bool,
 
         ntoks = 0
         t_gen = time.time()
+        # Auto-radiographie stall (#68, 2026-08-27) : si AUCUN token n'est émis
+        # dans PREFILL_DUMP_S, faulthandler dumpe la stack Python de TOUS les
+        # threads sur stderr → visible dans les logs container ([rank0]) — le
+        # site exact du hang prefill glm5_next se documente tout seul au
+        # prochain stall, sans watcher externe. Annulé au premier token (coût
+        # nul sur les requêtes saines) ; ré-armé à chaque requête (le timer
+        # précédent est remplacé). exit=False : on ne tue rien, on photographie.
+        _dump_s = float(os.environ.get("PREFILL_DUMP_S", "300"))
+        if _dump_s > 0:
+            try:
+                log(f"req {req_id}: stall-radiography armed ({_dump_s:.0f}s)")
+                faulthandler.dump_traceback_later(_dump_s, exit=False,
+                                                  file=sys.stderr)
+            except Exception:
+                pass
         emit_batch_n = int(os.environ.get("RUNNER_EMIT_BATCH", "10"))
         buf: list[str] = []
         full_text_parts: list[str] = []  # accumulate for tool-call parsing
@@ -2312,6 +2886,43 @@ def _run_legacy_main(model, tokenizer, repo: str, kv_q8_default: bool,
             gen_kwargs["sampler"] = _sampler
         if _lp is not None:
             gen_kwargs["logits_processors"] = _lp
+        # Endurance mode (probes longues / bench) : bannit tous les stop ids
+        # au niveau logits — la generation ne PEUT PAS s'arreter avant
+        # max_tokens. Le break _stop_ids plus bas est desactive de meme.
+        # Ajoute 2026-08-27 pour prouver le fix #1662 au-dela du mur ~44.8k.
+        _ignore_eos = bool(req.get("ignore_eos", False))
+        if _ignore_eos:
+            _ban_ids = set(_stop_ids or [])
+            _tk_eos = getattr(tokenizer, "eos_token_ids", None)
+            for _e in (_tk_eos or []):
+                if isinstance(_e, int):
+                    _ban_ids.add(_e)
+            _e1 = getattr(tokenizer, "eos_token_id", None)
+            if isinstance(_e1, int):
+                _ban_ids.add(_e1)
+            if _ban_ids:
+                # Operandes PRE-EVALUES et reutilises (mlx-lm #1332 : un
+                # scalaire Python par step = un buffer Metal retenu par step —
+                # la v1 de ce processor fuyait ~1 buffer/token et avancait la
+                # mort de la probe a 41.1k au lieu de la reculer).
+                _ban_state: dict = {}
+                def _ban_eos_processor(tokens, logits, _st=_ban_state,
+                                       _ids=tuple(sorted(_ban_ids))):
+                    # NB: __eq__ nanobind de mx.Dtype LEVE sur None (TypeError,
+                    # crash instantane de la probe v2 3c02d8e2) au lieu de
+                    # renvoyer NotImplemented — d'ou la garde None AVANT le !=
+                    # (et les Dtype ne sont pas des singletons: pas de `is`).
+                    _dt = _st.get("dt")
+                    if _dt is None or _dt != logits.dtype:
+                        _st["ids"] = mx.array(list(_ids))
+                        _st["neg"] = mx.array(-1e9, dtype=logits.dtype)
+                        mx.eval(_st["ids"], _st["neg"])
+                        _st["dt"] = logits.dtype
+                    logits[..., _st["ids"]] = _st["neg"]
+                    return logits
+                _cur = gen_kwargs.get("logits_processors") or []
+                gen_kwargs["logits_processors"] = list(_cur) + [_ban_eos_processor]
+                log(f"req {req_id}: ignore_eos ON — {len(_ban_ids)} stop ids bannis")
         # Speculative decoding: when a draft_model is loaded, pass it to
         # stream_generate. mlx-lm's stream_generate(draft_model=) draws N
         # tokens from the draft per main-model verify step.
@@ -2370,6 +2981,47 @@ def _run_legacy_main(model, tokenizer, repo: str, kv_q8_default: bool,
                     {"rid": req_id, "rank": rank, "round": r,
                      "drafted": d, "accepted": n, "sha": s}),
             )
+        elif _spec_dspark_on and world_size == 1:
+            # Single-node DSpark : rollback par TRIM du pool (un-fold), zero
+            # re-forward -> ~1.2-1.4x sur code, lossless. Pas de collectives,
+            # drafter in-process. Le generateur fait son propre prefill.
+            import spec_dspark
+            gen_iter = spec_dspark.single_node_spec_stream_generate(
+                model, tokenizer, list(prompt_tokens_full),
+                max_tokens=max_tokens,
+                drafter=spec_dspark_ctx.get("drafter"),
+                target_args=spec_dspark_ctx.get("args"),
+                dcfg=spec_dspark_ctx.get("dcfg"),
+                stop_ids=_stop_ids, stats_out=_spec_stats,
+                # fast-prefill (snap-cache) hooks — meme store byte-budgete que
+                # le chemin distribue ; restore via les constructeurs frais.
+                session_id=session_id if _SNAP_CACHE_ENABLED else None,
+                model_id=repo,
+                session_get=_spec_session_get,
+                session_put=_spec_session_put,
+                restore_from_snap=_restore_from_snap)
+        elif _spec_dspark_on:
+            # DSpark spec distribue : le generateur fait SON prefill (capture
+            # les taps -> ctx drafter) et pilote la loop propose/verify en
+            # lockstep multi-rang. rank0 yield les tokens acceptes ; les
+            # servants tournent la boucle de reception et ne yieldent rien.
+            import spec_dspark
+            gen_iter = spec_dspark.spec_dspark_stream_generate(
+                model, tokenizer, list(prompt_tokens_full),
+                max_tokens=max_tokens, rank=rank, size=world_size, group=group,
+                drafter=spec_dspark_ctx.get("drafter"),
+                target_args=spec_dspark_ctx.get("args"),
+                dcfg=spec_dspark_ctx.get("dcfg"),
+                stop_ids=_stop_ids,
+                # A (spec+snap) : hooks session — lookup/restore/store du store
+                # byte-budgete du runner ; restore via les constructeurs frais
+                # prouves du chemin plain (1.24.0).
+                session_id=session_id if _SNAP_CACHE_ENABLED else None,
+                model_id=repo,
+                session_get=_spec_session_get,
+                session_put=_spec_session_put,
+                restore_from_snap=_restore_from_snap,
+                stats_out=_spec_stats)
         else:
             gen_iter = stream_generate(model, tokenizer, gen_input, **gen_kwargs)
 
@@ -2380,6 +3032,11 @@ def _run_legacy_main(model, tokenizer, repo: str, kv_q8_default: bool,
         cancelled_mid_gen = False
         loop_detected = False
         anti_loop = bool(req.get("anti_loop", True))
+        # Context-limit: per-request override else the server default. Enforced
+        # per-step in the loop below (prompt + generated tokens).
+        context_limit = int(req.get("context_limit", 0) or _CONTEXT_LIMIT)
+        context_limit_hit = False
+        _prompt_n = len(prompt_tokens_full)
         # stream_generate's LAST response carries finish_reason ("stop" on an
         # eos_token_ids hit, "length" on the max_tokens cap). Capture it so the
         # done event can tell the API layer which one it was.
@@ -2398,11 +3055,38 @@ def _run_legacy_main(model, tokenizer, repo: str, kv_q8_default: bool,
             # stream_generate yields the marker as normal text — so we must
             # break BEFORE appending it, or it leaks into the completion
             # (the "391<|role_end|>" bug). See _resolve_eos_token_seqs.
-            if isinstance(tok_id, int) and tok_id in _stop_ids:
+            if isinstance(tok_id, int) and tok_id in _stop_ids and not _ignore_eos:
                 gen_finish = "stop"
                 break
             buf.append(res.text)
             full_text_parts.append(res.text)
+            if ntoks == 0:
+                try:
+                    faulthandler.cancel_dump_traceback_later()  # prefill OK
+                except Exception:
+                    pass
+            # Jalons long-contexte (#68 recadré Sophie 2026-08-27 : les morts
+            # frappent à ~42-43k tokens GÉNÉRÉS / ~35 min, en pleine
+            # génération — pas au prefill). Un jalon tous les 2000 tokens rend
+            # le point de mort visible au token près dans les logs.
+            if ntoks and ntoks % 2000 == 0:
+                try:
+                    import resource as _res
+                    _rss = _res.getrusage(_res.RUSAGE_SELF).ru_maxrss / 1e9
+                except Exception:
+                    _rss = 0
+                _el = time.time() - t_gen
+                log(f"req {req_id}: milestone {ntoks} toks, {_el:.0f}s, "
+                    f"{ntoks/_el:.1f} tok/s, rss~{_rss:.0f}GB")
+            # mlx-lm #1662: sans drain, ~11 buffers Metal vivants par token
+            # genere (modeles hybrides) -> [metal::malloc] Resource limit
+            # (499000) a ~45k tokens — la mort "35 min" de la semaine.
+            if (_CACHE_FLUSH_EVERY and prompt_cache is not None
+                    and ntoks and ntoks % _CACHE_FLUSH_EVERY == 0):
+                try:
+                    _flush_cache_graph(prompt_cache)
+                except Exception:
+                    pass
             if isinstance(tok_id, int):
                 gen_token_ids.append(tok_id)
                 if token_canary:
@@ -2412,6 +3096,16 @@ def _run_legacy_main(model, tokenizer, repo: str, kv_q8_default: bool,
                                       "ntoks": ntoks + 1,
                                       "sha": canary_sha.hexdigest()[:16]})
             ntoks += 1
+            # Context-limit: hard cap on prompt + generated. Deterministic on
+            # ntoks so multi-rank pools break in lockstep (same as anti-loop /
+            # _stop_ids). finish_reason stays "length"; the done event carries
+            # the distinct `context_limit` flag.
+            if context_limit and _prompt_n + ntoks >= context_limit:
+                context_limit_hit = True
+                gen_finish = "length"
+                log(f"req {req_id}: context-limit stop "
+                    f"(prompt={_prompt_n} gen={ntoks} limit={context_limit})")
+                break
             if len(buf) >= emit_batch_n:
                 emit(rank, {"event": "token", "id": req_id, "text": "".join(buf)})
                 buf.clear()
@@ -2421,6 +3115,8 @@ def _run_legacy_main(model, tokenizer, repo: str, kv_q8_default: bool,
             # construction as the _stop_ids break above).
             if anti_loop and ntoks % ANTI_LOOP_CHECK_EVERY == 0:
                 _hit = _detect_loop(gen_token_ids)
+                if _hit is None and ntoks % ANTI_LOOP_L_CHECK_EVERY == 0:
+                    _hit = _detect_loop_large(gen_token_ids)
                 if _hit:
                     loop_detected = True
                     gen_finish = "stop"
@@ -2439,6 +3135,10 @@ def _run_legacy_main(model, tokenizer, repo: str, kv_q8_default: bool,
                 break
         if buf:
             emit(rank, {"event": "token", "id": req_id, "text": "".join(buf)})
+        try:
+            faulthandler.cancel_dump_traceback_later()
+        except Exception:
+            pass
         elapsed = time.time() - t_gen
         tps = ntoks / elapsed if elapsed > 0 else 0.0
 
@@ -2455,10 +3155,24 @@ def _run_legacy_main(model, tokenizer, repo: str, kv_q8_default: bool,
         # resume mid-prompt. The cache currently holds K/V for
         # `prompt_tokens_full` + `gen_token_ids`; that's the cumulative
         # token list we store as the session prefix.
-        if session_id and prompt_cache is not None:
+        # Le chemin spec gere SA persistence de session DANS le generateur
+        # (il possede le cache) — l'outer store ne doit pas ecraser son entree
+        # avec le prompt_cache inutilise du chemin plain.
+        if session_id and prompt_cache is not None and not _spec_dspark_on:
             cumulative = list(prompt_tokens_full) + gen_token_ids
+            # NB (2026-08-05) : snap du PROMPT (pris avant gen). Cache TOUT
+            # l'historique jusqu'au dernier message (88% mesure en prod
+            # Companion) car le round-trip token EST stable -> l'histo entier
+            # reste un prefixe deterministe. Les ~12% non-caches = la DERNIERE
+            # reponse assistant (posterieure au snap) + le nouveau message.
+            # Un snap POST-gen les capturerait (faisable, round-trip stable)
+            # mais la 1re implementation buggait (match exact snap-hit
+            # divergeait sur le dernier token tronque) et le gain marginal
+            # (~12%) ne justifie pas le risque sur les 88% qui marchent.
             _session_store_after_gen(session_id, repo, prompt_cache, cumulative,
-                                     rank=rank, world=world_size)
+                                     rank=rank, world=world_size,
+                                     snap=_snap_pending,
+                                     snap_tokens=_snap_tokens_pending)
 
         # Prefix-cache hit accounting. When `cached_cache` was found and
         # `suffix_tokens` < `prompt_tokens_full`, the difference is the count
@@ -2471,6 +3185,9 @@ def _run_legacy_main(model, tokenizer, repo: str, kv_q8_default: bool,
             if (cached_cache is not None and suffix_tokens is not None)
             else 0
         )
+        if _spec_dspark_on:
+            # A (spec+snap) : le generateur publie son hit via stats_out.
+            cached_count = int(_spec_stats.get("cached_tokens") or 0)
         done_event = {
             "event": "done",
             "id": req_id,
@@ -2489,6 +3206,8 @@ def _run_legacy_main(model, tokenizer, repo: str, kv_q8_default: bool,
                 "length" if ntoks >= max_tokens else "stop")
         if loop_detected:
             done_event["loop_detected"] = True
+        if context_limit_hit:
+            done_event["context_limit"] = True
         if tool_calls:
             done_event["tool_calls"] = tool_calls
         if session_id:
@@ -2538,6 +3257,9 @@ def _run_batched_main(model, tokenizer, repo: str, kv_q8_default: bool,
         while not stop_requested["flag"]:
             line = sys.stdin.readline()
             if not line:
+                sys.stderr.write("[runner] DEATH-REPORT: stdin EOF "
+                                 "(parent ssh/RunnerProc gone)\n")
+                sys.stderr.flush()
                 in_q.put(EOF)
                 return
             line = line.strip()
@@ -2561,6 +3283,54 @@ def _run_batched_main(model, tokenizer, repo: str, kv_q8_default: bool,
     # uid → per-request state
     slot: dict[int, dict] = {}
     emit_batch_n = int(os.environ.get("RUNNER_EMIT_BATCH", "10"))
+    # Poison guard (2026-08-27): removing a LONG slot (thousands of generated
+    # tokens) from the BatchGenerator leaves it in a degraded state where every
+    # subsequent request decodes ~50x slower. Proven deterministically on
+    # glm5_next Q8 single-node: fresh BG serves a 7.5k-token c03 at 21 tok/s
+    # (finish=stop, perfectly healthy), then a 50-token "hello" times out at
+    # >150s; a 600-token completion does NOT trigger it; no cancel involved.
+    # This was the root of the bench C03/C04 "0.2 tok/s" wedges (the ghost
+    # generations fixed in api v1.41.2 were the amplifier, not the source).
+    # Same medicine as the bg.next() extend-cache recovery below: rebuild the
+    # BG. Every removal path (natural finish, hard-cancel, anti-loop) funnels
+    # through _emit_done_for / bg.remove — we mark the BG dirty when a big
+    # slot is removed and rebuild as soon as the batch is EMPTY, so in-flight
+    # requests are never disturbed and the cost lands between requests.
+    _bg_rebuild_min_toks = int(os.environ.get("BG_REBUILD_MIN_TOKS", "1000"))
+    # Force-rebuild guard (2026-08-27b): the empty-batch condition above can
+    # STARVE — with concurrent traffic (bench monitor probes, overlapping
+    # requests) the batch never empties, the dirty flag waits forever, and the
+    # poisoned BG keeps serving everything at ~0.25 tok/s (observed live on
+    # Bench R2 r01: 20 min at 0.25 with uids climbing and zero rebuilds). When
+    # the BG has been dirty for > BG_REBUILD_FORCE_S AND the batch's aggregate
+    # throughput is < BG_REBUILD_FORCE_TPS (i.e. it IS poisoned — a healthy
+    # overlapping batch decodes 10-20+ tok/s and is never touched), finalize
+    # the in-flight slots with finish=error (same contract as the
+    # metal::malloc recovery below — they are crawling anyway) and rebuild.
+    _bg_force_s = float(os.environ.get("BG_REBUILD_FORCE_S", "90"))
+    _bg_force_tps = float(os.environ.get("BG_REBUILD_FORCE_TPS", "2.0"))
+    bg_state = {"dirty": False, "since": 0.0, "toks": 0}
+    # ── Upstream instrumentation + candidate source fix (2026-08-27) ──────
+    # AMONT diagnosis: MLX (active+cache) memory grows ~50MB/generated-token
+    # on this path and hits the ~499GB Metal resource limit at ~7495 tokens
+    # (the constant magic number in every truncated run). Suspected: per-step
+    # allocations of ever-growing sizes that the MLX buffer cache cannot
+    # reuse, so cache_memory balloons. Instrumentation logs active/cache mem
+    # + step timing every BG_MEM_LOG_EVERY generated tokens (0 = off) to
+    # confirm; BG_CLEAR_CACHE_EVERY (0 = off) then bounds it by calling
+    # mx.clear_cache() every N generated tokens — the candidate SOURCE fix
+    # for both the 7495-token truncation ceiling and (if allocator thrash is
+    # the slow path) the post-long-gen crawl. Both OFF by default until
+    # measured on a controlled run.
+    # Defaults ON (2026-08-27, bench unblock): the runner gets its env from
+    # remote_cmd's inline assignments — arbitrary new envs don't reach it
+    # without an api.py change + container restart. Baking the defaults here
+    # keeps this a runner-only deploy. clear_cache every 512 generated tokens
+    # bounds the buffer-cache balloon (the ~50MB/tok growth that hits the
+    # 499GB Metal limit at ~7495 toks); mem log every 500 gives the curves.
+    _bg_mem_log_every = int(os.environ.get("BG_MEM_LOG_EVERY", "500"))
+    _bg_clear_cache_every = int(os.environ.get("BG_CLEAR_CACHE_EVERY", "512"))
+    _bg_mem_ctr = {"toks": 0, "last_t": time.time(), "last_toks": 0}
 
     log(f"batched main: completion_batch={bg_kwargs['completion_batch_size']}, "
         f"prefill_batch={bg_kwargs['prefill_batch_size']}, "
@@ -2633,6 +3403,18 @@ def _run_batched_main(model, tokenizer, repo: str, kv_q8_default: bool,
             + (f" · {len(tool_calls)} tool_call(s)" if tool_calls else "")
             + (f" · session={s['session_id']}({s['cache_label']})" if s["session_id"] else "")
             + (f" · finish={finish_reason}" if finish_reason else ""))
+        # Poison guard: a big slot is leaving the BG — schedule a rebuild for
+        # the next moment the batch is empty (see the flag's comment above).
+        # Criterion = TOTAL context (prompt + generated), not just generated:
+        # a huge-prompt test that emits few tokens (Bench P profile) poisons
+        # the BG just as hard as a long generation (observed 2026-08-27: p01/
+        # p02 big-prompt completions < 1000 gen toks → no dirty → p03 and the
+        # whole R2 bench crawled at 0.25 with zero rebuilds).
+        if (len(s["prompt_tokens_full"]) + s["ntoks"]) >= _bg_rebuild_min_toks:
+            if not bg_state["dirty"]:
+                bg_state["dirty"] = True
+                bg_state["since"] = time.time()
+                bg_state["toks"] = 0
         try:
             bg.remove([uid])
         except Exception:
@@ -2640,6 +3422,40 @@ def _run_batched_main(model, tokenizer, repo: str, kv_q8_default: bool,
         del slot[uid]
 
     while not stop_requested["flag"]:
+        # ── Poison guard rebuild ───────────────────────────────────────────
+        # Must run BEFORE the drain so the next request inserts into the
+        # fresh BG, never the poisoned one. Preferred path: batch is empty —
+        # in-flight slots are never disturbed.
+        if bg_state["dirty"] and not slot:
+            try:
+                bg = BatchGenerator(model, **bg_kwargs)
+                mx.clear_cache()
+                log(f"BG rebuilt after big-slot removal (poison guard, "
+                    f"ctx >= {_bg_rebuild_min_toks})")
+            except Exception as e:
+                log(f"BG poison-guard rebuild FAILED: {e}")
+            bg_state["dirty"] = False
+        # Force path (starvation guard): the batch never empties (concurrent
+        # probes / overlapping requests keep arriving) AND its aggregate
+        # throughput proves it is poisoned — cull the crawling slots with
+        # finish=error (same contract as the metal::malloc recovery) and
+        # rebuild. A healthy overlapping batch (>= _bg_force_tps aggregate)
+        # is never touched.
+        elif bg_state["dirty"] and slot:
+            _age = time.time() - bg_state["since"]
+            if _age > _bg_force_s and (bg_state["toks"] / max(_age, 1.0)) < _bg_force_tps:
+                log(f"BG FORCE rebuild: dirty {_age:.0f}s, aggregate "
+                    f"{bg_state['toks'] / max(_age, 1.0):.2f} tok/s < {_bg_force_tps} "
+                    f"— culling {len(slot)} crawling slot(s)")
+                for uid in list(slot.keys()):
+                    _emit_done_for(uid, finish_reason="error")
+                try:
+                    bg = BatchGenerator(model, **bg_kwargs)
+                    mx.clear_cache()
+                    log("BG rebuilt (force path)")
+                except Exception as e:
+                    log(f"BG force rebuild FAILED: {e}")
+                bg_state["dirty"] = False
         # ── Drain incoming requests (non-blocking) ─────────────────────────
         drained = 0
         while drained < 32:
@@ -2702,6 +3518,8 @@ def _run_batched_main(model, tokenizer, repo: str, kv_q8_default: bool,
             reasoning_effort = req.get("reasoning_effort", None)
             if reasoning_effort:
                 chat_kwargs["reasoning_effort"] = reasoning_effort
+            # clear_thinking: see single-stream branch (GLM-5.3 model card).
+            chat_kwargs["clear_thinking"] = bool(req.get("clear_thinking", True))
             if tools:
                 chat_kwargs["tools"] = tools
             try:
@@ -2847,6 +3665,16 @@ def _run_batched_main(model, tokenizer, repo: str, kv_q8_default: bool,
             try:
                 bg = BatchGenerator(model, **bg_kwargs)
                 log("BatchGenerator re-initialised after extend-cache failure")
+                bg_state["dirty"] = False  # fresh BG — poison guard satisfied
+                try:
+                    mx.clear_cache()  # release the ballooned buffer cache —
+                    # without this each 499GB-limit cycle RATCHETS process
+                    # memory up until the allocator lives at the ceiling and
+                    # every request crawls (r09 2026-08-27: fresh BG on a
+                    # pinned process still 0.27 tok/s; only a reload cured).
+                    log("mx.clear_cache() after malloc-limit reset")
+                except Exception:
+                    pass
             except Exception as e2:
                 log(f"BG reinit failed: {e2} — runner will die next iteration")
                 raise
@@ -2878,6 +3706,32 @@ def _run_batched_main(model, tokenizer, repo: str, kv_q8_default: bool,
             if isinstance(tok, int):
                 s["gen_token_ids"].append(tok)
                 s["ntoks"] += 1
+                if bg_state["dirty"]:
+                    bg_state["toks"] += 1  # feeds the force-rebuild rate check
+                # Upstream instrumentation / candidate fix (see flags above).
+                _bg_mem_ctr["toks"] += 1
+                if (_bg_mem_log_every
+                        and _bg_mem_ctr["toks"] % _bg_mem_log_every == 0):
+                    _now = time.time()
+                    _dt = _now - _bg_mem_ctr["last_t"]
+                    _dtoks = _bg_mem_ctr["toks"] - _bg_mem_ctr["last_toks"]
+                    _bg_mem_ctr["last_t"] = _now
+                    _bg_mem_ctr["last_toks"] = _bg_mem_ctr["toks"]
+                    try:
+                        log(f"[bg-mem] toks={_bg_mem_ctr['toks']} "
+                            f"active={mx.get_active_memory() / 1e9:.1f}GB "
+                            f"cache={mx.get_cache_memory() / 1e9:.1f}GB "
+                            f"peak={mx.get_peak_memory() / 1e9:.1f}GB "
+                            f"rate={_dtoks / max(_dt, 1e-6):.2f} tok/s "
+                            f"cache_kv={bg.prompt_cache_nbytes / 1e9:.1f}GB")
+                    except Exception as e:
+                        log(f"[bg-mem] probe failed: {e}")
+                if (_bg_clear_cache_every
+                        and _bg_mem_ctr["toks"] % _bg_clear_cache_every == 0):
+                    try:
+                        mx.clear_cache()
+                    except Exception:
+                        pass
                 # Stream via the slot's stateful detokenizer — handles BPE
                 # merges, multi-byte chars, and special-token suppression
                 # correctly across tokens. Skip stop tokens from user text;
@@ -2907,6 +3761,8 @@ def _run_batched_main(model, tokenizer, repo: str, kv_q8_default: bool,
                 if (s["anti_loop"]
                         and s["ntoks"] % ANTI_LOOP_CHECK_EVERY == 0):
                     _hit = _detect_loop(s["gen_token_ids"])
+                    if _hit is None and s["ntoks"] % ANTI_LOOP_L_CHECK_EVERY == 0:
+                        _hit = _detect_loop_large(s["gen_token_ids"])
                     if _hit:
                         s["loop_detected"] = True
                         log(f"req {s['req_id']}: anti-loop stop "

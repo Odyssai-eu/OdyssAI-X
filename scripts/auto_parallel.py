@@ -2,7 +2,7 @@ from abc import ABC, abstractmethod
 from collections.abc import Callable, Generator
 from functools import partial
 from inspect import signature
-from typing import TYPE_CHECKING, Literal, Protocol, TypeVar, cast
+from typing import TYPE_CHECKING, Literal, Optional, Protocol, TypeVar, cast
 
 # `_ModelT` is used by `patch_pipeline_model` to declare that the
 # return type matches the input model class. Declared the classic
@@ -162,19 +162,43 @@ class PipelineFirstLayer(CustomMlxLayer):
         original_layer: _LayerCallable,
         r: int,
         group: mx.distributed.Group,
+        attn_res_blocks: int = 0,
     ):
         super().__init__(original_layer)
         self.r: int = r
         self.group = group
         self.is_prefill: bool = False
+        # Attention-residual models (kimi_k3) ship a second tensor across the
+        # rank boundary, flattened onto the hidden state — see PipelineLastLayer.
+        # This is the number of depth checkpoints already accumulated when the
+        # stream reaches this shard's first layer, so it fixes the payload width.
+        self.attn_res_blocks: int = attn_res_blocks
 
     def __call__(self, x: mx.array, *args: object, **kwargs: object) -> mx.array:
         if self.r != 0:
             # We want to avoid GPU timeout errors by evalling the distributed operation
             # so that it stays on CPU, which does not have a timeout.
             mx.eval(x)
-            x = mx.distributed.recv_like(x, (self.r - 1), group=self.group)
-            mx.eval(x)
+            if self.attn_res_blocks > 0:
+                # recv_like matches the TEMPLATE's shape, so it has to be built
+                # at the payload width — hidden + the flattened block residual.
+                # A plain recv_like(x) would silently truncate.
+                B, S, H = x.shape
+                template = mx.zeros(
+                    (B, S, (1 + self.attn_res_blocks) * H), dtype=x.dtype
+                )
+                mx.eval(template)
+                payload = mx.distributed.recv_like(
+                    template, (self.r - 1), group=self.group
+                )
+                mx.eval(payload)
+                x = payload[..., :H]
+                kwargs["block_residual"] = payload[..., H:].reshape(
+                    B * S, self.attn_res_blocks, H
+                )
+            else:
+                x = mx.distributed.recv_like(x, (self.r - 1), group=self.group)
+                mx.eval(x)
         return self.original_layer(x, *args, **kwargs)
 
 
@@ -185,6 +209,7 @@ class PipelineLastLayer(CustomMlxLayer):
         r: int,
         s: int,
         group: mx.distributed.Group,
+        attn_res_total_blocks: int = 0,
     ):
         super().__init__(original_layer)
         self.r: int = r
@@ -193,13 +218,32 @@ class PipelineLastLayer(CustomMlxLayer):
         self.original_layer_signature = signature(self.original_layer.__call__)
         self.is_prefill: bool = False
         self.queue_sends: bool = False
+        # Total depth checkpoints at the END of the model. Each rank finishes
+        # with a DIFFERENT count (they accumulate down the stack), so the decode
+        # all_gather — which requires one shape across the group — is padded up
+        # to this common width. Only the last rank's slice is kept, and it is
+        # the one that actually holds attn_res_total_blocks of them.
+        self.attn_res_total_blocks: int = attn_res_total_blocks
 
     def __call__(self, x: mx.array, *args: object, **kwargs: object) -> mx.array:
         cache = self.original_layer_signature.bind_partial(
             x, *args, **kwargs
         ).arguments.get("cache", None)
 
-        output: mx.array = self.original_layer(x, *args, **kwargs)
+        result = self.original_layer(x, *args, **kwargs)
+
+        # Attention-residual layers (kimi_k3) return (hidden, block_residual).
+        # Flatten the residual onto the hidden state and let the whole payload
+        # travel through the existing single-tensor send/gather machinery, then
+        # split it again on the way out. One send per boundary, and every
+        # eval/depends ordering invariant below stays exactly as it was.
+        extra: Optional[mx.array] = None
+        if isinstance(result, tuple):
+            output, extra = result
+            B, S, _ = output.shape
+            output = mx.concatenate([output, extra.reshape(B, S, -1)], axis=-1)
+        else:
+            output = result
 
         # Eval layer output to materialize it before send — this splits the graph
         # so the send is isolated and the receiving rank's recv can complete.
@@ -225,12 +269,33 @@ class PipelineLastLayer(CustomMlxLayer):
                 mx.eval(_cache.keys)  # type: ignore
 
         if not self.is_prefill:
+            if extra is not None:
+                # Pad this rank's payload up to the group-wide width before the
+                # gather; the last rank is already at full width, so its slice
+                # (the one every rank keeps) is untouched.
+                H = extra.shape[-1]
+                full = (1 + self.attn_res_total_blocks) * H
+                if output.shape[-1] < full:
+                    B, S = output.shape[0], output.shape[1]
+                    output = mx.concatenate(
+                        [
+                            output,
+                            mx.zeros(
+                                (B, S, full - output.shape[-1]), dtype=output.dtype
+                            ),
+                        ],
+                        axis=-1,
+                    )
             output = mx.distributed.all_gather(output, group=self.group)[
                 -output.shape[0] :
             ]
             mx.eval(output)
 
-        return output
+        if extra is None:
+            return output
+        H = extra.shape[-1]
+        B, S = output.shape[0], output.shape[1]
+        return output[..., :H], output[..., H:].reshape(B * S, -1, H)
 
 
 def set_pipeline_prefill(model: nn.Module, is_prefill: bool) -> None:
@@ -328,6 +393,7 @@ def pipeline_auto_parallel(
     inner_model_instance: nn.Module = get_inner_model(model)
 
     layers = get_layers(inner_model_instance)
+    num_layers_total = len(layers)
 
     start_layer, end_layer = model_shard_meta.start_layer, model_shard_meta.end_layer
     device_rank, world_size = model_shard_meta.device_rank, model_shard_meta.world_size
@@ -339,12 +405,29 @@ def pipeline_auto_parallel(
         mx.clear_cache()
         yield ModelLoadingResponse(layers_loaded=i, total=total)
 
-    layers[0] = PipelineFirstLayer(layers[0], device_rank, group=group)
+    # Attention-residual models (kimi_k3) carry a second tensor across rank
+    # boundaries. Its width is set by how many depth checkpoints the stream has
+    # already accumulated when it reaches this shard: checkpoints are taken at
+    # the GLOBAL layers 0, B, 2B, … so a shard starting at L has seen
+    # |{c ≤ L-1}| = (L-1)//B + 1 of them (and none when it starts at 0).
+    # The sender finishing global layer L-1 holds exactly the same set, so both
+    # ends agree without negotiating.
+    attn_res_blocks = 0
+    attn_res_total_blocks = 0
+    block_size = getattr(layers[0], "attn_res_block_size", 0) if layers else 0
+    if block_size and getattr(layers[0], "use_attn_residuals", False):
+        attn_res_blocks = 0 if start_layer == 0 else (start_layer - 1) // block_size + 1
+        attn_res_total_blocks = (num_layers_total - 1) // block_size + 1
+
+    layers[0] = PipelineFirstLayer(
+        layers[0], device_rank, group=group, attn_res_blocks=attn_res_blocks
+    )
     layers[-1] = PipelineLastLayer(
         layers[-1],
         device_rank,
         world_size,
         group=group,
+        attn_res_total_blocks=attn_res_total_blocks,
     )
 
     if isinstance(inner_model_instance, GptOssMoeModel):
@@ -466,6 +549,43 @@ def pipeline_auto_parallel(
         inner_model_instance.attn_idx = attn_layers[0]
         inner_model_instance.gla_idx = gla_layers[0]
 
+    # Duck-typed: the kimi family (kimi_linear, kimi_k3) computes ssm_idx and
+    # attn_idx ONCE at init from the FULL layer list, then uses them to pick
+    # which layer's cache builds the SSM vs the attention mask
+    # (cache[ssm_idx] / cache[attn_idx]). After the pipeline slice cache[] is
+    # LOCAL, so a global index lands on the wrong layer — and on a layer of the
+    # wrong KIND, which surfaces as "make_mask() got an unexpected keyword
+    # argument 'return_array'" or a broadcast failure on the 2nd turn. Same fix
+    # class as GptOss / MimoV2Flash / Step35 / bailing above.
+    #
+    # The predicate cannot collide with those: Qwen3-Next exposes fa_idx (not
+    # attn_idx) and is matched by isinstance earlier, bailing carries gla_idx
+    # and is excluded here explicitly.
+    if (
+        hasattr(inner_model_instance, "ssm_idx")
+        and hasattr(inner_model_instance, "attn_idx")
+        and not hasattr(inner_model_instance, "gla_idx")
+        and any(getattr(l, "is_linear", None) is not None for l in layers)
+    ):
+        linear_locals = [
+            i for i, layer in enumerate(layers) if getattr(layer, "is_linear", False)
+        ]
+        full_locals = [
+            i for i, layer in enumerate(layers) if not getattr(layer, "is_linear", True)
+        ]
+        if not linear_locals or not full_locals:
+            # Both masks are derived from one layer of each kind, so a shard
+            # missing a kind cannot run. Fail loudly with the re-cut hint rather
+            # than produce garbage.
+            missing = "full-attention" if not full_locals else "linear-attention"
+            raise ValueError(
+                f"kimi pipeline shard [{start_layer},{end_layer}) contains no "
+                f"{missing} layer — re-cut the pipeline so every shard spans at "
+                f"least one layer of each kind."
+            )
+        inner_model_instance.ssm_idx = linear_locals[0]
+        inner_model_instance.attn_idx = full_locals[0]
+
     if isinstance(inner_model_instance, NemotronHInnerModel):
         # NemotronH uses block_type: "M" (Mamba/SSM), "*" (Attention), "E" (MoE), "-" (MLP)
         # Only "M" and "*" blocks have cache entries.
@@ -521,12 +641,22 @@ def patch_pipeline_model(model: _ModelT, group: mx.distributed.Group) -> _ModelT
             "cache", None
         )
 
-        # Add dependency to last cache entry to ensure distributed ops are evaluated
+        # Add a dependency onto a cache entry to force the distributed ops to
+        # evaluate. Hybrid trunks (qwen3.5 / qwen3-next) mix KVCache (full attn)
+        # with ArraysCache (Mamba/GatedDeltaNet) — the latter has no real .keys
+        # and `dep.keys` raises std::bad_cast, so pick the LAST entry that
+        # actually carries keys (a KVCache) and guard the access. Pure-KV models
+        # take cache[-1] first → unchanged behaviour.
         if cache is not None and len(cache) > 0:  # type: ignore
-            last = cache[-1]  # type: ignore
-            dep_cache = last[0] if hasattr(last, "caches") else last  # type: ignore
-            if hasattr(dep_cache, "keys") and dep_cache.keys is not None:  # type: ignore
-                dep_cache.keys = mx.depends(dep_cache.keys, logits)  # type: ignore
+            for entry in reversed(cache):  # type: ignore
+                dep = entry[0] if hasattr(entry, "caches") else entry
+                try:
+                    keys = getattr(dep, "keys", None)
+                    if keys is not None:
+                        dep.keys = mx.depends(dep.keys, logits)  # type: ignore
+                        break
+                except Exception:
+                    continue
 
         return logits
 

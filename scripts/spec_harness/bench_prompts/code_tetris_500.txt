@@ -1,0 +1,1 @@
+Write a complete Tetris game in a single HTML file with inline CSS and JavaScript. Include: game board rendering on canvas, all 7 tetromino shapes with rotation, keyboard controls (arrows + space for hard drop), line clearing with scoring, increasing speed per level, and a game-over screen with restart. Write clean, commented code.

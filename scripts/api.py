@@ -382,6 +382,23 @@ def _cluster_config_txn():
         _save_cluster_config(cfg)
 
 
+def _drafter_for_model(model_abspath: str) -> Optional[dict]:
+    """Per-model drafter association — a model's drafter is a PROPERTY OF THE
+    MODEL, not a per-load UI choice. Stored in cluster-config under
+    `model_drafters`: {"<model_abspath>": {"draft_model": "<drafter_abspath>",
+    "num_draft_tokens": int}}. When a model that has an association is loaded
+    WITHOUT an explicit draft, the loader auto-attaches its drafter → the model
+    serves as a spec pool from a single dashboard Load click, no draft field, no
+    API trick. Returns None for models with no registered drafter (they load
+    plain, as expected)."""
+    m = (_load_cluster_config().get("model_drafters") or {})
+    if not isinstance(m, dict):
+        return None
+    p = (model_abspath or "").rstrip("/")
+    a = m.get(model_abspath) or m.get(p)
+    return a if isinstance(a, dict) else None
+
+
 def models_dir_for(cluster: str) -> str:
     cfg = _load_cluster_config()
     return cfg.get(cluster, {}).get("models_dir", DEFAULT_MODELS_DIR)
@@ -439,7 +456,7 @@ def get_cluster_def(cluster_id: str) -> dict:
     default = DEFAULT_CLUSTER_DEFS.get(cluster_id, {})
     overlay = cfg.get(cluster_id, {})
     merged = json.loads(json.dumps(default))  # deep copy
-    for k in ("name", "kind", "backend", "max_nodes", "models_dir", "enabled", "upstream", "supports_vision", "_vlm_managed", "_vlm_port", "_vlm_model_path", "_vlm_pid"):
+    for k in ("name", "kind", "backend", "max_nodes", "models_dir", "enabled", "reload_on_restart", "reload_on_reboot", "upstream", "supports_vision", "_vlm_managed", "_vlm_port", "_vlm_model_path", "_vlm_pid"):
         if k in overlay:
             merged[k] = overlay[k]
     if "nodes" in overlay and overlay["nodes"]:
@@ -515,6 +532,22 @@ def _cluster_enabled(cluster_id: str) -> bool:
     """True unless cluster-config.json explicitly stored enabled=false for this
     cluster. Default True so existing config (no `enabled` field) keeps working."""
     return get_cluster_def(cluster_id).get("enabled", True) is not False
+
+
+def _reload_on_restart(cluster_id: str) -> bool:
+    """True (default) unless the cluster stored reload_on_restart=false. Gates the
+    container-startup desired-state restore, so an operator can stop a cluster's
+    last-loaded pools from auto-reloading when the odyssai-odysseus container
+    restarts (redeploy, crash). Default True preserves the historical behavior."""
+    return get_cluster_def(cluster_id).get("reload_on_restart", True) is not False
+
+
+def _reload_on_reboot(cluster_id: str) -> bool:
+    """True (default) unless the cluster stored reload_on_reboot=false. When on,
+    POST /admin/clusters/{id}/reboot-all schedules a background task that waits
+    for the nodes to come back SSH-up, sweeps orphans, then re-loads the pools
+    that were loaded before the reboot."""
+    return get_cluster_def(cluster_id).get("reload_on_reboot", True) is not False
 
 
 def save_cluster_def(cluster_id: str, updates: dict) -> None:
@@ -753,7 +786,11 @@ async def batch_get_model_sizes(ssh: str, paths: list[str]) -> dict[str, int]:
 # branch is added in auto_parallel.py, add its model_type string here too.
 TENSOR_CAPABLE_MODEL_TYPES = frozenset({
     "llama", "ministral3",
-    "deepseek_v3", "deepseek_v32", "kimi_k25", "deepseek_v4",
+    "deepseek_v3", "deepseek_v32", "kimi_k25",
+    # deepseek_v4 retiré 2026-08-03 : le module V4 est désormais dérivé du
+    # fork ivan (PipelineMixin, sans V4Attention) — l'import d'auto_parallel
+    # échoue proprement et la DeepseekV4ShardingStrategy (écrite contre
+    # l'ancien loader OdyssAI, jamais validée end-to-end) est inerte.
     "minimax", "glm4_moe", "glm4_moe_lite",
     "qwen3", "qwen3_moe", "qwen3_next", "qwen3_5", "qwen3_5_moe", "qwen3_vl",
     "gpt_oss", "step3p5", "nemotron_h", "gemma4",
@@ -769,7 +806,22 @@ TENSOR_CAPABLE_MODEL_TYPES = frozenset({
 # path (which calls model.model.pipeline() = our patch) is taken. The dashboard
 # default is use_ap=True, which is why a hand load without the flag "failed tout
 # le temps".
-FORCE_NO_AP_MODEL_TYPES = frozenset({"longcat2"})
+FORCE_NO_AP_MODEL_TYPES = frozenset({
+    "longcat2",
+    # deepseek_v4 (2026-08-03) : module dérivé du fork ivan, PipelineMixin.
+    # Le chemin sharded_load(pipeline_group) = model.model.pipeline() est
+    # celui prouvé 33.5 tok/s pipeline-2 (saga dv_c1/dv_e). Le chemin AP
+    # shard_pipeline n'a jamais vu le hidden 4D des HyperConnections
+    # (hc_mult=4) — non validé, donc interdit.
+    "deepseek_v4",
+})
+
+# Model types that carry a vision_config but must NOT route to mlx_vlm.server.
+# Inkling was here (text-only 1.37.1) but now routes to its OWN native
+# multimodal server (InklingPool, 1.38.0) inside the is_vision branch — so it
+# STAYS is_vision=True and this carve-out is empty again. Kept as the hook for
+# any future "text-only despite vision_config" model.
+TEXT_ONLY_DESPITE_VISION_CONFIG: frozenset = frozenset()
 
 # Inverse guard: model types whose ONLY working multi-node path is
 # auto_parallel. glm_moe_dsa's DSA patch (Option A) declares Indexer params on
@@ -779,7 +831,13 @@ FORCE_NO_AP_MODEL_TYPES = frozenset({"longcat2"})
 # is only supported for MLX converted models". A use_ap:false in the request
 # (dashboard Default-form checkbox, 2026-07-26) must not be able to take that
 # path.
-FORCE_AP_MODEL_TYPES = frozenset({"glm_moe_dsa"})
+FORCE_AP_MODEL_TYPES = frozenset({
+    "glm_moe_dsa",
+    # kimi_k3 has no PipelineMixin, and its attention-residual transport
+    # (the second tensor crossing each rank boundary) lives in
+    # pipeline_auto_parallel — the sharded_load path would drop it.
+    "kimi_k3",
+})
 
 # Mirror of mtp_module._DEEPSEEK_FAMILY — the model_types whose native-MTP
 # binding exists in the runner. Keep in sync when a new family binding lands
@@ -854,14 +912,21 @@ async def get_model_arch_meta(ssh: str, abspath: str) -> dict:
     # distributed text runner (which can't run them).
     _mt = (cfg.get("model_type") or cfg.get("text_config", {}).get("model_type") or "").lower()
     is_vision = bool(
-        "_vl" in _mt or "_vision" in _mt or "vision" in _mt
-        or "vision_config" in cfg or "vision_tower_config" in cfg
+        ("_vl" in _mt or "_vision" in _mt or "vision" in _mt
+         or "vision_config" in cfg or "vision_tower_config" in cfg)
+        and _mt not in TEXT_ONLY_DESPITE_VISION_CONFIG
     )
     return {
         "model_type": cfg.get("model_type"),
         "num_hidden_layers": _nested("num_hidden_layers"),
         "num_key_value_heads": _nested("num_key_value_heads"),
         "is_vision": is_vision,
+        # Fields the arch-aware RAM overhead needs (see _arch_load_overhead).
+        # Absent on every architecture that doesn't have them — the helper
+        # falls back to the flat factors when it can't compute.
+        "linear_attn_config": _nested("linear_attn_config"),
+        "kv_lora_rank": _nested("kv_lora_rank"),
+        "qk_rope_head_dim": _nested("qk_rope_head_dim"),
     }
 
 
@@ -889,6 +954,65 @@ def _validate_load_mode(model_type, num_layers, num_kv_heads,
             return False, f"KV-heads {num_kv_heads} non divisible par {nodes_count}"
         return True, ""
     return False, f"mode inconnu : {mode}"
+
+
+# Serving context budget for kimi_k3 in v1. NOT the architectural maximum
+# (1M) — the gate charges the KV cost of this budget, so raising it is a
+# deliberate act that has to pass the gate again.
+_KIMI_K3_CTX_BUDGET = 131072
+
+# Flat per-rank allowance for the runtime itself (Metal scratch, the framework,
+# macOS headroom) once the cache cost is accounted for exactly.
+_ARCH_RUNTIME_MARGIN_BYTES = 6 * 1024**3
+
+
+def _arch_load_overhead(arch: Optional[dict], nodes_count: int) -> Optional[dict]:
+    """Exact cache cost for architectures where it is CALCULABLE, else None.
+
+    The flat 1.15 / 1.10 factors below are proxies calibrated on GQA models,
+    where the KV cache grows with both layer count and context and can plausibly
+    reach that fraction of the weights. They are wrong by a wide margin for
+    fixed-state architectures: kimi_k3 carries a recurrent state of CONSTANT
+    size on its linear-attention layers and a compressed latent KV on the rest,
+    so its real overhead is a couple of GiB — not 15% of 1.4 TB. Charging the
+    proxy would refuse a load that fits comfortably.
+
+    Returns {"extra_total_bytes", "extra_rank_bytes", "note"} or None when the
+    architecture is unknown or the config didn't carry what's needed, in which
+    case callers keep the historical factors.
+    """
+    if not arch or arch.get("model_type") != "kimi_k3":
+        return None
+
+    lac = arch.get("linear_attn_config") or {}
+    layers = arch.get("num_hidden_layers")
+    full_attn = lac.get("full_attn_layers")
+    heads, head_dim = lac.get("num_heads"), lac.get("head_dim")
+    kv_lora, qk_rope = arch.get("kv_lora_rank"), arch.get("qk_rope_head_dim")
+    if not all((layers, full_attn, heads, head_dim, kv_lora, qk_rope)):
+        return None
+
+    n_mla = len(full_attn)
+    n_kda = layers - n_mla
+    ctx = _KIMI_K3_CTX_BUDGET
+
+    # MLA keeps one compressed latent per token per full-attention layer.
+    kv_bytes = n_mla * ctx * (kv_lora + qk_rope) * 2
+    # KDA's recurrent state is (head_dim x head_dim) per head, fp32, and does
+    # NOT grow with context — that is the whole point of the architecture.
+    kda_bytes = n_kda * heads * head_dim * head_dim * 4
+
+    margin = _ARCH_RUNTIME_MARGIN_BYTES * max(nodes_count, 1)
+    return {
+        "extra_total_bytes": kv_bytes + kda_bytes + margin,
+        "extra_rank_bytes": _ARCH_RUNTIME_MARGIN_BYTES
+        + (kv_bytes + kda_bytes) // max(nodes_count, 1),
+        "note": (
+            f"kimi_k3: KV {kv_bytes / 1024**3:.1f} GiB @ {ctx} ctx + "
+            f"KDA state {kda_bytes / 1024**3:.2f} GiB + "
+            f"{_ARCH_RUNTIME_MARGIN_BYTES / 1024**3:.0f} GiB/rank runtime"
+        ),
+    }
 
 
 def _model_load_overhead_factor() -> float:
@@ -937,9 +1061,26 @@ def _cluster_total_ram_bytes(cluster: str, nodes_count: int) -> tuple[int, list[
             ram = int(h["ram_total_bytes"])
         if h and h.get("wired_limit_mb"):
             wired_limit = int(h["wired_limit_mb"]) * 1024 * 1024
-        # No static RAM map here: hardware belongs in telemetry or
-        # topology/config, not in source. Unknown RAM degrades to a warning
-        # path in _validate_load_fits instead of guessing.
+        # Fallback when telemetry hasn't probed this node yet (e.g. right after
+        # a reboot — the exact window a 2-node K3 load hit on 2026-08-10: no
+        # per-rank RAM → the capacity-aware split silently degraded to an EVEN
+        # split → the 256 GB rank OOM'd at 82% with no traceback). Probe the
+        # node's real iogpu.wired_limit_mb + hw.memsize directly over ssh. Cheap
+        # (once per load), and it's the ACTUAL Metal ceiling the split needs.
+        if (not ram or not wired_limit) and ssh:
+            try:
+                rc, probe_out, _ = _ssh_exec(
+                    ssh, "sysctl -n iogpu.wired_limit_mb hw.memsize", 8)
+                if rc == 0:
+                    parts = (probe_out or "").split()
+                    if len(parts) >= 2:
+                        wl_mb = int(parts[0]); mem = int(parts[1])
+                        if not wired_limit and wl_mb > 0:
+                            wired_limit = wl_mb * 1024 * 1024
+                        if not ram and mem > 0:
+                            ram = mem
+            except Exception:
+                pass
         if not ram:
             ram = 0
         total += ram
@@ -951,14 +1092,21 @@ def _cluster_total_ram_bytes(cluster: str, nodes_count: int) -> tuple[int, list[
     return total, out
 
 
-def _hetero_pipeline_ceiling(per_node: list[dict]) -> int:
+def _hetero_pipeline_ceiling(
+    per_node: list[dict], extra_rank_bytes: int = 0, activations_factor: float = 1.10
+) -> int:
     """Max model bytes loadable in PIPELINE mode under the capacity-aware
     split the loader actually performs (see ram_weights_csv in start_runners):
     each rank's shard is proportional to its weight (wired_limit | raw RAM),
     and must fit its budget (wired_limit | 0.75×RAM) with the +10%
     activations factor. Returns 0 when the loader would NOT activate the
     capacity-aware split (a weight missing, or all nodes identical — in
-    which case the even-split math of the caller is already exact)."""
+    which case the even-split math of the caller is already exact).
+
+    When the architecture has a calculable overhead (_arch_load_overhead), the
+    caller passes it as a flat per-rank SUBTRACTION and neutralises the
+    multiplicative factor — a proxy fraction of 1.4 TB of weights is not a
+    meaningful stand-in for a fixed-size recurrent state."""
     weights: list[int] = []
     budgets: list[int] = []
     for nd in per_node:
@@ -971,12 +1119,18 @@ def _hetero_pipeline_ceiling(per_node: list[dict]) -> int:
     if len(weights) < 2 or len(set(weights)) == 1:
         return 0
     sw = sum(weights)
-    return int(min(b * sw / (1.10 * w) for w, b in zip(weights, budgets)))
+    return int(
+        min(
+            max(b - extra_rank_bytes, 0) * sw / (activations_factor * w)
+            for w, b in zip(weights, budgets)
+        )
+    )
 
 
 def _validate_load_fits(model_size_bytes: int, cluster: str,
                          nodes_count: int,
-                         mode: Optional[str] = None) -> tuple[bool, str, dict]:
+                         mode: Optional[str] = None,
+                         arch: Optional[dict] = None) -> tuple[bool, str, dict]:
     """Returns (ok, reason, detail) for a (model, nodes) combo.
 
     Two checks (both must pass):
@@ -1012,7 +1166,15 @@ def _validate_load_fits(model_size_bytes: int, cluster: str,
     activations_factor = 1.10  # +10% per-rank for KV + activations + scratch
     default_headroom_factor = 0.75
 
+    # Architectures whose cache cost is CALCULABLE replace both proxy factors
+    # with an additive term — see _arch_load_overhead.
+    arch_overhead = _arch_load_overhead(arch, nodes_count)
+    if arch_overhead:
+        activations_factor = 1.0
+
     per_rank_required = int((model_size_bytes / max(nodes_count, 1)) * activations_factor)
+    if arch_overhead:
+        per_rank_required += arch_overhead["extra_rank_bytes"]
 
     # Smallest node's budget — that's the binding constraint
     node_budgets = []
@@ -1024,8 +1186,15 @@ def _validate_load_fits(model_size_bytes: int, cluster: str,
     per_node_budget = min(node_budgets) if node_budgets else 0
     min_node_ram = min((n["ram_bytes"] for n in per_node if n["ram_bytes"]), default=0)
 
-    overall_required = int(model_size_bytes * _model_load_overhead_factor())
-    overall_headroom = total_ram - overall_required
+    if arch_overhead:
+        # The real ceiling is the sum of what Metal may actually wire, not the
+        # raw RAM total — at 95% utilisation the difference decides the load.
+        overall_budget = sum(node_budgets) if node_budgets else total_ram
+        overall_required = model_size_bytes + arch_overhead["extra_total_bytes"]
+    else:
+        overall_budget = total_ram
+        overall_required = int(model_size_bytes * _model_load_overhead_factor())
+    overall_headroom = overall_budget - overall_required
 
     # Indicate whether budget came from actual tuned wired_limit or fallback
     budget_source = "wired_limit_mb" if any(n.get("wired_limit_bytes") for n in per_node) else f"{default_headroom_factor}×RAM"
@@ -1042,12 +1211,33 @@ def _validate_load_fits(model_size_bytes: int, cluster: str,
         "per_node_budget_gb": round(per_node_budget / 1024**3, 1),
         "per_node_budget_source": budget_source,
         "overall_required_gb": round(overall_required / 1024**3, 1),
+        "overall_budget_gb": round(overall_budget / 1024**3, 1),
         "activations_factor": activations_factor,
         "per_node": per_node,
     }
+    if arch_overhead:
+        detail["arch_overhead"] = arch_overhead["note"]
+        detail["arch_overhead_rank_gb"] = round(
+            arch_overhead["extra_rank_bytes"] / 1024**3, 1
+        )
 
     # Check #1 : overall budget
     if overall_headroom < 0:
+        if arch_overhead:
+            # iogpu.wired_limit_mb does NOT survive a reboot — including the
+            # automatic ones the wired-leak self-healing triggers. A load that
+            # fit yesterday and doesn't today is usually that, not a real
+            # capacity change.
+            budgets_gb = [round(b / 1024**3) for b in node_budgets]
+            return False, (
+                f"model {detail['model_size_gb']} GB + {detail['arch_overhead']} = "
+                f"{detail['overall_required_gb']} GB needed, only "
+                f"{detail['overall_budget_gb']} GB wirable across "
+                f"{nodes_count} node{'s' if nodes_count>1 else ''} "
+                f"(per-node wired budgets: {budgets_gb} GB). "
+                f"iogpu.wired_limit_mb is not persistent — re-apply it if a node "
+                f"rebooted, then wait ~5s for the telemetry probe."
+            ), detail
         return False, (
             f"model {detail['model_size_gb']} GB × {_model_load_overhead_factor()} overhead = "
             f"{detail['overall_required_gb']} GB needed, only {detail['cluster_ram_gb']} GB total "
@@ -1061,7 +1251,13 @@ def _validate_load_fits(model_size_bytes: int, cluster: str,
     # gate refuses loads the engine handles fine (Ling-Q8 1T on 512+4×256).
     if per_rank_required > per_node_budget and per_node_budget > 0:
         if mode == "pipeline":
-            ceiling = _hetero_pipeline_ceiling(per_node)
+            ceiling = _hetero_pipeline_ceiling(
+                per_node,
+                extra_rank_bytes=(
+                    arch_overhead["extra_rank_bytes"] if arch_overhead else 0
+                ),
+                activations_factor=activations_factor,
+            )
             if ceiling and model_size_bytes <= ceiling:
                 detail["capacity_aware_split"] = True
                 detail["hetero_ceiling_gb"] = round(ceiling / 1024**3, 1)
@@ -1087,6 +1283,24 @@ def _validate_load_fits(model_size_bytes: int, cluster: str,
 # sections so the UI sees consistent values).
 _nautilus_loading: dict = {"in_progress": False}
 _loading_state: dict[str, dict] = {}
+# Self-heal floor for a leaked loading flag (2026-08-09). A real load runs
+# _end_loading on EVERY exit (success/error/cancel via try/finally), but a
+# request coroutine dropped without its finally (client disconnect mid-load,
+# a uvicorn-config-dependent asyncio path) leaves `in_progress` stuck → the
+# status endpoint shows a phantom "95%" forever and the operator must restart
+# the container. `_loading_snapshot` treats a flag older than
+# max(estimate*MULT, FLOOR) as stale and clears it. Generous so a genuinely
+# slow load (huge model, cold rsync) is never mis-cleared — a real load either
+# completes near its estimate or errors long before this.
+_LOADING_STALE_MIN_S = 120.0      # never clear a flag younger than 2 min (safety)
+_LOADING_STALE_MULT = 5.0         # clear past 5x the estimate (scales with model)
+# Cap on stopping the OLD pool before a hot-swap load. The stop ladder
+# (SIGTERM→grace→SIGKILL→sweep) does SSH calls that can hang if a node is slow/
+# unreachable — and it runs INSIDE the load's admin lock, so a hang there blocks
+# every future load on the cluster (the "must restart the container" symptom).
+# Bound it: on timeout, proceed anyway — the new pool's own orphan sweep reaps
+# any survivors. Worst case is a brief double-set of runners, not a dead cluster.
+_OLD_STOP_TIMEOUT_S = 150.0
 
 
 def _loading_state_for(cluster_id: str) -> dict:
@@ -1119,16 +1333,109 @@ def _loading_snapshot(state: dict) -> Optional[dict]:
         return None
     elapsed = time.time() - state.get("started_at", time.time())
     est = max(state.get("estimated_s") or 1.0, 1.0)
-    # Cap at 95 % until completion — last 5 % reserved for the success snap.
-    pct = min(95.0, (elapsed / est) * 100.0)
-    return {
+    # Self-heal a leaked flag: past max(est*MULT, FLOOR) the load's finally never
+    # ran (dropped coroutine) — clear it so the UI stops showing a phantom 95%
+    # and the next load isn't confused. Idempotent, cheap (runs on status polls).
+    if elapsed > max(est * _LOADING_STALE_MULT, _LOADING_STALE_MIN_S):
+        sys.stderr.write(
+            f"[load] stale loading flag for {state.get('model')} "
+            f"(elapsed {elapsed:.0f}s >> est {est:.0f}s) — auto-cleared\n")
+        _end_loading(state)
+        return None
+    total = state.get("size_bytes") or 0
+    loaded = state.get("loaded_bytes")
+    base = {
         "model": state.get("model"),
         "nodes": state.get("nodes"),
-        "size_bytes": state.get("size_bytes"),
+        "size_bytes": total,
+        "size_gb": round(total / 1024**3, 1),
         "elapsed_s": round(elapsed, 2),
         "estimated_s": round(est, 2),
-        "progress_pct": round(pct, 1),
     }
+    # Observable path: real bytes materialized on the ranks (poller-fed) →
+    # true %, throughput, ETA, per-rank, stall — not a time-based frozen 95 %.
+    if loaded is not None and total:
+        pct = min(99.0, loaded / total * 100.0)
+        tp = float(state.get("throughput_bps") or 0)
+        base.update({
+            "progress_pct": round(pct, 1),
+            "phase": "materializing weights",
+            "loaded_bytes": loaded,
+            "loaded_gb": round(loaded / 1024**3, 1),
+            "throughput_gbs": round(tp / 1024**3, 2),
+            "eta_s": state.get("eta_s"),
+            "stalled": bool(state.get("stalled")),
+            "per_rank_gb": [round(b / 1024**3, 1)
+                            for b in (state.get("per_rank_bytes") or [])],
+        })
+        return base
+    # Fallback (no poller / early): time-based, capped at 95 %.
+    base["progress_pct"] = round(min(95.0, (elapsed / est) * 100.0), 1)
+    base["phase"] = "starting"
+    return base
+
+
+# ── observable-load progress poller ─────────────────────────────────────
+_progress_pollers: dict = {}
+
+
+async def _poll_load_progress(cluster_id: str, state: dict,
+                              ssh_targets: list, total_bytes: int) -> None:
+    """While a load is in progress, read each rank's runner memory footprint
+    (bytes materialized) so the UI shows TRUE progress + throughput + ETA +
+    stall detection instead of a frozen elapsed/estimated 95 %. Self-terminates
+    when the load's in_progress flag clears (set by _end_loading)."""
+    match = RUNNER_MATCH_PATTERN
+    cmd = (f"ps -Ao rss,command | grep {shlex.quote(match)} "
+           "| grep -v grep | awk '{s+=$1} END{print s+0}'")
+
+    async def _rss(ssh: str) -> int:
+        try:
+            out = await asyncio.to_thread(
+                subprocess.run,
+                ["ssh", "-o", "ConnectTimeout=4", "-o", "BatchMode=yes", ssh, cmd],
+                capture_output=True, text=True, timeout=8)
+            return int((out.stdout or "0").strip() or 0) * 1024   # KB → B
+        except Exception:
+            return 0
+
+    last_bytes, last_t, stall_ticks = 0, time.time(), 0
+    await asyncio.sleep(2)
+    try:
+        while state.get("in_progress"):
+            per_rank = list(await asyncio.gather(*[_rss(s) for s in ssh_targets]))
+            loaded = sum(per_rank)
+            now = time.time()
+            dt = max(now - last_t, 0.1)
+            rate = (loaded - last_bytes) / dt
+            stall_ticks = stall_ticks + 1 if (loaded - last_bytes) < 50 * 1024**2 else 0
+            state["loaded_bytes"] = loaded
+            state["per_rank_bytes"] = per_rank
+            state["throughput_bps"] = max(rate, 0.0)
+            state["eta_s"] = (round((total_bytes - loaded) / rate, 1)
+                              if rate > 1e6 and total_bytes > loaded else None)
+            state["stalled"] = stall_ticks >= 4          # ~12 s flat
+            last_bytes, last_t = loaded, now
+            await asyncio.sleep(3)
+    except asyncio.CancelledError:
+        pass
+    finally:
+        _progress_pollers.pop(cluster_id, None)
+
+
+def _start_progress_poller(cluster_id: str, state: dict,
+                           ssh_targets: list, total_bytes: int) -> None:
+    """Spawn the observable-load poller for a load (no-op without targets)."""
+    if not ssh_targets or not total_bytes:
+        return
+    old = _progress_pollers.get(cluster_id)
+    if old and not old.done():
+        old.cancel()
+    try:
+        _progress_pollers[cluster_id] = asyncio.create_task(
+            _poll_load_progress(cluster_id, state, list(ssh_targets), int(total_bytes)))
+    except RuntimeError:
+        pass   # no running loop (shouldn't happen inside a request)
 
 # ──────────────────────────────────────────────────────────────────────────────
 # HF model downloader (runs `hf download` on configured hosts via SSH)
@@ -1136,6 +1443,13 @@ def _loading_snapshot(state: dict) -> Optional[dict]:
 # `hf` is the shipped Python entrypoint of the remote venv. User-pip installs
 # vary by Python version, so we point at the configured venv path instead.
 HF_BIN_REMOTE = env_get("HF_BIN_REMOTE", f"{REMOTE_CLUSTER_DIR}/.venv/bin/hf")
+
+# P8.1 — derniere activite de service par cluster (unload-guard).
+# Mis a jour au moment ou une requete /v1/* est resolue vers un pool
+# charge ; lu par admin_cluster_unload pour refuser un unload pendant
+# qu'un utilisateur est servi (incident 2026-08-04).
+_CLUSTER_LAST_SERVED: dict[str, float] = {}
+UNLOAD_GUARD_S = float(env_get("UNLOAD_GUARD_S", "30"))
 
 _downloads: dict[str, dict] = {}
 # Per-job → per-host process map. Host-keyed so cancel can target one target
@@ -1625,6 +1939,7 @@ def remote_cmd(node: dict, nodes: list[dict], model: str, mode: str, port: int,
         "RUNNER_USE_AP": "1" if use_ap else "0",
         "RUNNER_KV_Q8": "1" if kv_q8 else "0",
         "RUNNER_EMIT_BATCH": str(emit_batch),
+        "SPEC_SESS_DEBUG": os.environ.get("SPEC_SESS_DEBUG", ""),
     }
     if backend == "ring":
         # #40 WU4 — ring/TCP transport: MLX ring hostfile ([["ip:port"], ...]
@@ -1763,8 +2078,22 @@ class RunnerProc:
         # write(), stalling the distributed barrier -> deadlock. Send their
         # stdout to DEVNULL so the kernel never back-pressures them (#23).
         _stdout = subprocess.PIPE if node["rank"] == 0 else subprocess.DEVNULL
+        # ServerAliveInterval=10 alone means CountMax defaults to 3: the client
+        # tears the session down after 30s of an unresponsive sshd. Loading
+        # Kimi-K3 (15 GiB single-tensor layers, 233 GiB/rank of mmap page-in)
+        # starves the whole node hard enough that sshd misses keepalives for
+        # minutes — observed twice as a rank dying with exit=255, no stderr, no
+        # crash report, on a DIFFERENT node each time. 10s×30 keeps dead-node
+        # detection (5 min) while surviving the page-in storm of a heavy load.
         self.proc = subprocess.Popen(
-            ["ssh", "-o", "ServerAliveInterval=10", _safe_ssh_target(node["ssh"]), cmd],
+            # 60s x 60 = 1h of keepalive tolerance. Rank 0 of the Q3e load
+            # died at exactly startup+300s — the previous 10x30 ceiling — while
+            # paging 392 GiB off the slow external volume: sshd starved longer
+            # than the tolerance and the CLIENT killed a healthy load. Dead-node
+            # detection does not rest on keepalives anyway: the orchestrator's
+            # soft-timeout ladder (SIGTERM -> remote kill) owns that.
+            ["ssh", "-o", "ServerAliveInterval=60", "-o", "ServerAliveCountMax=60",
+             _safe_ssh_target(node["ssh"]), cmd],
             stdin=subprocess.PIPE, stdout=_stdout, stderr=subprocess.PIPE,
             text=True, bufsize=1,
         )
@@ -2582,7 +2911,11 @@ class RunnerPool:
                      session_id: Optional[str] = None,
                      request_id: Optional[str] = None,
                      reasoning_effort: Optional[str] = None,
-                     anti_loop: bool = True) -> AsyncIterator[dict]:
+                     anti_loop: bool = True,
+                     kv_q8: Optional[bool] = None,
+                     context_limit: Optional[int] = None,
+                     ignore_eos: bool = False,
+                     clear_thinking: Optional[bool] = None) -> AsyncIterator[dict]:
         # Concurrent submits are allowed: the runner side handles serialisation
         # (single-rank uses BatchGenerator for true parallelism; multi-rank
         # serialises in the gen loop but tokens are routed by req_id).
@@ -2611,6 +2944,25 @@ class RunnerPool:
         # Anti-loop detect-and-stop (runner-side, default ON). Identical on
         # every rank via the broadcast, so multi-rank pools break in lockstep.
         req["anti_loop"] = bool(anti_loop)
+        # Per-request KV-cache quantization override (2026-08-09, bench A/B):
+        # the runner already reads req["kv_q8"] with the pool's load-time value
+        # as fallback — None here = keep that default; an explicit bool lets a
+        # caller (TMB bench) A/B Q8-vs-fp16 KV on the SAME pool, no reload.
+        if kv_q8 is not None:
+            req["kv_q8"] = bool(kv_q8)
+        # Context-limit: per-request hard cap on prompt + generated tokens
+        # (server-wide default RUNNER_CONTEXT_LIMIT if unset). Runner enforces
+        # per-step and flags `context_limit` on the done event.
+        if context_limit:
+            req["context_limit"] = int(context_limit)
+        # Endurance mode: runner bans stop ids at the logits level and skips
+        # its own stop-seq break — generation runs to max_tokens.
+        if ignore_eos:
+            req["ignore_eos"] = True
+        # clear_thinking: None keeps the runner default (True); an explicit
+        # bool overrides per request (GLM-5.3 template kwarg).
+        if clear_thinking is not None:
+            req["clear_thinking"] = bool(clear_thinking)
         # reasoning_effort: forwarded as a chat-template kwarg (Step-3.7 reads
         # it). Only set when non-empty so models that don't read it are untouched.
         # Remapped onto the model's accepted vocabulary first (Hy3 release
@@ -2633,6 +2985,17 @@ class RunnerPool:
         # only now that the request is fully built and about to broadcast, so a
         # build-time error can't leak the counter. Released in the finally below.
         await self._acquire_busy()
+        # Ghost-guard (2026-08-26): tracks whether the runner actually finished
+        # this generation. If the consumer stops iterating BEFORE `done` — client
+        # disconnect (bench abort), cancel_event break, handler exception, watchdog
+        # timeout — the async generator closes and the old finally released the
+        # pool WITHOUT telling the runner, which kept grinding its full max_tokens
+        # budget into the void (listener gone). Those ghost generations stacked on
+        # the single-slot runner: every later request shared the GPU with them →
+        # 0.2 tok/s "degraded" on long-gen benches (C03/C04), model-independent,
+        # until a reload killed the runner. The finally now hard-cancels the
+        # request on any early exit so the runner stops at the next token boundary.
+        _gen_finished = False
         try:
             # Tight broadcast window so concurrent submits don't interleave
             # bytes on the runner stdins.
@@ -2716,6 +3079,19 @@ class RunnerPool:
                     ev = await asyncio.wait_for(q.get(), timeout=wait)
                 except asyncio.TimeoutError:
                     if not self._rank0_alive():
+                        # Fix #2 (2026-08-09): a spontaneous rank-0 death
+                        # mid-generation (native ring/JACCL abort, wedge kill)
+                        # previously raised WITHOUT flipping degraded — the
+                        # sweeper then purged and auto-reload resurrected the
+                        # pool onto possibly-poisoned nodes. Mark pool+cluster
+                        # degraded first so the gates catch the cascade; the
+                        # reset ladder / operator clears it after inspection.
+                        self.degraded = True
+                        self.degraded_reason = "rank-0 died mid-generation"
+                        self.degraded_at = time.time()
+                        _mark_cluster_degraded(
+                            self.cluster, "rank-0 died mid-generation",
+                            {"alias": self.alias, "request_id": req_id})
                         raise RuntimeError(
                             "runner died mid-generation "
                             "(no events and rank-0 process is gone)"
@@ -2724,12 +3100,27 @@ class RunnerPool:
                 if ev.get("event") == "token":
                     last_progress = time.monotonic()
                     seen_token = True
+                if ev.get("event") == "done":
+                    _gen_finished = True
                 yield ev
                 if ev.get("event") == "done":
                     return
         finally:
             self._listeners.pop(req_id, None)
             self._release_busy()
+            # Ghost-guard: consumer left before the runner said `done` → tell
+            # every rank to stop this request NOW. Idempotent with the explicit
+            # /cancel endpoints and the wedge watchdog (same _cancelled_ids set
+            # runner-side). Fire-and-forget so response teardown never blocks
+            # on the broadcast lock.
+            if not _gen_finished and req_id:
+                sys.stderr.write(
+                    f"[pool {self.cluster}:{self.alias}] ghost-guard: consumer "
+                    f"gone before done — hard-cancelling {req_id} on all ranks\n")
+                try:
+                    asyncio.get_running_loop().create_task(self.cancel(req_id))
+                except RuntimeError:
+                    pass  # loop teardown — runner dies with the app anyway
 
     async def cancel(self, request_id: str) -> int:
         """Broadcast a hard-cancel command for `request_id` to every rank.
@@ -3051,6 +3442,221 @@ class VLMPool:
         self.runners.clear()
 
 
+class DFlashPool:
+    """A single-node `mlx-dspark serve --mode dflash` server, engine-managed and
+    proxied under a cluster as a TEXT pool (B1, 2026-08-06).
+
+    Same shape as VLMPool (a single-node OpenAI server duck-typed onto the pool
+    surface, chat routed via internal http-proxy, unload = kill the process),
+    with two differences:
+      * ``is_vlm = False`` — a dflash-dense target (e.g. Gemma-4-31B) is a TEXT
+        model, so it routes through normal chat (NOT the vision-only guard that
+        rejects VL models as text) and is badged as a spec text pool, not "vlm".
+      * carries the DFlash ``drafter`` path (the relaunch on restore needs it).
+
+    Replaces the standalone dspartha (`mlx-dspark serve` on .42, proxied but
+    uncontrolled) so OdyssAI-X owns the process lifecycle: load / unload /
+    restore / dashboard. Runs in the SAME mlx-vlm venv (mlx-dspark's deps are a
+    subset already present there)."""
+
+    is_vlm = False
+    is_dflash = True
+
+    def __init__(self, model_path: str, cluster: str, alias: str,
+                 node_indices: list[int], upstream: str, port: int,
+                 ssh_target: str, host: str, drafter: str,
+                 max_draft: int = 4, pid: Optional[str] = None):
+        self.model = model_path
+        self.model_path = model_path
+        self.cluster = cluster
+        self.alias = alias or cluster
+        self.node_indices: Optional[list[int]] = list(node_indices) if node_indices else None
+        self.nodes_count = 1
+        self.mode = "dflash"
+        self.use_ap = False
+        self.kv_q8 = False
+        # draft_model duck-types the RunnerPool field the views read; drafter is
+        # the concrete path the relaunch needs.
+        self.draft_model: Optional[str] = drafter
+        self.drafter = drafter
+        self.max_draft = int(max_draft)
+        self.num_draft_tokens = int(max_draft)
+        self.runners: list = []
+        self.upstream = (upstream or "").rstrip("/")
+        self.port = int(port)
+        self.pid = pid
+        self.ssh_target = ssh_target
+        self.host = host
+        try:
+            self.nodes = build_topology_from_indices(cluster, list(node_indices))
+        except Exception:
+            self.nodes = [{"rank": 0, "ssh": ssh_target, "host": host, "rdma": None}]
+        self.started_at: Optional[float] = time.time()
+        self.load_s: Optional[float] = None
+        self.last_used_at: float = time.time()
+        self.last_token_at: float = time.monotonic()
+        self.ttl_seconds: int = 0
+        self.backend: str = "http-proxy"
+        self.degraded: bool = False
+        self.degraded_reason: Optional[str] = None
+        self.degraded_at: Optional[float] = None
+
+    def alive_count(self) -> int:
+        """No local runner children — the mlx-dspark server is external. Report
+        1 so the dead-pool sweeper never mistakes it for a crashed pool (mirror
+        VLMPool.alive_count)."""
+        return 1
+
+    async def stop(self):
+        """Kill the mlx-dspark serve on this pool's node (SIGTERM → grace →
+        SIGKILL, so Metal wired pages release). Mirror VLMPool.stop."""
+        try:
+            await asyncio.to_thread(
+                _ssh_exec, self.ssh_target,
+                _dflash_kill_cmd(self.port, self.model_path), 30,
+            )
+        except Exception as e:
+            sys.stderr.write(
+                f"[dflash-pool] {self.cluster}[{self.alias}] kill on "
+                f"{self.ssh_target} failed: {e}\n"
+            )
+        self.runners.clear()
+
+
+class InklingPool:
+    """A single-node native Inkling server (scripts/inkling_server.py), engine-
+    managed and proxied under a cluster as a MULTIMODAL pool (2026-08-10).
+
+    Inkling (thinkingmachines) can't be served by the distributed text runner
+    (the mlx_lm-adapter path ran <0.2 tok/s — short-conv + custom cache forced
+    through mlx_lm.generate) nor by mlx_vlm.server (no loader for
+    inkling_mm_model). Its own `inkling_mlx` package IS the fast path (native
+    25 tok/s text + working vision tower, validated 2026-08-10). This wraps that
+    package in an OpenAI server we own the lifecycle of — same shape as VLMPool
+    (single-node, chat via http-proxy, unload = kill), `is_vlm=True` so it gets
+    the vision badge + the proxy routing branch."""
+
+    is_vlm = True
+    is_inkling = True
+
+    def __init__(self, model_path: str, cluster: str, alias: str,
+                 node_indices: list[int], upstream: str, port: int,
+                 ssh_target: str, host: str, pid: Optional[str] = None):
+        self.model = model_path
+        self.model_path = model_path
+        self.cluster = cluster
+        self.alias = alias or cluster
+        self.node_indices: Optional[list[int]] = list(node_indices) if node_indices else None
+        self.nodes_count = 1
+        self.mode = "inkling"
+        self.use_ap = False
+        self.kv_q8 = False
+        self.draft_model: Optional[str] = None
+        self.num_draft_tokens = 4
+        self.runners: list = []
+        self.upstream = (upstream or "").rstrip("/")
+        self.port = int(port)
+        self.pid = pid
+        self.ssh_target = ssh_target
+        self.host = host
+        try:
+            self.nodes = build_topology_from_indices(cluster, list(node_indices))
+        except Exception:
+            self.nodes = [{"rank": 0, "ssh": ssh_target, "host": host, "rdma": None}]
+        self.started_at: Optional[float] = time.time()
+        self.load_s: Optional[float] = None
+        self.last_used_at: float = time.time()
+        self.last_token_at: float = time.monotonic()
+        self.ttl_seconds: int = 0
+        self.backend: str = "http-proxy"
+        self.degraded: bool = False
+        self.degraded_reason: Optional[str] = None
+        self.degraded_at: Optional[float] = None
+
+    def alive_count(self) -> int:
+        return 1
+
+    async def stop(self):
+        try:
+            await asyncio.to_thread(
+                _ssh_exec, self.ssh_target,
+                _inkling_kill_cmd(self.port, self.model_path), 30,
+            )
+        except Exception as e:
+            sys.stderr.write(
+                f"[inkling-pool] {self.cluster}[{self.alias}] kill on "
+                f"{self.ssh_target} failed: {e}\n"
+            )
+        self.runners.clear()
+
+
+class MuseGlimmerPool:
+    """A single-node native Muse-Glimmer server (scripts/muse_glimmer_server.py),
+    engine-managed and proxied under a cluster as a MULTIMODAL pool (2026-08-13).
+
+    Muse-Glimmer-30B (pipenetwork / meta-models) is a harmony/"ATEM" VLM whose
+    `muse_glimmer` arch no released mlx-vlm or mlx-lm can load — PipeNetwork's
+    `muse_glimmer_mlx` package IS its runtime. This wraps that package in our
+    own OpenAI server (native decode with channel-aware harmony parsing:
+    reasoning→reasoning_content, final→content, ATEM→tool_calls; vision tower
+    spliced in). Same shape as InklingPool/VLMPool — single-node, chat via
+    http-proxy, unload = kill — `is_vlm=True` for the vision badge + the proxy
+    routing branch (and so it survives a container restart, adopted in place)."""
+
+    is_vlm = True
+    is_muse = True
+
+    def __init__(self, model_path: str, cluster: str, alias: str,
+                 node_indices: list[int], upstream: str, port: int,
+                 ssh_target: str, host: str, pid: Optional[str] = None):
+        self.model = model_path
+        self.model_path = model_path
+        self.cluster = cluster
+        self.alias = alias or cluster
+        self.node_indices: Optional[list[int]] = list(node_indices) if node_indices else None
+        self.nodes_count = 1
+        self.mode = "muse"
+        self.use_ap = False
+        self.kv_q8 = False
+        self.draft_model: Optional[str] = None
+        self.num_draft_tokens = 4
+        self.runners: list = []
+        self.upstream = (upstream or "").rstrip("/")
+        self.port = int(port)
+        self.pid = pid
+        self.ssh_target = ssh_target
+        self.host = host
+        try:
+            self.nodes = build_topology_from_indices(cluster, list(node_indices))
+        except Exception:
+            self.nodes = [{"rank": 0, "ssh": ssh_target, "host": host, "rdma": None}]
+        self.started_at: Optional[float] = time.time()
+        self.load_s: Optional[float] = None
+        self.last_used_at: float = time.time()
+        self.last_token_at: float = time.monotonic()
+        self.ttl_seconds: int = 0
+        self.backend: str = "http-proxy"
+        self.degraded: bool = False
+        self.degraded_reason: Optional[str] = None
+        self.degraded_at: Optional[float] = None
+
+    def alive_count(self) -> int:
+        return 1
+
+    async def stop(self):
+        try:
+            await asyncio.to_thread(
+                _ssh_exec, self.ssh_target,
+                _muse_kill_cmd(self.port, self.model_path), 30,
+            )
+        except Exception as e:
+            sys.stderr.write(
+                f"[muse-pool] {self.cluster}[{self.alias}] kill on "
+                f"{self.ssh_target} failed: {e}\n"
+            )
+        self.runners.clear()
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # State + metrics
 # ──────────────────────────────────────────────────────────────────────────────
@@ -3154,6 +3760,23 @@ def save_cluster_state_v2(cluster_id: str, *,
                 "upstream": pool.upstream,
                 "ssh": pool.ssh_target,
                 "host": pool.host,
+            })
+            continue
+        # dflash pool (B1): a single-node mlx-dspark serve proxied as a TEXT
+        # pool. Persist the drafter + port so the startup restore relaunches it.
+        if getattr(pool, "is_dflash", False):
+            pools_payload.append({
+                "alias": alias,
+                "model": pool.model,
+                "is_dflash": True,
+                "node_indices": indices,
+                "nodes": 1,
+                "port": pool.port,
+                "upstream": pool.upstream,
+                "ssh": pool.ssh_target,
+                "host": pool.host,
+                "drafter": pool.drafter,
+                "max_draft": pool.max_draft,
             })
             continue
         pools_payload.append({
@@ -3399,7 +4022,44 @@ _THINK_MAX_PARTIAL = max(len(_THINK_OPEN), len(_THINK_CLOSE)) - 1  # 7
 # (content=null) — exactly M3's first-smoke symptom (2026-06-13).
 _THINK_MARKERS = {
     "minimax-m3": ("<mm:think>", "</mm:think>"),
+    # Kimi K3 envelope: <|open|>think<|sep|>REASONING<|close|>think<|sep|>
+    # <|open|>response<|sep|>ANSWER<|close|>response<|sep|><|close|>message<|sep|>.
+    # The CLOSE marker here is the RESPONSE open: it is emitted in BOTH modes
+    # (thinking on and off), so seeding in_think=True is correct for both — a
+    # no-think stream starts with it and flips to visible at offset 0, no ghost.
+    # The stray <|close|>think<|sep|> lands in reasoning; the trailing envelope
+    # tags are removed by _THINK_STRIP.
+    "kimi-k3": ("<|open|>think<|sep|>", "<|open|>response<|sep|>"),
+    # Inkling (thinking-machines) envelope, emitted by the model itself:
+    #   <|content_thinking|>REASONING<|end_message|>
+    #   <|message_model|><|content_text|>ANSWER<|end_message|>
+    # Open = the thinking tag; close = the first <|end_message|> (thinking end).
+    # The answer's envelope tags (<|message_model|>/<|content_text|>) + its
+    # trailing <|end_message|> are removed by _THINK_STRIP. The model emits its
+    # OWN open tag (not template-prefilled), so _seed_in_think returns False for
+    # it — otherwise a no-think reply (no thinking block) would ghost.
+    "inkling": ("<|content_thinking|>", "<|end_message|>"),
 }
+
+
+# Residual envelope tokens to erase from the SPLIT output (both channels).
+# Kimi K3 closes its envelope with tags the (open, close) pair cannot cover.
+_THINK_STRIP = {
+    "kimi-k3": ("<|close|>response<|sep|>", "<|close|>message<|sep|>",
+                "<|close|>think<|sep|>"),
+    # Inkling answer-envelope tags + any residual thinking tag / trailing
+    # end-message that the (open, close) pair doesn't consume.
+    "inkling": ("<|message_model|>", "<|content_text|>",
+                "<|content_thinking|>", "<|end_message|>"),
+}
+
+
+def _model_think_strips(model_id: Optional[str]) -> tuple:
+    needle = (model_id or "").lower()
+    for key, toks in _THINK_STRIP.items():
+        if key in needle:
+            return toks
+    return ()
 
 
 def _model_think_markers(model_id: Optional[str]) -> tuple[str, str]:
@@ -3421,6 +4081,12 @@ def _seed_in_think(model_id: Optional[str], enable_thinking) -> bool:
     """
     if "minimax-m3" in (model_id or "").lower():
         return enable_thinking is True
+    # Inkling emits its OWN <|content_thinking|> open tag (not template-prefilled),
+    # in both thinking and no-think replies. Seeding True would trap a no-think
+    # answer in reasoning until the trailing <|end_message|> (ghost). Let the
+    # filter catch the literal open tag instead.
+    if "inkling" in (model_id or "").lower():
+        return False
     return True
 
 # Models whose chat_template auto-prefills `<think>\n` at the end of the
@@ -3443,7 +4109,8 @@ def _seed_in_think(model_id: Optional[str], enable_thinking) -> bool:
 # (off -> empty <think></think> baked in the prompt, no output block), like
 # Qwen3.5/3.6 -> goes HERE only, NOT in _MODELS_IGNORE_ENABLE_THINKING_FLAG.
 # Substring "glm-5.2" matches the concrete HF path (kernelpool/GLM-5.2-*, all quants).
-_MODELS_AUTO_OPEN_THINK = ("minimax", "qwen3.5", "qwen3.6", "step-3.7", "step3p7", "glm-5.2")
+_MODELS_AUTO_OPEN_THINK = ("minimax", "qwen3.5", "qwen3.6", "step-3.7", "step3p7", "glm-5.2",
+                           "kimi-k3", "inkling")
 # Subset of _MODELS_AUTO_OPEN_THINK that IGNORES the `enable_thinking`
 # kwarg and always wraps reasoning in <think>...</think>. Per MiniMax M2
 # docs (2026-05-20 update): "The model's reasoning is wrapped in <think>
@@ -3464,7 +4131,16 @@ _MODELS_AUTO_OPEN_THINK = ("minimax", "qwen3.5", "qwen3.6", "step-3.7", "step3p7
 # would ghost every no-think answer into reasoning_content with empty
 # content (the exact Companion-ghost failure this list exists to avoid for
 # models that DO honor the flag — see Qwen3.5/3.6 note above).
-_MODELS_IGNORE_ENABLE_THINKING_FLAG = ("minimax-m2", "step-3.7", "step3p7")
+_MODELS_IGNORE_ENABLE_THINKING_FLAG = ("minimax-m2", "step-3.7", "step3p7",
+                                       # K3 is always-thinking by design (reasoning_effort,
+                                       # not enable_thinking) and emits its response envelope
+                                       # in every mode — the filter must stay on to strip it.
+                                       "kimi-k3",
+                                       # Inkling likewise always thinks: verified 2026-08-09
+                                       # that enable_thinking=false STILL emits its
+                                       # <|content_thinking|> envelope, so the filter must stay
+                                       # on in every mode to route it + strip the envelope tags.
+                                       "inkling")
 
 # Models whose chat template reads a `reasoning_effort` system directive
 # (OpenAI o-series convention: minimal/low/medium/high). Step-3.7-Flash is a
@@ -3489,6 +4165,13 @@ _MODELS_REASONING_EFFORT_DEFAULT = {
 # Values absent from the inner map pass through unchanged.
 _MODELS_REASONING_EFFORT_MAP = {
     "hy3": {"minimal": "low", "medium": "high"},
+    # GLM-5.3-Flash (model card 2026-08): template accepts low/high/max and
+    # treats ANY other value as max — silently. "medium" therefore ran at max
+    # budget (constat bench 27/08: budget 94k mangé par le thinking). Make
+    # the equivalence explicit so it's a decision, not an accident; "minimal"
+    # maps to low. Callers wanting mid-budget must pass "high".
+    "glm-5-3": {"minimal": "low", "medium": "max"},
+    "glm-5.3": {"minimal": "low", "medium": "max"},
 }
 
 
@@ -3572,7 +4255,24 @@ def _split_think_stream(text: str, state: dict) -> tuple[str, str]:
     """
     open_m = state.get("open", _THINK_OPEN)
     close_m = state.get("close", _THINK_CLOSE)
-    max_partial = max(len(open_m), len(close_m)) - 1
+    strips = state.get("strip") or ()
+    _markers = (open_m, close_m, *strips)
+    max_partial = max(len(t) for t in _markers) - 1
+
+    def _clean(chunk: str) -> str:
+        for tok in strips:
+            chunk = chunk.replace(tok, "")
+        return chunk
+
+    def _holdback(chunk: str) -> int:
+        """Longest suffix of `chunk` that is a proper prefix of any marker —
+        that many chars must wait in carry or a marker could be emitted split
+        across two chunks and never matched/stripped."""
+        for n in range(min(len(chunk), max_partial), 0, -1):
+            tail = chunk[-n:]
+            if any(m.startswith(tail) for m in _markers):
+                return n
+        return 0
     text = state.get("carry", "") + (text or "")
     state["carry"] = ""
     visible_parts: list[str] = []
@@ -3582,27 +4282,27 @@ def _split_think_stream(text: str, state: dict) -> tuple[str, str]:
         if state.get("in_think"):
             idx = text.find(close_m)
             if idx == -1:
-                # No close marker — emit body up to the last few chars that
-                # could be the start of the close tag. Hold those back.
-                tail_len = min(len(text), max_partial)
+                # No close marker — emit the body except a suffix that could
+                # still start a marker on the next chunk.
+                tail_len = _holdback(text)
                 if len(text) > tail_len:
-                    reasoning_parts.append(text[:-tail_len])
+                    reasoning_parts.append(_clean(text[:-tail_len] if tail_len else text))
                 state["carry"] = text[-tail_len:] if tail_len else ""
                 text = ""
             else:
-                reasoning_parts.append(text[:idx])
+                reasoning_parts.append(_clean(text[:idx]))
                 text = text[idx + len(close_m):]
                 state["in_think"] = False
         else:
             idx = text.find(open_m)
             if idx == -1:
-                tail_len = min(len(text), max_partial)
+                tail_len = _holdback(text)
                 if len(text) > tail_len:
-                    visible_parts.append(text[:-tail_len])
+                    visible_parts.append(_clean(text[:-tail_len] if tail_len else text))
                 state["carry"] = text[-tail_len:] if tail_len else ""
                 text = ""
             else:
-                visible_parts.append(text[:idx])
+                visible_parts.append(_clean(text[:idx]))
                 text = text[idx + len(open_m):]
                 state["in_think"] = True
 
@@ -3614,6 +4314,8 @@ def _flush_think_stream(state: dict) -> tuple[str, str]:
     Returns (visible, reasoning) for the residual."""
     carry = state.get("carry", "")
     state["carry"] = ""
+    for tok in state.get("strip") or ():
+        carry = carry.replace(tok, "")
     if not carry:
         return "", ""
     if state.get("in_think"):
@@ -3759,6 +4461,23 @@ class ChatCompletionRequest(BaseModel):
     # Anti-loop detect-and-stop (runner-side). Default ON; `false` disables
     # detection for this request (legitimately repetitive output).
     anti_loop: Optional[bool] = None
+    # Per-request KV-cache quantization: None → pool default (load-time kv_q8);
+    # explicit bool overrides for THIS request (bench A/B Q8 vs fp16, no reload).
+    kv_q8: Optional[bool] = None
+    # Context-limit: hard cap on prompt + generated tokens for THIS request,
+    # independent of max_tokens. None → server default (RUNNER_CONTEXT_LIMIT,
+    # off by default). Runner enforces per-step; finish_reason stays "length".
+    context_limit: Optional[int] = None
+    # Endurance probes / benches: ban every stop token at the logits level so
+    # the generation deterministically runs to max_tokens (finish=length).
+    # Added 2026-08-27 to prove the mlx-lm #1662 buffer-leak fix past the
+    # 44.8k-token death wall without relying on prompt luck.
+    ignore_eos: Optional[bool] = None
+    # GLM-5.3 model card: the chat template defaults clear_thinking=false but
+    # chat serving must pass true (strip prior turns' thinking from the
+    # rendered prompt). Runner defaults to True; None here keeps that default,
+    # explicit false opts out for this request.
+    clear_thinking: Optional[bool] = None
 
     @model_validator(mode="after")
     def _alias_max_completion_tokens(self) -> "ChatCompletionRequest":
@@ -4003,6 +4722,12 @@ _JACCL_ERROR_PATTERNS = (
     "errno=96",
     "ibv_",
     "rdma",
+    # Ring-backend native aborts (2026-08-09, fix #2). When one rank wedges or
+    # dies, its ring peers print this and abort() in C++ — an uncontrolled
+    # transport-level death that must flip the degraded bit exactly like a
+    # JACCL QP failure, so the load gate + auto-reload gate see the cascade.
+    "Too many send/recv errors",
+    "[ring]",
 )
 
 
@@ -4034,6 +4759,95 @@ def _clear_cluster_degraded(cluster_id: str) -> None:
     if cluster_id in _cluster_degraded:
         del _cluster_degraded[cluster_id]
         sys.stderr.write(f"[degraded] {cluster_id} → cleared\n")
+
+
+async def _restore_cluster_pools(cid: str, leaked_hosts: Optional[set] = None) -> list[str]:
+    """Restore a cluster's persisted desired-state pools (state-<cid>.json v2).
+
+    Shared by the container-startup restore (reload_on_restart) and the
+    reboot-all reload (reload_on_reboot). Returns the aliases actually restored.
+    `leaked_hosts`: nodes the post-sweep wired guard flagged — pools touching
+    them are skipped (they need a reboot before a fresh pool can land). A failed
+    entry KEEPS its desired-state (never removed here) so a later restore
+    re-attempts it — one dead pool must never erase the intent to serve it."""
+    leaked_hosts = leaked_hosts or set()
+    restored: list[str] = []
+    saved_pools = load_cluster_state_v2(cid)
+    if not saved_pools:
+        return restored
+    saved_pools.sort(key=lambda p: 0 if p.get("alias") == DEFAULT_ALIAS else 1)
+    for entry in saved_pools:
+        alias = entry.get("alias", DEFAULT_ALIAS)
+        try:
+            indices = entry.get("node_indices") or list(range(int(entry.get("nodes") or 1)))
+            # Wired-guard: never respawn onto a node the sweep left leaked.
+            if leaked_hosts:
+                _cd_nodes = (get_cluster_def(cid) or {}).get("nodes") or []
+                _entry_hosts = {_cd_nodes[i].get("host") for i in indices
+                                if 0 <= i < len(_cd_nodes)}
+                _bad = _entry_hosts & leaked_hosts
+                if _bad:
+                    sys.stderr.write(
+                        f"[api] skipping restore of {cid}:{alias} — node(s) "
+                        f"{sorted(_bad)} hold leaked wired memory (needs reboot)\n")
+                    continue
+            # Distributed VLM pool: restore through VLMDistPool.start()
+            # (ssh-spawned ranks). Gated on the same feature flag as the load
+            # path — with the flag off the entry is skipped, never mis-restored
+            # as a text RunnerPool.
+            if entry.get("is_vlm_dist"):
+                if not VLM_DISTRIBUTED_ENABLED:
+                    sys.stderr.write(
+                        f"[api] skipping vlm-dist restore ({cid}:{alias}) — "
+                        f"VLM_DISTRIBUTED_ENABLED is off\n")
+                    continue
+                vdpool = VLMDistPool(
+                    model=entry["model"], cluster=cid, alias=alias,
+                    node_indices=indices,
+                )
+                await vdpool.start()
+                set_pool(cid, alias, vdpool)
+                restored.append(alias)
+                continue
+            # VL pool (Argo-VLM fold): relaunch the single-node mlx_vlm.server
+            # and re-register a VLMPool. Never a RunnerPool (the distributed
+            # text runner can't serve a vision model).
+            if entry.get("is_vlm"):
+                vpool = await _restore_vlm_pool(cid, alias, entry, indices)
+                if vpool is not None:
+                    set_pool(cid, alias, vpool)
+                    restored.append(alias)
+                continue
+            # dflash pool (B1): relaunch the single-node mlx-dspark serve and
+            # re-register a DFlashPool (TEXT proxy pool). Never a RunnerPool.
+            if entry.get("is_dflash"):
+                dfpool = await _restore_dflash_pool(cid, alias, entry, indices)
+                if dfpool is not None:
+                    set_pool(cid, alias, dfpool)
+                    restored.append(alias)
+                continue
+            pool = RunnerPool(
+                model=entry["model"],
+                mode=entry.get("mode", "pipeline"),
+                use_ap=bool(entry.get("use_ap", True)),
+                nodes_count=len(indices),
+                cluster=cid,
+                kv_q8=bool(entry.get("kv_q8", False)),
+                draft_model=entry.get("draft_model"),
+                num_draft_tokens=int(entry.get("num_draft_tokens") or 4),
+                mtp=entry.get("mtp"),
+                alias=alias,
+                node_indices=indices,
+                backend=entry.get("backend"),
+            )
+            await pool.start()
+            set_pool(cid, alias, pool)
+            restored.append(alias)
+        except Exception as e:
+            sys.stderr.write(
+                f"[api] restore ({cid}:{alias}) failed: {e} — "
+                f"desired-state entry kept for retry\n")
+    return restored
 
 
 @asynccontextmanager
@@ -4097,79 +4911,19 @@ async def lifespan(app: FastAPI):
         except Exception as e:
             sys.stderr.write(f"[api] startup load (nautilus) failed: {e}\n")
             _pool = None
-    # Multi-pool restore (state file v2): iterate every cluster declared in
-    # topology.yaml, restore whatever pools were running at last shutdown.
-    # Within a cluster, sort the default alias first so any extra-alias load
-    # that depended on it sees a clean baseline.
+    # Multi-pool restore (state file v2): per cluster, restore whatever pools
+    # were running at last shutdown — GATED by reload_on_restart (default True).
+    # A cluster with the toggle OFF keeps its desired-state persisted (so a
+    # later reboot-reload or a manual load can still use it) but is NOT
+    # auto-restored here. Extracted to _restore_cluster_pools so the reboot-all
+    # reload path reuses the exact same logic.
     for cid in DEFAULT_CLUSTER_DEFS.keys():
-        saved_pools = load_cluster_state_v2(cid)
-        if not saved_pools:
+        if not _reload_on_restart(cid):
+            sys.stderr.write(
+                f"[api] reload_on_restart=false ({cid}) — skipping startup "
+                f"restore of its pools (desired-state kept)\n")
             continue
-        saved_pools.sort(key=lambda p: 0 if p.get("alias") == DEFAULT_ALIAS else 1)
-        for entry in saved_pools:
-            alias = entry.get("alias", DEFAULT_ALIAS)
-            try:
-                indices = entry.get("node_indices") or list(range(int(entry.get("nodes") or 1)))
-                # Wired-guard: never respawn onto a node the sweep left leaked.
-                if _leaked_hosts:
-                    _cd_nodes = (get_cluster_def(cid) or {}).get("nodes") or []
-                    _entry_hosts = {_cd_nodes[i].get("host") for i in indices
-                                    if 0 <= i < len(_cd_nodes)}
-                    _bad = _entry_hosts & _leaked_hosts
-                    if _bad:
-                        sys.stderr.write(
-                            f"[api] skipping restore of {cid}:{alias} — node(s) "
-                            f"{sorted(_bad)} hold leaked wired memory (needs reboot)\n")
-                        continue
-                # Distributed VLM pool: restore through VLMDistPool.start()
-                # (ssh-spawned ranks). Gated on the same feature flag as the
-                # load path — with the flag off the entry is skipped, never
-                # mis-restored as a text RunnerPool.
-                if entry.get("is_vlm_dist"):
-                    if not VLM_DISTRIBUTED_ENABLED:
-                        sys.stderr.write(
-                            f"[api] skipping vlm-dist restore ({cid}:{alias}) — "
-                            f"VLM_DISTRIBUTED_ENABLED is off\n"
-                        )
-                        continue
-                    vdpool = VLMDistPool(
-                        model=entry["model"], cluster=cid, alias=alias,
-                        node_indices=indices,
-                    )
-                    await vdpool.start()
-                    set_pool(cid, alias, vdpool)
-                    continue
-                # VL pool (Argo-VLM fold): relaunch the single-node
-                # mlx_vlm.server and re-register a VLMPool. Never a RunnerPool
-                # (the distributed text runner can't serve a vision model).
-                if entry.get("is_vlm"):
-                    vpool = await _restore_vlm_pool(cid, alias, entry, indices)
-                    if vpool is not None:
-                        set_pool(cid, alias, vpool)
-                    continue
-                pool = RunnerPool(
-                    model=entry["model"],
-                    mode=entry.get("mode", "pipeline"),
-                    use_ap=bool(entry.get("use_ap", True)),
-                    nodes_count=len(indices),
-                    cluster=cid,
-                    kv_q8=bool(entry.get("kv_q8", False)),
-                    draft_model=entry.get("draft_model"),
-                    num_draft_tokens=int(entry.get("num_draft_tokens") or 4),
-                    mtp=entry.get("mtp"),
-                    alias=alias,
-                    node_indices=indices,
-                    backend=entry.get("backend"),
-                )
-                await pool.start()
-                set_pool(cid, alias, pool)
-            except Exception as e:
-                # F3: a failed restore KEEPS the desired-state entry (we never
-                # remove it here) so a later restart / recovery re-attempts it.
-                # Never let one dead pool erase the intent to serve it.
-                sys.stderr.write(
-                    f"[api] startup restore ({cid}:{alias}) failed: {e} — "
-                    f"desired-state entry kept for retry\n")
+        await _restore_cluster_pools(cid, _leaked_hosts)
     # Apply persisted default TTL to any pool that just started up.
     _apply_default_ttl_to_pools()
     # Background TTL sweeper — auto-unloads pools idle for > ttl_seconds.
@@ -4246,6 +5000,98 @@ def _apply_default_ttl_to_pools() -> None:
         pool.ttl_seconds = ttl
 
 
+# Auto-reload self-healing (2026-08-06). A single-node runner dies whenever its
+# holding SSH session drops — a transient node network blip (Power Nap, an
+# interface reset) kills the ssh child, the runner exits, the sweeper purges the
+# pool, and every request then hangs on a dead node until an operator reloads by
+# hand. `.29` dropped the flash-spec runner twice in 12h this way. This makes a
+# liveness-purged pool RELOAD itself from desired-state once the node is back.
+_AUTO_RELOAD_RETRIES: dict = {}     # (cid, alias) -> failed attempts while node WAS up
+_AUTO_RELOAD_MAX = 5
+
+
+async def _node_reachable(ssh_target: str) -> bool:
+    """Quick SSH liveness probe. Distinguishes a still-down node (wait, don't
+    burn a retry) from a node that is back but whose reload failed (real retry)."""
+    def _probe():
+        try:
+            r = subprocess.run(
+                ["ssh", "-o", "ConnectTimeout=4", "-o", "BatchMode=yes",
+                 _safe_ssh_target(ssh_target), "true"],
+                capture_output=True, timeout=8)
+            return r.returncode == 0
+        except Exception:
+            return False
+    return await asyncio.to_thread(_probe)
+
+
+async def _auto_reload_purged(cid: str, purged: list) -> None:
+    """Reload liveness-purged pools from desired-state so they self-recover.
+    Guards: (a) never resurrect an alias the operator explicitly unloaded (gone
+    from desired-state); (b) skip while a node is unreachable — retry next sweep,
+    no retry burned; (c) cap real failures so a permanently-broken node doesn't
+    reload-loop; (d) RunnerPool text pools only (VLM restore lives elsewhere)."""
+    if not purged or cid in _WATCHDOG_RECOVERY_BY_CLUSTER:
+        return
+    # Degraded gate (2026-08-09, fix #1 of the cascade review). Without it, a
+    # pool purged BECAUSE the cluster is sick gets reloaded onto the same sick
+    # nodes -> immediate re-wedge -> re-purge -> reload loop (the observed
+    # crash-loop of the macOS 26.5 wedge week). Degraded means "an operator or
+    # the reset ladder must clear first"; the manual-load path already 409s on
+    # it — the self-healing path must respect the same gate.
+    if _cluster_is_degraded(cid):
+        sys.stderr.write(
+            f"[auto-reload] {cid}: cluster degraded — reload of {purged} "
+            f"withheld until reset\n"); sys.stderr.flush()
+        return
+    try:
+        desired = {e.get("alias"): e for e in load_cluster_state_v2(cid)}
+    except Exception:
+        return
+    cd_nodes = (get_cluster_def(cid) or {}).get("nodes") or []
+    live_aliases = {a for a, _ in list_pools(cid)}
+    for alias in purged:
+        entry = desired.get(alias)
+        if entry is None or alias in live_aliases:
+            continue
+        if entry.get("is_vlm") or entry.get("vlm_distributed"):
+            continue
+        key = (cid, alias)
+        if _AUTO_RELOAD_RETRIES.get(key, 0) >= _AUTO_RELOAD_MAX:
+            continue
+        indices = entry.get("node_indices") or list(range(int(entry.get("nodes") or 1)))
+        ssh_targets = [cd_nodes[i].get("ssh") for i in indices
+                       if 0 <= i < len(cd_nodes) and cd_nodes[i].get("ssh")]
+        reach = [await _node_reachable(s) for s in ssh_targets]
+        if ssh_targets and not all(reach):
+            continue                          # node(s) still down → wait, no retry burned
+        try:
+            async with get_admin_lock(cid):
+                if alias in {a for a, _ in list_pools(cid)}:
+                    _AUTO_RELOAD_RETRIES.pop(key, None)
+                    continue
+                pool = RunnerPool(
+                    model=entry["model"], mode=entry.get("mode", "pipeline"),
+                    use_ap=bool(entry.get("use_ap", True)), nodes_count=len(indices),
+                    cluster=cid, kv_q8=bool(entry.get("kv_q8", False)),
+                    draft_model=entry.get("draft_model"),
+                    num_draft_tokens=int(entry.get("num_draft_tokens") or 4),
+                    mtp=entry.get("mtp"), alias=alias, node_indices=indices,
+                    backend=entry.get("backend"))
+                await pool.start()
+                set_pool(cid, alias, pool)
+            _AUTO_RELOAD_RETRIES.pop(key, None)
+            sys.stderr.write(
+                f"[auto-reload] {cid}[{alias}]: pool self-recovered after runner "
+                f"death (node back up)\n"); sys.stderr.flush()
+        except Exception as e:
+            _AUTO_RELOAD_RETRIES[key] = _AUTO_RELOAD_RETRIES.get(key, 0) + 1
+            sys.stderr.write(
+                f"[auto-reload] {cid}[{alias}] reload failed "
+                f"(retry {_AUTO_RELOAD_RETRIES[key]}/{_AUTO_RELOAD_MAX}): {e}\n")
+            sys.stderr.flush()
+
+
 async def _dead_pool_sweeper() -> None:
     """Every 30s, scan every cluster for pools whose runners have all
     died and drop them. Same purge as the at-load path (#5 issue), just
@@ -4276,6 +5122,9 @@ async def _dead_pool_sweeper() -> None:
                         f"[dead-pool-sweeper] {cid}: purged {len(purged)} "
                         f"dead pool(s): {', '.join(purged)}\n"
                     )
+                    # Self-heal: reload the purged pools from desired-state once
+                    # the node is back (transient drop recovery). See helper.
+                    await _auto_reload_purged(cid, purged)
         except asyncio.CancelledError:
             return
         except Exception as e:
@@ -4827,7 +5676,7 @@ def _initial_default_config() -> Optional[dict]:
 #   major (1.7.2 → 2.0.0) — breaking API or topology change
 #
 # Use `./scripts/bump-version.sh patch|minor|major` to bump + auto-commit.
-APP_VERSION = "1.21.0"
+APP_VERSION = "1.42.0"
 
 app = FastAPI(
     title="OdyssAI-X (odyssai.eu)",
@@ -5208,9 +6057,13 @@ def _enrich_caps_from_config(caps: dict, config: dict) -> None:
     caps["family"] = mt or None
 
     # Vision: model_type pattern OR presence of vision_config / image processors.
-    is_vision = ("_vl" in mt or "_vision" in mt or "vision" in mt
+    # Same TEXT_ONLY_DESPITE_VISION_CONFIG carve-out as the load path (inkling
+    # is served text-only for now) so /v1/models doesn't advertise vision it
+    # can't yet do.
+    is_vision = (("_vl" in mt or "_vision" in mt or "vision" in mt
               or "vision_config" in config
               or "vision_tower_config" in config)
+              and mt not in TEXT_ONLY_DESPITE_VISION_CONFIG)
     if is_vision:
         caps["supports_vision"] = True
         caps["modalities"] = sorted(set((caps.get("modalities") or []) + ["text", "image"]))
@@ -5695,6 +6548,48 @@ def _has_quirk(prov_id: str, quirk: str) -> bool:
     return quirk in PROVIDER_QUIRKS.get(prov_id, [])
 
 
+# Idle heartbeat for cloud-proxy SSE streams. Reasoning / OpenRouter models
+# "think" for tens of seconds WITHOUT emitting any bytes; the engine's own
+# streaming read has no idle timeout (read=None), but the DOWNSTREAM client
+# (CodeOS agent, LiteLLM, any SSE reader) applies one and kills the request with
+# "Upstream idle timeout exceeded", stopping the agent mid-turn. Injecting a
+# periodic SSE comment while the upstream is silent keeps the client's idle timer
+# from firing. A `: ` comment line is valid SSE, ignored by OpenAI/Anthropic
+# clients, and is exactly what Anthropic's own API emits as `: ping` keepalives.
+_PROXY_SSE_HEARTBEAT_S = float(env_get("PROXY_SSE_HEARTBEAT_S", "15"))
+
+
+async def _aiter_with_heartbeat(src, heartbeat_s: float = _PROXY_SSE_HEARTBEAT_S):
+    """Relay an async byte-iterator, injecting a `: keepalive` SSE comment
+    whenever `src` stays silent longer than `heartbeat_s`. Upstream errors and
+    end-of-stream propagate unchanged so the caller's error handling is intact."""
+    ait = src.__aiter__()
+    nxt = None
+    try:
+        while True:
+            if nxt is None:
+                nxt = asyncio.ensure_future(ait.__anext__())
+            try:
+                chunk = await asyncio.wait_for(asyncio.shield(nxt), timeout=heartbeat_s)
+            except asyncio.TimeoutError:
+                # Upstream still thinking — keep the client stream alive.
+                yield b": keepalive\n\n"
+                continue
+            except StopAsyncIteration:
+                nxt = None
+                return
+            nxt = None
+            if chunk:
+                yield chunk
+    finally:
+        if nxt is not None and not nxt.done():
+            nxt.cancel()
+            try:
+                await nxt
+            except BaseException:
+                pass
+
+
 async def _proxy_chat_completion(prov_id: str, prov: dict, entry: dict,
                                   body: dict) -> Any:
     """Proxy OpenAI-compat chat completion to an upstream provider.
@@ -5891,7 +6786,7 @@ async def _proxy_chat_completion(prov_id: str, prov: dict, entry: dict,
                         # `cache_read_input_tokens` from Anthropic /v1/messages)
                         # transparent to the client. Companion StatsRow then
                         # surfaces the prefix-cache win without extra work.
-                        async for chunk in r.aiter_bytes():
+                        async for chunk in _aiter_with_heartbeat(r.aiter_bytes()):
                             if chunk:
                                 yield chunk
                 except Exception as e:
@@ -6344,8 +7239,10 @@ async def _proxy_chat_completion_via_anthropic(prov_id: str, prov: dict,
                                              "provider": prov_id}}
                             yield ("data: " + json.dumps(err) + "\n\n").encode()
                             return
-                        async for out_chunk in _translate_anthropic_sse_to_openai(
-                            r.aiter_bytes(), openai_model
+                        async for out_chunk in _aiter_with_heartbeat(
+                            _translate_anthropic_sse_to_openai(
+                                r.aiter_bytes(), openai_model
+                            )
                         ):
                             yield out_chunk
                 except Exception as e:
@@ -6431,7 +7328,7 @@ async def _proxy_anthropic_messages(prov_id: str, prov: dict, entry: dict,
                                              "provider": prov_id}}
                             yield ("event: error\ndata: " + json.dumps(err) + "\n\n").encode()
                             return
-                        async for chunk in r.aiter_bytes():
+                        async for chunk in _aiter_with_heartbeat(r.aiter_bytes()):
                             if chunk:
                                 yield chunk
                 except Exception as e:
@@ -8139,15 +9036,21 @@ async def coeos_resolve(req, request) -> tuple:
 
 
 _TOOL_BLOCK_RE = [
-    re.compile(r"<tool_call>.*?</tool_call>", re.DOTALL),
-    re.compile(r"<tool_calls>.*?</tool_calls>", re.DOTALL),
+    # `(?::\w+)?` tolerates the per-tag suffix some Hunyuan checkpoints emit
+    # (odyssai/Hy3-mlx-8bit: `<tool_calls:opensource>` / `<tool_call:opensource>`).
+    # The plural form (DOTALL) also strips the whole wrapper incl. inner blocks.
+    re.compile(r"<tool_call(?::\w+)?>.*?</tool_call(?::\w+)?>", re.DOTALL),
+    re.compile(r"<tool_calls(?::\w+)?>.*?</tool_calls(?::\w+)?>", re.DOTALL),
+    # LongCat native format (meituan-longcat/LongCat-Flash-Lite) — parsed into
+    # structured tool_calls by runner.parse_tool_calls; strip from content too.
+    re.compile(r"<longcat_tool_call>.*?</longcat_tool_call>", re.DOTALL),
 ]
 
 
 def _strip_tool_calls_from_text(text: str) -> str:
     """Remove `<tool_call>...</tool_call>` (and `<tool_calls>...`) blocks from
     the user-visible content, since we surface them as structured `tool_calls`.
-    Handles both Hermes JSON and Qwen3-Coder XML inner forms.
+    Handles Hermes JSON, Qwen3-Coder XML, Hy3 XML and LongCat inner forms.
     """
     out = text
     for pat in _TOOL_BLOCK_RE:
@@ -8230,6 +9133,9 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
                         "(add ?include_unloaded=true for inventory).",
             },
         )
+    # P8.1 — pool resolved to a loaded pool: mark this cluster as recently
+    # served so admin_cluster_unload's guard can refuse a concurrent unload.
+    _CLUSTER_LAST_SERVED[pool.cluster] = time.time()
     # Argo-VLM fold (2026-07-02). A VL pool has NO distributed RunnerProc — it's
     # a single-node mlx_vlm.server served under this cluster. Route to it via
     # internal http-proxy (body forward + <think> split + usage passthrough),
@@ -8237,7 +9143,11 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
     # The text hot path below (RunnerProc generation) is untouched.
     # VLMDistPool sets vlm_proxy=False: it is served by the normal
     # pool.submit() path below (its ranks ARE RunnerProcs), not the proxy.
-    if getattr(pool, "is_vlm", False) and getattr(pool, "vlm_proxy", True):
+    # dflash pool (B1) is ALSO a single-node OpenAI server proxied via
+    # http-proxy — same relay path, but it's a TEXT pool (is_vlm=False) so it
+    # skips the vision-only guard below and routes as normal chat.
+    if (getattr(pool, "is_vlm", False) and getattr(pool, "vlm_proxy", True)) \
+            or getattr(pool, "is_dflash", False):
         body = req.model_dump(exclude_none=True)
         return await _vlm_pool_proxy_chat_completion(pool, body, bool(req.stream))
     # Request classification + per-cluster acceptance. Replaces the older
@@ -8308,11 +9218,26 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
         try:
             async for ev in pool.submit(None, req.max_tokens or 512, req.enable_thinking,
                                         anti_loop=(req.anti_loop is not False),
+                                        kv_q8=req.kv_q8,
+                                        context_limit=req.context_limit,
+                                        ignore_eos=bool(req.ignore_eos),
+                                        clear_thinking=req.clear_thinking,
                                         messages=messages, tools=req.tools,
                                         session_id=session_id,
                                         request_id=completion_id,
                                         reasoning_effort=(req.reasoning_effort
                                                           or _default_reasoning_effort(model_id))):
+                # P8.1 — re-stamp per chunk: a long in-flight generation must
+                # keep the unload-guard window open, not just its first 30s.
+                _CLUSTER_LAST_SERVED[pool.cluster] = time.time()
+                # Ghost-guard companion (2026-08-26): the non-stream path never
+                # checked for client disconnect — a bench client timing out
+                # mid-generation left the loop consuming the full max_tokens
+                # budget server-side. Break like the streaming path does; the
+                # submit() finally then hard-cancels the runner.
+                if await request.is_disconnected():
+                    run_status = "disconnected"
+                    break
                 if cancel_event.is_set():
                     run_status = "cancelled"
                     break
@@ -8359,7 +9284,8 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
             # filter catch it. Full content in hand here, so detect directly.
             seed = not content.lstrip().startswith(open_m)
             ts: dict = {"in_think": seed, "carry": "",
-                        "open": open_m, "close": close_m}
+                        "open": open_m, "close": close_m,
+                        "strip": _model_think_strips(model_id)}
             visible_full, reasoning_full = _split_think_stream(content, ts)
             fl_vis, fl_reason = _flush_think_stream(ts)
             content = visible_full + fl_vis
@@ -8447,14 +9373,21 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
             think_state: dict = {
                 "in_think": think_filter_active and _seed_in_think(model_id, req.enable_thinking),
                 "carry": "", "open": _open_m, "close": _close_m,
+                "strip": _model_think_strips(model_id),
             }
             async for ev in pool.submit(None, req.max_tokens or 512, req.enable_thinking,
                                         anti_loop=(req.anti_loop is not False),
+                                        kv_q8=req.kv_q8,
+                                        context_limit=req.context_limit,
+                                        ignore_eos=bool(req.ignore_eos),
+                                        clear_thinking=req.clear_thinking,
                                         messages=messages, tools=req.tools,
                                         session_id=session_id,
                                         request_id=completion_id,
                                         reasoning_effort=(req.reasoning_effort
                                                           or _default_reasoning_effort(model_id))):
+                # P8.1 — re-stamp per chunk (see streaming path above).
+                _CLUSTER_LAST_SERVED[pool.cluster] = time.time()
                 if await request.is_disconnected():
                     run_status = "disconnected"
                     break
@@ -9110,6 +10043,10 @@ async def anthropic_messages(req: AnthropicMessagesRequest, request: Request):
             },
         )
 
+    # P8.1 — unload-guard stamp: this handler resolves its pool itself and
+    # never passes through chat_completions, so it must stamp on its own.
+    _CLUSTER_LAST_SERVED[pool.cluster] = time.time()
+
     # Argo-VLM fold: a VL pool (single-node mlx_vlm.server) speaks the OpenAI
     # chat shape, not the Anthropic /v1/messages shape. Route VL through
     # /v1/chat/completions (its upstream doesn't serve /v1/messages).
@@ -9168,6 +10105,8 @@ async def anthropic_messages(req: AnthropicMessagesRequest, request: Request):
                                     session_id=session_id,
                                     request_id=msg_id,
                                     reasoning_effort=_default_reasoning_effort(model_id)):
+            # P8.1 — re-stamp per chunk (in-flight coverage, cf chat path).
+            _CLUSTER_LAST_SERVED[pool.cluster] = time.time()
             if ev.get("event") == "token":
                 if ttft_s is None:
                     ttft_s = time.time() - t_start
@@ -9244,6 +10183,8 @@ async def anthropic_messages(req: AnthropicMessagesRequest, request: Request):
                                         session_id=session_id,
                                         request_id=msg_id,
                                         reasoning_effort=_default_reasoning_effort(model_id)):
+                # P8.1 — re-stamp per chunk (in-flight coverage, cf chat path).
+                _CLUSTER_LAST_SERVED[pool.cluster] = time.time()
                 if await request.is_disconnected():
                     break
                 if ev.get("event") == "token":
@@ -9389,6 +10330,11 @@ class LoadRequest(BaseModel):
     # "depth": int, "sidecar": str?, "hidden_source": "post_norm"|"pre_norm",
     # "quantize": bool}. Default None = pure AR, zero behavior change.
     mtp: Optional[dict] = None
+    # Bypass is_vision routing and load through the text path anyway
+    # (e.g. a vision_config checkpoint whose quant scheme the node's
+    # mlx-vlm can't apply, served text-only). The load handler already
+    # reads this via getattr — the field was simply missing here.
+    force: bool = False
     # Hot-swap: when False (default since 2026-05-18 audit), the old pool
     # is stopped BEFORE the new one starts — no double-allocation in RAM.
     # Set True to overlap the load with the old serving (faster cutover,
@@ -9915,12 +10861,26 @@ _SYNC_MATRIX_TTL_S = 60.0
 
 
 def _ssh_exec(ssh_target: str, cmd: str, timeout: int = 12) -> tuple[int, str, str]:
-    """Shared SSH helper for the matrix endpoint."""
-    p = subprocess.run(
-        ["ssh", "-o", "ConnectTimeout=4", "-o", "BatchMode=yes", _safe_ssh_target(ssh_target), cmd],
-        capture_output=True, text=True, timeout=timeout,
-    )
-    return p.returncode, p.stdout, p.stderr
+    """Shared SSH helper. Hardened 2026-08-09 against a hung remote command —
+    THE root of the recurring "load stuck at 95%, must restart": `ConnectTimeout`
+    bounds only the TCP connect, and `subprocess.run(timeout=)` with
+    `capture_output` can still hang forever in the post-timeout pipe drain when
+    the remote leaves a process holding the pipe. That froze this ssh (called in
+    the load preflight) → the load coroutine + its admin lock never released.
+    Fixes: ServerAlive* makes ssh self-terminate if the node sends nothing for
+    ~15s (silent/hung remote), stdin=DEVNULL stops a grandchild holding stdin,
+    and TimeoutExpired returns a clean 124 verdict instead of propagating."""
+    try:
+        p = subprocess.run(
+            ["ssh", "-o", "ConnectTimeout=4", "-o", "BatchMode=yes",
+             "-o", "ServerAliveInterval=5", "-o", "ServerAliveCountMax=3",
+             _safe_ssh_target(ssh_target), cmd],
+            capture_output=True, text=True, timeout=timeout,
+            stdin=subprocess.DEVNULL,
+        )
+        return p.returncode, p.stdout, p.stderr
+    except subprocess.TimeoutExpired:
+        return 124, "", f"ssh command timeout after {timeout}s to {ssh_target}"
 
 
 async def _probe_host(host: dict) -> dict:
@@ -10959,6 +11919,11 @@ class ClusterConfigUpdate(BaseModel):
     # Soft-disable a cluster without removing its definition. Disabled clusters
     # refuse load via the admin API and are hidden from the dashboard.
     enabled: Optional[bool] = None
+    # Auto-reload toggles (per cluster, default True). reload_on_restart gates
+    # the container-startup desired-state restore; reload_on_reboot makes
+    # reboot-all re-load the pools once the nodes come back up.
+    reload_on_restart: Optional[bool] = None
+    reload_on_reboot: Optional[bool] = None
 
 
 def _pool_for_cluster(cluster_id: str):
@@ -11097,6 +12062,8 @@ async def admin_clusters_list():
             "backend": cd.get("backend"),
             "upstream": cd.get("upstream") or None,
             "enabled": _cluster_enabled(cid),
+            "reload_on_restart": _reload_on_restart(cid),
+            "reload_on_reboot": _reload_on_reboot(cid),
             "master_host": master.get("host"),
             "master_ssh": master.get("ssh"),
             "node_count": len(nodes),
@@ -11166,9 +12133,135 @@ async def admin_cluster_get(cluster_id: str):
         "upstream": cd.get("upstream"),
         "fallback": cd.get("fallback") or None,
         "enabled": _cluster_enabled(cluster_id),
+        # Auto-reload toggles (default True) — the dashboard renders a switch
+        # for each in Cluster settings.
+        "reload_on_restart": _reload_on_restart(cluster_id),
+        "reload_on_reboot": _reload_on_reboot(cluster_id),
         "capacity_by_nodes": capacity_by_nodes,
         "model_overhead_factor": _model_load_overhead_factor(),
     }
+
+
+async def _read_raw_config(ssh: str, abspath: str) -> dict:
+    """Raw config.json of a model dir (preflight needs the full dict — quant,
+    vision_config — not just get_model_arch_meta's distilled fields)."""
+    cmd = f"cat {shlex.quote(abspath.rstrip('/') + '/config.json')} 2>/dev/null"
+    try:
+        out = await asyncio.to_thread(
+            subprocess.run,
+            ["ssh", "-o", "ConnectTimeout=5", "-o", "BatchMode=yes", ssh, cmd],
+            capture_output=True, text=True, timeout=15)
+        cfg = json.loads(out.stdout or "{}")
+        return cfg if isinstance(cfg, dict) else {}
+    except Exception:
+        return {}
+
+
+async def _vlm_venv_present(ssh: str) -> bool:
+    """Does the node carry the mlx-vlm serving venv? Its absence is why a
+    vision load silently sticks at 95% (mlx_vlm.server: No such file)."""
+    binp = f"{VLM_DEFAULT_VENV}/bin/mlx_vlm.server"
+    cmd = f"test -x {shlex.quote(binp)} && echo yes || echo no"
+    try:
+        out = await asyncio.to_thread(
+            subprocess.run,
+            ["ssh", "-o", "ConnectTimeout=5", "-o", "BatchMode=yes", ssh, cmd],
+            capture_output=True, text=True, timeout=10)
+        return (out.stdout or "").strip() == "yes"
+    except Exception:
+        return False
+
+
+async def _coresidence_free_by_index(cluster_id: str, per_node: list[dict],
+                                     rank0_ssh: str, base_dir: str) -> dict:
+    """Free wired bytes per node index = ceiling − what loaded pools already
+    hold on that node. This is what makes "add a second pool" honest: the
+    planner picks a node with room (or refuses) instead of the silent 409.
+    A pool's footprint = its model size (du) split across its ranks."""
+    free = {}
+    for i, nd in enumerate(per_node):
+        free[i] = int(nd.get("wired_limit_bytes") or (nd.get("ram_bytes", 0) * 0.75))
+    for _alias, pool in list_pools(cluster_id):
+        ranks = (getattr(pool, "node_indices", None)
+                 or list(range(len(getattr(pool, "nodes", []) or [0]))))
+        mp = getattr(pool, "model", None)
+        if not mp or not ranks:
+            continue
+        try:
+            sz = await get_model_size_bytes(rank0_ssh, _resolve_model_abspath(mp, base_dir))
+        except Exception:
+            sz = 0
+        if not sz:
+            continue
+        per_rank = int(sz * 1.10 / max(len(ranks), 1))   # +activations headroom
+        for r in ranks:
+            if r in free:
+                free[r] = max(0, free[r] - per_rank)
+    return free
+
+
+async def _gather_preflight(cluster_id: str, model: str,
+                            draft: Optional[str] = None,
+                            nodes: Optional[int] = None) -> dict:
+    """Gather the facts + run the pure evaluator. Read-only, no GPU.
+
+    `nodes`: intended pool size. The model/config probe runs on the node the
+    pool would ACTUALLY land on (the first auto-selected FREE node), not always
+    rank0 — a co-resident pool targets free nodes that carry the model while
+    rank0 (busy with another pool) may not even have it rsynced. Without this
+    the preflight reported 'config absent' against the wrong node."""
+    import preflight
+    detail = await admin_cluster_get(cluster_id)
+    cap = detail.get("capacity_by_nodes", {})
+    max_nodes = int(detail.get("max_nodes", 1) or 1)
+    per_node = (cap.get(str(max_nodes)) or {}).get("per_node") or []
+    base_dir = models_dir_for(cluster_id)
+    # Probe the intended target node (first free one for `nodes`), else rank0.
+    rank0 = rank0_ssh_for_cluster(cluster_id, 1)
+    if nodes:
+        _used = set()
+        for _a, _p in list_pools(cluster_id):
+            for _n in _p.nodes:
+                _h = _n.get("host")
+                _i = _host_to_index(cluster_id, _h) if _h else None
+                if _i is not None:
+                    _used.add(_i)
+        _free = [i for i in range(max_nodes) if i not in _used]
+        _target = (_free[:nodes] if len(_free) >= nodes else list(range(nodes)))
+        try:
+            rank0 = build_topology_from_indices(cluster_id, _target)[0]["ssh"]
+        except Exception:
+            pass
+    abspath = _resolve_model_abspath(model, base_dir)
+    cfg = await _read_raw_config(rank0, abspath)
+    size = await get_model_size_bytes(rank0, abspath)
+    is_vision = bool(cfg.get("vision_config") or "vision" in (cfg.get("model_type") or "").lower())
+    vlm_present = await _vlm_venv_present(rank0) if is_vision else None
+    draft_cfg = draft_size = None
+    if draft:
+        d_abs = _resolve_model_abspath(draft, base_dir)
+        draft_cfg = await _read_raw_config(rank0, d_abs)
+        draft_size = await get_model_size_bytes(rank0, d_abs)
+    free_by_index = await _coresidence_free_by_index(cluster_id, per_node, rank0, base_dir)
+    return preflight.evaluate(
+        config=cfg, size_bytes=size, capacity_by_nodes=cap, max_nodes=max_nodes,
+        per_node=per_node, free_by_index=free_by_index,
+        vlm_venv_present=vlm_present,
+        draft_config=draft_cfg, draft_size_bytes=draft_size or 0)
+
+
+@app.get("/admin/clusters/{cluster_id}/preflight")
+async def admin_cluster_preflight(cluster_id: str, model: str,
+                                  draft: Optional[str] = None,
+                                  nodes: Optional[int] = None):
+    """Pro-loader pre-flight: verdict + node plan BEFORE loading. Read-only.
+    The dashboard calls this on model pick to auto-select nodes + show the
+    verdict; admin_cluster_load calls the same evaluator as a gate. Pass
+    `nodes` for a co-resident pool so the probe hits the target free node,
+    not rank0 (which may be busy with another pool and lack the model)."""
+    if not cluster_exists(cluster_id):
+        raise HTTPException(404, f"unknown cluster {cluster_id}")
+    return await _gather_preflight(cluster_id, model, draft, nodes=nodes)
 
 
 @app.put("/admin/clusters/{cluster_id}")
@@ -11265,6 +12358,10 @@ async def admin_cluster_update(cluster_id: str, req: ClusterConfigUpdate):
         if req.enabled is False and pool is not None and getattr(pool, "loaded", False):
             raise HTTPException(409, f"{cluster_id} is loaded — unload first to disable")
         persist["enabled"] = bool(req.enabled)
+    if req.reload_on_restart is not None:
+        persist["reload_on_restart"] = bool(req.reload_on_restart)
+    if req.reload_on_reboot is not None:
+        persist["reload_on_reboot"] = bool(req.reload_on_reboot)
     if req.upstream is not None: persist["upstream"] = candidate["upstream"]
     if req.fallback is not None:
         # Empty string clears the fallback; non-empty validates against published cloud aliases.
@@ -11304,9 +12401,72 @@ async def admin_cluster_delete(cluster_id: str):
     return {"ok": True, "removed": cluster_id}
 
 
+async def _wait_nodes_up(cluster_id: str, timeout_s: int = 420,
+                         interval_s: int = 10) -> bool:
+    """Poll every host in the cluster until all answer SSH (`echo up`) or the
+    timeout elapses. Used by the reboot-reload path to know the machines are
+    back before re-launching runners."""
+    member_ids = _cluster_host_ids(cluster_id)
+    hosts = [_resolve_host(hid) for hid in member_ids]
+    hosts = [h for h in hosts if h]
+    if not hosts:
+        return False
+
+    async def _up(h) -> bool:
+        try:
+            rc, out, _ = await asyncio.to_thread(_ssh_exec, h["ssh"], "echo up", 8)
+            return rc == 0 and "up" in out
+        except Exception:
+            return False
+
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        oks = await asyncio.gather(*[_up(h) for h in hosts])
+        if all(oks):
+            return True
+        await asyncio.sleep(interval_s)
+    return False
+
+
+async def _reboot_reload_after(cluster_id: str) -> None:
+    """Background task scheduled by reboot-all when reload_on_reboot is on: wait
+    for the cluster's nodes to come back SSH-up, sweep any orphan runners, then
+    re-load the pools that were loaded before the reboot (via the shared
+    _restore_cluster_pools). Best-effort — a failure only logs; the desired
+    state is preserved so a later restart still re-attempts the pools."""
+    try:
+        # Give the machines a moment to actually go DOWN before polling for up,
+        # so we don't read the pre-reboot uptime as "already back".
+        await asyncio.sleep(30)
+        if not await _wait_nodes_up(cluster_id):
+            sys.stderr.write(
+                f"[api] reboot-reload ({cluster_id}): nodes did not return "
+                f"within timeout — skipping reload (desired-state kept)\n")
+            return
+        # Clear dead in-memory pools + orphan runners so the restore is clean
+        # (the reboot killed every rank; their queue pairs must be swept before
+        # JACCL can re-init).
+        try:
+            await _purge_dead_pools(cluster_id)
+        except Exception:
+            pass
+        try:
+            await asyncio.to_thread(_sweep_orphan_runners, cluster_id)
+        except Exception:
+            pass
+        restored = await _restore_cluster_pools(cluster_id)
+        sys.stderr.write(
+            f"[api] reboot-reload ({cluster_id}): restored "
+            f"{restored if restored else 'nothing'}\n")
+    except Exception as e:
+        sys.stderr.write(f"[api] reboot-reload ({cluster_id}) failed: {e}\n")
+
+
 @app.post("/admin/clusters/{cluster_id}/reboot-all")
 async def admin_cluster_reboot_all(cluster_id: str):
-    """Reboot every host in this cluster in parallel."""
+    """Reboot every host in this cluster in parallel. When reload_on_reboot is
+    on (default), schedule a background task that waits for the nodes to return
+    and re-loads the pools that were loaded before the reboot."""
     member_ids = _cluster_host_ids(cluster_id)
     if not member_ids:
         raise HTTPException(404, f"unknown cluster: {cluster_id}")
@@ -11315,7 +12475,12 @@ async def admin_cluster_reboot_all(cluster_id: str):
     if not hosts:
         raise HTTPException(404, "no resolved hosts")
     results = await asyncio.gather(*[_reboot_one(h) for h in hosts])
-    return {"ok": True, "cluster": cluster_id, "results": results}
+    reload_scheduled = False
+    if _reload_on_reboot(cluster_id):
+        asyncio.create_task(_reboot_reload_after(cluster_id))
+        reload_scheduled = True
+    return {"ok": True, "cluster": cluster_id, "results": results,
+            "reload_scheduled": reload_scheduled}
 
 
 class BulkDeleteRequest(BaseModel):
@@ -11759,9 +12924,23 @@ class ArgoLoadRequest(BaseModel):
     # the load auto-detects and serves it single-node via mlx_vlm.server as a
     # VL pool under this cluster. These optional fields tune that launch; they
     # are IGNORED for text (distributed) loads.
-    vlm_port: Optional[int] = None        # default VLM_DEFAULT_PORT (8080)
-    venv: Optional[str] = None            # default VLM_DEFAULT_VENV
+    vlm_port: Optional[int] = None        # default VLM_DEFAULT_PORT (8080) — reused as the dflash port too
+    venv: Optional[str] = None            # default VLM_DEFAULT_VENV (mlx-dspark lives here too)
     ready_timeout_s: Optional[float] = None  # default VLM_READY_TIMEOUT_S
+    # B1 dflash-dense (2026-08-06). Explicit opt-in: serve a DENSE target (e.g.
+    # Gemma-4-31B) single-node via `mlx-dspark serve --mode dflash` with the
+    # DFlash block-diffusion drafter `draft`, registered as a TEXT proxy pool
+    # under this cluster (replaces standalone dspartha). Ignored for normal
+    # text/VL loads. `draft` is required when dflash=True.
+    dflash: bool = False
+    draft: Optional[str] = None            # DFlash drafter path/id (rel to models_dir or abs)
+    dflash_max_draft: Optional[int] = None  # default DFLASH_MAX_DRAFT
+    # Toggle "use drafter" (2026-08-09). Gates the `model_drafters` auto-attach:
+    # None/True = attach the registered drafter when one exists (historic
+    # behavior); False = load PLAIN even when an association is registered.
+    # The dashboard checkbox sends the explicit bool, so switching between
+    # spec and plain is one click — no more editing cluster-config to disable.
+    use_drafter: Optional[bool] = None
 
 
 @app.get("/admin/clusters/{cluster_id}/load-options")
@@ -11808,7 +12987,8 @@ async def admin_cluster_load_options(cluster_id: str, model: str):
             # Fit is mode-dependent: pipeline gets the capacity-aware split.
             fit_ok, fit_reason, fit_detail = _validate_load_fits(
                 size_bytes, cluster_id, n,
-                mode="pipeline" if mode in ("solo", "pipeline") else mode)
+                mode="pipeline" if mode in ("solo", "pipeline") else mode,
+                arch=arch)
             # solo reuses the pipeline arch-validity (always ok for n==1).
             mode_ok, mode_reason = _validate_load_mode(
                 mt, layers, kv, n, "pipeline" if mode == "solo" else mode)
@@ -11853,6 +13033,27 @@ async def admin_cluster_load(cluster_id: str, req: ArgoLoadRequest):
     if cd.get("kind") == "telemak":
         await _telemak_reconcile_models_dir(cluster_id, cd)
         return await _telemak_proxy_load(cluster_id, cd, req)
+    # ── Pre-flight gate (pro loader) ──────────────────────────────────────
+    # Evaluate size / format / support / vision-venv / capacity BEFORE
+    # committing — refuse a load that will 100% fail (model absent from the
+    # node, won't fit any topology, VLM venv missing → the stuck-at-95%) instead
+    # of grinding for minutes then dying. Read-only, ~1s. force=true bypasses.
+    # Fail-OPEN: any error in the evaluator must never block a real load.
+    if not getattr(req, "force", False):
+        try:
+            _pf = await _gather_preflight(cluster_id, req.model,
+                                          getattr(req, "draft_model", None))
+        except Exception:
+            _pf = None
+        if _pf and not _pf.get("ok"):
+            raise HTTPException(422, {
+                "error": "preflight_refused",
+                "summary": _pf.get("summary"),
+                "blockers": _pf.get("blockers"),
+                "warnings": _pf.get("warnings"),
+                "plan": _pf.get("plan"),
+                "hint": "corrige la cause, ou relance avec force=true pour outrepasser",
+            })
     # Block reload if the cluster is currently flagged degraded — a JACCL
     # queue-pair stuck in TIME_WAIT or a wired-memory leak makes the next
     # load almost certain to crash the same way. Operator runs
@@ -11907,7 +13108,21 @@ async def admin_cluster_load(cluster_id: str, req: ArgoLoadRequest):
                 400,
                 f"{cluster_id}: unsupported nodes={req.nodes} (available: {avail}, max={effective_max})"
             )
-        node_indices = list(range(req.nodes))
+        # Auto-select FREE nodes (skip indices held by other loaded pools) so a
+        # co-resident pool doesn't blindly collide on node 0. `list(range(N))`
+        # started at 0 → a 2nd pool always 409'd against a pool on node 0 even
+        # when other nodes were free. Falls back to [0..N-1] when nothing frees
+        # up enough (the disjoint-subset 409 below then fires with the real hint).
+        _used_now = set()
+        for _a, _p in list_pools(cluster_id):
+            for _n in _p.nodes:
+                _h = _n.get("host")
+                _idx = _host_to_index(cluster_id, _h) if _h else None
+                if _idx is not None:
+                    _used_now.add(_idx)
+        _free = [i for i in range(effective_max) if i not in _used_now]
+        node_indices = (_free[:req.nodes] if len(_free) >= req.nodes
+                        else list(range(req.nodes)))
         nodes_count = req.nodes
 
     # Purge any pool whose runners have all died (OOM, panic, node reboot).
@@ -11943,11 +13158,34 @@ async def admin_cluster_load(cluster_id: str, req: ArgoLoadRequest):
                 used.add(i)
     overlap = set(node_indices) & used
     if overlap:
-        raise HTTPException(
-            409,
-            f"{cluster_id}: requested nodes {sorted(overlap)} are already in use by "
-            f"another loaded pool. Pick a disjoint subset."
+        # SINGLE-node pools can CO-RESIDE on one node — they're independent
+        # runner processes, RAM-gated by the operator / pro-loader (e.g. two
+        # 30B-A3B 6-bit ≈ 24GB each on a 96GB node). Only DISTRIBUTED pools
+        # (nodes>1: pipeline/tensor sharding + ring/jaccl collectives) need
+        # EXCLUSIVE nodes — two of them on one node would collide. So refuse
+        # the overlap only when the new pool OR an overlapping loaded pool is
+        # multi-node. (Regression fix: the blanket 409 broke the long-standing
+        # 2-pools-on-one-node setup.)
+        def _pool_indices(p):
+            out = set()
+            for _n in getattr(p, "nodes", []) or []:
+                _i = _host_to_index(cluster_id, _n.get("host")) if _n.get("host") else None
+                if _i is not None:
+                    out.add(_i)
+            return out
+        overlapping_multinode = any(
+            len(_pool_indices(p)) > 1
+            for a, p in list_pools(cluster_id)
+            if a != alias and (_pool_indices(p) & overlap)
         )
+        if nodes_count > 1 or overlapping_multinode:
+            raise HTTPException(
+                409,
+                f"{cluster_id}: requested nodes {sorted(overlap)} are already in use "
+                f"by a DISTRIBUTED pool (or this load is multi-node) — distributed "
+                f"pools need exclusive nodes. Pick a disjoint subset."
+            )
+        # else: single-node co-residence — allowed (capacity is the operator's).
 
     topo = build_topology_from_indices(cluster_id, node_indices)
 
@@ -11978,11 +13216,103 @@ async def admin_cluster_load(cluster_id: str, req: ArgoLoadRequest):
     base_dir = topo[0].get("models_dir") or models_dir_for(cluster_id)
     model_abspath = _resolve_model_abspath(req.model, base_dir)
 
+    # Model→drafter association (2026-08-06): a model whose drafter is registered
+    # in cluster-config `model_drafters` loads WITH its drafter AUTOMATICALLY — the
+    # drafter is a property of the model, not a per-load UI choice. One dashboard
+    # Load click serves with the drafter: no draft field, no API trick. Handles
+    # BOTH kinds — DSpark spec via `draft_model` (e.g. DSV4-Flash) and dense DFlash
+    # via `dflash`+`draft` (e.g. Gemma). Applied only when the request specified
+    # neither (an explicit choice always wins).
+    if (req.use_drafter is not False
+            and not req.draft_model and not getattr(req, "dflash", False)
+            and not getattr(req, "draft", None)):
+        _assoc = _drafter_for_model(model_abspath)
+        if _assoc and _assoc.get("dflash") and _assoc.get("draft"):
+            req.dflash = True
+            req.draft = _assoc["draft"]
+            if _assoc.get("num_draft_tokens"):
+                req.dflash_max_draft = int(_assoc["num_draft_tokens"])
+            sys.stderr.write(
+                f"[load] auto-attached DFlash drafter for {req.model} → {req.draft}\n")
+        elif _assoc and _assoc.get("draft_model"):
+            req.draft_model = _assoc["draft_model"]
+            if _assoc.get("num_draft_tokens"):
+                req.num_draft_tokens = int(_assoc["num_draft_tokens"])
+            sys.stderr.write(
+                f"[load] auto-attached drafter for {req.model} → {req.draft_model}\n")
+
     # Mode/architecture preflight: reject combinations the model can't do
     # (tensor on a pipeline-only model_type, KV-heads not divisible by N,
     # pipeline with more nodes than layers) BEFORE spawning runners that would
     # just die at the barrier. Independent of the RAM check below.
     arch = await get_model_arch_meta(rank0_ssh, model_abspath)
+
+    # B1 dflash-dense (2026-08-06). Explicit opt-in, checked BEFORE the is_vision
+    # auto-detect (a gemma-4 text checkpoint may otherwise trip the VL path).
+    # Serve a DENSE target single-node via `mlx-dspark serve --mode dflash` with
+    # a DFlash drafter, registered as a TEXT proxy pool under this cluster
+    # (replaces standalone dspartha; chat routes internally via http-proxy).
+    if getattr(req, "dflash", False):
+        if not getattr(req, "draft", None):
+            raise HTTPException(400, "dflash load requires `draft` (DFlash drafter path/id)")
+        df_index = node_indices[0]
+        df_topo = build_topology_from_indices(cluster_id, [df_index])
+        df_ssh = df_topo[0]["ssh"]
+        df_host = df_topo[0].get("host") or _host_id_from_ssh(df_ssh)
+        df_port = int(getattr(req, "vlm_port", None) or DFLASH_DEFAULT_PORT)
+        df_model_path = _vlm_resolve_model_path(req.model, base_dir)
+        df_drafter_path = _vlm_resolve_model_path(req.draft, base_dir)
+        df_max_draft = int(getattr(req, "dflash_max_draft", None) or DFLASH_MAX_DRAFT)
+        df_ip = _vlm_ip_from_ssh(df_ssh)
+        df_upstream = f"http://{df_ip}:{df_port}"
+        log_id = _dflash_pool_log_id(cluster_id, alias)
+        if await _vlm_probe_ready(df_ip, df_port) is True:
+            raise HTTPException(
+                409,
+                f"{df_ip}:{df_port} already serving — unload the dflash pool first "
+                f"(POST /admin/clusters/{cluster_id}/unload?alias={alias}) or pick another port",
+            )
+        df_size_bytes = await get_model_size_bytes(df_ssh, df_model_path)
+        df_estimated_s = estimate_load_s(req.model, df_size_bytes, cluster_id, 1)
+        df_loading_state = _loading_state_for(cluster_id)
+        _begin_loading(df_loading_state, req.model, 1, df_size_bytes, df_estimated_s)
+        _t_launch = time.time()
+        try:
+            async with get_admin_lock(cluster_id):
+                ready, launched_pid, tail = await _launch_dflash_server(
+                    df_ssh, log_id, df_model_path, df_drafter_path, df_port,
+                    (getattr(req, "venv", None) or VLM_DEFAULT_VENV), df_max_draft,
+                    float(getattr(req, "ready_timeout_s", None) or VLM_READY_TIMEOUT_S),
+                )
+                if not ready:
+                    raise HTTPException(
+                        503,
+                        f"mlx-dspark serve (dflash) did not become ready on "
+                        f"{df_upstream} (node {df_host}). Log tail:\n{tail}",
+                    )
+                dfpool = DFlashPool(
+                    model_path=df_model_path, cluster=cluster_id, alias=alias,
+                    node_indices=[df_index], upstream=df_upstream, port=df_port,
+                    ssh_target=df_ssh, host=df_host, drafter=df_drafter_path,
+                    max_draft=df_max_draft, pid=launched_pid,
+                )
+                dfpool.load_s = time.time() - _t_launch
+                set_pool(cluster_id, alias, dfpool)
+                save_cluster_state_v2(cluster_id)
+        finally:
+            _end_loading(df_loading_state)
+        return {
+            "loaded": True, "cluster": cluster_id, "alias": alias,
+            "is_dflash": True, "dispatched": "dflash-pool",
+            "model": df_model_path, "drafter": df_drafter_path,
+            "upstream": df_upstream, "node": df_host, "node_index": df_index,
+            "pid": launched_pid,
+            "note": (
+                f"{req.model} served single-node by mlx-dspark serve --mode dflash "
+                f"(drafter {req.draft}) on {df_host}, registered as dflash TEXT pool "
+                f"'{alias}' under {cluster_id} (chat routes internally)."
+            ),
+        }
 
     # Argo-VLM fold (2026-07-02). Unified load auto-detect. The distributed
     # text runner can't run a vision model — VL models serve single-node via
@@ -11995,6 +13325,127 @@ async def admin_cluster_load(cluster_id: str, req: ArgoLoadRequest):
     # attempt a (doomed) text load anyway. Multi-node VL requests collapse to
     # a single node (the first requested index, else index 0 = master).
     if arch.get("is_vision") and not getattr(req, "force", False):
+        # Inkling (inkling_mm_model): OUR native multimodal server, not
+        # mlx_vlm.server (no loader) nor the slow mlx_lm text adapter. Native
+        # inkling_mlx: 25 tok/s text + working vision tower (validated 2026-08-10).
+        if (arch.get("model_type") or "").lower() == "inkling_mm_model":
+            ink_index = node_indices[0]
+            ink_topo = build_topology_from_indices(cluster_id, [ink_index])
+            ink_ssh = ink_topo[0]["ssh"]
+            ink_host = ink_topo[0].get("host") or _host_id_from_ssh(ink_ssh)
+            ink_port = int(getattr(req, "vlm_port", None) or INKLING_DEFAULT_PORT)
+            ink_model_path = _vlm_resolve_model_path(req.model, base_dir)
+            ink_ip = _vlm_ip_from_ssh(ink_ssh)
+            ink_upstream = f"http://{ink_ip}:{ink_port}"
+            log_id = _inkling_pool_log_id(cluster_id, alias)
+            ink_size = await get_model_size_bytes(ink_ssh, ink_model_path)
+            ink_est = estimate_load_s(req.model, ink_size, cluster_id, 1)
+            ink_state = _loading_state_for(cluster_id)
+            _begin_loading(ink_state, req.model, 1, ink_size, ink_est)
+            _t_ink = time.time()
+            pid = None
+            try:
+                async with get_admin_lock(cluster_id):
+                    if await _vlm_probe_ready(ink_ip, ink_port) is not True:
+                        ready, pid, tail = await _launch_inkling_server(
+                            ink_ssh, log_id, ink_model_path, ink_port,
+                            (getattr(req, "venv", None) or VLM_DEFAULT_VENV),
+                            float(getattr(req, "ready_timeout_s", None) or VLM_READY_TIMEOUT_S),
+                        )
+                        if not ready:
+                            raise HTTPException(
+                                503,
+                                f"inkling_server did not become ready on {ink_upstream} "
+                                f"(node {ink_host}). Log tail:\n{tail}",
+                            )
+                    old = get_pool(cluster_id, alias)
+                    if old is not None:
+                        try:
+                            await old.stop()
+                        except Exception:
+                            pass
+                    ipool = InklingPool(
+                        model_path=ink_model_path, cluster=cluster_id, alias=alias,
+                        node_indices=[ink_index], upstream=ink_upstream, port=ink_port,
+                        ssh_target=ink_ssh, host=ink_host, pid=pid,
+                    )
+                    ipool.load_s = time.time() - _t_ink
+                    set_pool(cluster_id, alias, ipool)
+                    save_cluster_state_v2(cluster_id)
+            finally:
+                _end_loading(ink_state)
+            return {
+                "loaded": True, "cluster": cluster_id, "alias": alias,
+                "is_vlm": True, "is_inkling": True, "dispatched": "inkling-pool",
+                "model": ink_model_path, "upstream": ink_upstream,
+                "node": ink_host, "node_index": ink_index, "pid": pid,
+                "note": (
+                    f"{req.model} served MULTIMODAL by native inkling_server on "
+                    f"{ink_host} (25 tok/s text + vision), registered as pool "
+                    f"'{alias}' under {cluster_id} (chat routes internally)."
+                ),
+            }
+        # Muse-Glimmer (muse_glimmer): OUR native harmony/ATEM multimodal server
+        # (muse_glimmer_mlx runtime), not mlx_vlm.server (no loader). Native
+        # ~14 tok/s text + reasoning-split + ATEM tool_calls + vision tower.
+        if (arch.get("model_type") or "").lower() == "muse_glimmer":
+            mg_index = node_indices[0]
+            mg_topo = build_topology_from_indices(cluster_id, [mg_index])
+            mg_ssh = mg_topo[0]["ssh"]
+            mg_host = mg_topo[0].get("host") or _host_id_from_ssh(mg_ssh)
+            mg_port = int(getattr(req, "vlm_port", None) or MUSE_DEFAULT_PORT)
+            mg_model_path = _vlm_resolve_model_path(req.model, base_dir)
+            mg_ip = _vlm_ip_from_ssh(mg_ssh)
+            mg_upstream = f"http://{mg_ip}:{mg_port}"
+            log_id = _muse_pool_log_id(cluster_id, alias)
+            mg_size = await get_model_size_bytes(mg_ssh, mg_model_path)
+            mg_est = estimate_load_s(req.model, mg_size, cluster_id, 1)
+            mg_state = _loading_state_for(cluster_id)
+            _begin_loading(mg_state, req.model, 1, mg_size, mg_est)
+            _t_mg = time.time()
+            pid = None
+            try:
+                async with get_admin_lock(cluster_id):
+                    if await _vlm_probe_ready(mg_ip, mg_port) is not True:
+                        ready, pid, tail = await _launch_muse_glimmer_server(
+                            mg_ssh, log_id, mg_model_path, mg_port,
+                            (getattr(req, "venv", None) or VLM_DEFAULT_VENV),
+                            float(getattr(req, "ready_timeout_s", None) or VLM_READY_TIMEOUT_S),
+                        )
+                        if not ready:
+                            raise HTTPException(
+                                503,
+                                f"muse_glimmer_server did not become ready on "
+                                f"{mg_upstream} (node {mg_host}). Log tail:\n{tail}",
+                            )
+                    old = get_pool(cluster_id, alias)
+                    if old is not None:
+                        try:
+                            await old.stop()
+                        except Exception:
+                            pass
+                    mgpool = MuseGlimmerPool(
+                        model_path=mg_model_path, cluster=cluster_id, alias=alias,
+                        node_indices=[mg_index], upstream=mg_upstream, port=mg_port,
+                        ssh_target=mg_ssh, host=mg_host, pid=pid,
+                    )
+                    mgpool.load_s = time.time() - _t_mg
+                    set_pool(cluster_id, alias, mgpool)
+                    save_cluster_state_v2(cluster_id)
+            finally:
+                _end_loading(mg_state)
+            return {
+                "loaded": True, "cluster": cluster_id, "alias": alias,
+                "is_vlm": True, "is_muse": True, "dispatched": "muse-pool",
+                "model": mg_model_path, "upstream": mg_upstream,
+                "node": mg_host, "node_index": mg_index, "pid": pid,
+                "note": (
+                    f"{req.model} served MULTIMODAL by native muse_glimmer_server "
+                    f"on {mg_host} (harmony reasoning + ATEM tools + vision), "
+                    f"registered as pool '{alias}' under {cluster_id} "
+                    f"(chat routes internally)."
+                ),
+            }
         # Distributed VL path (feature-flagged). With VLM_DISTRIBUTED_ENABLED
         # and an explicit multi-node request, spawn tensor-parallel
         # vlm_runner.py ranks over ring/TCP instead of clamping to one node.
@@ -12149,7 +13600,7 @@ async def admin_cluster_load(cluster_id: str, req: ArgoLoadRequest):
 
     size_bytes = await get_model_size_bytes(rank0_ssh, model_abspath)
     ok, reason, detail = _validate_load_fits(size_bytes, cluster_id, nodes_count,
-                                             mode=req.mode)
+                                             mode=req.mode, arch=arch)
     if not ok and not getattr(req, "force", False):
         raise HTTPException(400, {
             "error": "model_too_big_for_cluster",
@@ -12164,13 +13615,21 @@ async def admin_cluster_load(cluster_id: str, req: ArgoLoadRequest):
     loading_state = _loading_state_for(cluster_id)
     async with get_admin_lock(cluster_id):
         _begin_loading(loading_state, req.model, nodes_count, size_bytes, estimated_s)
+        _start_progress_poller(cluster_id, loading_state,
+                               [n.get("ssh") for n in topo if n.get("ssh")],
+                               size_bytes)
         try:
             old = get_pool(cluster_id, alias)
             if old is not None and not req.force_hot_swap:
                 sys.stderr.write(
                     f"[load] {cluster_id}[{alias}]: stopping old pool before starting new\n"
                 )
-                await old.stop()
+                try:
+                    await asyncio.wait_for(old.stop(), timeout=_OLD_STOP_TIMEOUT_S)
+                except asyncio.TimeoutError:
+                    sys.stderr.write(
+                        f"[load] {cluster_id}[{alias}]: old-pool stop timed out after "
+                        f"{_OLD_STOP_TIMEOUT_S:.0f}s — proceeding, orphan sweep will reap\n")
                 old = None
                 del_pool(cluster_id, alias)
             new_pool = RunnerPool(
@@ -12442,8 +13901,16 @@ async def _telemak_proxy_chat_completion(
                 msg = choice.get("message") or {}
                 raw = msg.get("content") or ""
                 _om, _cm = _model_think_markers(upstream_model)
-                state = {"in_think": not raw.lstrip().startswith(_om),
-                         "carry": "", "open": _om, "close": _cm}
+                # Seed in_think only when the model auto-opens AND the raw output
+                # doesn't already start with its own open tag. `_seed_in_think`
+                # is False for models that emit their own open (inkling, whose
+                # no-think reply starts with the DIFFERENT `<|content_text|>`
+                # envelope tag → the old `not startswith(open)` heuristic alone
+                # wrongly seeded True and trapped the whole answer in reasoning).
+                state = {"in_think": (_seed_in_think(upstream_model, body.get("enable_thinking"))
+                                      and not raw.lstrip().startswith(_om)),
+                         "carry": "", "open": _om, "close": _cm,
+                         "strip": _model_think_strips(upstream_model)}
                 vis, reas = _split_think_stream(raw, state)
                 vis2, reas2 = _flush_think_stream(state)
                 visible = (vis + vis2).lstrip()
@@ -12475,7 +13942,8 @@ async def _telemak_proxy_chat_completion(
         if auto_think:
             _om, _cm = _model_think_markers(upstream_model)
             state = {"in_think": _seed_in_think(upstream_model, body.get("enable_thinking")),
-                     "carry": "", "open": _om, "close": _cm}
+                     "carry": "", "open": _om, "close": _cm,
+                     "strip": _model_think_strips(upstream_model)}
         else:
             state = None
         _ttft: list = []          # mutable cell for TTFT
@@ -12700,8 +14168,16 @@ async def _vlm_pool_proxy_chat_completion(pool, body: dict, stream: bool):
                 msg = choice.get("message") or {}
                 raw = msg.get("content") or ""
                 _om, _cm = _model_think_markers(upstream_model)
-                state = {"in_think": not raw.lstrip().startswith(_om),
-                         "carry": "", "open": _om, "close": _cm}
+                # Seed in_think only when the model auto-opens AND the raw output
+                # doesn't already start with its own open tag. `_seed_in_think`
+                # is False for models that emit their own open (inkling, whose
+                # no-think reply starts with the DIFFERENT `<|content_text|>`
+                # envelope tag → the old `not startswith(open)` heuristic alone
+                # wrongly seeded True and trapped the whole answer in reasoning).
+                state = {"in_think": (_seed_in_think(upstream_model, body.get("enable_thinking"))
+                                      and not raw.lstrip().startswith(_om)),
+                         "carry": "", "open": _om, "close": _cm,
+                         "strip": _model_think_strips(upstream_model)}
                 vis, reas = _split_think_stream(raw, state)
                 vis2, reas2 = _flush_think_stream(state)
                 visible = (vis + vis2).lstrip()
@@ -12731,7 +14207,8 @@ async def _vlm_pool_proxy_chat_completion(pool, body: dict, stream: bool):
         if auto_think:
             _om, _cm = _model_think_markers(upstream_model)
             state = {"in_think": _seed_in_think(upstream_model, body.get("enable_thinking")),
-                     "carry": "", "open": _om, "close": _cm}
+                     "carry": "", "open": _om, "close": _cm,
+                     "strip": _model_think_strips(upstream_model)}
         else:
             state = None
         _ttft: list = []
@@ -13398,6 +14875,28 @@ async def admin_cluster_unload(
     """
     if not cluster_exists(cluster_id):
         raise HTTPException(404, f"unknown cluster {cluster_id}")
+    # P8.1 — unload-guard: refuse an unload within UNLOAD_GUARD_S seconds of
+    # this cluster having served a request, unless the caller passes
+    # {"force": true}. Runs before any unload action, including the telemak
+    # proxy branch below (incident 2026-08-04: an unload killed a live
+    # 1183-token generation mid-flight).
+    payload: Optional[dict] = None
+    try:
+        raw = await request.body()
+        if raw:
+            parsed = json.loads(raw)
+            if isinstance(parsed, dict):
+                payload = parsed
+    except Exception:
+        pass
+    body_force = bool((payload or {}).get("force"))
+    last = _CLUSTER_LAST_SERVED.get(cluster_id, 0.0)
+    if not body_force and last and (time.time() - last) < UNLOAD_GUARD_S:
+        raise HTTPException(409, {
+            "error": "unload_guard",
+            "message": f"cluster served a request {time.time()-last:.1f}s ago "
+                       f"(guard {UNLOAD_GUARD_S:.0f}s); pass force:true to override",
+        })
     # kind=telemak: proxy to upstream /admin/unload. Optional `model` in
     # the body targets a specific loaded model; absent → unload all.
     cd_proxy = get_cluster_def(cluster_id)
@@ -14015,6 +15514,289 @@ async def _restore_vlm_pool(cluster_id: str, alias: str, entry: dict,
         model_path=model_path, cluster=cluster_id, alias=alias,
         node_indices=indices, upstream=upstream, port=port,
         ssh_target=ssh_target, host=host, pid=pid,
+    )
+
+
+# ── B1 dflash-dense managed pool (2026-08-06) ──────────────────────────────────
+# `mlx-dspark serve --mode dflash` is a single-node OpenAI server (like
+# mlx_vlm.server) that runs a DENSE target + a DFlash block-diffusion drafter.
+# These helpers mirror the VLM-fold ones so the engine owns the process
+# lifecycle (replaces standalone dspartha). It lives in the SAME mlx-vlm venv.
+DFLASH_MAX_DRAFT = int(env_get("DFLASH_MAX_DRAFT", "4") or "4")
+DFLASH_DEFAULT_PORT = int(env_get("DFLASH_PORT", "8091") or "8091")
+
+
+def _dflash_launch_cmd(vlm_id: str, venv: str, model_path: str,
+                       drafter_path: str, port: int, max_draft: int) -> str:
+    """nohup `mlx-dspark serve --mode dflash` with a full exported env — mirrors
+    _vlm_launch_cmd. Echoes VLM_PID=$! for the caller to capture."""
+    venv_bin = f"{venv.rstrip('/')}/bin"
+    server_bin = f"{venv_bin}/mlx-dspark"
+    log = _vlm_log_path(vlm_id)
+    return (
+        f"export HOME=/Users/admin USER=admin TMPDIR=/tmp "
+        f"PATH={shlex.quote(venv_bin)}:/usr/bin:/bin:/usr/sbin:/sbin && "
+        f"nohup {shlex.quote(server_bin)} serve "
+        f"--model {shlex.quote(model_path)} "
+        f"--mode dflash --drafter {shlex.quote(drafter_path)} "
+        f"--max-draft {int(max_draft)} "
+        f"--host 0.0.0.0 --port {int(port)} "
+        f"> {log} 2>&1 & "
+        f"echo VLM_PID=$!"
+    )
+
+
+def _dflash_kill_cmd(port: int, model_path: str) -> str:
+    """SIGTERM → grace → SIGKILL of the mlx-dspark serve for THIS port — mirrors
+    _vlm_kill_cmd. Matches `mlx-dspark serve.*--port <port>` (the ` ` after the
+    port token keeps 8091 from matching 80911)."""
+    pattern = shlex.quote(f"mlx-dspark serve.*--port {int(port)}( |$)")
+    return (
+        f"if pgrep -f {pattern} >/dev/null 2>&1; then "
+        f"  pkill -TERM -f {pattern} 2>/dev/null; "
+        f"  for i in $(seq 1 {_SWEEP_GRACE_ITERS}); do "
+        f"    pgrep -f {pattern} >/dev/null 2>&1 || break; "
+        f"    sleep 0.5; "
+        f"  done; "
+        f"  if pgrep -f {pattern} >/dev/null 2>&1; then "
+        f"    pkill -9 -f {pattern}; echo 'killed (SIGKILL)'; "
+        f"  else echo 'cleaned (SIGTERM)'; fi; "
+        f"else echo 'no process'; fi"
+    )
+
+
+def _dflash_pool_log_id(cluster_id: str, alias: str) -> str:
+    """Per-(cluster, alias) log slug for a dflash pool's server, in the same
+    [a-z0-9-] shape _vlm_log_path expects."""
+    raw = f"{cluster_id}-{alias}-dflash"
+    return re.sub(r"[^a-z0-9-]", "-", raw.lower())[:41].strip("-") or "dflash"
+
+
+# ── Inkling native multimodal server (2026-08-10) ─────────────────────────────
+# scripts/inkling_server.py wraps pipenetwork's `inkling_mlx` package (its HF
+# card's prescribed path) as an OpenAI server. Deployed on each serving node at
+# ~/mlx-cluster/inkling_server.py; runs in the SAME mlx-vlm venv (has fastapi/
+# uvicorn/scipy/PIL). Engine owns the lifecycle exactly like dflash/vlm.
+INKLING_DEFAULT_PORT = int(env_get("INKLING_PORT", "8080") or "8080")
+INKLING_SERVER_REMOTE = env_get("INKLING_SERVER_REMOTE",
+                                "/Users/admin/mlx-cluster/inkling_server.py")
+INKLING_WIRED_LIMIT_GB = float(env_get("INKLING_WIRED_LIMIT_GB", "460") or "460")
+
+
+def _inkling_launch_cmd(vlm_id: str, venv: str, model_path: str, port: int) -> str:
+    """nohup the native inkling_server.py with the mlx-vlm venv python. Echoes
+    VLM_PID=$! for the caller to capture (reuses the VLM launch/probe helpers)."""
+    venv_bin = f"{venv.rstrip('/')}/bin"
+    py = f"{venv_bin}/python"
+    log = _vlm_log_path(vlm_id)
+    return (
+        f"export HOME=/Users/admin USER=admin TMPDIR=/tmp "
+        f"PATH={shlex.quote(venv_bin)}:/usr/bin:/bin:/usr/sbin:/sbin && "
+        f"nohup {shlex.quote(py)} {shlex.quote(INKLING_SERVER_REMOTE)} "
+        f"--model {shlex.quote(model_path)} "
+        f"--host 0.0.0.0 --port {int(port)} "
+        f"--wired-limit-gb {INKLING_WIRED_LIMIT_GB} "
+        f"> {log} 2>&1 & "
+        f"echo VLM_PID=$!"
+    )
+
+
+def _inkling_kill_cmd(port: int, model_path: str) -> str:
+    """SIGTERM → grace → SIGKILL of inkling_server.py for THIS port — mirrors
+    _dflash_kill_cmd so Metal wired pages release."""
+    pattern = shlex.quote(f"inkling_server.py.*--port {int(port)}( |$)")
+    return (
+        f"if pgrep -f {pattern} >/dev/null 2>&1; then "
+        f"  pkill -TERM -f {pattern} 2>/dev/null; "
+        f"  for i in $(seq 1 {_SWEEP_GRACE_ITERS}); do "
+        f"    pgrep -f {pattern} >/dev/null 2>&1 || break; "
+        f"    sleep 0.5; "
+        f"  done; "
+        f"  if pgrep -f {pattern} >/dev/null 2>&1; then "
+        f"    pkill -9 -f {pattern}; echo 'killed (SIGKILL)'; "
+        f"  else echo 'cleaned (SIGTERM)'; fi; "
+        f"else echo 'no process'; fi"
+    )
+
+
+def _inkling_pool_log_id(cluster_id: str, alias: str) -> str:
+    raw = f"{cluster_id}-{alias}-inkling"
+    return re.sub(r"[^a-z0-9-]", "-", raw.lower())[:41].strip("-") or "inkling"
+
+
+async def _launch_inkling_server(
+    ssh_target: str, log_id: str, model_path: str, port: int,
+    venv: str, ready_timeout: float,
+) -> tuple[bool, Optional[str], str]:
+    """Launch inkling_server.py on a node, poll /v1/models until ready. Mirrors
+    _launch_dflash_server; reuses _vlm_probe_ready + _vlm_log_tail."""
+    ip = _vlm_ip_from_ssh(ssh_target)
+    launch = _inkling_launch_cmd(log_id, venv, model_path, port)
+    launched_pid: Optional[str] = None
+    rc, out, err = await asyncio.to_thread(_ssh_exec, ssh_target, launch, 20)
+    if rc != 0:
+        return False, None, (err or out or "").strip()[-4000:]
+    for line in (out or "").splitlines():
+        if line.startswith("VLM_PID="):
+            launched_pid = line.split("=", 1)[1].strip()
+    deadline = time.time() + ready_timeout
+    while time.time() < deadline:
+        if await _vlm_probe_ready(ip, port) is True:
+            return True, launched_pid, ""
+        await asyncio.sleep(3.0)
+    tail = await _vlm_log_tail(ssh_target, log_id)
+    return False, launched_pid, tail
+
+
+# ── Muse-Glimmer native multimodal server (2026-08-13) ────────────────────────
+# scripts/muse_glimmer_server.py wraps pipenetwork's `muse_glimmer_mlx` package
+# (its HF card's prescribed runtime) as an OpenAI server. Deployed on each
+# serving node at ~/mlx-cluster/muse_glimmer_server.py; runs in the SAME mlx-vlm
+# venv (has fastapi/uvicorn/PIL + muse_glimmer_mlx pip-installed). Engine owns
+# the lifecycle exactly like inkling/dflash/vlm. Mirrors the inkling helpers.
+MUSE_DEFAULT_PORT = int(env_get("MUSE_PORT", "8081") or "8081")
+MUSE_SERVER_REMOTE = env_get("MUSE_SERVER_REMOTE",
+                             "/Users/admin/mlx-cluster/muse_glimmer_server.py")
+# Right-sized for the ~33GB 8-bit model: wired holds it resident without paging,
+# cache_limit bounds MLX's freed-buffer cache so it doesn't climb to fill the
+# wired allowance under a long run (191GB wired for a 33GB model, 2026-08-13).
+MUSE_WIRED_LIMIT_GB = float(env_get("MUSE_WIRED_LIMIT_GB", "64") or "64")
+MUSE_CACHE_LIMIT_GB = float(env_get("MUSE_CACHE_LIMIT_GB", "8") or "8")
+
+
+def _muse_launch_cmd(vlm_id: str, venv: str, model_path: str, port: int) -> str:
+    """nohup the native muse_glimmer_server.py with the mlx-vlm venv python.
+    Echoes VLM_PID=$! for the caller (reuses the VLM launch/probe helpers)."""
+    venv_bin = f"{venv.rstrip('/')}/bin"
+    py = f"{venv_bin}/python"
+    log = _vlm_log_path(vlm_id)
+    return (
+        f"export HOME=/Users/admin USER=admin TMPDIR=/tmp "
+        f"PATH={shlex.quote(venv_bin)}:/usr/bin:/bin:/usr/sbin:/sbin && "
+        f"nohup {shlex.quote(py)} {shlex.quote(MUSE_SERVER_REMOTE)} "
+        f"--model {shlex.quote(model_path)} "
+        f"--host 0.0.0.0 --port {int(port)} "
+        f"--wired-limit-gb {MUSE_WIRED_LIMIT_GB} "
+        f"--cache-limit-gb {MUSE_CACHE_LIMIT_GB} "
+        f"> {log} 2>&1 & "
+        f"echo VLM_PID=$!"
+    )
+
+
+def _muse_kill_cmd(port: int, model_path: str) -> str:
+    """SIGTERM → grace → SIGKILL of muse_glimmer_server.py for THIS port —
+    mirrors _inkling_kill_cmd so Metal wired pages release."""
+    pattern = shlex.quote(f"muse_glimmer_server.py.*--port {int(port)}( |$)")
+    return (
+        f"if pgrep -f {pattern} >/dev/null 2>&1; then "
+        f"  pkill -TERM -f {pattern} 2>/dev/null; "
+        f"  for i in $(seq 1 {_SWEEP_GRACE_ITERS}); do "
+        f"    pgrep -f {pattern} >/dev/null 2>&1 || break; "
+        f"    sleep 0.5; "
+        f"  done; "
+        f"  if pgrep -f {pattern} >/dev/null 2>&1; then "
+        f"    pkill -9 -f {pattern}; echo 'killed (SIGKILL)'; "
+        f"  else echo 'cleaned (SIGTERM)'; fi; "
+        f"else echo 'no process'; fi"
+    )
+
+
+def _muse_pool_log_id(cluster_id: str, alias: str) -> str:
+    raw = f"{cluster_id}-{alias}-muse"
+    return re.sub(r"[^a-z0-9-]", "-", raw.lower())[:41].strip("-") or "muse"
+
+
+async def _launch_muse_glimmer_server(
+    ssh_target: str, log_id: str, model_path: str, port: int,
+    venv: str, ready_timeout: float,
+) -> tuple[bool, Optional[str], str]:
+    """Launch muse_glimmer_server.py on a node, poll /v1/models until ready.
+    Mirrors _launch_inkling_server; reuses _vlm_probe_ready + _vlm_log_tail."""
+    ip = _vlm_ip_from_ssh(ssh_target)
+    launch = _muse_launch_cmd(log_id, venv, model_path, port)
+    launched_pid: Optional[str] = None
+    rc, out, err = await asyncio.to_thread(_ssh_exec, ssh_target, launch, 20)
+    if rc != 0:
+        return False, None, (err or out or "").strip()[-4000:]
+    for line in (out or "").splitlines():
+        if line.startswith("VLM_PID="):
+            launched_pid = line.split("=", 1)[1].strip()
+    deadline = time.time() + ready_timeout
+    while time.time() < deadline:
+        if await _vlm_probe_ready(ip, port) is True:
+            return True, launched_pid, ""
+        await asyncio.sleep(3.0)
+    tail = await _vlm_log_tail(ssh_target, log_id)
+    return False, launched_pid, tail
+
+
+async def _launch_dflash_server(
+    ssh_target: str, log_id: str, model_path: str, drafter_path: str,
+    port: int, venv: str, max_draft: int, ready_timeout: float,
+) -> tuple[bool, Optional[str], str]:
+    """Launch mlx-dspark serve dflash on a node, poll /v1/models until ready.
+    Mirrors _launch_vlm_server; reuses _vlm_probe_ready + _vlm_log_tail. Returns
+    (ready, launched_pid, log_tail)."""
+    ip = _vlm_ip_from_ssh(ssh_target)
+    launch = _dflash_launch_cmd(log_id, venv, model_path, drafter_path, port, max_draft)
+    launched_pid: Optional[str] = None
+    rc, out, err = await asyncio.to_thread(_ssh_exec, ssh_target, launch, 20)
+    if rc != 0:
+        return False, None, (err or out or "").strip()[-4000:]
+    for line in (out or "").splitlines():
+        if line.startswith("VLM_PID="):
+            launched_pid = line.split("=", 1)[1].strip()
+    deadline = time.time() + ready_timeout
+    while time.time() < deadline:
+        if await _vlm_probe_ready(ip, port) is True:
+            return True, launched_pid, ""
+        await asyncio.sleep(3.0)
+    tail = await _vlm_log_tail(ssh_target, log_id)
+    return False, launched_pid, tail
+
+
+async def _restore_dflash_pool(cluster_id: str, alias: str, entry: dict,
+                               indices: list[int]) -> Optional["DFlashPool"]:
+    """Startup restore for a persisted dflash pool: relaunch mlx-dspark serve on
+    the saved node and rebuild the DFlashPool. Adopt in place if already up.
+    Mirrors _restore_vlm_pool."""
+    model_path = entry["model"]
+    drafter = entry.get("drafter")
+    port = int(entry.get("port") or DFLASH_DEFAULT_PORT)
+    max_draft = int(entry.get("max_draft") or DFLASH_MAX_DRAFT)
+    topo = build_topology_from_indices(cluster_id, indices)
+    ssh_target = entry.get("ssh") or topo[0]["ssh"]
+    host = entry.get("host") or topo[0].get("host") or _host_id_from_ssh(ssh_target)
+    ip = _vlm_ip_from_ssh(ssh_target)
+    upstream = entry.get("upstream") or f"http://{ip}:{port}"
+    pid = None
+    if await _vlm_probe_ready(ip, port) is True:
+        sys.stderr.write(
+            f"[api] dflash pool restore ({cluster_id}:{alias}): {upstream} "
+            f"already serving — adopting in place\n"
+        )
+    else:
+        if not drafter:
+            sys.stderr.write(
+                f"[api] dflash pool restore ({cluster_id}:{alias}) skipped — "
+                f"no drafter persisted\n"
+            )
+            return None
+        ready, pid, tail = await _launch_dflash_server(
+            ssh_target, _dflash_pool_log_id(cluster_id, alias), model_path,
+            drafter, port, VLM_DEFAULT_VENV, max_draft, VLM_READY_TIMEOUT_S,
+        )
+        if not ready:
+            sys.stderr.write(
+                f"[api] dflash pool restore ({cluster_id}:{alias}) failed — "
+                f"server did not become ready. Log tail:\n{tail}\n"
+            )
+            return None
+    return DFlashPool(
+        model_path=model_path, cluster=cluster_id, alias=alias,
+        node_indices=indices, upstream=upstream, port=port,
+        ssh_target=ssh_target, host=host, drafter=drafter,
+        max_draft=max_draft, pid=pid,
     )
 
 
