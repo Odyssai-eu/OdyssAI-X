@@ -3017,6 +3017,21 @@ def _run_batched_main(model, tokenizer, repo: str, kv_q8_default: bool,
     # uid → per-request state
     slot: dict[int, dict] = {}
     emit_batch_n = int(os.environ.get("RUNNER_EMIT_BATCH", "10"))
+    # Poison guard (2026-08-27): removing a LONG slot (thousands of generated
+    # tokens) from the BatchGenerator leaves it in a degraded state where every
+    # subsequent request decodes ~50x slower. Proven deterministically on
+    # glm5_next Q8 single-node: fresh BG serves a 7.5k-token c03 at 21 tok/s
+    # (finish=stop, perfectly healthy), then a 50-token "hello" times out at
+    # >150s; a 600-token completion does NOT trigger it; no cancel involved.
+    # This was the root of the bench C03/C04 "0.2 tok/s" wedges (the ghost
+    # generations fixed in api v1.41.2 were the amplifier, not the source).
+    # Same medicine as the bg.next() extend-cache recovery below: rebuild the
+    # BG. Every removal path (natural finish, hard-cancel, anti-loop) funnels
+    # through _emit_done_for / bg.remove — we mark the BG dirty when a big
+    # slot is removed and rebuild as soon as the batch is EMPTY, so in-flight
+    # requests are never disturbed and the cost lands between requests.
+    _bg_rebuild_min_toks = int(os.environ.get("BG_REBUILD_MIN_TOKS", "1000"))
+    bg_state = {"dirty": False}
 
     log(f"batched main: completion_batch={bg_kwargs['completion_batch_size']}, "
         f"prefill_batch={bg_kwargs['prefill_batch_size']}, "
@@ -3089,6 +3104,10 @@ def _run_batched_main(model, tokenizer, repo: str, kv_q8_default: bool,
             + (f" · {len(tool_calls)} tool_call(s)" if tool_calls else "")
             + (f" · session={s['session_id']}({s['cache_label']})" if s["session_id"] else "")
             + (f" · finish={finish_reason}" if finish_reason else ""))
+        # Poison guard: a big slot is leaving the BG — schedule a rebuild for
+        # the next moment the batch is empty (see the flag's comment above).
+        if s["ntoks"] >= _bg_rebuild_min_toks:
+            bg_state["dirty"] = True
         try:
             bg.remove([uid])
         except Exception:
@@ -3096,6 +3115,18 @@ def _run_batched_main(model, tokenizer, repo: str, kv_q8_default: bool,
         del slot[uid]
 
     while not stop_requested["flag"]:
+        # ── Poison guard rebuild ───────────────────────────────────────────
+        # Must run BEFORE the drain so the next request inserts into the
+        # fresh BG, never the poisoned one. Only fires when the batch is
+        # empty — in-flight slots are never disturbed.
+        if bg_state["dirty"] and not slot:
+            try:
+                bg = BatchGenerator(model, **bg_kwargs)
+                log(f"BG rebuilt after long-gen removal (poison guard, "
+                    f"ntoks >= {_bg_rebuild_min_toks})")
+            except Exception as e:
+                log(f"BG poison-guard rebuild FAILED: {e}")
+            bg_state["dirty"] = False
         # ── Drain incoming requests (non-blocking) ─────────────────────────
         drained = 0
         while drained < 32:
