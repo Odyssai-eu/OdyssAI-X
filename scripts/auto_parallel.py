@@ -238,10 +238,24 @@ class PipelineLastLayer(CustomMlxLayer):
         # split it again on the way out. One send per boundary, and every
         # eval/depends ordering invariant below stays exactly as it was.
         extra: Optional[mx.array] = None
+        _tuple_tail: Optional[tuple] = None
         if isinstance(result, tuple):
-            output, extra = result
-            B, S, _ = output.shape
-            output = mx.concatenate([output, extra.reshape(B, S, -1)], axis=-1)
+            if self.attn_res_total_blocks:
+                # Contrat kimi_k3 : (hidden, block_residual) — le residual voyage
+                # aplati dans le payload (pad/gather/split plus bas).
+                output, extra = result
+                B, S, _ = output.shape
+                output = mx.concatenate([output, extra.reshape(B, S, -1)], axis=-1)
+            else:
+                # Contrat tuple SANS attn-residual (glm_moe_dsa : (h, topk_indices),
+                # topk possiblement None). Seul h est transporté ; la queue du tuple
+                # est rendue telle quelle à la boucle native du modèle. Les indices
+                # ne traversent JAMAIS les rangs : les couches 'shared' en tête du
+                # rang suivant retombent en dense (surensemble sûr du sparse).
+                # Avant ce fix : extra.reshape sur None -> AttributeError, mort du
+                # rank-0 à chaque prefill multi-node GLM-5.3 (2026-08-29).
+                output = result[0]
+                _tuple_tail = result[1:]
         else:
             output = result
 
@@ -292,6 +306,10 @@ class PipelineLastLayer(CustomMlxLayer):
             mx.eval(output)
 
         if extra is None:
+            if _tuple_tail is not None:
+                # Restituer la forme tuple attendue par la boucle native
+                # (glm_moe_dsa : `h, prev_topk = layer(...)`).
+                return (output, *_tuple_tail)
             return output
         H = extra.shape[-1]
         B, S = output.shape[0], output.shape[1]

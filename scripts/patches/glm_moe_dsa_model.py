@@ -169,14 +169,54 @@ class DecoderLayer(_dsv32.DeepseekV32DecoderLayer):
 
 
 class _GlmModel(_dsv32.DeepseekV32Model):
-    """Reconstruit les couches avec notre DecoderLayer. `__call__` NON surchargé →
-    hérite le forward d'origine (mask + boucle + pipeline recv/send/all_gather intacts)."""
+    """Reconstruit les couches avec notre DecoderLayer (Option A, dense fallback →
+    forward 3-arg `layer(h, mask, cache)`, PAS le 4-arg DSA de GlmMoeDsaModel).
+    `__call__` = celui de DeepseekV32Model + support `inputs_embeds`, requis par le
+    forward pipeline (rangs non-premiers reçoivent les embeddings du rang précédent).
+    Sans ça: crash `unexpected keyword argument 'inputs_embeds'` sur tout load
+    multi-node (glm-5-3-q8h16, 2026-08-29). Une seule ligne diffère du parent :
+    `h = embed_tokens(x) if inputs_embeds is None else inputs_embeds`."""
 
     def __init__(self, config: ModelArgs):
         super().__init__(config)
         self.layers = [
             DecoderLayer(config, idx) for idx in range(config.num_hidden_layers)
         ]
+
+    def __call__(
+        self,
+        x: mx.array,
+        cache: Optional[Any] = None,
+        inputs_embeds: Optional[mx.array] = None,
+    ) -> mx.array:
+        # Identique à DeepseekV32Model.__call__ SAUF la 1re ligne (skip embed si
+        # inputs_embeds fourni). Réplique le forward pipeline dense complet.
+        h = self.embed_tokens(x) if inputs_embeds is None else inputs_embeds
+
+        pipeline_rank = self.pipeline_rank
+        pipeline_size = self.pipeline_size
+
+        if cache is None:
+            cache = [None] * self.num_layers
+        mask = _dsv32.create_attention_mask(
+            h, cache[0][0] if cache[0] else None, return_array=True
+        )
+
+        if pipeline_rank < pipeline_size - 1:
+            h = mx.distributed.recv_like(h, (pipeline_rank + 1))
+
+        for i in range(self.num_layers):
+            h = self.layers[self.start_idx + i](h, mask, cache[i])
+
+        if pipeline_rank != 0:
+            h = mx.distributed.send(h, (pipeline_rank - 1) % pipeline_size)
+            if cache[-1] is not None:
+                cache[-1][0].keys = mx.depends(cache[-1][0].keys, h)
+
+        if pipeline_size > 1:
+            h = mx.distributed.all_gather(h)[: h.shape[0]]
+
+        return self.norm(h)
 
 
 class Model(_glm.Model):

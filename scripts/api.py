@@ -4110,6 +4110,11 @@ def _seed_in_think(model_id: Optional[str], enable_thinking) -> bool:
 # Qwen3.5/3.6 -> goes HERE only, NOT in _MODELS_IGNORE_ENABLE_THINKING_FLAG.
 # Substring "glm-5.2" matches the concrete HF path (kernelpool/GLM-5.2-*, all quants).
 _MODELS_AUTO_OPEN_THINK = ("minimax", "qwen3.5", "qwen3.6", "step-3.7", "step3p7", "glm-5.2",
+                           # GLM-5.3 (gros DSA, alias avec points OU tirets:
+                           # glm-5-3-q8h16) — auto-open think, vérifié 2026-08-29:
+                           # sans ce match le raisonnement partait verbatim dans
+                           # `content`.
+                           "glm-5.3", "glm-5-3",
                            "kimi-k3", "inkling")
 # Subset of _MODELS_AUTO_OPEN_THINK that IGNORES the `enable_thinking`
 # kwarg and always wraps reasoning in <think>...</think>. Per MiniMax M2
@@ -4140,7 +4145,12 @@ _MODELS_IGNORE_ENABLE_THINKING_FLAG = ("minimax-m2", "step-3.7", "step3p7",
                                        # that enable_thinking=false STILL emits its
                                        # <|content_thinking|> envelope, so the filter must stay
                                        # on in every mode to route it + strip the envelope tags.
-                                       "inkling")
+                                       "inkling",
+                                       # GLM-5.3 always thinks (dial = reasoning_effort
+                                       # low/high/max, défaut max — pas de switch off).
+                                       # Vérifié 2026-08-29: enable_thinking défaut off,
+                                       # raisonnement émis quand même.
+                                       "glm-5.3", "glm-5-3")
 
 # Models whose chat template reads a `reasoning_effort` system directive
 # (OpenAI o-series convention: minimal/low/medium/high). Step-3.7-Flash is a
@@ -5676,7 +5686,7 @@ def _initial_default_config() -> Optional[dict]:
 #   major (1.7.2 → 2.0.0) — breaking API or topology change
 #
 # Use `./scripts/bump-version.sh patch|minor|major` to bump + auto-commit.
-APP_VERSION = "1.42.0"
+APP_VERSION = "1.42.1"
 
 app = FastAPI(
     title="OdyssAI-X (odyssai.eu)",

@@ -26,5 +26,5 @@ def apply_mlx_patches() -> None:
     apply_bailing_hybrid()
     apply_minimax_m3()
     apply_g9v3()
-    apply_glm_dsa()
+    # apply_glm_dsa()  # DEBRANCHE 2026-08-29: venv glm_moe_dsa = PR#1410 head (coherent full/shared), le patch Option A (juin, GLM-5.2) mixait mal avec le snapshot -> 3 bugs multi-node. Re-brancher SEULEMENT si regression GLM-5.2.
     apply_longcat2_pipeline()

@@ -1,28 +1,24 @@
-# Port MLX de Qwen3.8-Flash-Next (HF model_type: qwen4_exp)
-# Composants inedits vs qwen3_next : QSA sparse attention, gated residual
-# (hyper-connections), n-gram / PLE embedding shardé, projections deltanet splittées.
-#
-# VENDORISÉ — source : PR ml-explore/mlx-lm#1788 (auteur eauchs), extraite du
-# diff le 2026-08-26, ~1h après ouverture — NON REVIEWÉE upstream à cette date.
-# Garder byte-identique au diff sauf ce bloc ET le drop mtp.* dans sanitize
-# (delta marque "DELTA vs PR#1788" — la PR ne droppe pas la tete MTP du
-# checkpoint officiel, load strict refuse). Si la PR merge avec des
-# changements, re-vendoriser depuis la version mergée et re-verifier ce point.
-# Cible : Qwen/Qwen3.8-Flash-Next (bf16 officiel). Le sanitize strippe le
-# wrapper language_model., droppe la vision, transpose les conv1d.
+# MLX port of Qwen3.8-Flash-Next (HF model_type: qwen4_exp)
+# New compared to qwen3_next: QSA sparse attention, gated residual
+# (hyper-connections), sharded n-gram / PLE embedding, split deltanet projections.
 
 from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field
-from typing import Any, Optional
+from typing import Any, Optional, Union
 
 import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
 
-from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
-from .cache import ArraysCache, KVCache, _BaseCache
+from .base import (
+    BaseModelArgs,
+    create_attention_mask,
+    create_ssm_mask,
+    scaled_dot_product_attention,
+)
+from .cache import ArraysCache, BatchKVCache, KVCache, _BaseCache, dynamic_roll
 from .gated_delta import gated_delta_update
 from .switch_layers import SwitchGLU
 
@@ -103,25 +99,24 @@ class ModelArgs(BaseModelArgs):
 
 
 class RMSNorm(nn.Module):
-    """RMSNorm, avec normalisation par groupes quand group_size est donné.
+    """Zero-centered RMSNorm: y = norm(x) * (1 + weight).
 
-    Les hyper-connections normalisent chacun des hc_count flux séparément, d'où
-    le reshape : un poids de taille hc_count*hidden, mais une statistique par flux.
+    The checkpoint stores zero-centered weights, so `Qwen4ExpTextRMSNorm` scales
+    by `1 + weight` and initializes the weight to 0. Only the gated variant used
+    by the delta net is conventional, see `RMSNormGated`.
+
+    Hyper-connections normalize each of the hc_count streams separately, hence the
+    reshape: one weight of size hc_count*hidden, but one statistic per stream. The
+    scale applies to the flat vector, after the reshape, like the reference.
     """
 
-    # DELTA vs PR#1788 (4/4) — LE bug du charabia : les poids RMSNorm du
-    # checkpoint qwen4_exp sont CENTRES SUR ZERO (reference equipe Qwen,
-    # mlx-vlm PR#2028 Qwen4ExpRMSNorm : « checkpoint weights are centered at
-    # zero », application y * (1.0 + weight)). La PR#1788 appliquait
-    # y * weight -> activations multipliees par ~0 des la premiere couche.
-    # La variante Gated (deltanet) reste CLASSIQUE, conforme a la reference.
     def __init__(self, dim: int, group_size: Optional[int] = None, eps: float = 1e-6):
         super().__init__()
         self.weight = mx.zeros(dim)
         self.eps = eps
         self.group_size = group_size
         if group_size is not None and dim % group_size:
-            raise ValueError(f"dim {dim} non divisible par group_size {group_size}")
+            raise ValueError(f"dim {dim} is not divisible by group_size {group_size}")
 
     def __call__(self, x: mx.array) -> mx.array:
         if self.group_size is None:
@@ -133,6 +128,9 @@ class RMSNorm(nn.Module):
 
 
 class RMSNormGated(nn.Module):
+    """Conventional RMSNorm: `Qwen4ExpTextRMSNormGated` scales by `weight` alone
+    and initializes it to 1, unlike the non-gated norm above."""
+
     def __init__(self, dim: int, eps: float = 1e-6, activation: str = "sigmoid"):
         super().__init__()
         self.weight = mx.ones(dim)
@@ -151,25 +149,11 @@ class RMSNormGated(nn.Module):
 # ------------------------------------------------------------------- rope / helpers
 
 
-def _positions(offset, S: int) -> mx.array:
-    """DELTA vs PR#1788 (5/5) : positions rope tolerantes au batch.
-
-    En chemin stream_generate, `offset` est un int -> [1, S]. En chemin
-    BatchGenerator (le runner maison), `offset` est un mx.array d'offsets PAR
-    SLOT -> [B, S] (mx.arange(array, array) est un TypeError — c'etait la
-    cause du finish=error / 0 token via serveur alors que la generation
-    directe marchait).
-    """
-    if isinstance(offset, mx.array):
-        return offset[:, None] + mx.arange(S)
-    return mx.arange(offset, offset + S)[None]
-
-
 def _rope_partial(x: mx.array, cos: mx.array, sin: mx.array) -> mx.array:
-    """Applique le rope sur les `rotary_dim` premières dimensions seulement."""
+    """Apply rope to the first `rotary_dim` dimensions only."""
     d = cos.shape[-1]
-    # cos/sin sont calcules en float32 : sans ce cast ils promeuvent x et toute
-    # l'attention repasse en float32.
+    # cos/sin are computed in float32: without this cast they promote x and the
+    # whole attention falls back to float32.
     cos, sin = cos.astype(x.dtype), sin.astype(x.dtype)
     xr, xp = x[..., :d], x[..., d:]
     half = d // 2
@@ -191,15 +175,34 @@ class RotaryEmbedding:
         return mx.cos(emb), mx.sin(emb)
 
 
+def _positions(offset: Union[int, mx.array], S: int) -> mx.array:
+    """Positions of `S` tokens from `offset`, (1, S) or (B, S).
+
+    `offset` is an int with the usual caches, and one position per slot with a
+    batched cache (see `BatchKVCache.offset`).
+    """
+    if isinstance(offset, mx.array):
+        return offset.reshape(-1, 1) + mx.arange(S)
+    return mx.arange(offset, offset + S)[None]
+
+
+def _left_padding(cache) -> Optional[mx.array]:
+    """Left padding of a batched cache, per row, or None if the rows align."""
+    pad = getattr(cache, "left_padding", None)
+    if pad is None or pad.max().item() == 0:
+        return None
+    return pad
+
+
 # ------------------------------------------------------------------------ QSA
 
 
 class QSAIndexer(nn.Module):
-    """Sélectionne, par requête, un budget de blocs de clés compressées.
+    """Select, per query, a budget of compressed key blocks.
 
-    L'implémentation PyTorch de référence boucle sur (batch, query) ; ici tout est
-    vectorisé : les clés poolées ne dépendent pas de la requête, donc on les
-    calcule une fois puis on fait un top-k par ligne.
+    The reference PyTorch implementation loops over (batch, query); here everything
+    is vectorized: pooled keys do not depend on the query, so they are computed once
+    and followed by a per-row top-k.
     """
 
     def __init__(self, args: TextArgs):
@@ -216,7 +219,7 @@ class QSAIndexer(nn.Module):
         self.q_layernorm = RMSNorm(self.head_dim, eps=args.rms_norm_eps)
         self.k_layernorm = RMSNorm(self.head_dim, eps=args.rms_norm_eps)
 
-    def __call__(self, x, rope, cache, offset: int) -> Optional[mx.array]:
+    def __call__(self, x, rope, cache, offset, left_padding=None) -> Optional[mx.array]:
         B, S, _ = x.shape
         qk = self.index_qk_proj(x)
         split = self.n_heads * self.head_dim
@@ -227,55 +230,111 @@ class QSAIndexer(nn.Module):
             raw_k = cache.update(raw_k)
         kv_len = raw_k.shape[1]
 
-        # Sans sparsification possible : tous les tokens visibles tiennent dans le
-        # budget, le top-k retiendrait tout. Le masque causal habituel suffit.
+        # No sparsification possible: every visible token fits in the budget, so the
+        # top-k would keep them all. The usual causal mask is enough.
         if kv_len <= self.token_budget:
             return None
 
         n_blocks = kv_len // self.compress_ratio
-        pooled = raw_k[:, : n_blocks * self.compress_ratio].reshape(
-            B, n_blocks, self.compress_ratio, self.head_dim
-        )
+        pad = left_padding
+        if pad is None:
+            pooled = raw_k[:, : n_blocks * self.compress_ratio].reshape(
+                B, n_blocks, self.compress_ratio, self.head_dim
+            )
+        else:
+            # A block groups the tokens of one row, so it starts at the first
+            # real token of that row, not at column 0 of the shared buffer.
+            # Credit: Blaizzy/mlx-vlm#2028.
+            cols = (
+                pad[:, None, None]
+                + (mx.arange(n_blocks) * self.compress_ratio)[None, :, None]
+                + mx.arange(self.compress_ratio)[None, None, :]
+            ).reshape(B, -1)
+            # A block that runs past the buffer is masked out below.
+            cols = mx.minimum(cols, kv_len - 1)
+            pooled = mx.take_along_axis(
+                raw_k,
+                mx.broadcast_to(cols[..., None], (*cols.shape, self.head_dim)),
+                axis=1,
+            ).reshape(B, n_blocks, self.compress_ratio, self.head_dim)
         pooled = self.k_layernorm(
             pooled.astype(mx.float32).mean(axis=2).astype(raw_k.dtype)
         )
 
+        # Block n holds the logical positions n * compress_ratio and up in every
+        # row, so the padding does not move the block rope.
         block_starts = mx.arange(n_blocks) * self.compress_ratio
         cos_k, sin_k = rope(block_starts[None, :])
         pooled = _rope_partial(pooled, cos_k, sin_k)
 
-        cos_q, sin_q = rope(_positions(offset, S))
+        q_pos = _positions(offset, S)
+        cos_q, sin_q = rope(q_pos)
         q = self.q_layernorm(q)
         q = _rope_partial(q, cos_q[:, :, None, :], sin_q[:, :, None, :])
 
-        # scores: somme sur les têtes de relu(q.k), par bloc
+        # scores: sum over heads of relu(q.k), per block
         scores = mx.einsum(
             "bshd,bnd->bsnh", q.astype(mx.float32), pooled.astype(mx.float32)
         )
         scores = mx.maximum(scores, 0).sum(axis=-1) / math.sqrt(self.head_dim)
 
-        # un bloc n'est candidat que s'il est entièrement dans le passé de la requête
-        block_end = block_starts + self.compress_ratio - 1
-        visible = block_end[None, None, :] <= q_pos[None, :, None]
+        # A block is only a candidate if it lies entirely in the query's past.
+        # Count real tokens: `q_pos` already excludes the left padding.
+        n_complete = mx.maximum(q_pos + 1, 0) // self.compress_ratio
+        visible = mx.arange(n_blocks)[None, None, :] < n_complete[..., None]
         scores = mx.where(visible, scores, -mx.inf)
 
         k = min(self.block_topk, n_blocks)
         top = mx.argpartition(-scores, k - 1, axis=-1)[..., :k]  # (B, S, k)
+        picked = mx.take_along_axis(visible, top, axis=-1)
 
-        keep_block = mx.zeros((B, S, n_blocks + 1), dtype=mx.bool_)
-        top = mx.where(mx.take_along_axis(visible, top, axis=-1), top, n_blocks)
-        keep_block = mx.put_along_axis(keep_block, top, mx.array(True), axis=-1)[
-            ..., :n_blocks
-        ]
+        # remap block -> tokens; the buffer's trailing partial block belongs to no
+        # candidate block, so it is not selectable on its own
+        if pad is None:
+            keep_block = mx.put_along_axis(
+                mx.zeros((B, S, n_blocks + 1), dtype=mx.bool_),
+                mx.where(picked, top, n_blocks),
+                mx.array(True),
+                axis=-1,
+            )[..., :n_blocks]
+            keep = mx.repeat(keep_block, self.compress_ratio, axis=-1)
+            rest = kv_len - n_blocks * self.compress_ratio
+            if rest:
+                keep = mx.concatenate(
+                    [keep, mx.zeros((B, S, rest), dtype=mx.bool_)], axis=-1
+                )
+        else:
+            # One block grid per row, so a repeat no longer expands it: scatter
+            # the winners straight on the token axis.
+            tok = (
+                pad[:, None, None, None]
+                + top[..., None] * self.compress_ratio
+                + mx.arange(self.compress_ratio)[None, None, None, :]
+            ).reshape(B, S, -1)
+            flag = mx.broadcast_to(
+                picked[..., None], (*picked.shape, self.compress_ratio)
+            ).reshape(B, S, -1) & (tok < kv_len)
+            keep = mx.put_along_axis(
+                mx.zeros((B, S, kv_len + 1), dtype=mx.bool_),
+                mx.where(flag, tok, kv_len),
+                flag,
+                axis=-1,
+            )[..., :kv_len]
 
-        # remap bloc -> tokens, puis la queue incomplète est toujours visible
-        keep = mx.repeat(keep_block, self.compress_ratio, axis=-1)
-        tail = kv_len - n_blocks * self.compress_ratio
-        if tail:
-            keep = mx.concatenate(
-                [keep, mx.ones((B, S, tail), dtype=mx.bool_)], axis=-1
-            )
-        return keep[:, None]  # (B, 1, S, kv_len)
+        # The reference appends the tail of each query's own visible list, i.e. the
+        # partial block it sits in. Without it a query whose past holds fewer than
+        # compress_ratio tokens gets an all-masked row, which softmax turns into a
+        # uniform average over every key, future ones included.
+        own_start = n_complete * self.compress_ratio
+        if pad is not None:
+            own_start = own_start + pad[:, None]
+        tokens = mx.arange(kv_len)
+        # Physical column of each query in the shared buffer.
+        kv_pos = mx.arange(kv_len - S, kv_len)
+        own = (tokens[None, None, :] >= own_start[..., None]) & (
+            tokens[None, None, :] <= kv_pos[None, :, None]
+        )
+        return (keep | own)[:, None]  # (B, 1, S, kv_len)
 
 
 class Attention(nn.Module):
@@ -286,7 +345,7 @@ class Attention(nn.Module):
         self.head_dim = args.head_dim
         self.scale = self.head_dim**-0.5
         d = args.hidden_size
-        # q_proj porte aussi le gate de sortie : n_heads * head_dim * 2
+        # q_proj also carries the output gate: n_heads * head_dim * 2
         self.q_proj = nn.Linear(d, self.n_heads * self.head_dim * 2, bias=False)
         self.k_proj = nn.Linear(d, self.n_kv_heads * self.head_dim, bias=False)
         self.v_proj = nn.Linear(d, self.n_kv_heads * self.head_dim, bias=False)
@@ -299,7 +358,7 @@ class Attention(nn.Module):
         B, S, _ = x.shape
         offset = cache.offset if cache is not None else 0
 
-        sparse = self.indexer(x, rope, idx_cache, offset)
+        sparse = self.indexer(x, rope, idx_cache, offset, _left_padding(cache))
 
         q, gate = mx.split(self.q_proj(x).reshape(B, S, self.n_heads, -1), 2, axis=-1)
         gate = gate.reshape(B, S, -1)
@@ -317,13 +376,20 @@ class Attention(nn.Module):
             k, v = cache.update_and_fetch(k, v)
 
         if sparse is not None:
-            neg = mx.finfo(q.dtype).min if hasattr(mx, "finfo") else -1e9
-            add = mx.where(sparse, mx.array(0, q.dtype), mx.array(neg, q.dtype))
-            mask = (
-                add
-                if mask is None
-                else (mask + add if not isinstance(mask, str) else add)
-            )
+            # `sparse` is a boolean keep mask. Keep the combination boolean:
+            # adding it drops the causality held by the "causal" string.
+            if mask is None:
+                mask = sparse
+            elif isinstance(mask, str):  # "causal"
+                kv_len = k.shape[2]
+                rinds = mx.arange(kv_len)
+                linds = mx.arange(kv_len - S, kv_len)[:, None]
+                mask = (linds >= rinds) & sparse
+            elif mask.dtype == mx.bool_:
+                mask = mask & sparse
+            else:
+                neg = mx.finfo(mask.dtype).min
+                mask = mask + mx.where(sparse, mx.array(0, mask.dtype), neg)
 
         out = scaled_dot_product_attention(
             q, k, v, cache=cache, scale=self.scale, mask=mask
@@ -356,7 +422,7 @@ class GatedDeltaNet(nn.Module):
             groups=self.conv_dim,
             padding=0,
         )
-        # contrairement a qwen3-next, les projections sont splittees
+        # unlike qwen3-next, the projections are split
         self.in_proj_qkv = nn.Linear(d, self.conv_dim, bias=False)
         self.in_proj_z = nn.Linear(d, self.value_dim, bias=False)
         self.in_proj_b = nn.Linear(d, self.n_v, bias=False)
@@ -384,7 +450,14 @@ class GatedDeltaNet(nn.Module):
             mixed_qkv = mx.where(mask[..., None], mixed_qkv, 0)
         conv_input = mx.concatenate([conv_state, mixed_qkv], axis=1)
         if cache is not None:
-            cache[0] = mx.contiguous(conv_input[:, -(self.conv_kernel_size - 1) :, :])
+            n_keep = self.conv_kernel_size - 1
+            if cache.lengths is not None:
+                # A right padded batch ends each row at its own length.
+                ends = mx.clip(cache.lengths, 0, S)
+                positions = (ends[:, None] + mx.arange(n_keep))[..., None]
+                cache[0] = mx.take_along_axis(conv_input, positions, axis=1)
+            else:
+                cache[0] = mx.contiguous(conv_input[:, -n_keep:, :])
         conv_out = nn.silu(self.conv1d(conv_input))
 
         q, k, v = mx.split(conv_out, [self.key_dim, 2 * self.key_dim], axis=-1)
@@ -510,10 +583,10 @@ def _nth_prime_after(start: int, count: int) -> int:
 
 
 class NGramEmbedding(nn.Module):
-    """Table de hachage n-gram, shardée en `split_ngram_parts` morceaux.
+    """N-gram hash table, sharded into `split_ngram_parts` pieces.
 
-    ~51 Md de paramètres : on ne fait jamais de lookup dense. Les indices sont
-    triés par shard côté hôte, comme dans l'implémentation llama.cpp.
+    ~51B parameters: a dense lookup is never performed. Indices are sorted by shard
+    on the host side, as in the llama.cpp implementation.
     """
 
     def __init__(self, args: TextArgs, embed_dim: int, ple_layer_index: int = 0):
@@ -546,7 +619,7 @@ class NGramEmbedding(nn.Module):
             self.n_shards, self.rows_per_shard, head_dim
         )
 
-        # buffers repris tels quels depuis le checkpoint
+        # buffers taken as-is from the checkpoint
         mults = []
         max_long = (1 << 63) - 1
         half = max(1, (max_long // max(args.vocab_size, 1)) // 2)
@@ -555,10 +628,10 @@ class NGramEmbedding(nn.Module):
             mults.append(
                 2 * (_splitmix64((base_seed + _GAMMA * (i + 1)) & _MASK64) % half) + 1
             )
-        # Attributs publics : uniquement pour absorber les tenseurs du checkpoint.
-        # Ils sont dans parameters(), donc un astype(float16) les detruirait ; les
-        # valeurs reellement utilisees vivent dans les copies prefixees `_`, hors
-        # parameters() et reconstruites a l'identique depuis la config.
+        # Public attributes: only there to absorb the checkpoint tensors. They live
+        # in parameters(), so an astype(float16) would destroy them; the values
+        # actually used live in the `_`-prefixed copies, outside parameters() and
+        # rebuilt identically from the config.
         self.layer_multipliers = mx.array(mults, dtype=mx.int64)
         self.ngram_heads_vocab_sizes = mx.array(sizes, dtype=mx.int64)
         self.ngram_heads_offsets = mx.array(offsets, dtype=mx.int64)
@@ -567,7 +640,7 @@ class NGramEmbedding(nn.Module):
         self._offsets = mx.array(offsets, dtype=mx.int64)
 
     def _shift_right(self, ids: mx.array, shift: int) -> mx.array:
-        """Décale de `shift`, sans franchir une frontière d'EOS."""
+        """Shift right by `shift`, without crossing an EOS boundary."""
         if shift == 0:
             return ids
         B, T = ids.shape
@@ -605,7 +678,7 @@ class NGramEmbedding(nn.Module):
 
 
 class _ShardedEmbedding(nn.Module):
-    """N tables d'embedding concaténées logiquement, adressées par index global."""
+    """N embedding tables concatenated logically, addressed by global index."""
 
     def __init__(self, n_shards: int, rows: int, dim: int):
         super().__init__()
@@ -620,7 +693,7 @@ class _ShardedEmbedding(nn.Module):
         shard_of = flat // self.rows
         row_of = flat % self.rows
 
-        # quels shards sont réellement touchés : décidé côté hôte, comme llama.cpp
+        # which shards are actually touched: decided host-side, as llama.cpp does
         touched = np.unique(np.array(shard_of, copy=False))
         out = mx.zeros((flat.size, self.dim), dtype=mx.float32)
         for s in touched.tolist():
@@ -664,7 +737,13 @@ class PLELayer(nn.Module):
         )
         full = mx.concatenate([state, x], axis=1)
         if cache is not None:
-            cache[2] = mx.contiguous(full[:, -n:, :])
+            if cache.lengths is not None:
+                # A right padded batch ends each row at its own length.
+                ends = mx.clip(cache.lengths, 0, S)
+                positions = (ends[:, None] + mx.arange(n))[..., None]
+                cache[2] = mx.take_along_axis(full, positions, axis=1)
+            else:
+                cache[2] = mx.contiguous(full[:, -n:, :])
         return nn.silu(self.conv1d(full[:, -(n + S) :, :]))
 
     def __call__(
@@ -728,7 +807,7 @@ class Qwen4ExpModel(nn.Module):
         self.hc = args.hc_count
         self.embed_tokens = nn.Embedding(args.vocab_size, args.hidden_size)
         self.layers = [DecoderLayer(args, i) for i in range(args.num_hidden_layers)]
-        # pas de `norm` finale dans ce modèle : c'est ce mixer qui la porte
+        # no final `norm` in this model: this mixer carries it
         self.hyper_connection_mixer = GatedResidual(args, use_combine=False)
         rotary_dim = int(args.head_dim * args.partial_rotary_factor)
         self.rope = RotaryEmbedding(rotary_dim, args.rope_theta)
@@ -744,13 +823,17 @@ class Qwen4ExpModel(nn.Module):
         full_idx = [
             i for i, l in enumerate(self.layers) if l.layer_type == "full_attention"
         ]
-        attn_cache = cache[full_idx[0]] if full_idx else None
-        mask = create_attention_mask(
-            h, [attn_cache] if attn_cache is not None else None
-        )
-        conv_mask = None
+        lin_idx = [
+            i for i, l in enumerate(self.layers) if l.layer_type == "linear_attention"
+        ]
+        mask = create_attention_mask(h, cache[full_idx[0]] if full_idx else None)
+        # The deltanet reads the tokens in order, so it needs the padded ones
+        # zeroed out. Its cache holds the padding, one value per row.
+        conv_mask = create_ssm_mask(h, cache[lin_idx[0]]) if lin_idx else None
 
         prev_ctx = None
+        # The n-gram hash reads `ids` in order, so it holds for the right padded
+        # prompt of a batch, but not for one that is already left padded.
         if self.ple_layers:
             ctx_len = self.args.ngram_size - 1
             eos = self.args.eos_token_id
@@ -763,8 +846,14 @@ class Qwen4ExpModel(nn.Module):
                 else mx.full((ids.shape[0], ctx_len), eos, ids.dtype)
             )
             if pc is not None:
-                tail = mx.concatenate([prev_ctx, ids], axis=1)[:, -ctx_len:]
-                pc[3] = tail
+                history = mx.concatenate([prev_ctx, ids], axis=1)
+                if pc.lengths is not None:
+                    ends = mx.clip(pc.lengths, 0, ids.shape[1])
+                    pc[3] = mx.take_along_axis(
+                        history, ends[:, None] + mx.arange(ctx_len), axis=1
+                    )
+                else:
+                    pc[3] = history[:, -ctx_len:]
 
         h = mx.tile(h, (1, 1, self.hc))
         for layer, c in zip(self.layers, cache):
@@ -774,7 +863,7 @@ class Qwen4ExpModel(nn.Module):
 
 
 class _IndexerCache(_BaseCache):
-    """Garde les clés brutes de l'indexeur (une par token, non poolées)."""
+    """Holds the indexer raw keys (one per token, not pooled)."""
 
     def __init__(self):
         self.keys = None
@@ -783,19 +872,183 @@ class _IndexerCache(_BaseCache):
         self.keys = k if self.keys is None else mx.concatenate([self.keys, k], axis=1)
         return self.keys
 
+    def trim(self, size: int):
+        if self.keys is not None:
+            self.keys = self.keys[:, :size]
+
     @property
     def state(self):
-        return self.keys
+        # `None` is not serializable, so an empty array stands for it.
+        return mx.array([]) if self.keys is None else self.keys
 
     @state.setter
     def state(self, v):
-        self.keys = v
+        self.keys = v if v.size > 0 else None
 
 
 class _AttnCache(KVCache):
     def __init__(self):
         super().__init__()
         self.indexer = _IndexerCache()
+
+    def trim(self, n):
+        # `KVCache.trim` only moves the offset, but the indexer keys are exact.
+        n = super().trim(n)
+        self.indexer.trim(self.offset)
+        return n
+
+    @property
+    def state(self):
+        return (*super().state, self.indexer.state)
+
+    @state.setter
+    def state(self, v):
+        *kv, self.indexer.state = v
+        KVCache.state.fset(self, tuple(kv))
+
+    @classmethod
+    def merge(cls, caches):
+        return _BatchAttnCache.merge(caches)
+
+
+class _BatchAttnCache(BatchKVCache):
+    """Batched `_AttnCache`. The indexer keys follow the KV padding exactly.
+
+    Credit: mirrors BatchQSAKVCache from Blaizzy/mlx-vlm#2028 (MIT).
+    """
+
+    def __init__(self, left_padding):
+        super().__init__(left_padding)
+        self.indexer = _IndexerCache()
+
+    def finalize(self):
+        # The base class rolls a right padded prefill into left padding. The
+        # indexer keys share those columns, so they take the same roll.
+        padding = self._right_padding
+        super().finalize()
+        if padding is not None and self.indexer.keys is not None:
+            self.indexer.keys = dynamic_roll(self.indexer.keys, padding, axis=1)
+
+    def trim(self, n):
+        n = super().trim(n)
+        self.indexer.trim(self._idx)
+        return n
+
+    def filter(self, batch_indices):
+        min_pad = self.left_padding[batch_indices].min().item()
+        super().filter(batch_indices)
+        if self.indexer.keys is not None:
+            keys = self.indexer.keys[batch_indices]
+            self.indexer.keys = keys[:, min_pad:] if min_pad else keys
+
+    def extend(self, other):
+        keys, other_keys = self.indexer.keys, other.indexer.keys
+        idx, other_idx = self._idx, other._idx
+        super().extend(other)
+        if keys is None and other_keys is None:
+            return
+        sample = keys if keys is not None else other_keys
+        target = max(idx, other_idx)
+        rows = self.offset.shape[0] - other.offset.shape[0]
+
+        # Right-justify both sides on the shared index, like `BatchKVCache`.
+        def pad(k, n_rows, used):
+            if k is None:
+                k = mx.zeros((n_rows, 0, sample.shape[-1]), dtype=sample.dtype)
+            return mx.pad(k[:, :used], [(0, 0), (target - used, 0), (0, 0)])
+
+        self.indexer.keys = mx.concatenate(
+            [pad(keys, rows, idx), pad(other_keys, other.offset.shape[0], other_idx)],
+            axis=0,
+        )
+
+    def extract(self, idx):
+        cache = _AttnCache()
+        pad = self.left_padding[idx].item()
+        if self.keys is not None:
+            cache.keys = mx.contiguous(self.keys[idx : idx + 1, :, pad : self._idx])
+            cache.values = mx.contiguous(self.values[idx : idx + 1, :, pad : self._idx])
+            cache.offset = cache.keys.shape[2]
+        if self.indexer.keys is not None:
+            cache.indexer.keys = mx.contiguous(
+                self.indexer.keys[idx : idx + 1, pad : self._idx]
+            )
+        return cache
+
+    @classmethod
+    def merge(cls, caches):
+        # `BatchKVCache.merge` names its own class on the all-empty path, which
+        # drops the indexer.
+        if max(c.size() for c in caches) == 0:
+            return cls([0] * len(caches))
+        out = super().merge(caches)
+        rows = [c.indexer.keys for c in caches]
+        sample = next((k for k in rows if k is not None), None)
+        if sample is None:
+            return out
+        out.indexer.keys = mx.concatenate(
+            [
+                (
+                    mx.zeros((1, out._idx, sample.shape[-1]), dtype=sample.dtype)
+                    if k is None
+                    else mx.pad(
+                        k[:, : c.offset],
+                        [(0, 0), (out._idx - c.offset, 0), (0, 0)],
+                    )
+                )
+                for k, c in zip(rows, caches)
+            ],
+            axis=0,
+        )
+        return out
+
+    @property
+    def state(self):
+        return (*super().state, self.indexer.state)
+
+    @state.setter
+    def state(self, v):
+        *kv, self.indexer.state = v
+        BatchKVCache.state.fset(self, tuple(kv))
+
+
+class _LayerCache(ArraysCache):
+    """`ArraysCache` whose slots can stay unused on every row.
+
+    The PLE slots are only filled by the PLE layers, and `ArraysCache` raises
+    `StopIteration` on a slot that is `None` everywhere.
+    """
+
+    @classmethod
+    def merge(cls, caches):
+        n_state = len(caches[0].cache)
+        B = len(caches)
+        cache = cls(n_state)
+        if all(c.empty() for c in caches):
+            cache.left_padding = mx.array([0] * B)
+            return cache
+        for e in range(n_state):
+            c_init = next((c[e] for c in caches if c[e] is not None), None)
+            if c_init is None:
+                continue
+            shape = list(c_init.shape)
+            shape[0] = B
+            cache[e] = mx.zeros(shape, c_init.dtype)
+            for i in range(B):
+                if caches[i][e] is not None:
+                    cache[e][i : i + 1] = caches[i][e]
+        return cache
+
+    def extract(self, idx):
+        cache = _LayerCache(len(self.cache))
+        cache.cache = [None if c is None else c[idx : idx + 1] for c in self.cache]
+        return cache
+
+    def prepare(self, lengths=None, **kwargs):
+        # An empty merge leaves a zero `left_padding`, which shadows `lengths`
+        # in `make_mask` and lets the right padding into the deltanet.
+        self.left_padding = None
+        super().prepare(lengths=lengths, **kwargs)
 
 
 class Model(nn.Module):
@@ -825,56 +1078,59 @@ class Model(nn.Module):
             if t == "full_attention":
                 caches.append(_AttnCache())
             else:
-                # 0: conv deltanet, 1: état ssm, 2: conv PLE, 3: contexte n-gram
-                caches.append(ArraysCache(4))
+                # 0: deltanet conv, 1: ssm state, 2: PLE conv, 3: n-gram context
+                caches.append(_LayerCache(4))
         return caches
 
     def sanitize(self, weights):
         out = {}
         for k, v in weights.items():
-            if k.startswith("language_model."):
-                k = k[len("language_model.") :]
-            # DELTA vs PR#1788 (2/2) : le checkpoint officiel imbrique le
-            # wrapper SOUS `model.` — `model.language_model.layers...` — que la
-            # regle ci-dessus ne strippe pas. On normalise vers `model.layers...`.
+            # Multi-token-prediction head and vision tower: not implemented by this
+            # text-only port, and absent from the module tree -> drop them.
+            if k.startswith(("mtp.", "model.mtp.")):
+                continue
+            if k.startswith(("model.visual.", "visual.", "vision_tower.")):
+                continue
+
+            # Prefix. The official checkpoint nests the text model under
+            # `model.language_model.` while already-converted MLX checkpoints use
+            # the flat `language_model.` form; both must land on `model.`.
+            # `lm_head.weight` sits at the top level upstream and is left alone.
             if k.startswith("model.language_model."):
                 k = "model." + k[len("model.language_model.") :]
-            if k.startswith("vision_tower.") or k.startswith("model.visual."):
-                continue  # text-only pour l'instant
-            # DELTA vs PR#1788 : le checkpoint officiel Qwen/Qwen3.8-Flash-Next
-            # embarque une tete MTP (mtp.layers.0.* — indexer sparse inclus) que
-            # la PR ne droppe pas ; le load strict la refuse. Meme traitement
-            # que laguna.py / le dispatcher qwen3_5_moe : on la droppe.
-            if k.startswith("mtp.") or k.startswith("model.mtp."):
-                continue
-            if "conv1d.weight" in k and v.ndim == 3 and v.shape[-1] != 1:
-                # (C, 1, K) torch -> (C, K, 1) mlx
-                if v.shape[1] == 1:
-                    v = v.transpose(0, 2, 1)
-            # DELTA vs PR#1788 (3/3) : le checkpoint officiel stocke les experts
-            # FUSIONNES et stackes (`mlp.experts.gate_up_proj` [E, 2*mi, H],
-            # `mlp.experts.down_proj` [E, H, mi]) ; SwitchGLU attend
-            # switch_mlp.{gate,up,down}_proj.weight separes. Split sur dim -2,
-            # gate = premiere moitie — convention Qwen (identique a qwen3_5,
-            # validee sur les quants Q6h16 de la famille).
-            if k.endswith(".mlp.experts.gate_up_proj"):
-                base = k[: -len(".experts.gate_up_proj")]
+            elif k.startswith("language_model."):
+                k = k[len("language_model.") :]
+
+            # Experts. Upstream stacks them as `experts.gate_up_proj`
+            # (E, 2 * moe_intermediate, hidden) and `experts.down_proj`
+            # (E, hidden, moe_intermediate), i.e. already the (E, out, in) layout
+            # SwitchGLU wants. The reference splits the *output* of the fused
+            # projection with chunk(2, dim=-1), so gate is the first half of
+            # axis -2 of the weight and up the second.
+            if k.endswith("mlp.experts.gate_up_proj"):
+                base = k[: -len("experts.gate_up_proj")]
                 mid = v.shape[-2] // 2
-                out[f"{base}.switch_mlp.gate_proj.weight"] = v[..., :mid, :]
-                out[f"{base}.switch_mlp.up_proj.weight"] = v[..., mid:, :]
+                out[base + "switch_mlp.gate_proj.weight"] = v[..., :mid, :]
+                out[base + "switch_mlp.up_proj.weight"] = v[..., mid:, :]
                 continue
-            if k.endswith(".mlp.experts.down_proj"):
-                base = k[: -len(".experts.down_proj")]
-                out[f"{base}.switch_mlp.down_proj.weight"] = v
+            if k.endswith("mlp.experts.down_proj"):
+                base = k[: -len("experts.down_proj")]
+                out[base + "switch_mlp.down_proj.weight"] = v
                 continue
+
+            # (C, 1, K) torch -> (C, K, 1) mlx. Idempotent: an already converted
+            # weight has shape[1] == kernel_size != 1.
+            if k.endswith("conv1d.weight") and v.ndim == 3 and v.shape[1] == 1:
+                v = v.transpose(0, 2, 1)
+
             out[k] = v
         return out
 
     @property
     def quant_predicate(self):
-        def fn(path, module, _):
-            # seul le routeur MoE reste en pleine precision (les norms et conv1d
-            # ne sont de toute facon jamais quantifies)
+        def fn(path, module, _=None):
+            # only the MoE router stays in full precision (norms and conv1d are
+            # never quantized anyway)
             return not path.endswith("mlp.gate")
 
         return fn
