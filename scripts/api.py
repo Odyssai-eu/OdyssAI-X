@@ -370,6 +370,59 @@ def _save_cluster_config(cfg: dict) -> None:
             sys.stderr.write(f"[api] failed to save cluster config: {e}\n")
 
 
+# ── Odomètre (ODO) — cumul persistant des tokens PRODUITS par les pools ──────
+# Demande Sophie 2026-08-29 : "un compteur ODO qui accumule tous les tokens
+# produits par tous pour odyssai-x" (header + About, reset dans About) + un
+# compteur par pool "depuis le load" (bande metrics, à côté d'Uptime — ce
+# dernier vit sur pool.tokens_produced, remis à zéro par nature à chaque load).
+# Périmètre v1 : les pools texte locaux (RunnerPool, chemins stream+non-stream)
+# — pas les proxys cloud (tokens produits ailleurs) ni les pools VLM.
+# Écriture write-through atomique (tmp+replace) : les incréments arrivent par
+# REQUÊTE terminée (pas par token), sur l'event loop unique → pas de lock.
+_ODO_FILE = (Path("/app/data/odometer.json") if Path("/app/data").is_dir()
+             else Path(os.environ.get("ODO_FILE", "odometer.json")))
+
+
+def _odo_read() -> dict:
+    try:
+        d = json.loads(_ODO_FILE.read_text())
+        return {"total": int(d.get("total", 0)), "since_ts": d.get("since_ts")}
+    except Exception:
+        return {"total": 0, "since_ts": None}
+
+
+_odo: dict = _odo_read()
+
+
+def _odo_write() -> None:
+    try:
+        tmp = _ODO_FILE.with_name(_ODO_FILE.name + ".tmp")
+        tmp.write_text(json.dumps(_odo))
+        os.replace(tmp, _ODO_FILE)
+    except Exception as e:
+        sys.stderr.write(f"[odo] persist failed: {e}\n")
+
+
+def odo_add(ntoks: int, pool=None) -> None:
+    """Créditer `ntoks` tokens produits : ODO global (persisté) + compteur
+    depuis-load du pool. Appelé à la FIN de chaque complétion locale."""
+    try:
+        n = int(ntoks)
+    except Exception:
+        return
+    if n <= 0:
+        return
+    if pool is not None:
+        try:
+            pool.tokens_produced = int(getattr(pool, "tokens_produced", 0)) + n
+        except Exception:
+            pass
+    _odo["total"] = int(_odo.get("total", 0)) + n
+    if not _odo.get("since_ts"):
+        _odo["since_ts"] = time.time()
+    _odo_write()
+
+
 @contextmanager
 def _cluster_config_txn():
     """Atomic read-modify-write of cluster-config.json. Holds `_config_lock`
@@ -2537,6 +2590,9 @@ class RunnerPool:
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self.load_s: Optional[float] = None
         self.started_at: Optional[float] = None
+        # Tokens produits par CE pool depuis son load (bande metrics, à côté
+        # d'Uptime). Crédité par odo_add() à chaque complétion terminée.
+        self.tokens_produced: int = 0
         # Idle TTL bookkeeping. `last_used_at` is touched on every submit; the
         # background ttl sweeper auto-unloads when (now - last_used_at) exceeds
         # `ttl_seconds`. ttl_seconds=0 disables. Default sourced from
@@ -5686,7 +5742,7 @@ def _initial_default_config() -> Optional[dict]:
 #   major (1.7.2 → 2.0.0) — breaking API or topology change
 #
 # Use `./scripts/bump-version.sh patch|minor|major` to bump + auto-commit.
-APP_VERSION = "1.42.1"
+APP_VERSION = "1.43.0"
 
 app = FastAPI(
     title="OdyssAI-X (odyssai.eu)",
@@ -5704,6 +5760,9 @@ async def admin_version():
         "version": APP_VERSION,
         "python": _platform.python_version(),
         "platform": _platform.platform(),
+        # ODO global — le dashboard le lit ici (poll existant) pour le header.
+        "odometer": int(_odo.get("total", 0)),
+        "odometer_since_ts": _odo.get("since_ts"),
     }
     # Best-effort upstream lib versions — useful for diagnosing engine drift.
     try:
@@ -5717,6 +5776,23 @@ async def admin_version():
     except Exception:
         pass
     return info
+
+
+@app.get("/admin/odometer")
+async def admin_odometer():
+    """ODO global : total de tokens produits par les pools locaux (persistant,
+    survit aux restarts). `since_ts` = epoch du dernier reset (ou 1er token)."""
+    return {"total": int(_odo.get("total", 0)), "since_ts": _odo.get("since_ts")}
+
+
+@app.post("/admin/odometer/reset")
+async def admin_odometer_reset():
+    """Remise à zéro de l'ODO (bouton Reset de l'onglet About)."""
+    prev = int(_odo.get("total", 0))
+    _odo["total"] = 0
+    _odo["since_ts"] = time.time()
+    _odo_write()
+    return {"total": 0, "previous": prev, "since_ts": _odo["since_ts"]}
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -9311,6 +9387,7 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
             "completion_tokens": int(ntoks),
             "total_tokens": int(p_tokens) + int(ntoks),
         }
+        odo_add(ntoks, pool)
         # Prefix cache hit (session-HIT in mlx-lm prompt_cache terms). Surface
         # as OpenAI-compat `prompt_tokens_details.cached_tokens` so Companion's
         # StatsRow shows the win for local requests, not just the cloud proxy.
@@ -9475,6 +9552,7 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
                     }
                     if cached_toks > 0:
                         usage_payload["prompt_tokens_details"] = {"cached_tokens": cached_toks}
+                    odo_add(ntoks_total, pool)
                     final = {"id": completion_id, "object": "chat.completion.chunk",
                              "created": created, "model": model_id,
                              "choices": [{"index": 0, "delta": delta,
@@ -12756,6 +12834,7 @@ async def admin_cluster_status(cluster_id: str):
             "alias": alias,
             "model": pool.model,
             "mode": pool.mode,
+            "tokens_since_load": int(getattr(pool, "tokens_produced", 0)),
             "is_vlm": bool(getattr(pool, "is_vlm", False)),
             "use_ap": pool.use_ap,
             "nodes": pool.nodes_count,
@@ -12809,6 +12888,7 @@ async def admin_cluster_status(cluster_id: str):
                 if getattr(primary_pool, "mtp_cfg", None) else None),
         "alive": _vlm_alive_by_alias.get(primary_pool.alias, primary_pool.alive_count()),
         "load_s": primary_pool.load_s, "uptime_s": uptime,
+        "tokens_since_load": int(getattr(primary_pool, "tokens_produced", 0)),
         "recent_avg_tps": round(sum(recent_tps) / len(recent_tps), 2) if recent_tps else None,
         "topology": [{"rank": n["rank"], "ssh": n["ssh"]} for n in topo],
         "pools": pools,

@@ -1384,6 +1384,14 @@ function fmtTime(t) {
   const d = new Date(t * 1000);
   return d.toLocaleTimeString("en-US", { hour12: false, hour: "2-digit", minute: "2-digit", second: "2-digit" });
 }
+// Compteur de tokens compact : 812 → "812", 76 651 → "76.7k", 4 210 000 → "4.21M".
+function fmtTok(n) {
+  n = Number(n) || 0;
+  if (n >= 1e9) return (n / 1e9).toFixed(2) + "B";
+  if (n >= 1e6) return (n / 1e6).toFixed(2) + "M";
+  if (n >= 1e4) return (n / 1e3).toFixed(1) + "k";
+  return String(Math.round(n));
+}
 function fmtBytes(b) {
   if (!b) return "—";
   if (b < 1024) return b + " B";
@@ -2115,6 +2123,16 @@ function renderSettingsAbout() {
             <div style="color:var(--ink-3)">${escapeHtml(k)}</div>
             <div style="color:var(--ink)">${escapeHtml(String(val))}</div>
           `).join("")}
+        </div>
+        <div style="display:flex;align-items:center;gap:14px;padding-top:10px;border-top:1px solid var(--line)">
+          <div style="flex:1">
+            <div class="cap" style="margin-bottom:2px">Odomètre</div>
+            <div class="mono" style="font-size:13px;color:var(--ink)" title="Tokens produits par tous les pools locaux — cumul persistant (survit aux restarts)">
+              <b>${(v.odometer != null) ? Number(v.odometer).toLocaleString("fr-FR") : "—"}</b> tokens
+              ${v.odometer_since_ts ? `<span style="color:var(--ink-3)"> · depuis ${new Date(v.odometer_since_ts * 1000).toLocaleDateString("fr-FR")}</span>` : ""}
+            </div>
+          </div>
+          <button class="btn btn-sm" data-act="odo-reset" title="Remet l'odomètre global à zéro">Reset</button>
         </div>
       </div>
       <div style="font-size:11px;color:var(--ink-3);text-align:center">Mobilis in Mobile</div>
@@ -3608,6 +3626,8 @@ function renderHeader() {
         </div>
       </div>
       <div class="header-actions">
+        ${(state.version_info && state.version_info.odometer != null) ? `
+        <div class="pill-meta mono" title="ODO — tokens produits par tous les pools locaux (cumul persistant)" style="letter-spacing:0.02em">ODO <b>${fmtTok(state.version_info.odometer)}</b></div>` : ""}
         ${renderHealthPill()}
         <div class="pill-meta">${escapeHtml(location.host || ".141:8000")}</div>
         <button class="icon-btn" data-act="settings" title="Settings">${Icon.settings}</button>
@@ -4648,6 +4668,10 @@ function renderMetricsRow(a) {
       <div class="col">
         <div class="cap">Uptime</div>
         <div class="val${loaded?"":" muted"}">${loaded && a.uptime_s ? fmtSecs(a.uptime_s) : "—"}</div>
+      </div>
+      <div class="col">
+        <div class="cap">Tokens · load</div>
+        <div class="val${loaded?"":" muted"}" title="Tokens produits par ce pool depuis son load">${loaded ? fmtTok(a.tokens_since_load) : "—"}</div>
       </div>
     </div>
   `;
@@ -5881,6 +5905,21 @@ async function handleAct(e) {
   if (act === "pick-cluster") { pickCluster(el.dataset.cluster); return; }
   if (act === "add-cluster")  { state.settings_open = true; state.settings_tab = "clusters"; render(); return; }
   if (act === "settings")     { state.settings_open = true; render(); return; }
+  if (act === "odo-reset") {
+    const cur = state.version_info?.odometer;
+    if (!confirm(`Remettre l'odomètre à zéro ?${cur != null ? `\n(compteur actuel : ${Number(cur).toLocaleString("fr-FR")} tokens)` : ""}`)) return;
+    fetch("/admin/odometer/reset", { method: "POST" })
+      .then(r => r.json())
+      .then(d => {
+        if (state.version_info) {
+          state.version_info.odometer = d.total;
+          state.version_info.odometer_since_ts = d.since_ts;
+        }
+        render();
+      })
+      .catch(e => alert("Reset ODO échoué : " + e));
+    return;
+  }
   if (act === "cluster-settings") {
     state.settings_open = true;
     state.settings_tab = "clusters";
