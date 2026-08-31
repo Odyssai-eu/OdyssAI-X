@@ -901,12 +901,15 @@ MTP_FAMILY_MODEL_TYPES = frozenset({
     "hy_v3",       # binding 2026-07-07 (GQA + final_layernorm, mtp_module registry)
     "qwen4_exp",   # binding 2026-08-31 (#72 hybrid snapshot/restore, HF drafter
                    # sidecar; needs mtp.hybrid=true -> RUNNER_MTP_HYBRID_SNAPSHOT)
+    "glm5_next",   # binding 2026-08-31 (#73 native MTP head layer-45 DSA MoE,
+                   # hybrid trunk -> snapshot/restore + _pool fix)
 })
 
-# Hybrid linear-attention trunks (#72): speculation needs the snapshot/restore
-# rollback armed (RUNNER_MTP_HYBRID_SNAPSHOT=1). The load handler resolves this
-# from the model's config so the dashboard checkbox stays a plain boolean.
-MTP_HYBRID_MODEL_TYPES = frozenset({"qwen4_exp"})
+# Hybrid linear-attention trunks (#72/#73): speculation needs the
+# snapshot/restore rollback armed (RUNNER_MTP_HYBRID_SNAPSHOT=1). The load
+# handler resolves this from the model's config so the dashboard checkbox stays
+# a plain boolean.
+MTP_HYBRID_MODEL_TYPES = frozenset({"qwen4_exp", "glm5_next"})
 
 
 async def probe_mtp_sidecar(ssh: str, abspath: str) -> bool:
@@ -5770,7 +5773,7 @@ def _initial_default_config() -> Optional[dict]:
 #   major (1.7.2 → 2.0.0) — breaking API or topology change
 #
 # Use `./scripts/bump-version.sh patch|minor|major` to bump + auto-commit.
-APP_VERSION = "1.44.1"
+APP_VERSION = "1.45.0"
 
 app = FastAPI(
     title="OdyssAI-X (odyssai.eu)",

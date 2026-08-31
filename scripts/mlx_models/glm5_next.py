@@ -727,6 +727,38 @@ class Glm5NextDecoderLayer(nn.Module):
         return hc_expand(m, residual, post, comb)
 
 
+class Glm5NextMTPLayer(nn.Module):
+    """Plain-residual (NO hyper-connections) sparse DSA + MoE block for the
+    GLM-5.3-Flash native MTP head (checkpoint layer index == num_hidden_layers).
+
+    The head weights carry input_layernorm / self_attn (Glm5NextSparseAttention:
+    NoPE MLA + Glm5NextIndexer) / post_attention_layernorm / mlp (DeepseekV32MoE)
+    but NO `hc_*` — verified on the zai-org checkpoint. So it runs the standard
+    residual form, NOT Glm5NextDecoderLayer's hc_expand path. Same signature
+    (x, mask, cache) as the trunk layer; `cache` is a CacheList(KVCache, KVCache)
+    (DSA latent + indexer), trimmable — the trunk (hybrid) rollback is what the
+    #72 snapshot/restore handles."""
+
+    def __init__(self, config: ModelArgs, layer_idx: Optional[int] = None):
+        super().__init__()
+        self.self_attn = Glm5NextSparseAttention(config)
+        self.mlp = DeepseekV32MoE(config)
+        self.input_layernorm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.post_attention_layernorm = nn.RMSNorm(
+            config.hidden_size, eps=config.rms_norm_eps
+        )
+
+    def __call__(
+        self,
+        x: mx.array,
+        mask: Optional[mx.array] = None,
+        cache: Optional[Any] = None,
+    ) -> mx.array:
+        x = x + self.self_attn(self.input_layernorm(x), mask, cache)
+        x = x + self.mlp(self.post_attention_layernorm(x))
+        return x
+
+
 class Glm5NextModel(nn.Module):
     def __init__(self, config: ModelArgs):
         super().__init__()

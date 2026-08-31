@@ -135,6 +135,20 @@ def _restore_hybrid_state(cache: list, snap: list) -> None:
             delta = c.offset - s[1]
             if delta > 0:
                 c.trim(delta)
+            # #73 — per-cache incremental side-state that is NOT offset-
+            # addressable by trim: glm5_next's Glm5NextIndexer caches a pooled
+            # view keyed by the sequence length T (`_pool = (..., T)`) + a
+            # `_no_pad` flag, read on the S==1 decode fast-path
+            # (glm5_next.py:464-488). A trim-only restore leaves them describing
+            # the PRE-rollback T → stale pool reuse → non-lossless. Invalidate
+            # them so the next forward rebuilds the pool exactly from the
+            # restored sequence (full-pool else-branch, O(T) once — negligible
+            # vs the verify). Distinct from qwen4_exp's _IndexerCache, which is
+            # trim-cascade-correct (#72). Guarded by hasattr → no-op elsewhere.
+            if getattr(c, "_pool", None) is not None:
+                c._pool = None
+            if getattr(c, "_no_pad", False):
+                c._no_pad = False
 
 
 def native_mtp_stream_generate(

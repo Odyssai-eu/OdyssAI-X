@@ -67,12 +67,23 @@ def _log(msg: str) -> None:
 #             DecoderLayer (MoE + QSA indexer) in HC space, own final mixer.
 #             HYBRID trunk -> requires the #72 snapshot/restore rollback,
 #             gated behind RUNNER_MTP_HYBRID_SNAPSHOT=1.
+#  glm5_next: GLM-5.3-Flash native MTP head (checkpoint layer 45 ==
+#             num_hidden_layers). DeepSeek-V3-lineage fusion (enorm/hnorm/
+#             eh_proj concat) -> ONE Glm5NextMTPLayer (plain residual: NoPE MLA
+#             + Glm5NextIndexer + DeepseekV32MoE, NO hyper-connections) ->
+#             shared_head_norm -> shared lm_head. Reuses the NativeMTPModule
+#             scaffold (concat order matches). The trunk is HYBRID (alternating
+#             linear-attn + sparse-DSA layers) -> requires the #72 snapshot/
+#             restore rollback, gated behind RUNNER_MTP_HYBRID_SNAPSHOT=1. The
+#             sidecar ships MODULE-layout keys (embed_q/unembed_out absorbed,
+#             experts stacked as switch_mlp) -> loaded STRICT.
 _FAMILY_BY_MODEL_TYPE = {
     "glm_moe_dsa": "deepseek", "deepseek_v32": "deepseek",
     "deepseek_v3": "deepseek", "kimi_k2": "deepseek",
     "hy_v3": "hy_v3",
     "qwen3_5": "qwen3",
     "qwen4_exp": "qwen4_exp",
+    "glm5_next": "glm5_next",
 }
 
 
@@ -85,6 +96,12 @@ def _family_layer_cls(family: str):
     if family == "qwen3":
         from mlx_lm.models.qwen3_5 import DecoderLayer
         return DecoderLayer
+    if family == "glm5_next":
+        # Plain-residual sparse-DSA MTP block (NoPE MLA + Glm5NextIndexer +
+        # DeepseekV32MoE, no hyper-connections). Vendored under mlx_lm.models
+        # by install-model-modules.sh, imported by path like the trunk.
+        from mlx_lm.models.glm5_next import Glm5NextMTPLayer
+        return Glm5NextMTPLayer
     from mlx_lm.models.deepseek_v32 import DeepseekV32DecoderLayer
     return DeepseekV32DecoderLayer
 
@@ -193,6 +210,14 @@ def detect_native_mtp(model_dir: str | Path,
             _log("qwen4_exp trunk is hybrid — set RUNNER_MTP_HYBRID_SNAPSHOT=1 "
                  "to enable snapshot/restore speculation (#72) — AR only")
             return None
+    # glm5_next (GLM-5.3-Flash) is likewise a HYBRID trunk (linear-attn +
+    # sparse-DSA layers, ArraysCache has no .trim): speculation is only safe
+    # with the #72 snapshot/restore rollback. Same opt-in gate as qwen4_exp.
+    if family == "glm5_next":
+        if os.environ.get("RUNNER_MTP_HYBRID_SNAPSHOT", "0") != "1":
+            _log("glm5_next trunk is hybrid — set RUNNER_MTP_HYBRID_SNAPSHOT=1 "
+                 "to enable snapshot/restore speculation (#72) — AR only")
+            return None
     prefix = f"model.layers.{n_layers}."
 
     # 1. Conversion kept the MTP tensors in the model dir itself.
@@ -247,12 +272,20 @@ class NativeMTPModule(nn.Module):
     F-32).
     """
 
+    # #72 rollback mode. A HYBRID trunk (glm5_next: linear-attn + sparse-DSA)
+    # can't trim its ArraysCache linear state — mtp_spec switches to snapshot/
+    # restore when this is True. Set per-instance from the family (default off
+    # for the pure full-attention deepseek trunks that trim cleanly).
+    hybrid_snapshot = False
+
     def __init__(self, args: Any, layer_cls: Callable, layer_idx: int,
                  family: str = "deepseek"):
         super().__init__()
         hs = int(args.hidden_size)
         eps = float(args.rms_norm_eps)
         self.family = family
+        if family == "glm5_next":
+            self.hybrid_snapshot = True
         self.enorm = nn.RMSNorm(hs, eps=eps)
         self.hnorm = nn.RMSNorm(hs, eps=eps)
         self.eh_proj = nn.Linear(2 * hs, hs, bias=False)
@@ -605,6 +638,37 @@ def load_native_mtp(model: Any, model_dir: str | Path, *,
         from mlx.utils import tree_flatten
         gb = sum(v.nbytes for _, v in tree_flatten(module.parameters())) / 1e9
         _log(f"loaded {spec} — {len(raw)} tensors, {gb:.2f} GB bf16, "
+             f"hybrid_snapshot armed, {time.time()-t0:.1f}s")
+        return module
+
+    # glm5_next: the NativeMTPModule scaffold fits (DeepSeek-V3 concat fusion),
+    # but the sidecar already ships MODULE-layout keys (embed_q/unembed_out
+    # absorbed by the extraction's glm5_next.sanitize reuse, experts stacked as
+    # switch_mlp, indexer passthrough) — so it maps onto the module tree 1:1
+    # and loads STRICT. Any mismatch aborts to AR rather than serving garbage.
+    # Served bf16 as-is next to the quantized trunk (like qwen4_exp): the draft
+    # head tolerates it — the trunk verify guards exactness.
+    if spec.family == "glm5_next":
+        try:
+            layer_cls = _family_layer_cls("glm5_next")
+            module = NativeMTPModule(args, layer_cls, spec.start_layer,
+                                     family="glm5_next")
+            module.bind_trunk(model)
+            raw = dict(mx.load(str(spec.source_path)))
+            if not raw:
+                _log(f"spec found ({spec}) but zero tensors loaded — AR only")
+                return None
+            module.load_weights(list(raw.items()), strict=True)
+            mx.eval(module.parameters())
+        except Exception as e:
+            _log(f"glm5_next MTP load failed ({e}) — AR only")
+            return None
+        if quantize:
+            _log("glm5_next MTP: quantize requested but v1 serves the bf16 "
+                 "sidecar as-is — ignored")
+        from mlx.utils import tree_flatten
+        gb = sum(v.nbytes for _, v in tree_flatten(module.parameters())) / 1e9
+        _log(f"loaded {spec} — {len(raw)} tensors, {gb:.2f} GB bf16, STRICT, "
              f"hybrid_snapshot armed, {time.time()-t0:.1f}s")
         return module
 
