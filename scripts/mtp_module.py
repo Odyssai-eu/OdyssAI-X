@@ -25,6 +25,7 @@ indexer reuse) lands in E4 once the base port exists.
 from __future__ import annotations
 
 import json
+import os
 import sys
 import time
 from pathlib import Path
@@ -60,11 +61,18 @@ def _log(msg: str) -> None:
 #             wrapper), so args + embed/lm_head resolve one level deeper. The
 #             sidecar ships module-layout keys (fc/norm/pre_fc_norm_*/layers.0)
 #             with the trunk's +1 norm shift already applied (extract script).
+#  qwen4_exp: Qwen3.8-Flash-Next residual_linear_shared MTP (own module class
+#             Qwen4ExpMTPModule, NOT NativeMTPModule): consumes the trunk's
+#             PRE-final-mixer HC multi stream, one trunk-class full-attention
+#             DecoderLayer (MoE + QSA indexer) in HC space, own final mixer.
+#             HYBRID trunk -> requires the #72 snapshot/restore rollback,
+#             gated behind RUNNER_MTP_HYBRID_SNAPSHOT=1.
 _FAMILY_BY_MODEL_TYPE = {
     "glm_moe_dsa": "deepseek", "deepseek_v32": "deepseek",
     "deepseek_v3": "deepseek", "kimi_k2": "deepseek",
     "hy_v3": "hy_v3",
     "qwen3_5": "qwen3",
+    "qwen4_exp": "qwen4_exp",
 }
 
 
@@ -177,6 +185,14 @@ def detect_native_mtp(model_dir: str | Path,
             _log(f"native MTP unsupported on hybrid linear-attn trunk "
                  f"(full_attention_interval={fai}, non-trimmable Mamba cache) — AR only")
             return None
+    # qwen4_exp is ALWAYS hybrid (3/4 linear-attn layers): speculation is only
+    # safe with the #72 snapshot/restore rollback. New machinery -> opt-in env
+    # gate, default 0 = today's behaviour (clean AR fallback).
+    if family == "qwen4_exp":
+        if os.environ.get("RUNNER_MTP_HYBRID_SNAPSHOT", "0") != "1":
+            _log("qwen4_exp trunk is hybrid — set RUNNER_MTP_HYBRID_SNAPSHOT=1 "
+                 "to enable snapshot/restore speculation (#72) — AR only")
+            return None
     prefix = f"model.layers.{n_layers}."
 
     # 1. Conversion kept the MTP tensors in the model dir itself.
@@ -198,7 +214,15 @@ def detect_native_mtp(model_dir: str | Path,
     candidates.append(model_dir / "mtp-sidecar" / "mtp-sidecar.safetensors")
     for cand in candidates:
         if cand.is_dir():
-            cand = cand / "mtp-sidecar.safetensors"
+            # Our extract scripts write mtp-sidecar.safetensors; an HF drafter
+            # repo (e.g. kikekewl/...MTP-Drafter, qwen4_exp) ships a plain
+            # model.safetensors — accept both layouts.
+            for name in ("mtp-sidecar.safetensors", "model.safetensors"):
+                if (cand / name).exists():
+                    cand = cand / name
+                    break
+            else:
+                cand = cand / "mtp-sidecar.safetensors"
         if cand.exists():
             return MTPSpec(family, n_layers, 1, "sidecar", cand)
 
@@ -291,6 +315,95 @@ class NativeMTPModule(nn.Module):
         mask = create_attention_mask(mixed, first, return_array=True)
         h = self.mtp_block(mixed, mask=mask, cache=cache[0])
         logits = self._lm_head(self.shared_head_norm(h))
+        return logits, h
+
+
+class Qwen4ExpMTPModule(nn.Module):
+    """Qwen4Exp (Qwen3.8-Flash-Next) MTP step — residual_linear_shared fusion.
+
+    Reference: vLLM vllm/models/qwen4_exp/nvidia/mtp.py (Apache-2.0),
+    "scheme A". Differs from NativeMTPModule's concat fusion:
+      * consumes the trunk's PRE-final-mixer MULTI stream [B, S, hc*H]
+        (mtp_spec captures it via `hidden_source_override = "hc_multi"`);
+      * fc_embedding projects the token embedding, fc_hidden (shared across
+        branches) projects each HC branch; the embedding is added as a
+        residual to EVERY branch;
+      * the block is ONE trunk-class DecoderLayer forced full_attention,
+        running in HC space (own _AttnCache: KV + QSA indexer — trimmable,
+        so the mtp_cache trim/re-forward sequence is unchanged);
+      * its OWN final mixer (use_combine=False — it carries the norm, like
+        the trunk's) collapses to the sample hidden for the trunk's lm_head;
+        the UN-collapsed layer output is the next step's multi stream.
+    `hybrid_snapshot = True` switches mtp_spec to the #72 snapshot/restore
+    rollback on the trunk (ArraysCache has no .trim). embed/lm_head are trunk
+    references OUT of the module tree (same contract as NativeMTPModule).
+    """
+
+    hybrid_snapshot = True
+    hidden_source_override = "hc_multi"
+
+    def __init__(self, targs: Any):
+        super().__init__()
+        import copy
+        from mlx_lm.models.qwen4_exp import (
+            DecoderLayer, GatedResidual, RMSNorm, RotaryEmbedding)
+
+        hs = int(targs.hidden_size)
+        eps = float(targs.rms_norm_eps)
+        self.family = "qwen4_exp"
+        self.hc = int(targs.hc_count)
+        self.d = hs
+        # vLLM: GemmaRMSNorm — flat norm (embedding H, hidden hc*H); the
+        # per-branch norm lives inside the mixers' hc_norm (group_size=H).
+        self.pre_fc_norm_embedding = RMSNorm(hs, eps=eps)
+        self.pre_fc_norm_hidden = RMSNorm(self.hc * hs, eps=eps)
+        self.fc_embedding = nn.Linear(hs, hs, bias=False)
+        self.fc_hidden = nn.Linear(hs, hs, bias=False)
+        # One trunk DecoderLayer at a PAST-THE-END index: layer_types gets a
+        # full_attention slot appended, and (idx+1) can't collide with
+        # ple_layer_ids — so no PLE, no n-gram inputs on this layer.
+        idx = len(targs.layer_types)
+        args2 = copy.copy(targs)
+        args2.layer_types = list(targs.layer_types) + ["full_attention"]
+        self.layers = [DecoderLayer(args2, idx)]
+        self.hyper_connection_mixer = GatedResidual(targs, use_combine=False)
+        rotary_dim = int(targs.head_dim * targs.partial_rotary_factor)
+        self.rope = RotaryEmbedding(rotary_dim, targs.rope_theta)
+        object.__setattr__(self, "_embed", None)
+        object.__setattr__(self, "_lm_head", None)
+
+    def bind_trunk(self, model: Any) -> None:
+        inner, lm, _ = _family_trunk("qwen4_exp", model)
+        object.__setattr__(self, "_embed", inner.embed_tokens)
+        if lm is None:
+            lm = inner.embed_tokens.as_linear
+        object.__setattr__(self, "_lm_head", lm)
+
+    def make_cache(self) -> list:
+        from mlx_lm.models.qwen4_exp import _AttnCache
+        return [_AttnCache()]
+
+    def draft_step(self, token_ids: mx.array, prev_hidden: mx.array,
+                   cache: list) -> tuple[mx.array, mx.array]:
+        """One MTP step over S positions (S=1 in the chained-draft loop).
+
+        token_ids: [B, S] — appended to the mtp KV(+indexer) cache.
+        prev_hidden: [B, S, hc*H] MULTI stream — trunk capture on prefill /
+        after commit, previous draft_step output inside the chain.
+        Returns (logits [B, S, V], multi stream [B, S, hc*H]).
+        """
+        from mlx_lm.models.base import create_attention_mask
+        B, S = token_ids.shape
+        emb = self.fc_embedding(
+            self.pre_fc_norm_embedding(self._embed(token_ids)))
+        h = self.pre_fc_norm_hidden(prev_hidden)
+        h = self.fc_hidden(h.reshape(B, S, self.hc, self.d))
+        h = (emb[..., None, :] + h).reshape(B, S, self.hc * self.d)
+        c = cache[0]
+        mask = create_attention_mask(h, c)
+        h = self.layers[0](h, self.rope, mask, None, c, c.indexer, None, None)
+        sample = self.hyper_connection_mixer(h)
+        logits = self._lm_head(sample)
         return logits, h
 
 
@@ -463,6 +576,34 @@ def load_native_mtp(model: Any, model_dir: str | Path, *,
     if args is None:
         _log("trunk model has no .args — cannot build MTP block")
         return None
+
+    # qwen4_exp: own module class (residual_linear_shared fusion in HC space)
+    # — bypasses the NativeMTPModule scaffold. The kikekewl sidecar ships the
+    # official `mtp.*` weights with the prefix stripped and the experts
+    # already stacked as switch_mlp: keys match this module tree 1:1, so the
+    # load is STRICT — any mismatch aborts to AR instead of serving garbage.
+    if spec.family == "qwen4_exp":
+        targs = getattr(args, "text", args)
+        try:
+            module = Qwen4ExpMTPModule(targs)
+            module.bind_trunk(model)
+            raw = dict(mx.load(str(spec.source_path)))
+            if not raw:
+                _log(f"spec found ({spec}) but zero tensors loaded — AR only")
+                return None
+            module.load_weights(list(raw.items()), strict=True)
+            mx.eval(module.parameters())
+        except Exception as e:
+            _log(f"qwen4_exp MTP load failed ({e}) — AR only")
+            return None
+        if quantize:
+            _log("qwen4_exp MTP: quantize requested but v1 serves the bf16 "
+                 "sidecar as-is (5.2 GB) — ignored")
+        from mlx.utils import tree_flatten
+        gb = sum(v.nbytes for _, v in tree_flatten(module.parameters())) / 1e9
+        _log(f"loaded {spec} — {len(raw)} tensors, {gb:.2f} GB bf16, "
+             f"hybrid_snapshot armed, {time.time()-t0:.1f}s")
+        return module
 
     try:
         layer_cls = _family_layer_cls(spec.family)

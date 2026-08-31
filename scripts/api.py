@@ -898,7 +898,9 @@ FORCE_AP_MODEL_TYPES = frozenset({
 # dashboard can show the "Enable MTP" checkbox only when it would work.
 MTP_FAMILY_MODEL_TYPES = frozenset({
     "glm_moe_dsa", "deepseek_v32", "deepseek_v3", "kimi_k2",
-    "hy_v3",   # binding 2026-07-07 (GQA + final_layernorm, mtp_module registry)
+    "hy_v3",       # binding 2026-07-07 (GQA + final_layernorm, mtp_module registry)
+    "qwen4_exp",   # binding 2026-08-31 (#72 hybrid snapshot/restore, HF drafter
+                   # sidecar; needs mtp.hybrid=true -> RUNNER_MTP_HYBRID_SNAPSHOT)
 })
 
 
@@ -2030,6 +2032,10 @@ def remote_cmd(node: dict, nodes: list[dict], model: str, mode: str, port: int,
             env["RUNNER_MTP_HIDDEN"] = str(mtp["hidden_source"])
         if mtp.get("quantize"):
             env["RUNNER_MTP_QUANT"] = "1"
+        if mtp.get("hybrid"):
+            # #72: hybrid linear-attn trunks (qwen4_exp) — arms the
+            # snapshot/restore rollback in mtp_spec (default off = AR).
+            env["RUNNER_MTP_HYBRID_SNAPSHOT"] = "1"
     env_str = " ".join(f"{k}={shlex.quote(v)}" for k, v in env.items())
     if backend != "ring":
         write_prefix = f"echo {shlex.quote(devices_json)} > /tmp/mlx_jaccl_devices.json"
@@ -2971,7 +2977,8 @@ class RunnerPool:
                      kv_q8: Optional[bool] = None,
                      context_limit: Optional[int] = None,
                      ignore_eos: bool = False,
-                     clear_thinking: Optional[bool] = None) -> AsyncIterator[dict]:
+                     clear_thinking: Optional[bool] = None,
+                     mtp_on: Optional[bool] = None) -> AsyncIterator[dict]:
         # Concurrent submits are allowed: the runner side handles serialisation
         # (single-rank uses BatchGenerator for true parallelism; multi-rank
         # serialises in the gen loop but tokens are routed by req_id).
@@ -3033,8 +3040,15 @@ class RunnerPool:
         # construction. A canary trip flips mtp_tripped and the pool keeps
         # serving AR — no restart, no control message.
         if self.mtp_cfg:
+            # Per-request opt-out (mtp_on=False): the AR reference lane for
+            # parity/perf gates on the SAME pool (#72 Travail 4) — same
+            # weights, same cache pin, only the speculation differs.
+            _mtp_active = (bool(self.mtp_cfg.get("enabled"))
+                           and not self.mtp_tripped)
+            if mtp_on is False:
+                _mtp_active = False
             req["mtp"] = {
-                "on": bool(self.mtp_cfg.get("enabled")) and not self.mtp_tripped,
+                "on": _mtp_active,
                 "depth": int(self.mtp_cfg.get("depth") or 3),
             }
         # #40: mark the pool busy (idle-gating for keepalive + preventive reload)
@@ -4544,6 +4558,10 @@ class ChatCompletionRequest(BaseModel):
     # rendered prompt). Runner defaults to True; None here keeps that default,
     # explicit false opts out for this request.
     clear_thinking: Optional[bool] = None
+    # Per-request MTP opt-out on an MTP-armed pool: False forces plain AR for
+    # THIS request (parity/perf reference lane, #72 Travail 4). None/True =
+    # pool default. Ignored on pools without mtp_cfg.
+    mtp_on: Optional[bool] = None
 
     @model_validator(mode="after")
     def _alias_max_completion_tokens(self) -> "ChatCompletionRequest":
@@ -5742,7 +5760,7 @@ def _initial_default_config() -> Optional[dict]:
 #   major (1.7.2 → 2.0.0) — breaking API or topology change
 #
 # Use `./scripts/bump-version.sh patch|minor|major` to bump + auto-commit.
-APP_VERSION = "1.43.0"
+APP_VERSION = "1.44.0"
 
 app = FastAPI(
     title="OdyssAI-X (odyssai.eu)",
@@ -9307,6 +9325,7 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
                                         kv_q8=req.kv_q8,
                                         context_limit=req.context_limit,
                                         ignore_eos=bool(req.ignore_eos),
+                                        mtp_on=req.mtp_on,
                                         clear_thinking=req.clear_thinking,
                                         messages=messages, tools=req.tools,
                                         session_id=session_id,
@@ -9467,6 +9486,7 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
                                         kv_q8=req.kv_q8,
                                         context_limit=req.context_limit,
                                         ignore_eos=bool(req.ignore_eos),
+                                        mtp_on=req.mtp_on,
                                         clear_thinking=req.clear_thinking,
                                         messages=messages, tools=req.tools,
                                         session_id=session_id,

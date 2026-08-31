@@ -79,6 +79,64 @@ def _cache_offset(cache: list) -> int:
     return -1
 
 
+def _snapshot_hybrid_state(cache: list) -> list:
+    """Round-start snapshot of a HYBRID trunk cache (#72 v1).
+
+    Per entry: ArraysCache-like (rebound constant-size slots — deltanet conv,
+    ssm state, PLE conv, n-gram tail) -> defensive copy of every slot;
+    KVCache-like (offset-carrying; `_AttnCache.trim` also trims its indexer
+    keys) -> the integer offset; CacheList -> recurse. The defensive copy
+    guards against in-place slot mutation (review §2: the "refs suffice" bet
+    is retired — the copy of constant-size states costs ~nothing).
+    """
+    snap: list = []
+    for c in cache:
+        if c is None:
+            snap.append(None)
+            continue
+        children = getattr(c, "caches", None)
+        if children is not None:                      # CacheList
+            snap.append(("list", _snapshot_hybrid_state(children)))
+            continue
+        slots = getattr(c, "cache", None)
+        if isinstance(slots, list):                   # ArraysCache family
+            copies = [None if s is None else mx.array(s) for s in slots]
+            lengths = getattr(c, "lengths", None)
+            lp = getattr(c, "left_padding", None)
+            snap.append(("arrays", copies,
+                         None if lengths is None else mx.array(lengths),
+                         None if lp is None else mx.array(lp)))
+            continue
+        off = getattr(c, "offset", None)
+        if isinstance(off, int):                      # KVCache family
+            snap.append(("kv", off))
+            continue
+        raise TypeError(
+            f"hybrid snapshot: unsupported cache {type(c).__name__}")
+    return snap
+
+
+def _restore_hybrid_state(cache: list, snap: list) -> None:
+    """Rebind ArraysCache slots to the snapshot and trim KV back to the
+    round-start offset. Exact inverse of `_snapshot_hybrid_state`."""
+    for c, s in zip(cache, snap):
+        if s is None:
+            continue
+        kind = s[0]
+        if kind == "list":
+            _restore_hybrid_state(c.caches, s[1])
+        elif kind == "arrays":
+            _, copies, lengths, lp = s
+            for i, v in enumerate(copies):
+                c[i] = v
+            c.lengths = lengths
+            c.left_padding = lp
+        else:                                          # "kv"
+            delta = c.offset - s[1]
+            if delta > 0:
+                c.trim(delta)
+
+
 def native_mtp_stream_generate(
     model: Any,
     tokenizer: Any,
@@ -114,15 +172,40 @@ def native_mtp_stream_generate(
         inner = model.model            # dsv32-style inner: returns POST-norm hidden
         lm_head = model.lm_head
 
-    # D8 "pre_norm" A/B: wrap the final norm to record its INPUT while
-    # returning the normal output — one mechanism for every mlx-lm family.
+    # A module family can impose its capture point (qwen4_exp: "hc_multi" —
+    # the drafter consumes the PRE-final-mixer multi stream, vLLM scheme A).
+    _hs_override = getattr(mtp, "hidden_source_override", None)
+    if _hs_override:
+        hidden_source = _hs_override
+    # #72: hybrid linear-attn trunks roll back by snapshot/restore + commit
+    # re-forward instead of trim (ArraysCache has no .trim).
+    hybrid = bool(getattr(mtp, "hybrid_snapshot", False))
+
+    # Capture wrappers: record the tapped tensor while returning the normal
+    # output — one mechanism for every mlx-lm family.
+    #  * "pre_norm" (D8 A/B): the final norm's INPUT.
+    #  * "hc_multi" (qwen4_exp): the final hyper-connection mixer's INPUT,
+    #    the [B, S, hc*H] multi stream.
     capture: dict[str, mx.array] = {}
-    real_norm = inner.norm
+    _unpatch: Optional[Callable[[], None]] = None
     if hidden_source == "pre_norm":
+        real_norm = inner.norm
         def _capture_norm(x):
             capture["h"] = x
             return real_norm(x)
         inner.norm = _capture_norm
+        def _unpatch_norm():
+            inner.norm = real_norm
+        _unpatch = _unpatch_norm
+    elif hidden_source == "hc_multi":
+        real_mixer = inner.hyper_connection_mixer
+        def _capture_mixer(x):
+            capture["h"] = x
+            return real_mixer(x)
+        inner.hyper_connection_mixer = _capture_mixer
+        def _unpatch_mixer():
+            inner.hyper_connection_mixer = real_mixer
+        _unpatch = _unpatch_mixer
 
     # mlx-lm runs every generation forward inside a dedicated thread-local
     # stream (generate.py:226). Without it, the distributed pipeline's
@@ -149,23 +232,39 @@ def native_mtp_stream_generate(
         """One trunk pass -> (logits, hidden) for all S positions."""
         with mx.stream(_gen_stream):
             h_post = inner(tokens, trunk_cache)
-            h = capture.pop("h") if hidden_source == "pre_norm" else h_post
+            h = (capture.pop("h")
+                 if hidden_source in ("pre_norm", "hc_multi") else h_post)
             return lm_head(h_post), h
 
     # Enter the wired-limit context manually (avoids re-indenting the whole
     # generator body); exited in the finally below.
     _wl_ctx = _wired_limit(model, [_gen_stream])
     _wl_ctx.__enter__()
+    # Initialized BEFORE the try: the finally's canary references them, and a
+    # prefill-time crash must not shadow the real error with UnboundLocalError.
+    accepted_total = 0
+    drafted_total = 0
+    sha = hashlib.sha256()
     try:
         # ── Prefill (chunked): trunk + mtp pairs (token_{p+1}, hidden_p) ──
         t0 = time.time()
         todo = prompt_ids[prefix_len:]
         if not todo:
-            # Warm session cache holds the WHOLE prompt: no hidden was stored,
-            # so re-forward the last prompt token (invariant F-5, 1-token cost).
-            trim_prompt_cache(trunk_cache, 1)
-            todo = prompt_ids[-1:]
-            prefix_len = len(prompt_ids) - 1
+            if hybrid:
+                # F-5's trim(1)+re-forward would double-advance the linear
+                # states (no rollback on ArraysCache). Rebuild from scratch,
+                # IN PLACE so the caller's session-cache list stays coherent —
+                # correctness over the one-time prefill cost.
+                trunk_cache.clear()
+                trunk_cache.extend(make_prompt_cache(model))
+                todo = prompt_ids
+                prefix_len = 0
+            else:
+                # Warm session cache holds the WHOLE prompt: no hidden was
+                # stored, so re-forward the last prompt token (invariant F-5).
+                trim_prompt_cache(trunk_cache, 1)
+                todo = prompt_ids[-1:]
+                prefix_len = len(prompt_ids) - 1
 
         h_carry: Optional[mx.array] = None   # last hidden, spans chunk borders
         logits = h = None
@@ -173,20 +272,24 @@ def native_mtp_stream_generate(
             chunk = todo[i:i + PREFILL_CHUNK]
             toks = mx.array([chunk], dtype=mx.uint32)
             logits, h = trunk_forward(toks)
-            if h_carry is not None:
-                mtp_h = mx.concatenate([h_carry, h[:, :-1, :]], axis=1)
-                mtp_t = toks
-            else:
-                # Very first token of the context has no predecessor pair.
-                mtp_h = h[:, :-1, :]
-                mtp_t = toks[:, 1:]
-            if mtp_t.shape[1] > 0:
-                mtp.draft_step(mtp_t, mtp_h, mtp_cache)
-            h_carry = h[:, -1:, :]
-            mx.eval(logits)
+            # Same stream for the mtp pairs + eval (MLX_METAL_FAST_SYNCH:
+            # cross-stream host reads return stale data, cf round loop).
+            with mx.stream(_gen_stream):
+                if h_carry is not None:
+                    mtp_h = mx.concatenate([h_carry, h[:, :-1, :]], axis=1)
+                    mtp_t = toks
+                else:
+                    # Very first token of the context has no predecessor pair.
+                    mtp_h = h[:, :-1, :]
+                    mtp_t = toks[:, 1:]
+                if mtp_t.shape[1] > 0:
+                    mtp.draft_step(mtp_t, mtp_h, mtp_cache)
+                h_carry = h[:, -1:, :]
+                mx.eval(logits)
         prompt_tps = len(todo) / max(time.time() - t0, 1e-9)
 
-        bonus = int(mx.argmax(logits[:, -1, :], axis=-1).item())
+        with mx.stream(_gen_stream):
+            bonus = int(mx.argmax(logits[:, -1, :], axis=-1).item())
         seed_hidden = h[:, -1:, :]   # hidden of the position that produced bonus
         prompt_len_total = prefix_len + len(todo)
 
@@ -194,10 +297,7 @@ def native_mtp_stream_generate(
         detok.reset()
 
         emitted = 0
-        accepted_total = 0
-        drafted_total = 0
         round_idx = 0
-        sha = hashlib.sha256()
         gen_t0 = time.time()
         finish: Optional[str] = None
 
@@ -234,13 +334,24 @@ def native_mtp_stream_generate(
         # so these are REAL compute times, not lazy graph-build.
         _timing = os.environ.get("TIMING_MTP", "0") == "1"
         t_draft_tot = t_verify_tot = t_round_tot = 0.0
+        t_snap_tot = t_restore_tot = t_commit_tot = 0.0
+        # Hybrid round state (referenced by the final reconcile).
+        round_snap: Optional[list] = None
+        _rs_bonus = bonus
+        _round_emitted = 0
+        hybrid_flips = 0
 
         # One-time BISECT (collective — all ranks run each forward): isolate
         # what makes inner() 4.2s. lm_head is already known-fast (draft_step
         # runs it 3x in 68ms). Compare inner() on the POPULATED cache vs a
         # FRESH empty cache (pure 1-token, no context), and dump the cache
         # structure (entry count should match the LOCAL shard's layer count).
-        if _timing:
+        if _timing and hybrid:
+            # The bisect's populated-cache probe + trim(1) would desync the
+            # linear states (no rollback) — KV-pur debug tool only.
+            import sys as _sys
+            _sys.stderr.write("[mtp-bisect] skipped (hybrid trunk)\n")
+        if _timing and not hybrid:
             import sys as _sys
             from mlx_lm.models.cache import make_prompt_cache as _mkc
             _p = mx.array([[bonus]], dtype=mx.uint32)
@@ -272,23 +383,38 @@ def native_mtp_stream_generate(
             D = min(depth, max_tokens - emitted)  # never draft past the budget
 
             # (i) Draft chain: D sequential mtp steps, ONE position each.
+            # SAME stream as the trunk: mixing the default stream with
+            # _gen_stream corrupts host reads under MLX_METAL_FAST_SYNCH=1
+            # (round-lagged argmax — the engine sets that env on every
+            # runner; root-caused 2026-08-31, #72).
             _td = time.time()
             drafts: list[int] = []
             d_tok, d_hid = bonus, seed_hidden
-            for _ in range(D):
-                d_logits, d_hid = mtp.draft_step(
-                    mx.array([[d_tok]], dtype=mx.uint32), d_hid, mtp_cache)
-                d_tok = int(mx.argmax(d_logits[:, -1, :], axis=-1).item())
-                drafts.append(d_tok)
+            with mx.stream(_gen_stream):
+                for _ in range(D):
+                    d_logits, d_hid = mtp.draft_step(
+                        mx.array([[d_tok]], dtype=mx.uint32), d_hid, mtp_cache)
+                    d_tok = int(mx.argmax(d_logits[:, -1, :], axis=-1).item())
+                    drafts.append(d_tok)
             drafted_total += D
             t_draft_tot += time.time() - _td
+
+            # (i-bis) HYBRID: round-start snapshot BEFORE verify dirties the
+            # linear states (the draft chain only touches mtp_cache).
+            if hybrid:
+                _rs_bonus = bonus
+                _ts = time.time()
+                with mx.stream(_gen_stream):
+                    round_snap = _snapshot_hybrid_state(trunk_cache)
+                t_snap_tot += time.time() - _ts
 
             # (ii) Verify: ONE trunk pass over [bonus, d0..dD-1] (D+1 pos).
             _tv = time.time()
             v_in = mx.array([[bonus] + drafts], dtype=mx.uint32)
             v_logits, v_hidden = trunk_forward(v_in)
-            v_tokens_arr = mx.argmax(v_logits, axis=-1)
-            mx.eval(v_tokens_arr)
+            with mx.stream(_gen_stream):
+                v_tokens_arr = mx.argmax(v_logits, axis=-1)
+                mx.eval(v_tokens_arr)
             t_verify_tot += time.time() - _tv
             v_tokens = [int(t) for t in v_tokens_arr[0].tolist()]
 
@@ -298,21 +424,87 @@ def native_mtp_stream_generate(
                 n += 1
             new_bonus = v_tokens[n]
             accepted_total += n
+            if os.environ.get("RUNNER_MTP_DEBUG_ROUNDS") and round_idx <= 4:
+                import sys as _sys
+                _vfin = bool(mx.isfinite(v_logits).all().item())
+                _vmax = float(mx.max(v_logits).item())
+                _hfin = bool(mx.isfinite(v_hidden.astype(mx.float32)).all().item())
+                _sys.stderr.write(
+                    f"[mtp-dbg] r{round_idx} bonus={bonus} drafts={drafts} "
+                    f"v_tokens={v_tokens} n={n} "
+                    f"v_finite={_vfin} v_max={_vmax:.2f} h_finite={_hfin} "
+                    f"off={_cache_offset(trunk_cache)} "
+                    f"seed_norm={float(mx.linalg.norm(seed_hidden.astype(mx.float32)).item()):.1f} "
+                    f"inner={type(inner).__name__}\n")
+                _sys.stderr.flush()
 
-            # (iv) Rollback. Trunk keeps n+1 of D+1. MTP drops ALL D
-            # speculative entries, then re-forwards the n+1 accepted pairs
-            # with TRUNK hiddens (advance == trunk's n+1; stays 1 behind).
-            if D - n:
-                trim_prompt_cache(trunk_cache, D - n)
-            trim_prompt_cache(mtp_cache, D)
-            upd_tokens = mx.array([[bonus] + drafts[:n]], dtype=mx.uint32)
-            upd_hidden = mx.concatenate([seed_hidden, v_hidden[:, :n, :]], axis=1)
-            mtp.draft_step(upd_tokens, upd_hidden, mtp_cache)
+            # (iv) Rollback.
+            if hybrid:
+                # #72 v1 "verify on snapshot, commit by re-forward": restore
+                # the linear slots + trim KV to ROUND START (not D-n), then
+                # ONE batched re-forward of the accepted chunk rebuilds KV
+                # and linear states exactly at the accepted position.
+                _ts = time.time()
+                with mx.stream(_gen_stream):
+                    _restore_hybrid_state(trunk_cache, round_snap)
+                t_restore_tot += time.time() - _ts
+                _tc = time.time()
+                c_in = mx.array([[bonus] + drafts[:n]], dtype=mx.uint32)
+                c_logits, c_hidden = trunk_forward(c_in)
+                with mx.stream(_gen_stream):
+                    c_last = int(mx.argmax(c_logits[:, n, :], axis=-1).item())
+                t_commit_tot += time.time() - _tc
+                # Drift gate (review §1, AMENDED 2026-08-31): the linear-scan
+                # kernels are S-dependent at bf16 noise level (verify S=D+1 vs
+                # commit S=n+1 -> logit_maxdiff ~0.4 measured), so a TIED
+                # top-2 can legitimately flip argmax (round-35 case:
+                # top2_gap=0.0000, ground-truthed VERIFY-side correct). Rare
+                # flips = kernel noise, tolerated (emission stays verify-truth
+                # and the state is rebuilt from exact tokens each round — no
+                # accumulation). SYSTEMATIC flips = a real restore bug (the
+                # fast-synch race flipped 100% of rounds): trip on rate.
+                if c_last != new_bonus:
+                    hybrid_flips += 1
+                    _dmax = float(mx.max(mx.abs(
+                        c_logits[:, n, :].astype(mx.float32)
+                        - v_logits[:, n, :].astype(mx.float32))).item())
+                    import sys as _sys
+                    _sys.stderr.write(
+                        f"[mtp-hybrid] argmax flip {hybrid_flips} at round "
+                        f"{round_idx} (n={n}, commit {c_last} vs verify "
+                        f"{new_bonus}, logit_maxdiff={_dmax:.4f}) — "
+                        f"emitting verify\n")
+                    _sys.stderr.flush()
+                    if hybrid_flips >= 8 and hybrid_flips > 0.10 * round_idx:
+                        raise AssertionError(
+                            f"hybrid commit drift SYSTEMATIC: "
+                            f"{hybrid_flips} flips in {round_idx} rounds "
+                            f"(last: commit {c_last} != verify {new_bonus}, "
+                            f"n={n}, logit_maxdiff={_dmax:.4f}) — restore "
+                            f"presumed broken, refusing to serve")
+                upd_tokens = c_in
+                upd_hidden = mx.concatenate(
+                    [seed_hidden, c_hidden[:, :n, :]], axis=1)
+            else:
+                # Trunk keeps n+1 of D+1.
+                if D - n:
+                    trim_prompt_cache(trunk_cache, D - n)
+                upd_tokens = mx.array([[bonus] + drafts[:n]], dtype=mx.uint32)
+                upd_hidden = mx.concatenate(
+                    [seed_hidden, v_hidden[:, :n, :]], axis=1)
+            # MTP drops ALL D speculative entries, then re-forwards the n+1
+            # accepted pairs with TRUNK hiddens (advance == trunk's n+1;
+            # stays 1 behind).
+            with mx.stream(_gen_stream):
+                trim_prompt_cache(mtp_cache, D)
+                mtp.draft_step(upd_tokens, upd_hidden, mtp_cache)
 
             # (v) Emit: the n accepted drafts + the new bonus (n+1 tokens).
             out_this_round = drafts[:n] + [new_bonus]
+            _round_emitted = 0
             for j, tok in enumerate(out_this_round):
                 emitted += 1
+                _round_emitted += 1
                 sha.update(tok.to_bytes(4, "little"))
                 if tok in stop_ids:
                     finish = "stop"
@@ -336,14 +528,22 @@ def native_mtp_stream_generate(
                     f"(round {round_idx}, emitted {emitted})")
 
             # (vii) Seed next round (invariant F-1: LAST ACCEPTED position).
+            # Hybrid: the COMMITTED hidden is canonical (review §1 —
+            # v_hidden[n] would be a silent-drift channel the canary can't see).
             bonus = new_bonus
-            seed_hidden = v_hidden[:, n:n + 1, :]
+            seed_hidden = (c_hidden[:, n:n + 1, :] if hybrid
+                           else v_hidden[:, n:n + 1, :])
             t_round_tot += time.time() - _tr
             if _timing and round_idx % 8 == 0:
                 import sys as _sys
+                _hyb = (f"snap={t_snap_tot/round_idx*1000:.0f}ms "
+                        f"restore={t_restore_tot/round_idx*1000:.0f}ms "
+                        f"commit={t_commit_tot/round_idx*1000:.0f}ms "
+                        if hybrid else "")
                 _sys.stderr.write(
                     f"[mtp-timing] round {round_idx}: draft={t_draft_tot/round_idx*1000:.0f}ms "
                     f"verify={t_verify_tot/round_idx*1000:.0f}ms "
+                    f"{_hyb}"
                     f"round={t_round_tot/round_idx*1000:.0f}ms "
                     f"(other={((t_round_tot-t_draft_tot-t_verify_tot)/round_idx)*1000:.0f}ms)\n")
                 _sys.stderr.flush()
@@ -354,12 +554,24 @@ def native_mtp_stream_generate(
         off = _cache_offset(trunk_cache)
         expect = prompt_len_total + emitted - 1
         if off > expect:
-            trim_prompt_cache(trunk_cache, off - expect)
-            trim_prompt_cache(mtp_cache, off - expect)
+            if hybrid and round_snap is not None:
+                # Trimming would desync the linear states. Restore to round
+                # start and re-forward EXACTLY the emitted chunk (the last
+                # emitted token stays pending, like the bonus convention).
+                _restore_hybrid_state(trunk_cache, round_snap)
+                k = _round_emitted
+                if k > 0:
+                    trunk_forward(mx.array([[_rs_bonus] + drafts[:k - 1]],
+                                           dtype=mx.uint32))
+                trim_prompt_cache(mtp_cache, off - expect)
+            else:
+                trim_prompt_cache(trunk_cache, off - expect)
+                trim_prompt_cache(mtp_cache, off - expect)
             off = _cache_offset(trunk_cache)
         assert off in (-1, expect), f"final cache drift: {off} != {expect}"
     finally:
-        inner.norm = real_norm
+        if _unpatch is not None:
+            _unpatch()
         try:
             _wl_ctx.__exit__(None, None, None)
         except Exception:

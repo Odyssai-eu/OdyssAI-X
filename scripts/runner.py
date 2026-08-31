@@ -2976,7 +2976,9 @@ def _run_legacy_main(model, tokenizer, repo: str, kv_q8_default: bool,
                 prompt_cache=prompt_cache,
                 prefix_len=_mtp_prefix,
                 hidden_source=os.environ.get("RUNNER_MTP_HIDDEN", "post_norm"),
-                stop_ids=_stop_ids,
+                # ignore_eos (endurance): the AR path bans stop ids at the
+                # logits level; the MTP loop just doesn't stop on them.
+                stop_ids=(set() if _ignore_eos else _stop_ids),
                 canary_cb=lambda r, d, n, s: _canary_line(
                     {"rid": req_id, "rank": rank, "round": r,
                      "drafted": d, "accepted": n, "sha": s}),
