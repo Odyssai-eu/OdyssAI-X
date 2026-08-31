@@ -2830,9 +2830,23 @@ def _run_legacy_main(model, tokenizer, repo: str, kv_q8_default: bool,
         _snap_tokens_pending = None
         _spec_dspark_on = bool(spec_dspark_ctx and spec_dspark_ctx.get("enabled"))
         _spec_stats: dict = {}
+        # Native-MTP owns its OWN prefill (mtp_spec re-prefills prompt_ids from
+        # prefix_len over the passed prompt_cache). The snap-cache path below
+        # ALSO prefills (_manual_prefill) — for a session request on a
+        # non-truncatable hybrid trunk (glm5_next/qwen4_exp) both fire and the
+        # prompt gets prefilled TWICE → trunk offset = 2× → mtp_spec's periodic
+        # cache-drift assert kills the runner mid-gen (crash reproduced via
+        # Companion, which sets session_id; short session-less curls never hit
+        # it). MTP manages its own cache, so skip the snap path entirely when
+        # MTP will engage. (2026-08-31, #73.)
+        _mtp_owns_prefill = (
+            native_mtp is not None
+            and bool((req.get("mtp") or {}).get("on", True))
+        )
         if (_SNAP_CACHE_ENABLED
                 and session_id and prompt_cache is not None and draft_model is None
                 and not _spec_dspark_on          # le pool spec fait son propre prefill
+                and not _mtp_owns_prefill        # #73: MTP préfill lui-même
                 and not _truncatable_cache(prompt_cache)):
             _pre = (suffix_tokens if cached_cache is not None
                     else prompt_tokens_full)
