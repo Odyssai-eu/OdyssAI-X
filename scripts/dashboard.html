@@ -4136,7 +4136,7 @@ function renderArgoPoolsList(a) {
     const mtpPill = (p.mtp && p.mtp.enabled)
       ? (p.mtp.tripped
           ? `<span class="kind-pill" style="background:#5c5c66" title="MTP auto-disabled (canary trip) — serving AR">MTP off</span>`
-          : `<span class="kind-pill" style="background:#2e7d4f" title="Native-MTP speculative decoding">MTP D${p.mtp.depth || 3}${p.mtp.accept_rate != null ? " · " + Math.round(p.mtp.accept_rate * 100) + "%" : ""}</span>`)
+          : `<span class="kind-pill" style="background:#2e7d4f" title="Native-MTP speculative decoding${p.mtp.hybrid ? " — tronc hybride, rollback snapshot/restore (#72)" : ""}">MTP D${p.mtp.depth || 3}${p.mtp.hybrid ? "·hyb" : ""}${p.mtp.accept_rate != null ? " · " + Math.round(p.mtp.accept_rate * 100) + "%" : ""}</span>`)
       : "";
     const kindPill = (isVlmPool
       ? `<span class="kind-pill vlm" title="VL model — mlx_vlm.server, single node">VLM</span>`

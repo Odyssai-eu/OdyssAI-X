@@ -903,17 +903,27 @@ MTP_FAMILY_MODEL_TYPES = frozenset({
                    # sidecar; needs mtp.hybrid=true -> RUNNER_MTP_HYBRID_SNAPSHOT)
 })
 
+# Hybrid linear-attention trunks (#72): speculation needs the snapshot/restore
+# rollback armed (RUNNER_MTP_HYBRID_SNAPSHOT=1). The load handler resolves this
+# from the model's config so the dashboard checkbox stays a plain boolean.
+MTP_HYBRID_MODEL_TYPES = frozenset({"qwen4_exp"})
+
 
 async def probe_mtp_sidecar(ssh: str, abspath: str) -> bool:
-    """True when `<model_dir>/mtp-sidecar/mtp-sidecar.safetensors` exists on the
-    node — the canonical auto-discovery location mtp_module.detect_native_mtp
-    checks (its RUNNER_MTP_SIDECAR-less fallback). One cheap ssh test."""
-    p = abspath.rstrip("/") + "/mtp-sidecar/mtp-sidecar.safetensors"
+    """True when `<model_dir>/mtp-sidecar/` holds a native-MTP sidecar the
+    runner can auto-discover (mtp_module.detect_native_mtp, no
+    RUNNER_MTP_SIDECAR needed): either our extract layout
+    (mtp-sidecar.safetensors) or an HF drafter repo layout
+    (model.safetensors — e.g. kikekewl qwen4_exp_mtp, dir or symlink, #72).
+    One cheap ssh test."""
+    d = abspath.rstrip("/") + "/mtp-sidecar"
+    p1 = d + "/mtp-sidecar.safetensors"
+    p2 = d + "/model.safetensors"
     try:
         out = await asyncio.to_thread(
             subprocess.run,
             ["ssh", "-o", "ConnectTimeout=5", "-o", "BatchMode=yes", ssh,
-             f"test -f {shlex.quote(p)} && echo yes"],
+             f"test -e {shlex.quote(p1)} -o -e {shlex.quote(p2)} && echo yes"],
             capture_output=True, text=True, timeout=15,
         )
         return out.stdout.strip() == "yes"
@@ -5760,7 +5770,7 @@ def _initial_default_config() -> Optional[dict]:
 #   major (1.7.2 → 2.0.0) — breaking API or topology change
 #
 # Use `./scripts/bump-version.sh patch|minor|major` to bump + auto-commit.
-APP_VERSION = "1.44.0"
+APP_VERSION = "1.44.1"
 
 app = FastAPI(
     title="OdyssAI-X (odyssai.eu)",
@@ -13186,6 +13196,22 @@ async def admin_cluster_load(cluster_id: str, req: ArgoLoadRequest):
         raise HTTPException(400, f"invalid mode {req.mode}")
     if req.backend is not None and req.backend not in ("jaccl", "ring"):
         raise HTTPException(400, f"invalid backend {req.backend!r} — 'jaccl' or 'ring'")
+    # #72: hybrid linear-attn trunks (qwen4_exp) need mtp.hybrid=true to arm
+    # the snapshot/restore rollback. Resolved HERE from the model's config so
+    # the dashboard "Enable MTP" checkbox stays a plain {enabled, depth} —
+    # the operator never types hybrid/sidecar. Fail-open: explicit API loads
+    # can always pass hybrid themselves.
+    if req.mtp and req.mtp.get("enabled") and "hybrid" not in req.mtp:
+        try:
+            _hidx = req.node_indices[0] if req.node_indices else 0
+            _htopo = build_topology_from_indices(cluster_id, [_hidx])
+            _hdir = _htopo[0].get("models_dir") or models_dir_for(cluster_id)
+            _harch = await get_model_arch_meta(
+                _htopo[0]["ssh"], _resolve_model_abspath(req.model, _hdir))
+            if str(_harch.get("model_type", "")).lower() in MTP_HYBRID_MODEL_TYPES:
+                req.mtp = {**req.mtp, "hybrid": True}
+        except Exception:
+            pass
     cd = get_cluster_def(cluster_id)
     cluster_max = len(cd.get("nodes", []))
     effective_max = get_cluster_max_nodes(cluster_id, default=cluster_max)

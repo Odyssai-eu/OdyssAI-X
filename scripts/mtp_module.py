@@ -212,6 +212,9 @@ def detect_native_mtp(model_dir: str | Path,
     if sidecar_env:
         candidates.append(Path(sidecar_env))
     candidates.append(model_dir / "mtp-sidecar" / "mtp-sidecar.safetensors")
+    # HF drafter repo layout dropped/symlinked into the model dir (#72:
+    # `<model_dir>/mtp-sidecar/` -> kikekewl snapshot with model.safetensors).
+    candidates.append(model_dir / "mtp-sidecar")
     for cand in candidates:
         if cand.is_dir():
             # Our extract scripts write mtp-sidecar.safetensors; an HF drafter

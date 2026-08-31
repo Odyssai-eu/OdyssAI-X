@@ -245,6 +245,7 @@ def native_mtp_stream_generate(
     accepted_total = 0
     drafted_total = 0
     sha = hashlib.sha256()
+    _final_sent = False
     try:
         # ── Prefill (chunked): trunk + mtp pairs (token_{p+1}, hidden_p) ──
         t0 = time.time()
@@ -316,6 +317,18 @@ def native_mtp_stream_generate(
                 round_idx=round_idx,
             )
 
+        # Final canary (round -1). Emitted BEFORE the terminal yield: the
+        # runner's consumer breaks on finish_reason and never pulls again, so
+        # anything after that yield only runs at generator GC — the engine's
+        # accept-rate (dashboard pill) stayed null until the NEXT request.
+        # Idempotent; the finally keeps a guarded copy for crash paths.
+        def _final_canary():
+            nonlocal _final_sent
+            if not _final_sent and canary_cb is not None:
+                _final_sent = True
+                canary_cb(-1, drafted_total, accepted_total,
+                          sha.hexdigest()[:16])
+
         # The prefill's argmax IS the first generated token (parity with AR /
         # mlx-lm, which yields it before any speculative round).
         emitted += 1
@@ -327,6 +340,7 @@ def native_mtp_stream_generate(
         first = _mk(bonus, from_draft=False)
         if finish:
             first.finish_reason = finish
+            _final_canary()
         yield first
 
         # Instrumentation (TIMING_MTP=1): per-phase wall time, emitted in the
@@ -513,6 +527,7 @@ def native_mtp_stream_generate(
                 r = _mk(tok, from_draft=(j < n))
                 if finish:
                     r.finish_reason = finish
+                    _final_canary()
                 yield r
                 if finish:
                     break
@@ -576,5 +591,5 @@ def native_mtp_stream_generate(
             _wl_ctx.__exit__(None, None, None)
         except Exception:
             pass
-        if canary_cb is not None:
+        if canary_cb is not None and not _final_sent:
             canary_cb(-1, drafted_total, accepted_total, sha.hexdigest()[:16])
