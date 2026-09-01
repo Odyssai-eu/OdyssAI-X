@@ -523,6 +523,41 @@ def pipeline_auto_parallel(
                 has_linear=bool(linear_layers),
             )
 
+    # Duck-typed: qwen4_exp (Qwen3.8-Flash-Next, hybrid HC trunk — #74). Two
+    # shard-local alignments, same fix class as GptOss/MimoV2/Step35 above
+    # (first landed 2026-08-28, lost in a resync — recommitted for good):
+    #  1. `ple_layers` is computed at init from GLOBAL layer indices
+    #     (qwen4_exp.py:814-816); Model.__call__ uses cache[ple_layers[0]] for
+    #     the n-gram tail (L841-856). After the slice the cache list is LOCAL,
+    #     so recompute ple_layers from the sliced layers (the PLE layer lives
+    #     on rank 0 in a contiguous split; other ranks get [] and skip the
+    #     n-gram block entirely, which is correct — their layers have no .ple).
+    #  2. Model.make_cache() (qwen4_exp.py:1075) builds the FULL layer_types
+    #     cache list; per-rank it must follow the local slice or cache kinds
+    #     misalign with layers (the 2026-08-28 "ArraysCache.offset" crash).
+    # The hc tile/mixer need NO patch: boundary payloads are DecoderLayer
+    # outputs (hc-wide), and the decode all_gather hands every rank the last
+    # rank's stream, so the per-rank final mixer sees identical input.
+    if (
+        hasattr(inner_model_instance, "ple_layers")
+        and hasattr(inner_model_instance, "hyper_connection_mixer")
+        and hasattr(inner_model_instance, "hc")
+    ):
+        inner_model_instance.ple_layers = [
+            i
+            for i, layer in enumerate(layers)
+            if getattr(layer, "ple", None) is not None
+        ]
+
+        _q4_orig_make_cache = model.make_cache
+
+        def _q4_sliced_make_cache(
+            _mc=_q4_orig_make_cache, _s=start_layer, _e=end_layer
+        ):
+            return _mc()[_s:_e]
+
+        model.make_cache = _q4_sliced_make_cache
+
     # Duck-typed: matches mlx-lm's bailing_moe_linear.LanguageModel AND the
     # vendored patches/bailing_hybrid_model.LanguageModel (and any future
     # hybrid using the same attn_idx/gla_idx + per-layer is_global contract) —
