@@ -242,30 +242,49 @@ class Glm5NextLinearAttention(nn.Module):
         self.o_proj = nn.Linear(self.qkv_dim, self.hidden_size, bias=False)
         self.fuse_in = True
         self._fused_ready = False
+        self._fsrc: list = []
 
     def _fused_in_proj(self, inputs):
         # q,k,v,f_a,g_a,b all take `inputs`; fuse into one matmul via a lossless
         # output-axis concat of the (quantized) weights, built once and cached.
-        if not self._fused_ready:
-            mods = [
-                self.q_proj,
-                self.k_proj,
-                self.v_proj,
-                self.forget_gate.f_a_proj,
-                self.g_a_proj,
-                self.b_proj,
-            ]
+        # The cache is keyed on the IDENTITY of the six source weights: a
+        # model.update() after the first forward (dtype cast, nn.quantize, LoRA
+        # merge, test harness) swaps the arrays, and serving the stale fused
+        # copy would silently keep the old dtype/quantization. Returns None
+        # when the six projections do not share one quantization scheme (the
+        # caller then runs them unfused) — mixed-quant checkpoints exist.
+        mods = [
+            self.q_proj,
+            self.k_proj,
+            self.v_proj,
+            self.forget_gate.f_a_proj,
+            self.g_a_proj,
+            self.b_proj,
+        ]
+        srcs = [m.weight for m in mods]
+        if not self._fused_ready or any(a is not b for a, b in zip(srcs, self._fsrc)):
+            fq = hasattr(mods[0], "scales")
+            if any(hasattr(m, "scales") != fq for m in mods) or (
+                fq
+                and any(
+                    (m.group_size, m.bits) != (mods[0].group_size, mods[0].bits)
+                    for m in mods
+                )
+            ):
+                self._fused_ready = False
+                return None
             pts, acc = [], 0
             for m in mods[:-1]:
                 acc += m.weight.shape[0]
                 pts.append(acc)
             self._split_pts = pts
-            self._fq = hasattr(mods[0], "scales")
-            self._fw = mx.concatenate([m.weight for m in mods], axis=0)
+            self._fq = fq
+            self._fw = mx.concatenate(srcs, axis=0)
             if self._fq:
                 self._fs = mx.concatenate([m.scales for m in mods], axis=0)
                 self._fb = mx.concatenate([m.biases for m in mods], axis=0)
                 self._gs, self._bits = mods[0].group_size, mods[0].bits
+            self._fsrc = srcs
             self._fused_ready = True
         if self._fq:
             out = mx.quantized_matmul(
@@ -288,8 +307,9 @@ class Glm5NextLinearAttention(nn.Module):
         cache: Optional[Any] = None,
     ) -> mx.array:
         B, S, _ = inputs.shape
-        if self.fuse_in:
-            q_o, k_o, v_o, fa_o, ga_o, b_o = self._fused_in_proj(inputs)
+        fused = self._fused_in_proj(inputs) if self.fuse_in else None
+        if fused is not None:
+            q_o, k_o, v_o, fa_o, ga_o, b_o = fused
             mixed = mx.concatenate([q_o, k_o, v_o], axis=-1)
         else:
             mixed = mx.concatenate(
