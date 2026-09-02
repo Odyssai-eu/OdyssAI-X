@@ -467,6 +467,14 @@ class Glm5NextIndexer(nn.Module):
             and getattr(cache, "_pool", None) is not None
             and getattr(cache, "_no_pad", False)
             and cache._pool[0].shape[0] == B
+            # Time-continuity guard (upstream Blaizzy/mlx-vlm#2086): the pool
+            # must have been written exactly one token ago. Any rewind between
+            # decode steps (multi-turn trim, rollback outside our restore path,
+            # batch splice) leaves t_prev >= T -> empty suffix -> argmax on a
+            # zero-size array, or silent reuse of pooled keys built from
+            # content no longer in the cache. A discontinuity takes one full
+            # pooling pass (rebuilds the pool) and the fast path resumes next.
+            and cache._pool[3] == T - 1
         ):
             ck, ci, cv, t_prev = cache._pool
             n_stable = t_prev // self.index_kpool
