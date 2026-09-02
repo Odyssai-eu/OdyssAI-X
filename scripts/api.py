@@ -874,7 +874,16 @@ FORCE_NO_AP_MODEL_TYPES = frozenset({
 # multimodal server (InklingPool, 1.38.0) inside the is_vision branch — so it
 # STAYS is_vision=True and this carve-out is empty again. Kept as the hook for
 # any future "text-only despite vision_config" model.
-TEXT_ONLY_DESPITE_VISION_CONFIG: frozenset = frozenset()
+#
+# qwen4_exp (Qwen3.8-Flash-Next, #74): the OFFICIAL checkpoint is the
+# multimodal Qwen4ExpForConditionalGeneration and carries a vision_config
+# (the mlx_lm-converted Q8 dropped it, which is why the Q8 always routed to
+# the text runner while the bf16 raw went to vlm-dist and died with
+# "No module named mlx_vlm.speculative.drafters.qwen4_exp"). The text runner
+# loads it text-only by construction — mlx_lm qwen4_exp.sanitize drops the
+# visual tower and remaps language_model.* — and pipeline_auto_parallel is
+# its ONLY multi-node path. mlx-vlm has no qwen4_exp support at all.
+TEXT_ONLY_DESPITE_VISION_CONFIG: frozenset = frozenset({"qwen4_exp"})
 
 # Inverse guard: model types whose ONLY working multi-node path is
 # auto_parallel. glm_moe_dsa's DSA patch (Option A) declares Indexer params on
@@ -5773,7 +5782,7 @@ def _initial_default_config() -> Optional[dict]:
 #   major (1.7.2 → 2.0.0) — breaking API or topology change
 #
 # Use `./scripts/bump-version.sh patch|minor|major` to bump + auto-commit.
-APP_VERSION = "1.45.1"
+APP_VERSION = "1.45.2"
 
 app = FastAPI(
     title="OdyssAI-X (odyssai.eu)",
@@ -12356,7 +12365,13 @@ async def _gather_preflight(cluster_id: str, model: str,
     abspath = _resolve_model_abspath(model, base_dir)
     cfg = await _read_raw_config(rank0, abspath)
     size = await get_model_size_bytes(rank0, abspath)
-    is_vision = bool(cfg.get("vision_config") or "vision" in (cfg.get("model_type") or "").lower())
+    _pf_mt = (cfg.get("model_type") or "").lower()
+    # Same carve-out as get_model_arch_meta / _model_capabilities — a model
+    # served text-only must not be preflighted as a VLM.
+    is_vision = bool(
+        (cfg.get("vision_config") or "vision" in _pf_mt)
+        and _pf_mt not in TEXT_ONLY_DESPITE_VISION_CONFIG
+    )
     vlm_present = await _vlm_venv_present(rank0) if is_vision else None
     draft_cfg = draft_size = None
     if draft:
