@@ -4867,7 +4867,8 @@ def _clear_cluster_degraded(cluster_id: str) -> None:
         sys.stderr.write(f"[degraded] {cluster_id} → cleared\n")
 
 
-async def _restore_cluster_pools(cid: str, leaked_hosts: Optional[set] = None) -> list[str]:
+async def _restore_cluster_pools(cid: str, leaked_hosts: Optional[set] = None,
+                                 restore_down: bool = True) -> list[str]:
     """Restore a cluster's persisted desired-state pools (state-<cid>.json v2).
 
     Shared by the container-startup restore (reload_on_restart) and the
@@ -4875,7 +4876,17 @@ async def _restore_cluster_pools(cid: str, leaked_hosts: Optional[set] = None) -
     `leaked_hosts`: nodes the post-sweep wired guard flagged — pools touching
     them are skipped (they need a reboot before a fresh pool can land). A failed
     entry KEEPS its desired-state (never removed here) so a later restore
-    re-attempts it — one dead pool must never erase the intent to serve it."""
+    re-attempts it — one dead pool must never erase the intent to serve it.
+
+    `restore_down`: when False, entries stamped `down: true` are KEPT on disk
+    (intent preserved) but NOT relaunched. The container-startup path passes
+    False: broadened to every active cluster (2026-09-02), it would otherwise
+    replay the ACCUMULATED graveyard of down entries — every model ever loaded
+    on every cluster — and clusters that share physical nodes (hades on
+    .30-.32 vs hercules on .30-.33) would overcommit and OOM. Only the pools
+    that were LIVE at the last state-save (the ones the operator is actually
+    serving) come back. The reboot-all path keeps the default True: it targets
+    ONE cluster deliberately and wants its full desired-set back."""
     leaked_hosts = leaked_hosts or set()
     restored: list[str] = []
     saved_pools = load_cluster_state_v2(cid)
@@ -4915,6 +4926,11 @@ async def _restore_cluster_pools(cid: str, leaked_hosts: Optional[set] = None) -
     for entry in saved_pools:
         alias = entry.get("alias", DEFAULT_ALIAS)
         try:
+            # Graveyard guard (container-startup only): a `down` entry is kept
+            # on disk (intent preserved for a later reboot-all / manual reload)
+            # but not relaunched here — see the restore_down docstring.
+            if not restore_down and entry.get("down"):
+                continue
             indices = entry.get("node_indices") or list(range(int(entry.get("nodes") or 1)))
             # Wired-guard: never respawn onto a node the sweep left leaked.
             if leaked_hosts:
@@ -5070,7 +5086,7 @@ async def lifespan(app: FastAPI):
                 f"[api] reload_on_restart=false ({cid}) — skipping startup "
                 f"restore of its pools (desired-state kept)\n")
             continue
-        await _restore_cluster_pools(cid, _leaked_hosts)
+        await _restore_cluster_pools(cid, _leaked_hosts, restore_down=False)
     # Apply persisted default TTL to any pool that just started up.
     _apply_default_ttl_to_pools()
     # Background TTL sweeper — auto-unloads pools idle for > ttl_seconds.
