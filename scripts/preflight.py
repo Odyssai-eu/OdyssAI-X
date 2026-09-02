@@ -229,15 +229,21 @@ def select_concrete_nodes(indices: list[int], per_node: list[dict],
         ranked.sort(key=lambda i: -free_by_index.get(i, 0))
     chosen = ranked[:n]
     shard = size_bytes / n * (DEFAULT_ACTIVATION_FACTOR if mode == "pipeline" else 1.0)
-    tight = []
+    raw_shard = size_bytes / n  # weights only, no activation headroom
+    tight = []      # weights fit but the 1.10 margin doesn't — may still run
+    overflow = []   # raw weights don't even fit alongside — certain OOM
     if free_by_index:
         for i in chosen:
-            if free_by_index.get(i, 0) < shard:
+            fi = free_by_index.get(i, 0)
+            if fi < raw_shard:
+                overflow.append(i)
+            elif fi < shard:
                 tight.append(i)
     return {"chosen": chosen,
             "hosts": [per_node[i].get("host") for i in chosen if i < len(per_node)],
             "shard_gb": round(shard / 1024**3, 1),
-            "tight_indices": tight}
+            "tight_indices": tight,
+            "overflow_indices": overflow}
 
 
 def validate_draft(draft_meta: Optional[dict], main_meta: dict) -> Optional[dict]:
@@ -305,6 +311,12 @@ def evaluate(*, config: dict, size_bytes: int, capacity_by_nodes: dict,
         selection = select_concrete_nodes(plan["indices"], per_node,
                                            meta["size_bytes"], plan["mode"],
                                            free_by_index)
+        if selection.get("overflow_indices"):
+            blockers.append(
+                f"co-résidence: nodes {selection['overflow_indices']} n'ont pas "
+                f"la place — un autre pool les occupe et le shard "
+                f"{selection['shard_gb']} GB dépasse le libre (OOM certain). "
+                f"Unload le pool résident d'abord, ou force=true pour outrepasser")
         if selection["tight_indices"]:
             warnings.append(
                 f"nodes {selection['tight_indices']} serrés (co-résidence) — "

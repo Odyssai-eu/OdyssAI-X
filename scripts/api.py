@@ -4881,6 +4881,36 @@ async def _restore_cluster_pools(cid: str, leaked_hosts: Optional[set] = None) -
     saved_pools = load_cluster_state_v2(cid)
     if not saved_pools:
         return restored
+    # Prune STRUCTURALLY-dead entries: a desired-state pool whose node_indices
+    # reference a node that no longer exists on this cluster (topology shrank —
+    # e.g. `main` went 5-node → 1-node, leaving a `qwen3-8-…` entry pinned to
+    # index 1). Such an entry fails "node index N out of range [0..M]" on EVERY
+    # boot and, under the keep-for-retry rule, is retried forever. That rule is
+    # for TRANSIENT failures (node down, OOM); an out-of-range index can never
+    # succeed on the current topology, so drop it (explicit remove, not a
+    # liveness event). Skip the check when the cluster has no node list
+    # (telemak/upstream proxies).
+    _node_count = len((get_cluster_def(cid) or {}).get("nodes") or [])
+    if _node_count:
+        _dead = [
+            p.get("alias", DEFAULT_ALIAS) for p in saved_pools
+            if any(i >= _node_count for i in (p.get("node_indices") or []))
+        ]
+        if _dead:
+            sys.stderr.write(
+                f"[api] pruning structurally-dead desired-state on {cid}: "
+                f"{_dead} — node_indices out of range for {_node_count}-node "
+                f"topology (never restorable)\n")
+            try:
+                save_cluster_state_v2(cid, remove_aliases=_dead,
+                                      allow_empty_delete=True)
+            except Exception as e:
+                sys.stderr.write(f"[api] prune of {cid} state failed: {e}\n")
+            _deadset = set(_dead)
+            saved_pools = [p for p in saved_pools
+                           if p.get("alias", DEFAULT_ALIAS) not in _deadset]
+            if not saved_pools:
+                return restored
     saved_pools.sort(key=lambda p: 0 if p.get("alias") == DEFAULT_ALIAS else 1)
     for entry in saved_pools:
         alias = entry.get("alias", DEFAULT_ALIAS)
@@ -4985,7 +5015,13 @@ async def lifespan(app: FastAPI):
     # Run the per-cluster orphan sweeps OFF the event loop and in parallel:
     # each does blocking SSH (up to ~15s/node), so calling them synchronously
     # here stalls startup (and /health) for N*timeout when a node is down (#24).
-    _sweep_cids = list(DEFAULT_CLUSTER_DEFS.keys())
+    #
+    # active_cluster_ids() — NOT DEFAULT_CLUSTER_DEFS — so dashboard-created
+    # clusters (hercules, tele-fast, …) are swept too. Before 2026-09-02 this
+    # iterated only the topology.yaml seed, so a restart left custom-cluster
+    # runners alive on their nodes (RAM wired, JACCL QPs busy) with the engine
+    # blind to them (Sophie: "au restart odyssai ne les voit pas").
+    _sweep_cids = active_cluster_ids()
     _sweep_results = await asyncio.gather(
         *[asyncio.to_thread(_sweep_orphan_runners, _cid) for _cid in _sweep_cids],
         return_exceptions=True,
@@ -5023,7 +5059,12 @@ async def lifespan(app: FastAPI):
     # later reboot-reload or a manual load can still use it) but is NOT
     # auto-restored here. Extracted to _restore_cluster_pools so the reboot-all
     # reload path reuses the exact same logic.
-    for cid in DEFAULT_CLUSTER_DEFS.keys():
+    #
+    # active_cluster_ids() — same fix as the sweep above: restore the pools of
+    # dashboard-created clusters, not only the topology.yaml seed. Each entry
+    # dispatches to its correct branch (vlm-dist / vlm-adopt / dflash / normal)
+    # inside _restore_cluster_pools, so this is safe for every cluster kind.
+    for cid in active_cluster_ids():
         if not _reload_on_restart(cid):
             sys.stderr.write(
                 f"[api] reload_on_restart=false ({cid}) — skipping startup "
@@ -5782,7 +5823,7 @@ def _initial_default_config() -> Optional[dict]:
 #   major (1.7.2 → 2.0.0) — breaking API or topology change
 #
 # Use `./scripts/bump-version.sh patch|minor|major` to bump + auto-commit.
-APP_VERSION = "1.45.2"
+APP_VERSION = "1.45.3"
 
 app = FastAPI(
     title="OdyssAI-X (odyssai.eu)",
@@ -12303,11 +12344,16 @@ async def _vlm_venv_present(ssh: str) -> bool:
 
 
 async def _coresidence_free_by_index(cluster_id: str, per_node: list[dict],
-                                     rank0_ssh: str, base_dir: str) -> dict:
+                                     rank0_ssh: str, base_dir: str,
+                                     exclude_model_abspath: Optional[str] = None) -> dict:
     """Free wired bytes per node index = ceiling − what loaded pools already
     hold on that node. This is what makes "add a second pool" honest: the
     planner picks a node with room (or refuses) instead of the silent 409.
-    A pool's footprint = its model size (du) split across its ranks."""
+    A pool's footprint = its model size (du) split across its ranks.
+
+    `exclude_model_abspath`: skip a loaded pool serving THIS exact model — a
+    reload of the same model reuses the same footprint, so counting it against
+    itself would falsely report the node as full and block the reload."""
     free = {}
     for i, nd in enumerate(per_node):
         free[i] = int(nd.get("wired_limit_bytes") or (nd.get("ram_bytes", 0) * 0.75))
@@ -12316,6 +12362,8 @@ async def _coresidence_free_by_index(cluster_id: str, per_node: list[dict],
                  or list(range(len(getattr(pool, "nodes", []) or [0]))))
         mp = getattr(pool, "model", None)
         if not mp or not ranks:
+            continue
+        if exclude_model_abspath and _resolve_model_abspath(mp, base_dir) == exclude_model_abspath:
             continue
         try:
             sz = await get_model_size_bytes(rank0_ssh, _resolve_model_abspath(mp, base_dir))
@@ -12378,7 +12426,8 @@ async def _gather_preflight(cluster_id: str, model: str,
         d_abs = _resolve_model_abspath(draft, base_dir)
         draft_cfg = await _read_raw_config(rank0, d_abs)
         draft_size = await get_model_size_bytes(rank0, d_abs)
-    free_by_index = await _coresidence_free_by_index(cluster_id, per_node, rank0, base_dir)
+    free_by_index = await _coresidence_free_by_index(
+        cluster_id, per_node, rank0, base_dir, exclude_model_abspath=abspath)
     return preflight.evaluate(
         config=cfg, size_bytes=size, capacity_by_nodes=cap, max_nodes=max_nodes,
         per_node=per_node, free_by_index=free_by_index,

@@ -4,6 +4,16 @@ services:
     image: odyssai-odysseus:latest
     container_name: odyssai-odysseus
     restart: unless-stopped
+    # Cap the json-file log: the access-log line per canary/status poll grows
+    # it to tens of millions of lines in days, which makes `docker logs
+    # --since` unusable for post-mortem (2026-09-02: 22M lines / the GLM crash
+    # window had already rotated out of reach). 5×50 MB keeps ~forensic depth
+    # without unbounded growth. Applies at the next `up -d --force-recreate`.
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "5"
     ports:
       - "8000:8000"
     environment:
