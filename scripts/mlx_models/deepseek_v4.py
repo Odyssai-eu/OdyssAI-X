@@ -1160,10 +1160,46 @@ class Model(nn.Module):
         for k, v in weights.items():
             if k.startswith("mtp."):
                 continue
+            # Drop the whole multimodal stack (vision tower + aligner + image
+            # tokens). Some DeepSeek-V4-Flash checkpoints ship it even when
+            # config.json carries no vision_config, so the engine routes them
+            # to the TEXT runner. This text Model has no such modules, so a
+            # STRICT load_weights dies on the leftovers (exit=255, no traceback
+            # — 2026-09-04). Text-only by construction, same carve-out class as
+            # qwen4_exp (#74).
+            if k.startswith(("vision.", "visual.", "model.vision.",
+                             "model.visual.", "vision_tower.", "aligner.",
+                             "image_")) or k.endswith("_vl"):
+                # `*.ffn.gate.bias_vl` is the vision-language expert-routing
+                # gate bias — the text stack uses the plain `.bias` only.
+                continue
+            # Multimodal checkpoints nest the text stack under `language_model.`
+            # (language_model.model.layers.*, language_model.lm_head). Strip it
+            # so the keys land on this Model's names (model.*, lm_head) — same
+            # nesting normalisation as qwen4_exp / glm5_next.
+            if k.startswith("language_model."):
+                k = k[len("language_model."):]
             parts = k.split(".")
+            # Drop the extra nextn/MTP layer (index == num_hidden_layers),
+            # whether stored bare (`layers.N`) or nested (`model.layers.N`).
+            _li = None
             if len(parts) >= 2 and parts[0] == "layers":
+                _li = parts[1]
+            elif len(parts) >= 3 and parts[0] == "model" and parts[1] == "layers":
+                _li = parts[2]
+            if _li is not None:
                 try:
-                    if int(parts[1]) >= n_layers:
+                    _lin = int(_li)
+                    if _lin >= n_layers:
+                        continue
+                    # Hash-routed layers (idx < num_hash_layers) route via
+                    # `tid2eid`, not the score-correction bias — but the
+                    # checkpoint ships a redundant `ffn.gate.e_score_correction_bias`
+                    # for them too. The model's hash gate has no such param, so
+                    # drop it (keep it for the non-hash layers that DO use it).
+                    if _lin < self.args.num_hash_layers and k.endswith(
+                        ".ffn.gate.e_score_correction_bias"
+                    ):
                         continue
                 except ValueError:
                     pass
