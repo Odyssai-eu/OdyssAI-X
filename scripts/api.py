@@ -885,6 +885,34 @@ FORCE_NO_AP_MODEL_TYPES = frozenset({
 # its ONLY multi-node path. mlx-vlm has no qwen4_exp support at all.
 TEXT_ONLY_DESPITE_VISION_CONFIG: frozenset = frozenset({"qwen4_exp"})
 
+
+def _config_is_vision(cfg: dict) -> bool:
+    """True when a checkpoint is multimodal and must route to mlx_vlm.server
+    instead of the text runner. Single source of truth for the three detection
+    sites (get_model_arch_meta / _model_capabilities / _gather_preflight).
+
+    Config-only (works before the weights finish downloading). Recognises, in
+    order: a `_vl`/`vision` marker in model_type; a nested `vision_config` /
+    `vision_tower_config`; an `audio_config`; OR — the inferencerlabs
+    DeepSeek-V4-Flash-Vision case (2026-09-04) — a vision tower FLATTENED into
+    top-level `vision_*` fields (vision_dim, vision_n_layers, vision_patch_size,
+    …) with NO nested vision_config, which the plain `"vision_config" in cfg`
+    test missed entirely (it mis-routed the model to the text runner).
+    TEXT_ONLY_DESPITE_VISION_CONFIG opts a type back out (qwen4_exp)."""
+    mt = (cfg.get("model_type")
+          or cfg.get("text_config", {}).get("model_type") or "").lower()
+    if mt in TEXT_ONLY_DESPITE_VISION_CONFIG:
+        return False
+    if "_vl" in mt or "_vision" in mt or "vision" in mt:
+        return True
+    if ("vision_config" in cfg or "vision_tower_config" in cfg
+            or "audio_config" in cfg):
+        return True
+    # Flattened vision tower — need several vision_* fields so a lone stray
+    # key can't trip it.
+    return sum(1 for k in cfg if k.startswith("vision_")) >= 3
+
+
 # Inverse guard: model types whose ONLY working multi-node path is
 # auto_parallel. glm_moe_dsa's DSA patch (Option A) declares Indexer params on
 # every layer, including the `shared` layers whose indexer weights don't exist
@@ -983,16 +1011,10 @@ async def get_model_arch_meta(ssh: str, abspath: str) -> dict:
             or cfg.get("language_model", {}).get(key)
             or (cfg.get("text_config", {}).get("language_model", {}) or {}).get(key)
         )
-    # Vision detection — same rule as _model_capabilities: model_type carries a
-    # "_vl"/"vision" marker OR a vision_config nest is present. Lets the loader
-    # route VL models to the single-node mlx_vlm.server flow instead of the
-    # distributed text runner (which can't run them).
-    _mt = (cfg.get("model_type") or cfg.get("text_config", {}).get("model_type") or "").lower()
-    is_vision = bool(
-        ("_vl" in _mt or "_vision" in _mt or "vision" in _mt
-         or "vision_config" in cfg or "vision_tower_config" in cfg)
-        and _mt not in TEXT_ONLY_DESPITE_VISION_CONFIG
-    )
+    # Vision detection (single source of truth: _config_is_vision) — routes
+    # VL models to the single-node mlx_vlm.server flow instead of the text
+    # runner. Covers flattened `vision_*` configs (inferencerlabs DeepSeek-V4).
+    is_vision = _config_is_vision(cfg)
     return {
         "model_type": cfg.get("model_type"),
         "num_hidden_layers": _nested("num_hidden_layers"),
@@ -6256,10 +6278,7 @@ def _enrich_caps_from_config(caps: dict, config: dict) -> None:
     # Same TEXT_ONLY_DESPITE_VISION_CONFIG carve-out as the load path (inkling
     # is served text-only for now) so /v1/models doesn't advertise vision it
     # can't yet do.
-    is_vision = (("_vl" in mt or "_vision" in mt or "vision" in mt
-              or "vision_config" in config
-              or "vision_tower_config" in config)
-              and mt not in TEXT_ONLY_DESPITE_VISION_CONFIG)
+    is_vision = _config_is_vision(config)
     if is_vision:
         caps["supports_vision"] = True
         caps["modalities"] = sorted(set((caps.get("modalities") or []) + ["text", "image"]))
@@ -11884,13 +11903,9 @@ async def _gather_preflight(cluster_id: str, model: str,
     abspath = _resolve_model_abspath(model, base_dir)
     cfg = await _read_raw_config(rank0, abspath)
     size = await get_model_size_bytes(rank0, abspath)
-    _pf_mt = (cfg.get("model_type") or "").lower()
-    # Same carve-out as get_model_arch_meta / _model_capabilities — a model
-    # served text-only must not be preflighted as a VLM.
-    is_vision = bool(
-        (cfg.get("vision_config") or "vision" in _pf_mt)
-        and _pf_mt not in TEXT_ONLY_DESPITE_VISION_CONFIG
-    )
+    # Single source of truth (get_model_arch_meta / _model_capabilities use it
+    # too) — recognises flattened `vision_*` configs, not just nested ones.
+    is_vision = _config_is_vision(cfg)
     vlm_present = await _vlm_venv_present(rank0) if is_vision else None
     draft_cfg = draft_size = None
     if draft:
