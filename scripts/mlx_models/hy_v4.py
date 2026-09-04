@@ -37,6 +37,19 @@ from .base import BaseModelArgs, create_attention_mask
 from .cache import CacheList, KVCache
 from .switch_layers import SwiGLU
 
+# transformers < 5.16 ne connait pas `model_type: hy_v4` : AutoTokenizer tombe
+# alors sur AutoConfig qui leve KeyError. On enregistre un config no-op des
+# l'import de ce module (le runner importe hy_v4 via load_model AVANT de charger
+# le tokenizer) pour que le tokenizer se charge sans transformers 5.16.
+try:
+    from transformers import AutoConfig as _AutoConfig, PretrainedConfig as _PC
+
+    _AutoConfig.register(
+        "hy_v4", type("HYV4AutoConfig", (_PC,), {"model_type": "hy_v4"})
+    )
+except Exception:
+    pass  # deja enregistre (transformers 5.16) ou collision -> no-op
+
 
 def _limited_swiglu(gate, up, limit):
     if limit and limit > 0:
