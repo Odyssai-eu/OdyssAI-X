@@ -229,16 +229,34 @@ def select_concrete_nodes(indices: list[int], per_node: list[dict],
         ranked.sort(key=lambda i: -free_by_index.get(i, 0))
     chosen = ranked[:n]
     shard = size_bytes / n * (DEFAULT_ACTIVATION_FACTOR if mode == "pipeline" else 1.0)
-    raw_shard = size_bytes / n  # weights only, no activation headroom
     tight = []      # weights fit but the 1.10 margin doesn't — may still run
-    overflow = []   # raw weights don't even fit alongside — certain OOM
+    overflow = []   # doesn't fit at all — certain OOM
     if free_by_index:
-        for i in chosen:
-            fi = free_by_index.get(i, 0)
-            if fi < raw_shard:
-                overflow.append(i)
-            elif fi < shard:
-                tight.append(i)
+        needed = size_bytes * DEFAULT_ACTIVATION_FACTOR
+        if mode == "pipeline":
+            # Pipeline split is HETEROGENEOUS: each rank's shard is proportional
+            # to its budget (auto_parallel RAM-weighted split), NOT size/n. So
+            # the binding constraint is the SUM of free budgets over the chosen
+            # nodes — a proportional split never overflows a single node when
+            # the sum fits. Testing size/n against each node (the old even-split
+            # assumption) FALSELY flagged the small nodes of a hetero cluster
+            # (main: .29=494 GB, .30-.33=215 GB) — it refused a 764 GB Hy4 that
+            # fits fine at 3 nodes hetero (494+215+215=924 > 764).
+            total_free = sum(free_by_index.get(i, 0) for i in chosen)
+            if total_free < size_bytes:
+                overflow = list(chosen)
+            elif total_free < needed:
+                tight = list(chosen)
+        else:
+            # Tensor-parallel splits EVENLY — every rank holds size/n, so the
+            # per-node budget IS the binding constraint.
+            raw_shard = size_bytes / n
+            for i in chosen:
+                fi = free_by_index.get(i, 0)
+                if fi < raw_shard:
+                    overflow.append(i)
+                elif fi < raw_shard * DEFAULT_ACTIVATION_FACTOR:
+                    tight.append(i)
     return {"chosen": chosen,
             "hosts": [per_node[i].get("host") for i in chosen if i < len(per_node)],
             "shard_gb": round(shard / 1024**3, 1),
@@ -313,10 +331,11 @@ def evaluate(*, config: dict, size_bytes: int, capacity_by_nodes: dict,
                                            free_by_index)
         if selection.get("overflow_indices"):
             blockers.append(
-                f"co-résidence: nodes {selection['overflow_indices']} n'ont pas "
-                f"la place — un autre pool les occupe et le shard "
-                f"{selection['shard_gb']} GB dépasse le libre (OOM certain). "
-                f"Unload le pool résident d'abord, ou force=true pour outrepasser")
+                f"pas assez de mémoire libre sur les nodes "
+                f"{selection['overflow_indices']} pour {meta['size_gb']} GB "
+                f"(OOM certain) — un pool résident les occupe, ou le cluster est "
+                f"trop petit pour ce modèle. Unload le résident, ajoute des "
+                f"nodes, ou force=true pour outrepasser")
         if selection["tight_indices"]:
             warnings.append(
                 f"nodes {selection['tight_indices']} serrés (co-résidence) — "
