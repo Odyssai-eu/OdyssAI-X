@@ -4912,12 +4912,25 @@ async def _restore_cluster_pools(cid: str, leaked_hosts: Optional[set] = None,
                 f"[api] pruning structurally-dead desired-state on {cid}: "
                 f"{_dead} — node_indices out of range for {_node_count}-node "
                 f"topology (never restorable)\n")
+            _deadset = set(_dead)
+            # Persist the prune by rewriting the state file DIRECTLY — remove
+            # only the dead aliases, keep every other entry verbatim. NOT via
+            # save_cluster_state_v2: that rebuilds the file from the LIVE
+            # registry, which at boot (before restore) is EMPTY, so it would
+            # stamp every live pool `down` and — with allow_empty_delete — even
+            # UNLINK the file, wiping the desired state of GLM/qwen-bf16 (the
+            # 2026-09-04 incident that took both prod pools offline on a
+            # restart). Direct edit touches nothing but the dead entries.
             try:
-                save_cluster_state_v2(cid, remove_aliases=_dead,
-                                      allow_empty_delete=True)
+                _sf = state_file_for(cid)
+                _raw = json.loads(_sf.read_text())
+                if isinstance(_raw, dict) and isinstance(_raw.get("pools"), list):
+                    _raw["pools"] = [
+                        p for p in _raw["pools"]
+                        if p.get("alias", DEFAULT_ALIAS) not in _deadset]
+                    _sf.write_text(json.dumps(_raw, indent=2))
             except Exception as e:
                 sys.stderr.write(f"[api] prune of {cid} state failed: {e}\n")
-            _deadset = set(_dead)
             saved_pools = [p for p in saved_pools
                            if p.get("alias", DEFAULT_ALIAS) not in _deadset]
             if not saved_pools:
@@ -5839,7 +5852,7 @@ def _initial_default_config() -> Optional[dict]:
 #   major (1.7.2 → 2.0.0) — breaking API or topology change
 #
 # Use `./scripts/bump-version.sh patch|minor|major` to bump + auto-commit.
-APP_VERSION = "1.45.4"
+APP_VERSION = "1.45.5"
 
 app = FastAPI(
     title="OdyssAI-X (odyssai.eu)",
