@@ -31,7 +31,7 @@ from typing import Any, Optional
 # load single-node or tensor-split, but not pipeline across ranks.
 PIPELINE_CAPABLE = frozenset({
     "deepseek_v2", "deepseek_v3", "deepseek_v32", "deepseek_v4",
-    "glm4_moe", "glm4_moe_lite", "glm_moe_dsa", "ministral3", "hy_v3",
+    "glm4_moe", "glm4_moe_lite", "glm_moe_dsa", "ministral3", "hy_v3", "hy_v4",
     "kimi_k3", "longcat2", "qwen3_5_moe", "qwen3_5_mixed", "bailing_moe_linear",
     "minimax_m3", "g9v3",
 })
