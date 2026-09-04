@@ -1216,7 +1216,7 @@ async function refreshAll() {
     // Global (non-cluster-scoped) endpoints — fetched in parallel too.
     const [metrics, sessions, telemetry, runs, syncJobs, inventory,
            providers, crew, discoveryState, serverSettings, versionInfo, providerTemplates,
-           coeosConfig, coeosModels, downloads] = await Promise.all([
+           downloads] = await Promise.all([
       getJson("/admin/metrics").catch(() => ({ data: [] })),
       getJson("/admin/sessions").catch(() => ({ data: [], count: 0 })),
       getJson("/admin/nodes/telemetry").catch(() => null),
@@ -1229,16 +1229,12 @@ async function refreshAll() {
       getJson("/admin/settings").catch(() => null),
       getJson("/admin/version").catch(() => null),
       getJson("/admin/providers/templates").catch(() => ({ data: [] })),
-      getJson("/admin/coeos").catch(() => ({})),
-      getJson("/admin/coeos/available-models").catch(() => ({ data: [] })),
       // HF download queue. Best-effort like every other global endpoint:
       // `null` on failure so the previous list survives a transient 5xx
       // instead of the whole download surface blinking out for one tick.
       getJson("/admin/downloads").catch(() => null),
     ]);
     if (serverSettings) state.server_settings = serverSettings;
-    state.coeos = coeosConfig || {};
-    state.coeos_available = coeosModels?.data || [];
     if (versionInfo) state.version_info = versionInfo;
     if (providerTemplates?.data) state.provider_templates = providerTemplates.data;
     state.cloud_providers = providers?.data || [];
@@ -1662,7 +1658,6 @@ const SETTINGS_TABS = [
   { id: "models",     label: "Models" },
   { id: "huggingface", label: "Hugging Face" },
   { id: "providers",  label: "Cloud providers" },
-  { id: "coeos",      label: "CoeOS" },
   { id: "crew",       label: "Crew" },
   { id: "endpoints",  label: "Endpoints" },
   { id: "userguide",  label: "User Guide" },
@@ -1710,7 +1705,6 @@ function renderSettingsBody(tab) {
   if (tab === "models")    return renderSettingsModels();
   if (tab === "huggingface") return renderSettingsHuggingFace();
   if (tab === "providers") return renderSettingsProviders();
-  if (tab === "coeos")     return renderSettingsCoeos();
   if (tab === "crew")      return renderSettingsCrew();
   if (tab === "endpoints") return renderSettingsEndpoints();
   if (tab === "userguide") return renderSettingsUserGuide();
@@ -2219,76 +2213,6 @@ function renderSettingsGeneral() {
   `;
 }
 
-// ─── Settings: Coeos (smart LLM-router, RFC #63) ───────────────────
-const COEOS_PUBLIC_ID = "CoeOS";  // public model id (matches the server's COEOS_DISPLAY_ID)
-function renderSettingsCoeos() {
-  const c = state.coeos || {};
-  const enabled = c.enabled === true;
-  const autoload = c.cold_boot_autoload === true;
-  const axes = Array.isArray(c.axes) ? c.axes : [];
-  const baseUrl = endpointBaseUrl();
-  const curl =
-`export OPENAI_BASE_URL="${baseUrl}"
-export OPENAI_API_KEY="dummy"
-
-curl "${baseUrl}/chat/completions" \\
-  -H "Content-Type: application/json" \\
-  -H "x-coeos-axis: coding" \\
-  -d '{"model":"${COEOS_PUBLIC_ID}","messages":[{"role":"user","content":"Hello"}]}'`;
-
-  const loadedLine = c.name
-    ? `Loaded: <b>${escapeHtml(c.name)}</b>${c.regime ? ` · <span class="mono">${escapeHtml(c.regime)}</span>` : ""}${c.updated ? ` · ${escapeHtml(c.updated)}` : ""}`
-    : `No settings loaded.`;
-
-  return `
-    <div style="display:flex;flex-direction:column;gap:20px">
-      <div style="background:var(--surface);border:1px solid var(--line);border-radius:12px;padding:18px;display:flex;flex-direction:column;gap:14px">
-        <div>
-          <div class="field-label">CoeOS · benchmark-composed virtual model</div>
-          <div style="font-size:12px;color:var(--ink-2);margin-top:2px">A virtual <span class="mono">${COEOS_PUBLIC_ID}</span> model. The decider classifies each agent request into one skill axis, then serves the model our TMB benchmarks proved best on it. Taxonomy + bindings = data (the TMB Settings). For agents — Companion keeps its own router.</div>
-          <div style="font-size:11px;color:var(--ink-3);margin-top:6px">${loadedLine}</div>
-        </div>
-        <div style="display:flex;align-items:center;justify-content:space-between;gap:14px;padding:10px 12px;background:var(--surface-2);border-radius:8px">
-          <div>
-            <div style="font-size:13px;font-weight:600">Enabled</div>
-            <div style="font-size:11px;color:var(--ink-3);margin-top:2px">When on, <span class="mono">${COEOS_PUBLIC_ID}</span> appears in <span class="mono">/v1/models</span> (and in Companion as an endpoint) and routes requests.</div>
-          </div>
-          <label style="display:inline-flex;align-items:center;gap:8px;cursor:pointer">
-            <input type="checkbox" data-act="coeos-toggle-enabled" ${enabled?"checked":""}/>
-            <span style="font-family:var(--font-mono);font-size:12px;color:${enabled?'var(--blue-deep)':'var(--ink-3)'}">${enabled?'ON':'OFF'}</span>
-          </label>
-        </div>
-        <div style="display:flex;align-items:center;justify-content:space-between;gap:14px;padding:10px 12px;background:var(--surface-2);border-radius:8px">
-          <div>
-            <div style="font-size:13px;font-weight:600">Cold-boot autoload</div>
-            <div style="font-size:11px;color:var(--ink-3);margin-top:2px">If no bound model is warm, route to the default axis's model anyway (triggers a load) instead of returning 503. Off = strict.</div>
-          </div>
-          <label style="display:inline-flex;align-items:center;gap:8px;cursor:pointer">
-            <input type="checkbox" data-act="coeos-toggle-autoload" ${autoload?"checked":""}/>
-            <span style="font-family:var(--font-mono);font-size:12px;color:${autoload?'var(--blue-deep)':'var(--ink-3)'}">${autoload?'ON':'OFF'}</span>
-          </label>
-        </div>
-      </div>
-
-      <div style="background:var(--surface);border:1px solid var(--line);border-radius:12px;padding:18px;display:flex;flex-direction:column;gap:14px">
-        <div>
-          <div class="field-label">OpenAI-compatible endpoint</div>
-          <div style="font-size:12px;color:var(--ink-2);margin-top:2px">Point any agent here — model <span class="mono">${COEOS_PUBLIC_ID}</span>. An agent that knows its skill can force an axis with the optional <span class="mono">x-coeos-axis</span> header${axes.length?` (<span class="mono">${axes.map(a=>escapeHtml(a.key)).join(" · ")}</span>)`:""}; otherwise the decider classifies it.</div>
-        </div>
-        <div style="display:flex;gap:10px;align-items:center">
-          <span style="font-size:12px;color:var(--ink-3);width:70px">Base URL</span>
-          <input class="ce-input mono" value="${escapeHtml(baseUrl)}" readonly style="flex:1;font-size:12px" onclick="this.select()"/>
-        </div>
-        <div style="display:flex;gap:10px;align-items:center">
-          <span style="font-size:12px;color:var(--ink-3);width:70px">Model</span>
-          <input class="ce-input mono" value="${COEOS_PUBLIC_ID}" readonly style="flex:1;font-size:12px" onclick="this.select()"/>
-        </div>
-        <pre style="margin:0;background:#0f1419;color:#E5E9EE;border-radius:10px;padding:14px;overflow:auto;font-size:12px;line-height:1.5"><code>${escapeHtml(curl)}</code></pre>
-        <div><button class="btn btn-sm" data-act="endpoint-copy" data-v="${escapeHtml(curl)}">Copy snippet</button></div>
-      </div>
-    </div>
-  `;
-}
 
 // ─── Settings: Clusters ────────────────────────────────────────────
 function renderSettingsClusters() {
@@ -6441,7 +6365,6 @@ async function handleAct(e) {
     if (v === "models" && !state.matrix && !state.matrix_loading) fetchMatrix(false);
     if (v === "userguide" && !state.userguide_topics_loaded) loadUserGuideTopics();
     if (v === "endpoints" && !state.endpoint_models_loaded) loadEndpointModels();
-    if (v === "coeos" && !state.endpoint_models_loaded) loadEndpointModels();
     render(); return;
   }
   if (act === "userguide-pick") {
@@ -6549,20 +6472,6 @@ async function handleAct(e) {
     } catch (e) {
       toast(`Prewarm failed: ${e.message}`, "err");
     }
-    return;
-  }
-  // ── Coeos router (RFC #63) ──────────────────────────────────────
-  if (act === "coeos-toggle-enabled" || act === "coeos-toggle-autoload") {
-    const field = act === "coeos-toggle-enabled" ? "enabled" : "cold_boot_autoload";
-    try {
-      const r = await fetch("/admin/coeos", { method: "PUT",
-        headers: { "content-type": "application/json", ...authHeaders() },
-        body: JSON.stringify({ [field]: el.checked }) });
-      if (!r.ok) throw new Error(`HTTP ${r.status}`);
-      state.coeos = await r.json();
-      toast(`Coeos ${field} = ${el.checked ? "on" : "off"}`, "ok");
-    } catch (e) { toast(`Save failed: ${e.message}`, "err"); }
-    render();
     return;
   }
   if (act === "server-restart") {
