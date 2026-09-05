@@ -2321,7 +2321,7 @@ function renderArgoForm() {
         <div class="head-left">
           <div class="dot" style="background:var(--slate-blue)"></div>
           <h2>+ Add Argo</h2>
-          <span class="kind-pill" style="background:var(--slate-blue-soft, #e8ecf5);color:var(--slate-blue, #4a5b8a)">mlx-distributed</span>
+          <span class="kind-pill" style="background:var(--slate-blue-soft, #e8ecf5);color:var(--slate-blue, #4a5b8a)">${escapeHtml(f.kind || "mlx-distributed")}</span>
         </div>
         <div class="head-right">
           <button class="btn btn-sm" data-act="argo-cancel">Cancel</button>
@@ -2341,6 +2341,13 @@ function renderArgoForm() {
             <input class="ce-input" data-act="argo-edit-label" value="${escapeHtml(f.label || "")}" placeholder="Argo 2"/>
           </div>
           <div class="field">
+            <div class="field-label">Kind</div>
+            <select class="ce-input mono" data-act="argo-edit-kind">
+              <option value="mlx-distributed" ${f.kind!=="replica"?"selected":""}>mlx-distributed (1 modèle réparti sur les nodes)</option>
+              <option value="replica" ${f.kind==="replica"?"selected":""}>replica (1 copie par node, débit concurrent)</option>
+            </select>
+          </div>
+          <div class="field" ${f.kind==="replica"?"hidden":""}>
             <div class="field-label">Backend</div>
             <select class="ce-input mono" data-act="argo-edit-backend">
               <option value="ring" ${f.backend!=="jaccl"?"selected":""}>ring (TCP/IP)</option>
@@ -6509,6 +6516,11 @@ async function handleAct(e) {
     if (e.type === "change") render();
     return;
   }
+  if (act === "argo-edit-kind") {
+    if (!state.argo_form) return;
+    state.argo_form.kind = el.value || "mlx-distributed";
+    render(); return;
+  }
   if (act === "argo-edit-backend") {
     if (!state.argo_form) return;
     state.argo_form.backend = el.value || "ring";
@@ -6535,7 +6547,7 @@ async function handleAct(e) {
     try {
       const body = {
         name: f.label.trim(),
-        kind: "mlx-distributed",
+        kind: f.kind || "mlx-distributed",
         backend: f.backend || "ring",
         nodes: [{ host: f.host, ssh: f.ssh, master: true }],
       };
