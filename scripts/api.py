@@ -47,6 +47,7 @@ import asyncio
 import concurrent.futures
 import copy
 import json
+import math
 import os
 import random
 import re
@@ -730,6 +731,13 @@ def validate_cluster_def(cluster_id: str, new_def: dict) -> Optional[str]:
             return f"telemak kind requires exactly 1 node (got {len(nodes)})"
         if not (new_def.get("upstream") or "").strip():
             return "telemak kind requires non-empty 'upstream' (e.g. http://host.lan:8003)"
+        return None
+
+    # Replica (data-parallel serving) — each node holds a FULL copy and serves
+    # independently. No inter-node collective (TCP control-plane only), so no
+    # RDMA wiring, no backend constraint, no node cap. 1 node is a degenerate
+    # replica pool (== a plain single-node batched pool) — allowed, pointless.
+    if kind == "replica":
         return None
 
     if kind != "mlx-distributed":
@@ -3771,6 +3779,199 @@ class MuseGlimmerPool:
         self.runners.clear()
 
 
+# Per-replica batch ceiling used ONLY for the affinity-vs-rebalance threshold.
+# busy_count is a backpressure PROXY (BatchGenerator shares forwards, so
+# busy_count=3 != 3 GPU slots), not true utilisation — this is a soft knob.
+REPLICA_MAX_CONCURRENT = int(env_get("REPLICA_MAX_CONCURRENT", "16"))
+# Evict a session→replica affinity entry after this idle window (unbounded map
+# otherwise on a long-lived server). Aligned with the session TTL.
+REPLICA_AFFINITY_TTL_S = float(env_get("REPLICA_AFFINITY_TTL_S", "1800"))
+
+
+class ReplicaPool(RunnerPool):
+    """Data-parallel serving: N INDEPENDENT single-node runners, each holding a
+    FULL copy of the model and doing its own continuous batching (world_size=1
+    → BatchGenerator path, runner.py:2517). A request is dispatched to ONE
+    replica — least-busy, with session affinity so a conversation's KV cache
+    stays on its home replica (zero transfer, zero re-prefill). NO inter-node
+    collective: TCP control-plane only, so no JACCL, no wiring, no node cap.
+    Multiplies concurrent throughput where the distributed pipeline serialises.
+
+    Contrast with the distributed RunnerPool (one model split across ranks):
+    here each `self._replicas[i]` is a *separate* nodes_count=1 RunnerPool, not
+    a rank of one pool. v1 carries NO drafter/MTP — the batched path requires
+    `draft_model is None`.
+    """
+
+    is_replica = True
+
+    def __init__(self, model: str, cluster: str, alias: str,
+                 node_indices: list[int], kv_q8: bool = False,
+                 max_concurrent: int = REPLICA_MAX_CONCURRENT):
+        # Duck-type the RunnerPool surface the views/registry read, WITHOUT
+        # calling super().__init__ (which would build a distributed topology).
+        self.model = model
+        self.mode = "replica"
+        self.use_ap = False
+        self.cluster = cluster
+        self.alias = alias or cluster
+        self.node_indices = list(node_indices)
+        self.nodes_count = len(node_indices)
+        self.kv_q8 = bool(kv_q8)
+        self.draft_model = None          # v1: no drafter (batched path needs it)
+        self.num_draft_tokens = 0
+        self.mtp_cfg = None
+        self.mtp_tripped = False
+        self.mtp_accept_rate = None
+        self.backend = "replica"
+        self.max_concurrent = int(max_concurrent)
+        self.emit_batch = 10
+        self.started_at: Optional[float] = None
+        self.load_s: Optional[float] = None
+        self.last_used_at: float = time.time()
+        self.last_token_at: float = time.monotonic()
+        self.ttl_seconds: int = 0
+        self.degraded: bool = False
+        self.degraded_reason: Optional[str] = None
+        self.degraded_at: Optional[float] = None
+        self.maintenance: bool = False
+        try:
+            self.nodes = build_topology_from_indices(cluster, list(node_indices))
+        except Exception:
+            self.nodes = []
+        # N single-node child pools — one per node, each world_size=1.
+        self._replicas: list[RunnerPool] = [
+            RunnerPool(
+                model=model, mode="pipeline", use_ap=False, nodes_count=1,
+                cluster=cluster, kv_q8=kv_q8, draft_model=None,
+                alias=f"{self.alias}#r{i}", node_indices=[idx], mtp=None,
+            )
+            for i, idx in enumerate(node_indices)
+        ]
+        self._live: set[int] = set()                  # indices that started OK
+        self._affinity: dict[str, tuple[int, float]] = {}   # sid -> (idx, ts)
+        self._dispatch_lock = asyncio.Lock()
+
+    async def start(self):
+        """Fan-out spawn: start every replica concurrently. Graceful — the pool
+        is up as long as ≥1 replica started; failed ones are just excluded."""
+        self._loop = asyncio.get_running_loop()
+        t0 = time.time()
+        results = await asyncio.gather(
+            *(r.start() for r in self._replicas), return_exceptions=True)
+        for i, res in enumerate(results):
+            if isinstance(res, Exception):
+                sys.stderr.write(
+                    f"[replica-pool] {self.cluster}[{self.alias}] replica {i} "
+                    f"(node {self.node_indices[i]}) failed to start: {res}\n")
+            else:
+                self._live.add(i)
+        if not self._live:
+            raise RuntimeError(
+                f"replica pool {self.cluster}[{self.alias}]: no replica started")
+        self.started_at = time.time()
+        self.load_s = self.started_at - t0
+        sys.stderr.write(
+            f"[replica-pool] {self.cluster}[{self.alias}] up: "
+            f"{len(self._live)}/{len(self._replicas)} replicas in "
+            f"{self.load_s:.1f}s\n")
+
+    def _evict_stale_affinity(self, now: float) -> None:
+        dead = [s for s, (_, ts) in self._affinity.items()
+                if now - ts > REPLICA_AFFINITY_TTL_S]
+        for s in dead:
+            self._affinity.pop(s, None)
+
+    async def _pick_replica(self, session_id: Optional[str]) -> int:
+        """Choose a live replica: session affinity (home replica if alive and
+        not saturated) else least-busy. Atomic under the dispatch lock so a
+        burst can't over-fill one replica."""
+        async with self._dispatch_lock:
+            now = time.time()
+            self._evict_stale_affinity(now)
+            live = sorted(self._live)
+            if not live:
+                raise RuntimeError(
+                    f"replica pool {self.cluster}[{self.alias}]: no live replica")
+            threshold = math.ceil(self.max_concurrent * 0.8)
+            # Session affinity: stick to the home replica while it's alive and
+            # under the rebalance threshold.
+            if session_id and session_id in self._affinity:
+                home, _ = self._affinity[session_id]
+                if home in self._live and self._replicas[home].busy_count <= threshold:
+                    self._affinity[session_id] = (home, now)
+                    return home
+            # Least-busy among live replicas.
+            idx = min(live, key=lambda i: self._replicas[i].busy_count)
+            if session_id:
+                self._affinity[session_id] = (idx, now)
+            return idx
+
+    async def submit(self, prompt, max_tokens, enable_thinking, messages=None,
+                     tools=None, session_id=None, request_id=None,
+                     reasoning_effort=None, anti_loop=True, kv_q8=None,
+                     context_limit=None, ignore_eos=False, clear_thinking=None,
+                     mtp_on=None):
+        """Dispatch to one replica and stream its tokens through. Mid-stream
+        failure is retried on ANOTHER replica ONLY if no token has been emitted
+        yet (else the client already has a partial reply — propagate)."""
+        self.last_used_at = time.time()
+        tried: set[int] = set()
+        kwargs = dict(
+            prompt=prompt, max_tokens=max_tokens, enable_thinking=enable_thinking,
+            messages=messages, tools=tools, session_id=session_id,
+            request_id=request_id, reasoning_effort=reasoning_effort,
+            anti_loop=anti_loop, kv_q8=kv_q8, context_limit=context_limit,
+            ignore_eos=ignore_eos, clear_thinking=clear_thinking, mtp_on=mtp_on)
+        while True:
+            idx = await self._pick_replica(session_id)
+            if idx in tried:
+                # already failed on this one — no fresh replica left
+                raise RuntimeError(
+                    f"replica pool {self.cluster}[{self.alias}]: all replicas "
+                    f"failed for this request")
+            tried.add(idx)
+            emitted = False
+            try:
+                async for chunk in self._replicas[idx].submit(**kwargs):
+                    emitted = True
+                    self.last_token_at = time.monotonic()
+                    yield chunk
+                return
+            except Exception as e:
+                if emitted or len(tried) >= len(self._live):
+                    raise
+                # No token yet and another replica may serve — drop affinity and
+                # retry on a different one.
+                if session_id:
+                    self._affinity.pop(session_id, None)
+                self._live.discard(idx)   # treat as unhealthy for now
+                sys.stderr.write(
+                    f"[replica-pool] {self.cluster}[{self.alias}] replica {idx} "
+                    f"failed pre-first-token ({e}) — retrying on another\n")
+
+    def alive_count(self) -> int:
+        return len(self._live)
+
+    def is_idle(self) -> bool:
+        return (not self.maintenance
+                and all(self._replicas[i].busy_count == 0 for i in self._live))
+
+    def replica_stats(self) -> list[dict]:
+        """Per-replica view for the dashboard (backs 'dégradation gracieuse')."""
+        return [
+            {"index": i, "node": self.node_indices[i],
+             "live": i in self._live,
+             "busy_count": self._replicas[i].busy_count}
+            for i in range(len(self._replicas))
+        ]
+
+    async def stop(self):
+        await asyncio.gather(
+            *(r.stop() for r in self._replicas), return_exceptions=True)
+        self._live.clear()
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # State + metrics
 # ──────────────────────────────────────────────────────────────────────────────
@@ -3851,6 +4052,16 @@ def save_cluster_state_v2(cluster_id: str, *,
         # checked BEFORE is_vlm because VLMDistPool also carries is_vlm=True
         # (badge), but has no port/upstream and restores through start(),
         # not through the mlx_vlm.server relaunch.
+        if getattr(pool, "is_replica", False):
+            pools_payload.append({
+                "alias": alias,
+                "model": pool.model,
+                "is_replica": True,
+                "node_indices": indices,
+                "nodes": pool.nodes_count,
+                "kv_q8": bool(getattr(pool, "kv_q8", False)),
+            })
+            continue
         if getattr(pool, "is_vlm_dist", False):
             pools_payload.append({
                 "alias": alias,
@@ -4982,6 +5193,15 @@ async def _restore_cluster_pools(cid: str, leaked_hosts: Optional[set] = None,
             # (ssh-spawned ranks). Gated on the same feature flag as the load
             # path — with the flag off the entry is skipped, never mis-restored
             # as a text RunnerPool.
+            if entry.get("is_replica"):
+                rpool = ReplicaPool(
+                    model=entry["model"], cluster=cid, alias=alias,
+                    node_indices=indices,
+                    kv_q8=bool(entry.get("kv_q8", False)))
+                await rpool.start()
+                set_pool(cid, alias, rpool)
+                restored.append(alias)
+                continue
             if entry.get("is_vlm_dist"):
                 if not VLM_DISTRIBUTED_ENABLED:
                     sys.stderr.write(
@@ -11914,6 +12134,43 @@ async def _gather_preflight(cluster_id: str, model: str,
         draft_size = await get_model_size_bytes(rank0, d_abs)
     free_by_index = await _coresidence_free_by_index(
         cluster_id, per_node, rank0, base_dir, exclude_model_abspath=abspath)
+    # Replica (data-parallel): every node holds a FULL copy, so the binding
+    # constraint is the SMALLEST node (MIN), not the pipeline SUM. Refuse if the
+    # tightest node — or the tightest FREE node under co-residence — can't hold
+    # a whole copy. (Presence on every node is re-checked at load by each
+    # child RunnerPool.start.)
+    if get_cluster_def(cluster_id).get("kind") == "replica":
+        _daf = 1.10
+        _need = size * _daf
+        _budgets = [int(n.get("wired_limit_bytes")
+                        or (n.get("ram_bytes", 0) * 0.75)) for n in per_node]
+        _min_budget = min(_budgets) if _budgets else 0
+        _min_free = min(free_by_index.values()) if free_by_index else _min_budget
+        _gb = lambda b: round(b / 1024 ** 3, 1)
+        _blk = []
+        if size <= 0:
+            _blk.append("taille 0 — modèle absent du/des node(s) cible(s) "
+                        "(à synchroniser sur TOUS les nodes) ou volume non monté")
+        elif _need > _min_budget:
+            _blk.append(f"replica: {_gb(size)} GB ne tient pas sur le plus petit "
+                        f"node ({_gb(_min_budget)} GB de budget wired) — chaque "
+                        f"node héberge une copie entière")
+        elif _need > _min_free:
+            _blk.append(f"replica: un pool résident sature un node — {_gb(_min_free)}"
+                        f" GB libre au minimum < {_gb(size)} GB requis ; unload le "
+                        f"résident ou force=true")
+        _ok = not _blk
+        return {
+            "ok": _ok, "verdict": "OK" if _ok else "REFUSÉ",
+            "model": {"model_type": cfg.get("model_type"), "size_bytes": size,
+                      "size_gb": _gb(size), "is_vision": is_vision,
+                      "supported": True},
+            "plan": {"ok": _ok, "nodes": len(per_node), "mode": "replica",
+                     "indices": list(range(len(per_node)))},
+            "selection": None, "draft": None, "warnings": [], "blockers": _blk,
+            "summary": (f"OK : replica {_gb(size)} GB × {len(per_node)} nodes "
+                        f"(min budget {_gb(_min_budget)} GB)" if _ok
+                        else "REFUSÉ — " + "; ".join(_blk))}
     return preflight.evaluate(
         config=cfg, size_bytes=size, capacity_by_nodes=cap, max_nodes=max_nodes,
         per_node=per_node, free_by_index=free_by_index,
@@ -12745,9 +13002,11 @@ async def admin_cluster_load(cluster_id: str, req: ArgoLoadRequest):
                 "details": info.get("details"),
             },
         )
-    if req.mode not in ("pipeline", "tensor"):
+    _is_replica_cluster = get_cluster_def(cluster_id).get("kind") == "replica"
+    if not _is_replica_cluster and req.mode not in ("pipeline", "tensor"):
         raise HTTPException(400, f"invalid mode {req.mode}")
-    if req.backend is not None and req.backend not in ("jaccl", "ring"):
+    if (not _is_replica_cluster and req.backend is not None
+            and req.backend not in ("jaccl", "ring")):
         raise HTTPException(400, f"invalid backend {req.backend!r} — 'jaccl' or 'ring'")
     # #72: hybrid linear-attn trunks (qwen4_exp) need mtp.hybrid=true to arm
     # the snapshot/restore rollback. Resolved HERE from the model's config so
@@ -12904,6 +13163,38 @@ async def admin_cluster_load(cluster_id: str, req: ArgoLoadRequest):
     # turning the RAM preflight into a no-op (see _resolve_model_abspath).
     base_dir = topo[0].get("models_dir") or models_dir_for(cluster_id)
     model_abspath = _resolve_model_abspath(req.model, base_dir)
+
+    # Replica (data-parallel serving): fan-out ONE full copy per node, dispatched
+    # internally by ReplicaPool (least-busy + session affinity, no collective).
+    # Runs BEFORE dflash/vlm/distributed branches — a replica cluster never
+    # takes those. node_indices = ALL cluster nodes.
+    if get_cluster_def(cluster_id).get("kind") == "replica":
+        _rep_indices = list(range(len(get_cluster_def(cluster_id).get("nodes") or [])))
+        async with get_admin_lock(cluster_id):
+            _old = get_pool(cluster_id, alias)
+            if _old is not None:
+                try:
+                    await _old.stop()
+                except Exception as e:
+                    sys.stderr.write(f"[api] stop of old pool '{alias}' failed: {e}\n")
+                del_pool(cluster_id, alias)
+            _rep_kv_q8 = req.kv_q8 if req.kv_q8 is not None else get_kv_q8_default()
+            rpool = ReplicaPool(
+                model=req.model, cluster=cluster_id, alias=alias,
+                node_indices=_rep_indices, kv_q8=_rep_kv_q8)
+            await rpool.start()
+            set_pool(cluster_id, alias, rpool)
+            save_cluster_state_v2(cluster_id)
+        return {
+            "loaded": True, "cluster": cluster_id, "alias": alias,
+            "is_replica": True, "dispatched": "replica-pool",
+            "model": req.model, "nodes": len(_rep_indices),
+            "replicas": rpool.replica_stats(),
+            "load_s": rpool.load_s,
+            "note": (f"{req.model} servi en REPLICA (data-parallel) sur "
+                     f"{len(_rep_indices)} nodes — continuous batching par node, "
+                     f"least-busy + affinité de session, sans collective."),
+        }
 
     # Model→drafter association (2026-08-06): a model whose drafter is registered
     # in cluster-config `model_drafters` loads WITH its drafter AUTOMATICALLY — the
