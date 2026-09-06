@@ -2034,7 +2034,8 @@ def remote_cmd(node: dict, nodes: list[dict], model: str, mode: str, port: int,
                num_draft_tokens: int = 4,
                ram_weights_csv: Optional[str] = None,
                backend: str = "jaccl",
-               mtp: Optional[dict] = None) -> str:
+               mtp: Optional[dict] = None,
+               batch: bool = False) -> str:
     world_size = len(nodes)
     env = {
         "MLX_RANK": str(node["rank"]),
@@ -2045,6 +2046,9 @@ def remote_cmd(node: dict, nodes: list[dict], model: str, mode: str, port: int,
         "RUNNER_BACKEND": backend,
         "RUNNER_USE_AP": "1" if use_ap else "0",
         "RUNNER_KV_Q8": "1" if kv_q8 else "0",
+        # Continuous batching (runner.py loop dispatcher). Explicit opt-in per
+        # pool since the 2026-08-27 revert: "0" = legacy single-stream loop.
+        "RUNNER_BATCH": "1" if batch else "0",
         "RUNNER_EMIT_BATCH": str(emit_batch),
         "SPEC_SESS_DEBUG": os.environ.get("SPEC_SESS_DEBUG", ""),
     }
@@ -2601,13 +2605,18 @@ class RunnerPool:
                  alias: Optional[str] = None,
                  node_indices: Optional[list[int]] = None,
                  backend: Optional[str] = None,
-                 mtp: Optional[dict] = None):
+                 mtp: Optional[dict] = None,
+                 batch: bool = False):
         self.model = model
         self.mode = mode
         self.use_ap = use_ap
         self.cluster = cluster
         self.nodes_count = nodes_count
         self.kv_q8 = kv_q8
+        # Continuous batching inside the runner (BatchGenerator loop). Only
+        # honoured by single-node runners (world_size==1) — the replica pool's
+        # children. Off = legacy single-stream loop (production default).
+        self.batch = bool(batch)
         self.draft_model = draft_model
         self.num_draft_tokens = num_draft_tokens
         # Native-MTP pool config (plan docs/PLAN-distributed-mtp.md D7):
@@ -2808,7 +2817,8 @@ class RunnerPool:
                              num_draft_tokens=self.num_draft_tokens,
                              ram_weights_csv=ram_weights_csv,
                              backend=getattr(self, "backend", "jaccl"),
-                             mtp=self.mtp_cfg)
+                             mtp=self.mtp_cfg,
+                             batch=getattr(self, "batch", False))
             self.runners.append(RunnerProc(node, cmd, self._on_event,
                                            cluster=self.cluster, pool=self))
         rank0 = next(r for r in self.runners if r.node["rank"] == 0)
@@ -3807,7 +3817,8 @@ class ReplicaPool(RunnerPool):
 
     def __init__(self, model: str, cluster: str, alias: str,
                  node_indices: list[int], kv_q8: bool = False,
-                 max_concurrent: int = REPLICA_MAX_CONCURRENT):
+                 max_concurrent: int = REPLICA_MAX_CONCURRENT,
+                 batch: bool = False):
         # Duck-type the RunnerPool surface the views/registry read, WITHOUT
         # calling super().__init__ (which would build a distributed topology).
         self.model = model
@@ -3818,6 +3829,10 @@ class ReplicaPool(RunnerPool):
         self.node_indices = list(node_indices)
         self.nodes_count = len(node_indices)
         self.kv_q8 = bool(kv_q8)
+        # Continuous batching per replica (dashboard "Batch" checkbox, off by
+        # default). Without it each replica serves ONE request at a time —
+        # the 2026-09-06 stress run: 4 replicas = exactly 4 streams.
+        self.batch = bool(batch)
         self.draft_model = None          # v1: no drafter (batched path needs it)
         self.num_draft_tokens = 0
         self.mtp_cfg = None
@@ -3845,6 +3860,7 @@ class ReplicaPool(RunnerPool):
                 model=model, mode="pipeline", use_ap=False, nodes_count=1,
                 cluster=cluster, kv_q8=kv_q8, draft_model=None,
                 alias=f"{self.alias}#r{i}", node_indices=[idx], mtp=None,
+                batch=self.batch,
             )
             for i, idx in enumerate(node_indices)
         ]
@@ -4069,6 +4085,7 @@ def save_cluster_state_v2(cluster_id: str, *,
                 "node_indices": indices,
                 "nodes": pool.nodes_count,
                 "kv_q8": bool(getattr(pool, "kv_q8", False)),
+                "batch": bool(getattr(pool, "batch", False)),
             })
             continue
         if getattr(pool, "is_vlm_dist", False):
@@ -5206,7 +5223,8 @@ async def _restore_cluster_pools(cid: str, leaked_hosts: Optional[set] = None,
                 rpool = ReplicaPool(
                     model=entry["model"], cluster=cid, alias=alias,
                     node_indices=indices,
-                    kv_q8=bool(entry.get("kv_q8", False)))
+                    kv_q8=bool(entry.get("kv_q8", False)),
+                    batch=bool(entry.get("batch", False)))
                 await rpool.start()
                 set_pool(cid, alias, rpool)
                 restored.append(alias)
@@ -6103,7 +6121,7 @@ def _initial_default_config() -> Optional[dict]:
 #   major (1.7.2 → 2.0.0) — breaking API or topology change
 #
 # Use `./scripts/bump-version.sh patch|minor|major` to bump + auto-commit.
-APP_VERSION = "1.46.1"
+APP_VERSION = "1.47.0"
 
 app = FastAPI(
     title="OdyssAI-X (odyssai.eu)",
@@ -12690,6 +12708,8 @@ async def admin_cluster_status(cluster_id: str):
             "mode": pool.mode,
             "tokens_since_load": int(getattr(pool, "tokens_produced", 0)),
             "is_vlm": bool(getattr(pool, "is_vlm", False)),
+            "is_replica": bool(getattr(pool, "is_replica", False)),
+            "batch": bool(getattr(pool, "batch", False)),
             "use_ap": pool.use_ap,
             "nodes": pool.nodes_count,
             "node_indices": list(pool.node_indices)
@@ -12885,6 +12905,12 @@ class ArgoLoadRequest(BaseModel):
     # The dashboard checkbox sends the explicit bool, so switching between
     # spec and plain is one click — no more editing cluster-config to disable.
     use_drafter: Optional[bool] = None
+    # Replica clusters only (2026-09-06): continuous batching inside each
+    # replica (runner BatchGenerator loop, RUNNER_BATCH=1). Off by default —
+    # the batched loop was reverted from production on 2026-08-27 — so it is
+    # an explicit per-load opt-in (dashboard "Batch" checkbox). Ignored for
+    # distributed / VL / dflash loads.
+    batch: bool = False
 
 
 @app.get("/admin/clusters/{cluster_id}/load-options")
@@ -13212,7 +13238,8 @@ async def admin_cluster_load(cluster_id: str, req: ArgoLoadRequest):
                 _rep_kv_q8 = req.kv_q8 if req.kv_q8 is not None else get_kv_q8_default()
                 rpool = ReplicaPool(
                     model=req.model, cluster=cluster_id, alias=alias,
-                    node_indices=_rep_indices, kv_q8=_rep_kv_q8)
+                    node_indices=_rep_indices, kv_q8=_rep_kv_q8,
+                    batch=bool(req.batch))
                 await rpool.start()
                 set_pool(cluster_id, alias, rpool)
                 save_cluster_state_v2(cluster_id)
@@ -13227,9 +13254,12 @@ async def admin_cluster_load(cluster_id: str, req: ArgoLoadRequest):
             "model": req.model, "nodes": len(_rep_indices),
             "replicas": rpool.replica_stats(),
             "load_s": rpool.load_s,
+            "batch": rpool.batch,
             "note": (f"{req.model} servi en REPLICA (data-parallel) sur "
-                     f"{len(_rep_indices)} nodes — continuous batching par node, "
-                     f"least-busy + affinité de session, sans collective."),
+                     f"{len(_rep_indices)} nodes — "
+                     + ("continuous batching par node, " if rpool.batch
+                        else "une requête à la fois par node (batch off), ")
+                     + "least-busy + affinité de session, sans collective."),
         }
 
     # Model→drafter association (2026-08-06): a model whose drafter is registered
