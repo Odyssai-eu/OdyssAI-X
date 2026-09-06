@@ -3852,6 +3852,15 @@ class ReplicaPool(RunnerPool):
         self._affinity: dict[str, tuple[int, float]] = {}   # sid -> (idx, ts)
         self._dispatch_lock = asyncio.Lock()
 
+    @property
+    def runners(self) -> list:
+        """Flattened child runners (one RunnerProc per replica) — the
+        duck-typed `.runners` surface the shared machinery reads
+        (/status per-rank phases during a load, session-clear broadcast).
+        Missing before: `_pool_per_rank_phases` raised AttributeError on a
+        replica anchor as soon as /status carried a loading snapshot."""
+        return [r for child in self._replicas for r in child.runners]
+
     async def start(self):
         """Fan-out spawn: start every replica concurrently. Graceful — the pool
         is up as long as ≥1 replica started; failed ones are just excluded."""
@@ -6094,7 +6103,7 @@ def _initial_default_config() -> Optional[dict]:
 #   major (1.7.2 → 2.0.0) — breaking API or topology change
 #
 # Use `./scripts/bump-version.sh patch|minor|major` to bump + auto-commit.
-APP_VERSION = "1.46.0"
+APP_VERSION = "1.46.1"
 
 app = FastAPI(
     title="OdyssAI-X (odyssai.eu)",
@@ -12577,10 +12586,15 @@ def _pool_per_rank_phases(pool) -> Optional[list[dict]]:
     if pool is None or not pool.runners:
         return None
     out = []
-    for r in sorted(pool.runners, key=lambda x: x.node.get("rank", 0)):
+    # Replica pool: every child runner is rank 0 of its own world — label the
+    # rows by replica index instead so the dashboard shows "rank 0 · rank 1".
+    is_rep = bool(getattr(pool, "is_replica", False))
+    ordered = (list(pool.runners) if is_rep
+               else sorted(pool.runners, key=lambda x: x.node.get("rank", 0)))
+    for i, r in enumerate(ordered):
         rc = r.proc.poll()
         out.append({
-            "rank": r.node.get("rank"),
+            "rank": i if is_rep else r.node.get("rank"),
             "host": r.node.get("host"),
             "phase": "dead" if rc is not None else getattr(r, "phase", "spawning"),
             "phase_age_s": (round(time.time() - r.phase_at, 1) if r.phase_at else None),
@@ -13170,21 +13184,43 @@ async def admin_cluster_load(cluster_id: str, req: ArgoLoadRequest):
     # takes those. node_indices = ALL cluster nodes.
     if get_cluster_def(cluster_id).get("kind") == "replica":
         _rep_indices = list(range(len(get_cluster_def(cluster_id).get("nodes") or [])))
-        async with get_admin_lock(cluster_id):
-            _old = get_pool(cluster_id, alias)
-            if _old is not None:
-                try:
-                    await _old.stop()
-                except Exception as e:
-                    sys.stderr.write(f"[api] stop of old pool '{alias}' failed: {e}\n")
-                del_pool(cluster_id, alias)
-            _rep_kv_q8 = req.kv_q8 if req.kv_q8 is not None else get_kv_q8_default()
-            rpool = ReplicaPool(
-                model=req.model, cluster=cluster_id, alias=alias,
-                node_indices=_rep_indices, kv_q8=_rep_kv_q8)
-            await rpool.start()
-            set_pool(cluster_id, alias, rpool)
-            save_cluster_state_v2(cluster_id)
+        # Feed the SAME loading-progress state the distributed and VLM paths
+        # use (mirror of the 2026-07-08 VLM fix). Without it /status reports
+        # `loading: null` for the whole fan-out, so the dashboard shows no
+        # loader — the pool just appears once every replica is up. Each node
+        # materializes the FULL copy in parallel: the wall time is one
+        # single-node load, and the bytes the poller sums across nodes total
+        # size x N. Posted BEFORE the admin lock so a concurrent /status poll
+        # sees it immediately.
+        _rep_topo = build_topology_from_indices(cluster_id, _rep_indices)
+        _rep_size = await get_model_size_bytes(rank0_ssh, model_abspath)
+        _rep_est = estimate_load_s(req.model, _rep_size, cluster_id, len(_rep_indices))
+        _rep_state = _loading_state_for(cluster_id)
+        _begin_loading(_rep_state, req.model, len(_rep_indices), _rep_size, _rep_est)
+        _start_progress_poller(cluster_id, _rep_state,
+                               [n.get("ssh") for n in _rep_topo if n.get("ssh")],
+                               _rep_size * len(_rep_indices))
+        try:
+            async with get_admin_lock(cluster_id):
+                _old = get_pool(cluster_id, alias)
+                if _old is not None:
+                    try:
+                        await _old.stop()
+                    except Exception as e:
+                        sys.stderr.write(f"[api] stop of old pool '{alias}' failed: {e}\n")
+                    del_pool(cluster_id, alias)
+                _rep_kv_q8 = req.kv_q8 if req.kv_q8 is not None else get_kv_q8_default()
+                rpool = ReplicaPool(
+                    model=req.model, cluster=cluster_id, alias=alias,
+                    node_indices=_rep_indices, kv_q8=_rep_kv_q8)
+                await rpool.start()
+                set_pool(cluster_id, alias, rpool)
+                save_cluster_state_v2(cluster_id)
+                # Empirical prior for the next estimate (keyed model+nodes).
+                record_load_history(cluster_id, req.model, rpool.load_s or 0.0,
+                                    _rep_size, len(_rep_indices))
+        finally:
+            _end_loading(_rep_state)
         return {
             "loaded": True, "cluster": cluster_id, "alias": alias,
             "is_replica": True, "dispatched": "replica-pool",
