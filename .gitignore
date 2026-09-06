@@ -21,6 +21,8 @@ docs/*
 !docs/DEPLOY.md
 !docs/RUNBOOK-argo-v4.md
 !docs/bug-reports/
+# Public user-guide chapters (mirrored into the guide and the site content).
+!docs/user-guide/
 audit/
 onepage/
 ABOUT.md
