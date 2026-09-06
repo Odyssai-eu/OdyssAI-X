@@ -3796,6 +3796,16 @@ REPLICA_MAX_CONCURRENT = int(env_get("REPLICA_MAX_CONCURRENT", "16"))
 # Evict a session→replica affinity entry after this idle window (unbounded map
 # otherwise on a long-lived server). Aligned with the session TTL.
 REPLICA_AFFINITY_TTL_S = float(env_get("REPLICA_AFFINITY_TTL_S", "1800"))
+# Self-healing (2026-09-07). A replica whose runner died (crash, jetsam, node
+# reboot) or that failed to start (node not back yet at load time — ultra-256d
+# after its 21:22 reboot on 2026-09-06 stayed out of the pool for hours) is
+# restarted by the pool's own watchdog and re-admitted to dispatch. Backoff
+# between attempts, retries unbounded at the cap (a node down for an hour comes
+# back after an hour), one restart in flight per pool, never during stop().
+REPLICA_WATCHDOG_S = float(env_get("REPLICA_WATCHDOG_S", "30"))
+REPLICA_RESTART_BACKOFF_S = (30.0, 60.0, 120.0, 300.0)
+REPLICA_RESTART_TIMEOUT_S = float(env_get("REPLICA_RESTART_TIMEOUT_S", "900"))
+REPLICA_NODE_PROBE_TIMEOUT_S = float(env_get("REPLICA_NODE_PROBE_TIMEOUT_S", "8"))
 
 
 class ReplicaPool(RunnerPool):
@@ -3867,6 +3877,13 @@ class ReplicaPool(RunnerPool):
         self._live: set[int] = set()                  # indices that started OK
         self._affinity: dict[str, tuple[int, float]] = {}   # sid -> (idx, ts)
         self._dispatch_lock = asyncio.Lock()
+        # Self-healing state per replica index (see _watchdog / _heal_tick).
+        self._heal: dict[int, dict] = {
+            i: {"attempts": 0, "next_at": 0.0, "restarts": 0, "restarting": False,
+                "last_error": None, "died_at": None}
+            for i in range(len(node_indices))}
+        self._watchdog_task: Optional[asyncio.Task] = None
+        self._stopping = False
 
     @property
     def runners(self) -> list:
@@ -3889,6 +3906,7 @@ class ReplicaPool(RunnerPool):
                 sys.stderr.write(
                     f"[replica-pool] {self.cluster}[{self.alias}] replica {i} "
                     f"(node {self.node_indices[i]}) failed to start: {res}\n")
+                self._note_failure(i, res)
             else:
                 self._live.add(i)
         if not self._live:
@@ -3900,6 +3918,10 @@ class ReplicaPool(RunnerPool):
             f"[replica-pool] {self.cluster}[{self.alias}] up: "
             f"{len(self._live)}/{len(self._replicas)} replicas in "
             f"{self.load_s:.1f}s\n")
+        # Self-healing watchdog: brings back replicas that failed to start or
+        # die later. Strong ref kept on the pool (asyncio only weak-refs tasks).
+        self._stopping = False
+        self._watchdog_task = asyncio.create_task(self._watchdog())
 
     def _evict_stale_affinity(self, now: float) -> None:
         dead = [s for s, (_, ts) in self._affinity.items()
@@ -3970,7 +3992,8 @@ class ReplicaPool(RunnerPool):
                 # retry on a different one.
                 if session_id:
                     self._affinity.pop(session_id, None)
-                self._live.discard(idx)   # treat as unhealthy for now
+                self._live.discard(idx)   # unhealthy until the watchdog re-admits/restarts it
+                self._note_failure(idx, e)
                 sys.stderr.write(
                     f"[replica-pool] {self.cluster}[{self.alias}] replica {idx} "
                     f"failed pre-first-token ({e}) — retrying on another\n")
@@ -3983,15 +4006,177 @@ class ReplicaPool(RunnerPool):
                 and all(self._replicas[i].busy_count == 0 for i in self._live))
 
     def replica_stats(self) -> list[dict]:
-        """Per-replica view for the dashboard (backs 'dégradation gracieuse')."""
-        return [
-            {"index": i, "node": self.node_indices[i],
-             "live": i in self._live,
-             "busy_count": self._replicas[i].busy_count}
-            for i in range(len(self._replicas))
-        ]
+        """Per-replica view for the dashboard (backs 'dégradation gracieuse'
+        and the self-healing state)."""
+        now = time.time()
+        out = []
+        for i in range(len(self._replicas)):
+            h = self._heal.get(i, {})
+            host = (self._replicas[i].nodes[0].get("host")
+                    if getattr(self._replicas[i], "nodes", None) else None)
+            row = {"index": i, "node": self.node_indices[i], "host": host,
+                   "live": i in self._live,
+                   "busy_count": self._replicas[i].busy_count,
+                   "restarts": h.get("restarts", 0)}
+            if i not in self._live:
+                row.update({
+                    "restarting": bool(h.get("restarting")),
+                    "attempts": h.get("attempts", 0),
+                    "next_retry_in_s": (max(0.0, round(h.get("next_at", 0.0) - now, 1))
+                                        if not h.get("restarting") else None),
+                    "last_error": h.get("last_error"),
+                    "died_at": h.get("died_at"),
+                })
+            out.append(row)
+        return out
+
+    @property
+    def healing(self) -> bool:
+        """True while at least one replica is out and the watchdog is working on
+        it — the dead-pool sweeper must not purge the pool in that window."""
+        return (not self._stopping and self._watchdog_task is not None
+                and not self._watchdog_task.done()
+                and len(self._live) < len(self._replicas))
+
+    # ── self-healing ────────────────────────────────────────────────────
+    @staticmethod
+    def _backoff(attempts: int) -> float:
+        i = min(max(attempts, 0), len(REPLICA_RESTART_BACKOFF_S) - 1)
+        return REPLICA_RESTART_BACKOFF_S[i]
+
+    def _note_failure(self, i: int, err) -> None:
+        """A replica just failed (start, pre-first-token, or runner death):
+        schedule its next restart attempt with backoff."""
+        h = self._heal.setdefault(i, {"attempts": 0, "next_at": 0.0, "restarts": 0,
+                                      "restarting": False, "last_error": None, "died_at": None})
+        if h.get("died_at") is None:
+            h["died_at"] = time.time()
+        h["last_error"] = str(err)[:200] if err is not None else h.get("last_error")
+        h["next_at"] = time.time() + self._backoff(h["attempts"])
+
+    def _child_alive(self, i: int) -> bool:
+        rp = self._replicas[i]
+        return bool(getattr(rp, "runners", None)) and rp.alive_count() > 0
+
+    async def _node_ready(self, i: int) -> bool:
+        """Cheap reachability probe before a restart: ssh to the node and check
+        the models volume is mounted. A node that is rebooting fails here in
+        seconds instead of eating a full load timeout."""
+        rp = self._replicas[i]
+        node = rp.nodes[0] if getattr(rp, "nodes", None) else None
+        if not node or not node.get("ssh"):
+            return True
+        mdir = node.get("models_dir") or models_dir_for(self.cluster)
+        cmd = ["ssh", "-o", f"ConnectTimeout={int(REPLICA_NODE_PROBE_TIMEOUT_S)}",
+               "-o", "BatchMode=yes", node["ssh"], f"test -d {shlex.quote(mdir)}"]
+        try:
+            r = await asyncio.to_thread(
+                subprocess.run, cmd, capture_output=True, text=True,
+                timeout=REPLICA_NODE_PROBE_TIMEOUT_S + 4)
+            return r.returncode == 0
+        except Exception:
+            return False
+
+    async def _watchdog(self) -> None:
+        try:
+            while not self._stopping:
+                await asyncio.sleep(REPLICA_WATCHDOG_S)
+                if self._stopping:
+                    break
+                try:
+                    await self._heal_tick()
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:
+                    sys.stderr.write(
+                        f"[replica-pool] {self.cluster}[{self.alias}] watchdog tick failed: {e}\n")
+        except asyncio.CancelledError:
+            pass
+
+    async def _heal_tick(self) -> None:
+        """One pass: detect newly dead replicas, re-admit discarded-but-alive
+        ones, restart dead ones whose backoff has elapsed (one at a time)."""
+        now = time.time()
+        for i in range(len(self._replicas)):
+            alive = self._child_alive(i)
+            if i in self._live and not alive:
+                self._live.discard(i)
+                self._heal[i]["died_at"] = now
+                rc = None
+                try:
+                    rc = next((r.proc.poll() for r in self._replicas[i].runners), None)
+                except Exception:
+                    pass
+                self._note_failure(i, f"runner exited (rc={rc})")
+                sys.stderr.write(
+                    f"[replica-pool] {self.cluster}[{self.alias}] replica {i} "
+                    f"(node {self.node_indices[i]}) died — restart in "
+                    f"{self._heal[i]['next_at'] - now:.0f}s\n")
+            elif i not in self._live and alive and not self._heal[i].get("restarting"):
+                # Discarded after a pre-first-token failure but the runner is
+                # up: put it back. If it fails again, submit() discards it again
+                # and the attempt counter grows the backoff.
+                self._live.add(i)
+                self._heal[i]["attempts"] += 1
+                sys.stderr.write(
+                    f"[replica-pool] {self.cluster}[{self.alias}] replica {i} "
+                    f"is alive again — re-admitted\n")
+        if any(h.get("restarting") for h in self._heal.values()):
+            return                                   # one restart in flight
+        for i in range(len(self._replicas)):
+            h = self._heal[i]
+            if i in self._live or self._child_alive(i) or now < h["next_at"]:
+                continue
+            await self._restart_replica(i)
+            return                                   # one per tick
+
+    async def _restart_replica(self, i: int) -> None:
+        h = self._heal[i]
+        h["restarting"] = True
+        h["attempts"] += 1
+        rp = self._replicas[i]
+        t0 = time.time()
+        try:
+            try:
+                await asyncio.wait_for(rp.stop(), timeout=60.0)   # node-local cleanup + remote pkill
+            except Exception as e:
+                sys.stderr.write(
+                    f"[replica-pool] {self.cluster}[{self.alias}] replica {i} "
+                    f"stop before restart: {e}\n")
+            rp.busy_count = 0
+            if not await self._node_ready(i):
+                raise RuntimeError("node unreachable or models volume not mounted")
+            sys.stderr.write(
+                f"[replica-pool] {self.cluster}[{self.alias}] replica {i} "
+                f"(node {self.node_indices[i]}) restart attempt {h['attempts']}\n")
+            await asyncio.wait_for(rp.start(), timeout=REPLICA_RESTART_TIMEOUT_S)
+            self._live.add(i)
+            h.update({"attempts": 0, "next_at": 0.0, "last_error": None,
+                      "died_at": None, "restarts": h.get("restarts", 0) + 1})
+            sys.stderr.write(
+                f"[replica-pool] {self.cluster}[{self.alias}] replica {i} back in "
+                f"the pool in {time.time() - t0:.1f}s ({len(self._live)}/"
+                f"{len(self._replicas)} live)\n")
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            h["last_error"] = str(e)[:200]
+            h["next_at"] = time.time() + self._backoff(h["attempts"])
+            sys.stderr.write(
+                f"[replica-pool] {self.cluster}[{self.alias}] replica {i} restart "
+                f"attempt {h['attempts']} failed: {e} — next in "
+                f"{h['next_at'] - time.time():.0f}s\n")
+        finally:
+            h["restarting"] = False
 
     async def stop(self):
+        self._stopping = True
+        if self._watchdog_task is not None and not self._watchdog_task.done():
+            self._watchdog_task.cancel()
+            try:
+                await self._watchdog_task
+            except (asyncio.CancelledError, Exception):
+                pass
         await asyncio.gather(
             *(r.stop() for r in self._replicas), return_exceptions=True)
         self._live.clear()
@@ -6121,7 +6306,7 @@ def _initial_default_config() -> Optional[dict]:
 #   major (1.7.2 → 2.0.0) — breaking API or topology change
 #
 # Use `./scripts/bump-version.sh patch|minor|major` to bump + auto-commit.
-APP_VERSION = "1.47.0"
+APP_VERSION = "1.48.0"
 
 app = FastAPI(
     title="OdyssAI-X (odyssai.eu)",
@@ -11879,6 +12064,10 @@ async def _purge_dead_pools(cluster_id: str) -> list[str]:
     for alias, pool in list(list_pools(cluster_id)):
         if pool.alive_count() > 0:
             continue
+        # A replica pool whose watchdog is bringing replicas back (all nodes
+        # rebooting, for instance) is not dead — leave it to self-heal.
+        if getattr(pool, "healing", False):
+            continue
         try:
             await pool.stop()
         except Exception as e:
@@ -12710,6 +12899,8 @@ async def admin_cluster_status(cluster_id: str):
             "is_vlm": bool(getattr(pool, "is_vlm", False)),
             "is_replica": bool(getattr(pool, "is_replica", False)),
             "batch": bool(getattr(pool, "batch", False)),
+            "replicas": (pool.replica_stats()
+                         if getattr(pool, "is_replica", False) else None),
             "use_ap": pool.use_ap,
             "nodes": pool.nodes_count,
             "node_indices": list(pool.node_indices)

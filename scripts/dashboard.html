@@ -4072,8 +4072,16 @@ function renderArgoPoolsList(a) {
       : "";
     // Replica pool pill — "· batch" when continuous batching is on inside the
     // replicas (otherwise each replica serves one request at a time).
+    // Degraded replica pool: "replica 3/4" + a tooltip with the self-healing
+    // state of the replicas that are out (restart countdown, attempts, error).
+    const reps = Array.isArray(p.replicas) ? p.replicas : [];
+    const liveN = reps.length ? reps.filter(r => r.live).length : (p.alive ?? null);
+    const degraded = p.is_replica && reps.length > 0 && liveN < reps.length;
+    const healTip = reps.filter(r => !r.live).map(r =>
+      `replica ${r.index} (${r.host || "node " + r.node}): ${r.restarting ? "restarting…" : (r.next_retry_in_s != null ? "restart in " + Math.round(r.next_retry_in_s) + "s" : "down")}${r.attempts ? ", attempt " + r.attempts : ""}${r.last_error ? " — " + r.last_error : ""}`
+    ).join("\n");
     const replicaPill = p.is_replica
-      ? `<span class="kind-pill" style="background:var(--slate-blue-soft, #e8ecf5);color:var(--slate-blue, #4a5b8a)" title="Replica pool — one full copy per node, least-busy dispatch + session affinity${p.batch ? ". Continuous batching ON inside each replica" : ". One request at a time per replica (batch off)"}">replica${p.batch ? " · batch" : ""}</span>`
+      ? `<span class="kind-pill" style="background:${degraded ? "var(--amber-soft)" : "var(--slate-blue-soft, #e8ecf5)"};color:${degraded ? "var(--amber-deep)" : "var(--slate-blue, #4a5b8a)"}" title="${escapeHtml("Replica pool — one full copy per node, least-busy dispatch + session affinity" + (p.batch ? ". Continuous batching ON inside each replica" : ". One request at a time per replica (batch off)") + (degraded ? "\n" + healTip : ""))}">replica${degraded ? ` ${liveN}/${reps.length}` : ""}${p.batch ? " · batch" : ""}</span>`
       : "";
     const kindPill = (isVlmPool
       ? `<span class="kind-pill vlm" title="VL model — mlx_vlm.server, single node">VLM</span>`

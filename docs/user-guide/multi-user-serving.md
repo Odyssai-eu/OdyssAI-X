@@ -29,6 +29,12 @@ use a **replica cluster**.
   serves up to eight requests in the same forward pass instead of one after the
   other. Graceful degradation: a dead replica is dropped, the pool stays up as
   long as one replica lives.
+- **Self-healing.** A replica whose runner died — crash, memory kill, node
+  reboot — or that was not ready when the pool loaded is restarted by the pool
+  itself and put back into dispatch, with a 30 s → 5 min backoff between
+  attempts and no limit on attempts: a node that is down for an hour comes back
+  after an hour. The pool row shows `replica 3/4` while a replica is out, with
+  the restart countdown in its tooltip.
 
 ## What to expect
 
@@ -111,6 +117,8 @@ way.
 | `BG_CLEAR_CACHE_EVERY` | 512 | Metal buffer-cache purge every N tokens |
 | `REPLICA_MAX_CONCURRENT` | 16 | Affinity threshold before rebalancing |
 | `REPLICA_AFFINITY_TTL_S` | 1800 | Idle lifetime of a session's affinity |
+| `REPLICA_WATCHDOG_S` | 30 | Liveness check period of the self-healing watchdog |
+| `REPLICA_RESTART_TIMEOUT_S` | 900 | Cap on one replica restart (model reload) |
 
 ## Read next
 
