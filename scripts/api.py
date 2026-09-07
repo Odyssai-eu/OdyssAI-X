@@ -3808,6 +3808,14 @@ REPLICA_RESTART_TIMEOUT_S = float(env_get("REPLICA_RESTART_TIMEOUT_S", "900"))
 REPLICA_NODE_PROBE_TIMEOUT_S = float(env_get("REPLICA_NODE_PROBE_TIMEOUT_S", "8"))
 
 
+def _error_tail(err, limit: int = 400) -> str:
+    """The END of an error text — a runner death carries a stderr tail whose
+    last lines name the cause (`No module named ...`); the head is importlib
+    noise. Whitespace-collapsed so it fits a status field and a tooltip."""
+    txt = " | ".join(line.strip() for line in str(err).splitlines() if line.strip())
+    return txt if len(txt) <= limit else "…" + txt[-limit:]
+
+
 class ReplicaPool(RunnerPool):
     """Data-parallel serving: N INDEPENDENT single-node runners, each holding a
     FULL copy of the model and doing its own continuous batching (world_size=1
@@ -4051,7 +4059,7 @@ class ReplicaPool(RunnerPool):
                                       "restarting": False, "last_error": None, "died_at": None})
         if h.get("died_at") is None:
             h["died_at"] = time.time()
-        h["last_error"] = str(err)[:200] if err is not None else h.get("last_error")
+        h["last_error"] = _error_tail(err) if err is not None else h.get("last_error")
         h["next_at"] = time.time() + self._backoff(h["attempts"])
 
     def _child_alive(self, i: int) -> bool:
@@ -4160,7 +4168,7 @@ class ReplicaPool(RunnerPool):
         except asyncio.CancelledError:
             raise
         except Exception as e:
-            h["last_error"] = str(e)[:200]
+            h["last_error"] = _error_tail(e)
             h["next_at"] = time.time() + self._backoff(h["attempts"])
             sys.stderr.write(
                 f"[replica-pool] {self.cluster}[{self.alias}] replica {i} restart "
@@ -6306,7 +6314,7 @@ def _initial_default_config() -> Optional[dict]:
 #   major (1.7.2 → 2.0.0) — breaking API or topology change
 #
 # Use `./scripts/bump-version.sh patch|minor|major` to bump + auto-commit.
-APP_VERSION = "1.48.0"
+APP_VERSION = "1.48.1"
 
 app = FastAPI(
     title="OdyssAI-X (odyssai.eu)",
