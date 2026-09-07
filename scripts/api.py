@@ -1409,6 +1409,22 @@ _LOADING_STALE_MULT = 5.0         # clear past 5x the estimate (scales with mode
 # any survivors. Worst case is a brief double-set of runners, not a dead cluster.
 _OLD_STOP_TIMEOUT_S = 150.0
 
+# Load-time capacity guard (2026-09-07). A model whose RESIDENT footprint at load
+# exceeds what a node can pin is not a slow load, it is a jetsam event waiting to
+# happen: DeepSeek-V4-Flash-0731 (156 GB of weights) reached 271 GB RSS on a
+# 256 GB node and macOS killed 344 processes to make room — on three nodes, and
+# again at every watchdog retry. Checkpoint SIZE does not predict this: MiniMax
+# M2.7 is 173 GiB on disk and serves fine at 173 GB RSS, DeepSeek V4 is 146 GiB
+# and blows to 271 GB. So the guard is on the MEASURED RSS, sampled by the load
+# poller that already SSHes every node every 3 s. Ceiling = the node's
+# iogpu.wired_limit_mb (the Metal pin ceiling it is configured with, 200 GiB on
+# a 256 GB Studio, 460 GiB on ultra-512), else a fraction of its RAM. Breach =>
+# kill that node's runner for THIS model, before the OS starts jettisoning
+# daemons. Known-good loads peak at 173 GB, the failing one at 271 GB: the
+# configured ceiling sits between them without any invented margin.
+LOAD_RSS_GUARD = env_get("LOAD_RSS_GUARD", "1") == "1"
+LOAD_RSS_GUARD_RAM_FRACTION = float(env_get("LOAD_RSS_GUARD_RAM_FRACTION", "0.85"))
+
 
 def _loading_state_for(cluster_id: str) -> dict:
     """Per-cluster loading state. Created lazily on first use."""
@@ -1486,8 +1502,53 @@ def _loading_snapshot(state: dict) -> Optional[dict]:
 _progress_pollers: dict = {}
 
 
+def _node_load_ceilings(cluster: str, nodes_count: int) -> list[dict]:
+    """Per-node RSS ceiling for a load, in rank order. Prefers the node's
+    configured Metal pin ceiling (iogpu.wired_limit_mb) — what MLX can actually
+    hold — and falls back to a fraction of RAM when telemetry has no wired
+    limit. Empty list when topology/telemetry is unavailable: the guard then
+    does nothing rather than blocking a legitimate load."""
+    try:
+        _total, per_node = _cluster_total_ram_bytes(cluster, nodes_count)
+    except Exception as e:
+        sys.stderr.write(f"[load-guard] no ceilings for {cluster}: {e}\n")
+        return []
+    out: list[dict] = []
+    for e in per_node:
+        cap = int(e.get("wired_limit_bytes") or 0)
+        if not cap:
+            cap = int((e.get("ram_bytes") or 0) * LOAD_RSS_GUARD_RAM_FRACTION)
+        out.append({"host": e.get("host"), "ssh": e.get("ssh"),
+                    "ceiling": cap, "ram_bytes": int(e.get("ram_bytes") or 0)})
+    return out
+
+
+def _kill_model_runner_on_host(ssh: str, model: str) -> None:
+    """SIGTERM then SIGKILL the runner serving `model` on ONE host.
+
+    Deliberately NOT RUNNER_MATCH_PATTERN: that generic `mlx-cluster/runner.py`
+    match is what makes _sweep_orphan_runners kill every pool on a shared node
+    (the 2026-09-07 09:54 incident — an unload on `main` decapitated three
+    replicas). remote_cmd puts `RUNNER_MODEL=<model>` on the command line, so
+    matching that kills this load's runner and leaves another cluster's pool on
+    the same machine alone. SIGTERM first so Metal releases wired pages.
+    """
+    pat = "RUNNER_MODEL=" + shlex.quote(model) + " "
+    q = shlex.quote(pat)
+    sh = (f"pkill -f {q} ; sleep 5 ; "
+          f"pgrep -f {q} >/dev/null 2>&1 && pkill -9 -f {q} ; true")
+    try:
+        subprocess.run(["ssh", "-o", "ConnectTimeout=5", "-o", "BatchMode=yes",
+                        ssh, sh], capture_output=True, text=True, timeout=30)
+    except Exception as e:
+        sys.stderr.write(f"[load-guard] pkill on {ssh} failed: {e}\n")
+
+
 async def _poll_load_progress(cluster_id: str, state: dict,
-                              ssh_targets: list, total_bytes: int) -> None:
+                              ssh_targets: list, total_bytes: int,
+                              ceilings: Optional[list] = None,
+                              hosts: Optional[list] = None,
+                              model: Optional[str] = None) -> None:
     """While a load is in progress, read each rank's runner memory footprint
     (bytes materialized) so the UI shows TRUE progress + throughput + ETA +
     stall detection instead of a frozen elapsed/estimated 95 %. Self-terminates
@@ -1507,6 +1568,7 @@ async def _poll_load_progress(cluster_id: str, state: dict,
             return 0
 
     last_bytes, last_t, stall_ticks = 0, time.time(), 0
+    breached: set = set()          # ranks already stopped by the capacity guard
     await asyncio.sleep(2)
     try:
         while state.get("in_progress"):
@@ -1522,6 +1584,30 @@ async def _poll_load_progress(cluster_id: str, state: dict,
             state["eta_s"] = (round((total_bytes - loaded) / rate, 1)
                               if rate > 1e6 and total_bytes > loaded else None)
             state["stalled"] = stall_ticks >= 4          # ~12 s flat
+            # Capacity guard: a rank past its node's pin ceiling will not
+            # finish — it will be killed by jetsam, taking hundreds of system
+            # daemons with it. Stop it ourselves and record why, so the load
+            # fails with a cause instead of "1 rank(s) died during load".
+            if LOAD_RSS_GUARD and ceilings and model:
+                # NB: not `_rss` as the loop var — that name is the RSS
+                # probe closure above, and rebinding it here breaks the NEXT
+                # tick ("'int' object is not callable", caught by the smoke).
+                for _i, _used in enumerate(per_rank):
+                    _cap = (ceilings[_i] if _i < len(ceilings) else 0) or 0
+                    if not _cap or _used <= _cap or _i in breached:
+                        continue
+                    breached.add(_i)
+                    _h = (hosts[_i] if hosts and _i < len(hosts)
+                          else ssh_targets[_i])
+                    state.setdefault("capacity_breach", {})[_h] = {
+                        "host": _h, "rss_bytes": _used,
+                        "ceiling_bytes": _cap, "at": time.time()}
+                    sys.stderr.write(
+                        f"[load-guard] {cluster_id}: {_h} at {_used / 1e9:.1f} GB "
+                        f"loading {model} > ceiling {_cap / 1e9:.1f} GB — "
+                        f"stopping this runner before macOS jetsam does\n")
+                    await asyncio.to_thread(_kill_model_runner_on_host,
+                                            ssh_targets[_i], model)
             last_bytes, last_t = loaded, now
             await asyncio.sleep(3)
     except asyncio.CancelledError:
@@ -1531,7 +1617,10 @@ async def _poll_load_progress(cluster_id: str, state: dict,
 
 
 def _start_progress_poller(cluster_id: str, state: dict,
-                           ssh_targets: list, total_bytes: int) -> None:
+                           ssh_targets: list, total_bytes: int,
+                           ceilings: Optional[list] = None,
+                           hosts: Optional[list] = None,
+                           model: Optional[str] = None) -> None:
     """Spawn the observable-load poller for a load (no-op without targets)."""
     if not ssh_targets or not total_bytes:
         return
@@ -1540,7 +1629,9 @@ def _start_progress_poller(cluster_id: str, state: dict,
         old.cancel()
     try:
         _progress_pollers[cluster_id] = asyncio.create_task(
-            _poll_load_progress(cluster_id, state, list(ssh_targets), int(total_bytes)))
+            _poll_load_progress(cluster_id, state, list(ssh_targets),
+                                int(total_bytes), ceilings=ceilings,
+                                hosts=hosts, model=model))
     except RuntimeError:
         pass   # no running loop (shouldn't happen inside a request)
 
@@ -4030,8 +4121,12 @@ class ReplicaPool(RunnerPool):
                 row.update({
                     "restarting": bool(h.get("restarting")),
                     "attempts": h.get("attempts", 0),
-                    "next_retry_in_s": (max(0.0, round(h.get("next_at", 0.0) - now, 1))
-                                        if not h.get("restarting") else None),
+                    # fatal => next_at is +inf, which is not valid JSON. Report
+                    # "no retry scheduled" instead of poisoning /status.
+                    "next_retry_in_s": (
+                        None if (h.get("restarting") or h.get("fatal"))
+                        else max(0.0, round(h.get("next_at", 0.0) - now, 1))),
+                    "fatal": bool(h.get("fatal")),
                     "last_error": h.get("last_error"),
                     "died_at": h.get("died_at"),
                 })
@@ -4044,7 +4139,9 @@ class ReplicaPool(RunnerPool):
         it — the dead-pool sweeper must not purge the pool in that window."""
         return (not self._stopping and self._watchdog_task is not None
                 and not self._watchdog_task.done()
-                and len(self._live) < len(self._replicas))
+                and any(i not in self._live
+                        and not self._heal.get(i, {}).get("fatal")
+                        for i in range(len(self._replicas))))
 
     # ── self-healing ────────────────────────────────────────────────────
     @staticmethod
@@ -4052,15 +4149,47 @@ class ReplicaPool(RunnerPool):
         i = min(max(attempts, 0), len(REPLICA_RESTART_BACKOFF_S) - 1)
         return REPLICA_RESTART_BACKOFF_S[i]
 
-    def _note_failure(self, i: int, err) -> None:
+    def _note_failure(self, i: int, err, fatal: bool = False) -> None:
         """A replica just failed (start, pre-first-token, or runner death):
-        schedule its next restart attempt with backoff."""
+        schedule its next restart attempt with backoff.
+
+        `fatal` = the failure is a property of the node, not a transient: the
+        model does not fit there. Retrying is not healing, it is the same OOM
+        every backoff window (DeepSeek V4 on 2026-09-07: three nodes, a jetsam
+        storm each time, forever). Fatal replicas are never restarted — the
+        operator changes the model or the node."""
         h = self._heal.setdefault(i, {"attempts": 0, "next_at": 0.0, "restarts": 0,
                                       "restarting": False, "last_error": None, "died_at": None})
         if h.get("died_at") is None:
             h["died_at"] = time.time()
         h["last_error"] = _error_tail(err) if err is not None else h.get("last_error")
-        h["next_at"] = time.time() + self._backoff(h["attempts"])
+        if fatal or h.get("fatal"):
+            h["fatal"] = True
+            h["next_at"] = float("inf")      # _heal_tick's `now < next_at` skips it
+        else:
+            h["next_at"] = time.time() + self._backoff(h["attempts"])
+
+    def mark_capacity_fatal(self, breaches: dict) -> None:
+        """Freeze the replicas the load-time RSS guard stopped, keyed by host."""
+        if not breaches:
+            return
+        for i, rp in enumerate(self._replicas):
+            if i in self._live:
+                continue
+            host = (rp.nodes[0].get("host")
+                    if getattr(rp, "nodes", None) else None)
+            d = breaches.get(host)
+            if not d:
+                continue
+            self._note_failure(
+                i, f"model does not fit {host}: the runner reached "
+                   f"{d['rss_bytes'] / 1e9:.0f} GB while loading, ceiling "
+                   f"{d['ceiling_bytes'] / 1e9:.0f} GB — stopped by the load "
+                   f"guard, no automatic retry",
+                fatal=True)
+            sys.stderr.write(
+                f"[replica-pool] {self.cluster}[{self.alias}] replica {i} "
+                f"({host}) frozen: model does not fit this node\n")
 
     def _child_alive(self, i: int) -> bool:
         rp = self._replicas[i]
@@ -6314,7 +6443,7 @@ def _initial_default_config() -> Optional[dict]:
 #   major (1.7.2 → 2.0.0) — breaking API or topology change
 #
 # Use `./scripts/bump-version.sh patch|minor|major` to bump + auto-commit.
-APP_VERSION = "1.48.1"
+APP_VERSION = "1.49.0"
 
 app = FastAPI(
     title="OdyssAI-X (odyssai.eu)",
@@ -13419,12 +13548,43 @@ async def admin_cluster_load(cluster_id: str, req: ArgoLoadRequest):
         # sees it immediately.
         _rep_topo = build_topology_from_indices(cluster_id, _rep_indices)
         _rep_size = await get_model_size_bytes(rank0_ssh, model_abspath)
+        # Capacity preflight. Every replica holds a FULL copy, so the binding
+        # constraint is the SMALLEST node. Refuse up front what provably cannot
+        # be pinned: laguna-m-1 (2026-09-07, all four replicas dead at load,
+        # 262 GB resident on a 256 GB node) went through here unchecked.
+        # Size is a FLOOR, not a predictor — the runtime footprint is
+        # model-dependent (DeepSeek V4: 146 GiB on disk, 271 GB resident, while
+        # MiniMax M2.7 at 173 GiB loads fine) — that case is caught later by the
+        # load-time RSS guard. force=true overrides, like the VLM/RAM checks.
+        _rep_caps = _node_load_ceilings(cluster_id, len(_rep_indices))
+        if _rep_size and not getattr(req, "force", False):
+            _tight = [c for c in _rep_caps if c["ceiling"] and _rep_size > c["ceiling"]]
+            if _tight:
+                raise HTTPException(
+                    409,
+                    f"{cluster_id}: refusing to load — {req.model} is "
+                    f"{_rep_size / 1e9:.1f} GB and every replica holds a full "
+                    f"copy; "
+                    + "; ".join(f"{c['host']} can pin {c['ceiling'] / 1e9:.1f} GB"
+                                for c in _tight)
+                    + ". Load it on a node with more memory, or override with "
+                      "force=true.")
         _rep_est = estimate_load_s(req.model, _rep_size, cluster_id, len(_rep_indices))
         _rep_state = _loading_state_for(cluster_id)
         _begin_loading(_rep_state, req.model, len(_rep_indices), _rep_size, _rep_est)
-        _start_progress_poller(cluster_id, _rep_state,
-                               [n.get("ssh") for n in _rep_topo if n.get("ssh")],
-                               _rep_size * len(_rep_indices))
+        _rep_targets = [c for c in _rep_caps if c.get("ssh")]
+        if _rep_targets:
+            _start_progress_poller(
+                cluster_id, _rep_state,
+                [c["ssh"] for c in _rep_targets],
+                _rep_size * len(_rep_indices),
+                ceilings=[c["ceiling"] for c in _rep_targets],
+                hosts=[c["host"] for c in _rep_targets],
+                model=req.model)
+        else:
+            _start_progress_poller(cluster_id, _rep_state,
+                                   [n.get("ssh") for n in _rep_topo if n.get("ssh")],
+                                   _rep_size * len(_rep_indices))
         try:
             async with get_admin_lock(cluster_id):
                 _old = get_pool(cluster_id, alias)
@@ -13439,7 +13599,25 @@ async def admin_cluster_load(cluster_id: str, req: ArgoLoadRequest):
                     model=req.model, cluster=cluster_id, alias=alias,
                     node_indices=_rep_indices, kv_q8=_rep_kv_q8,
                     batch=bool(req.batch))
-                await rpool.start()
+                try:
+                    await rpool.start()
+                except Exception as _e:
+                    _cb = _rep_state.get("capacity_breach") or {}
+                    if _cb:
+                        raise HTTPException(
+                            409,
+                            f"{cluster_id}: {req.model} does not fit these "
+                            f"nodes — "
+                            + "; ".join(
+                                f"{h} reached {d['rss_bytes'] / 1e9:.0f} GB "
+                                f"(ceiling {d['ceiling_bytes'] / 1e9:.0f} GB)"
+                                for h, d in _cb.items())
+                            + ". The load was stopped before macOS started "
+                              "killing processes. Use a node with more memory.",
+                        ) from _e
+                    raise
+                # Replicas the guard stopped are frozen, not retried forever.
+                rpool.mark_capacity_fatal(_rep_state.get("capacity_breach") or {})
                 set_pool(cluster_id, alias, rpool)
                 save_cluster_state_v2(cluster_id)
                 # Empirical prior for the next estimate (keyed model+nodes).
