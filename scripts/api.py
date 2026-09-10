@@ -875,6 +875,10 @@ FORCE_NO_AP_MODEL_TYPES = frozenset({
     # shard_pipeline n'a jamais vu le hidden 4D des HyperConnections
     # (hc_mult=4) — non validé, donc interdit.
     "deepseek_v4",
+    # deepseek_v41 (2026-09-10) : port maison mono-noeud v1 (pas de PipelineMixin
+    # ni de shard()) — l'etat partage CSA2 (KV compresse des couches 2/8/14/20,
+    # top-k, pool de candidats) ne traverse pas un split AP. Meme regle que V4.
+    "deepseek_v41",
 })
 
 # Model types that carry a vision_config but must NOT route to mlx_vlm.server.
@@ -6443,7 +6447,7 @@ def _initial_default_config() -> Optional[dict]:
 #   major (1.7.2 → 2.0.0) — breaking API or topology change
 #
 # Use `./scripts/bump-version.sh patch|minor|major` to bump + auto-commit.
-APP_VERSION = "1.49.0"
+APP_VERSION = "1.49.1"
 
 app = FastAPI(
     title="OdyssAI-X (odyssai.eu)",

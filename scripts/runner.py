@@ -853,22 +853,31 @@ def _restore_from_snap(template_cache, snap) -> list:
     CLASSES par couche ; le snapshot fournit l'etat. Les objets retournes
     sont frais : la generation les mute sans toucher ni au snapshot ni au
     cache stocke — le snapshot est donc reutilisable a chaque tour."""
+    # Les attributs poses PAR INSTANCE par _pin_cache_values (#1662) ne doivent
+    # PAS etre recopies : `update_and_fetch`/`advance` y sont des closures liees
+    # a l'ANCIEN objet — un cache restaure ecrirait alors dans le cache du tour
+    # precedent (qui contient deja la reponse du tour 1). Vu 2026-09-10 sur
+    # deepseek_v41 (RotatingKVCache + masque tableau -> broadcast error au tour
+    # 2) ; silencieux mais faux avec un masque "causal". On filtre puis on re-pin.
+    _skip = ("update_and_fetch", "advance", "_oxpin", "_oxpin_adv")
     fresh = []
     for c, (kind, st) in zip(template_cache, snap):
         if kind == "l":
             subs = []
             for sub, d in zip(c.caches, st):
                 obj = sub.__class__.__new__(sub.__class__)
-                obj.__dict__.update(dict(d))
+                obj.__dict__.update({k: v for k, v in d.items() if k not in _skip})
                 subs.append(obj)
             cl = c.__class__.__new__(c.__class__)
-            cl.__dict__.update(dict(vars(c)))
+            cl.__dict__.update({k: v for k, v in vars(c).items() if k not in _skip})
             cl.caches = subs
             fresh.append(cl)
         else:
             obj = c.__class__.__new__(c.__class__)
-            obj.__dict__.update(dict(st))
+            obj.__dict__.update({k: v for k, v in st.items() if k not in _skip})
             fresh.append(obj)
+    if _CACHE_PIN_VALUES:
+        _pin_cache_values(fresh)
     return fresh
 
 
@@ -2531,6 +2540,8 @@ def main() -> None:
     # (no-drafter) load crashes with NameError at bg.next(). Single-user is the
     # supported mode; with a DSpark drafter it already takes the legacy path.
     # Batched pooled cache (B>1 concurrent) is phase-2 scope, like minimax_m3.
+    # deepseek_v41 (2026-09-10) : meme PoolingCache (4 sources KV partagees) +
+    # EngramCache, aucun `merge` batch -> legacy single-slot, comme deepseek_v4.
     # inkling_mm_model shares the constraint: its LayerCache (KVCache + 4 short-
     # conv ConvCaches per layer) has no batched merge, so BatchGenerator's
     # _merge_caches raises "does not yet support batching with history". Single-
@@ -2556,7 +2567,7 @@ def main() -> None:
     ) and (
         os.environ.get("RUNNER_BATCH", "0") == "1"
     ) and ("minimax-m3" not in repo.lower()) and (
-        _mt not in ("deepseek_v4", "deepseek_v4_dspark", "inkling_mm_model")
+        _mt not in ("deepseek_v4", "deepseek_v4_dspark", "deepseek_v41", "inkling_mm_model")
     )
     if use_batched:
         log("entering batched main loop (BatchGenerator)")
