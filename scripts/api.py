@@ -3129,7 +3129,7 @@ class RunnerPool:
                      tools: Optional[list[dict]] = None,
                      session_id: Optional[str] = None,
                      request_id: Optional[str] = None,
-                     reasoning_effort: Optional[str] = None,
+                     reasoning_effort: Optional[Union[int, str]] = None,
                      anti_loop: bool = True,
                      kv_q8: Optional[bool] = None,
                      context_limit: Optional[int] = None,
@@ -4792,6 +4792,16 @@ _MODELS_AUTO_OPEN_THINK = ("minimax", "qwen3.5", "qwen3.6", "step-3.7", "step3p7
                            # sans ce match le raisonnement partait verbatim dans
                            # `content`.
                            "glm-5.3", "glm-5-3",
+                           # DeepSeek V4.1 Flash — le template génération prime
+                           # `<｜Assistant｜><think>` en thinking-ON (le modèle
+                           # émet reasoning + `</think>` en CLAIR, pas de token
+                           # spécial ; vérifié 2026-09-11 en streaming :
+                           # `…Final one line.</think>Ils se croisent à 10h36.`).
+                           # Sans ce match, aucun filtre ne tourne et le
+                           # raisonnement + `</think>` partaient verbatim dans
+                           # `content`. Honore enable_thinking (thinking-off →
+                           # clean, pas de ghost) donc PAS dans _MODELS_IGNORE_*.
+                           "deepseek-v4-1", "deepseek-v4.1", "deepseek-v41",
                            "kimi-k3", "inkling")
 # Subset of _MODELS_AUTO_OPEN_THINK that IGNORES the `enable_thinking`
 # kwarg and always wraps reasoning in <think>...</think>. Per MiniMax M2
@@ -4862,11 +4872,22 @@ _MODELS_REASONING_EFFORT_MAP = {
 }
 
 
-def _map_reasoning_effort(model_id: Optional[str],
-                          effort: Optional[str]) -> Optional[str]:
-    """Translate a caller effort onto the model's accepted vocabulary."""
-    if not effort or not model_id:
+def _map_reasoning_effort(model_id: Optional[str], effort):
+    """Translate a caller effort onto the model's accepted vocabulary.
+
+    Accepts int OR str. DeepSeek V4.1 documents a CONTINUOUS integer effort
+    (1-100); its template uses the value directly when it isn't a string and
+    only maps low/high/max via effort_map — so a numeric STRING like "100"
+    KeyErrors that map (no effect, 2026-09-11). Pass ints through, and coerce a
+    numeric string to int so the continuous value reaches the model instead of
+    dying in the low/high/max lookup. Word efforts keep the per-model mapping.
+    """
+    if effort is None or effort == "" or not model_id:
         return effort
+    if isinstance(effort, int):
+        return effort
+    if isinstance(effort, str) and effort.strip().lstrip("-").isdigit():
+        return int(effort.strip())
     needle = model_id.lower()
     for key, table in _MODELS_REASONING_EFFORT_MAP.items():
         if key in needle:
@@ -5141,7 +5162,7 @@ class ChatCompletionRequest(BaseModel):
     # OpenAI o-series reasoning dial (minimal/low/medium/high). Forwarded to
     # the chat template as a "Reasoning: <effort>" system directive for models
     # that read it (Step-3.7). None → per-model default (_default_reasoning_effort).
-    reasoning_effort: Optional[str] = None
+    reasoning_effort: Optional[Union[int, str]] = None
     tools: Optional[list[dict]] = None
     tool_choice: Optional[Any] = None
     session_id: Optional[str] = None  # opt-in prefix-cache key (also: X-Session-Id header)
@@ -6447,7 +6468,7 @@ def _initial_default_config() -> Optional[dict]:
 #   major (1.7.2 → 2.0.0) — breaking API or topology change
 #
 # Use `./scripts/bump-version.sh patch|minor|major` to bump + auto-commit.
-APP_VERSION = "1.49.1"
+APP_VERSION = "1.49.2"
 
 app = FastAPI(
     title="OdyssAI-X (odyssai.eu)",
