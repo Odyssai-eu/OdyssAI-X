@@ -18,6 +18,7 @@ Stdout events (rank 0 only, one JSON per line):
 
 import hashlib
 import faulthandler
+import contextlib
 import json
 import os
 import pickle
@@ -2308,6 +2309,27 @@ def _install_death_reporters():
             pass
 
 
+
+@contextlib.contextmanager
+def _cpu_default_device():
+    """Charge les poids avec le device par defaut sur CPU, puis restaure le GPU.
+
+    Les `sanitize` de mlx-lm font parfois de petites ops (Qwen3.5 : moveaxis du
+    conv1d, +1 sur les norms ; DeepSeek : astype) DANS le graphe de chargement.
+    Sur un modele de 300+ GB, le command buffer Metal qui les porte attend les
+    chargements derriere lui et le watchdog tue le process ("Caused GPU Timeout",
+    puis "Ignored (for causing prior/excessive GPU errors)") -- 3/3 sur
+    Nex-N2.5-Pro-Q6h16 (324 GB) le 2026-09-12, meme signature que V4.1 le 10.
+    Construites sur le stream CPU, ces ops sont negligeables et le chargement
+    passe (4/4). La memoire est unifiee : rien a copier pour servir sur GPU.
+    """
+    prev = mx.default_device()
+    mx.set_default_device(mx.cpu)
+    try:
+        yield
+    finally:
+        mx.set_default_device(prev)
+
 def main() -> None:
     _install_death_reporters()
     repo = os.environ.get("RUNNER_MODEL", "mlx-community/GLM-4.5-Air-4bit")
@@ -2357,8 +2379,9 @@ def main() -> None:
         # Single-node: load full model, no sharding.
         repo_path = Path(repo) if Path(repo).exists() else hf_repo_to_path(repo)
         log(f"single-node loading model from {repo_path}")
-        model, model_config = load_model(repo_path, lazy=False, strict=False)
-        mx.eval(model.parameters())
+        with _cpu_default_device():
+            model, model_config = load_model(repo_path, lazy=False, strict=False)
+            mx.eval(model.parameters())
         # trust_remote_code=True: some model repos (mimo_v2, deepseek-v4, …) ship
         # custom tokenizer/model Python files referenced via `auto_map` in their
         # config; without this flag transformers prompts interactively and hangs.
@@ -2372,7 +2395,8 @@ def main() -> None:
         # Resolve HF repo to local path if needed
         repo_path = Path(repo) if Path(repo).exists() else hf_repo_to_path(repo)
         log(f"rank {rank} loading model (lazy=True) from {repo_path}")
-        model, model_config = load_model(repo_path, lazy=True, strict=False)
+        with _cpu_default_device():
+            model, model_config = load_model(repo_path, lazy=True, strict=False)
         if mode == "tensor":
             log(f"rank {rank} applying tensor_auto_parallel")
             model = shard_tensor(model, group)
@@ -2444,8 +2468,9 @@ def main() -> None:
             draft_path = Path(draft_repo) if Path(draft_repo).exists() else hf_repo_to_path(draft_repo)
             log(f"loading DRAFT model from {draft_path}"
                 + (f" (MULTIRANK harness, rank {rank})" if size > 1 else ""))
-            draft_model, _ = load_model(draft_path, lazy=False, strict=False)
-            mx.eval(draft_model.parameters())
+            with _cpu_default_device():
+                draft_model, _ = load_model(draft_path, lazy=False, strict=False)
+                mx.eval(draft_model.parameters())
             log(f"draft model loaded in {time.time()-t_draft:.1f}s — speculative decoding ENABLED "
                 f"(num_draft_tokens={num_draft_tokens})")
         except Exception as e:
