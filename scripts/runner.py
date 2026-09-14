@@ -2330,6 +2330,41 @@ def _cpu_default_device():
     finally:
         mx.set_default_device(prev)
 
+
+def _warm_import_model_module(repo_path) -> None:
+    """Build a model's device-sensitive Metal kernels on the GPU BEFORE the
+    CPU-default-device weight load (1.49.3).
+
+    `_cpu_default_device()` sets the default device to CPU so mlx-lm's load-time
+    `sanitize` ops don't stall a 300 GB+ weight command buffer (GPU timeout).
+    But the FIRST import of the model class runs under that CPU device too, and a
+    module-level Metal kernel guarded on `mx.default_device() == mx.gpu` at build
+    time then stays None for the whole process — e.g. glm5_next →
+    `dsv4_hyper_connection._hc_sinkhorn_collapse_kernel`, which the GPU dispatch
+    later calls, raising "'NoneType' object is not callable" mid-generation
+    (GLM-5.3-Flash sur Argo — régression introduite par 1.49.3 le 2026-09-12).
+    Importing the model module while the device is GPU builds those kernels
+    correctly; the weight load then stays on CPU. Kernel compilation is a tiny
+    Metal function, unrelated to the weight command buffer, so this does NOT
+    reintroduce the timeout the CPU-load fix addressed."""
+    try:
+        import importlib
+        cfg = Path(repo_path) / "config.json"
+        if not cfg.exists():
+            return
+        model_type = json.loads(cfg.read_text()).get("model_type")
+        if not model_type:
+            return
+        prev = mx.default_device()
+        mx.set_default_device(mx.gpu)
+        try:
+            importlib.import_module(f"mlx_lm.models.{model_type}")
+        finally:
+            mx.set_default_device(prev)
+    except Exception as e:
+        log(f"[warm-import] {repo_path}: skipped ({e})")
+
+
 def main() -> None:
     _install_death_reporters()
     repo = os.environ.get("RUNNER_MODEL", "mlx-community/GLM-4.5-Air-4bit")
@@ -2379,6 +2414,7 @@ def main() -> None:
         # Single-node: load full model, no sharding.
         repo_path = Path(repo) if Path(repo).exists() else hf_repo_to_path(repo)
         log(f"single-node loading model from {repo_path}")
+        _warm_import_model_module(repo_path)
         with _cpu_default_device():
             model, model_config = load_model(repo_path, lazy=False, strict=False)
             mx.eval(model.parameters())
@@ -2395,6 +2431,7 @@ def main() -> None:
         # Resolve HF repo to local path if needed
         repo_path = Path(repo) if Path(repo).exists() else hf_repo_to_path(repo)
         log(f"rank {rank} loading model (lazy=True) from {repo_path}")
+        _warm_import_model_module(repo_path)
         with _cpu_default_device():
             model, model_config = load_model(repo_path, lazy=True, strict=False)
         if mode == "tensor":
@@ -2468,6 +2505,7 @@ def main() -> None:
             draft_path = Path(draft_repo) if Path(draft_repo).exists() else hf_repo_to_path(draft_repo)
             log(f"loading DRAFT model from {draft_path}"
                 + (f" (MULTIRANK harness, rank {rank})" if size > 1 else ""))
+            _warm_import_model_module(draft_path)
             with _cpu_default_device():
                 draft_model, _ = load_model(draft_path, lazy=False, strict=False)
                 mx.eval(draft_model.parameters())
