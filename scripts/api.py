@@ -6503,7 +6503,7 @@ def _initial_default_config() -> Optional[dict]:
 #   major (1.7.2 → 2.0.0) — breaking API or topology change
 #
 # Use `./scripts/bump-version.sh patch|minor|major` to bump + auto-commit.
-APP_VERSION = "1.49.5"
+APP_VERSION = "1.49.6"
 
 app = FastAPI(
     title="OdyssAI-X (odyssai.eu)",
@@ -6976,8 +6976,24 @@ async def _validate_model_layout(ssh_target: str, model_path: str,
         " if want-have: print('INCOMPLETE_SHARDS:%d'%len(want-have)); sys.exit()\n"
         "print('OK')\n"
     )
+    # Run the probe with the cluster venv's python (PYTHON_REMOTE — the same
+    # interpreter that spawns the runner), NOT the node's bare `python3`. On a
+    # Mac with Xcode.app, `/usr/bin/python3` is the Xcode shim: after an Xcode
+    # update it refuses to run until the licence is re-accepted ("You have not
+    # agreed to the Xcode license agreements") and exits non-zero — which this
+    # probe used to report as "model not present/complete", taking every
+    # replica on the updated nodes down (2026-09-15: overnight Xcode auto-
+    # update on .29/.30/.31/.32; replica 3/4 down, GLM load refused on Argo).
+    # The venv python is a real interpreter, immune to that gate. Fall back to
+    # `python3` only where the venv is absent, so non-cluster hosts keep
+    # working exactly as before. PYTHON_REMOTE carries a literal $HOME that the
+    # remote shell expands — interpolated raw, like the runner spawn line.
+    remote_cmd = (
+        f"PY={PYTHON_REMOTE}; [ -x \"$PY\" ] || PY=python3; "
+        f"\"$PY\" -c {shlex.quote(remote_py)}"
+    )
     cmd = ["ssh", "-o", "ConnectTimeout=4", "-o", "BatchMode=yes",
-           ssh_target, "python3 -c " + shlex.quote(remote_py)]
+           ssh_target, remote_cmd]
     try:
         proc = await asyncio.create_subprocess_exec(
             *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
