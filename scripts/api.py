@@ -1646,6 +1646,23 @@ def _start_progress_poller(cluster_id: str, state: dict,
 # vary by Python version, so we point at the configured venv path instead.
 HF_BIN_REMOTE = env_get("HF_BIN_REMOTE", f"{REMOTE_CLUSTER_DIR}/.venv/bin/hf")
 
+
+def _split_hf_repo(repo: str) -> tuple[str, Optional[str]]:
+    """Split a model spec into (repo_id, subfolder).
+
+    A HF repo id is exactly `namespace/name`. Many MLX repos ship several quant
+    variants as SUBFOLDERS of a single repo — e.g.
+    `GlobalCybersecurityAlliance/Qwen3.8-Flash-Next-FP8-Abliterated-MLX/6bit`
+    with siblings `4bit/`, `8bit/`, `MTP/`. Passing that 3-segment string to
+    `hf download` fails with "Repo id must be in the form 'namespace/repo_name'".
+    Return the 2-segment repo id plus the remaining path as the subfolder, so the
+    caller can restrict the pull with `--include "<subfolder>/*"`. A plain
+    2-segment id returns (id, None) — unchanged behaviour."""
+    parts = [p for p in repo.strip().strip("/").split("/") if p]
+    if len(parts) <= 2:
+        return "/".join(parts), None
+    return "/".join(parts[:2]), "/".join(parts[2:])
+
 # P8.1 — derniere activite de service par cluster (unload-guard).
 # Mis a jour au moment ou une requete /v1/* est resolue vers un pool
 # charge ; lu par admin_cluster_unload pour refuser un unload pendant
@@ -1685,7 +1702,9 @@ async def _hf_repo_total_bytes(repo: str, token: Optional[str]) -> Optional[int]
     """Best-effort total size of an HF repo = sum of file sizes, via the HF tree
     API. Mechanism borrowed from the HF tools app (#14) to drive a real progress
     bar. Returns None on any failure so the caller falls back to indeterminate."""
-    url = f"https://huggingface.co/api/models/{repo}/tree/main?recursive=true"
+    repo_id, subfolder = _split_hf_repo(repo)
+    prefix = (subfolder.rstrip("/") + "/") if subfolder else None
+    url = f"https://huggingface.co/api/models/{repo_id}/tree/main?recursive=true"
     headers = {"Authorization": f"Bearer {token}"} if token else {}
     try:
         async with httpx.AsyncClient(timeout=15.0) as c:
@@ -1695,6 +1714,9 @@ async def _hf_repo_total_bytes(repo: str, token: Optional[str]) -> Optional[int]
             total = 0
             for e in r.json():
                 if e.get("type") == "file":
+                    # Subfolder spec (e.g. `<repo>/6bit`): only that variant's bytes.
+                    if prefix and not str(e.get("path", "")).startswith(prefix):
+                        continue
                     sz = e.get("size") or (e.get("lfs") or {}).get("size") or 0
                     total += int(sz)
             return total or None
@@ -1713,7 +1735,16 @@ async def _hf_dl_one(dl_id: str, host: dict, repo: str,
     # Models from HF land under `<org>/<name>` so the matrix sees them at
     # the right hierarchy (e.g. `inferencerlabs/Hy3-preview-MLX-9bit`).
     # That matches the layout the rest of OdyssAI-X expects.
+    # A 3+ segment spec names a quant SUBFOLDER inside the repo (e.g.
+    # `<org>/<name>/6bit`): `hf download` only takes the 2-segment repo id, so
+    # split it out and restrict the pull with `--include "<subfolder>/*"`. The
+    # files still land at `<models_dir>/<full spec>` (= the subfolder path), so
+    # the served model dir has its config.json at its own root, unchanged.
+    repo_id, subfolder = _split_hf_repo(repo)
     target = f"{models_dir}/{repo}"
+    # `--include "<sub>/*"` writes into `<local-dir>/<sub>/…`, so point --local-dir
+    # at the repo-id dir and the files resolve to `target`. No subfolder → target.
+    local_dir = f"{models_dir}/{repo_id}" if subfolder else target
     slot["host"] = host["id"]
     slot["ssh"] = ssh
     slot["target"] = target
@@ -1724,12 +1755,16 @@ async def _hf_dl_one(dl_id: str, host: dict, repo: str,
     env_prefix = ""
     if hf_token:
         env_prefix = f"HF_TOKEN={shlex.quote(hf_token)} "
+    include = ""
+    if subfolder:
+        include = f"--include {shlex.quote(subfolder.rstrip('/') + '/*')} "
     # `hf download` resumes partial files by default. 4 workers keeps the
     # per-file resume granular even on multi-GB safetensors shards.
     cmd = (
-        f"mkdir -p {shlex.quote(target)} && "
-        f"{env_prefix}{HF_BIN_REMOTE} download {shlex.quote(repo)} "
-        f"--local-dir {shlex.quote(target)} "
+        f"mkdir -p {shlex.quote(local_dir)} && "
+        f"{env_prefix}{HF_BIN_REMOTE} download {shlex.quote(repo_id)} "
+        f"{include}"
+        f"--local-dir {shlex.quote(local_dir)} "
         f"--max-workers 4"
     )
     proc = await asyncio.create_subprocess_exec(
@@ -6468,7 +6503,7 @@ def _initial_default_config() -> Optional[dict]:
 #   major (1.7.2 → 2.0.0) — breaking API or topology change
 #
 # Use `./scripts/bump-version.sh patch|minor|major` to bump + auto-commit.
-APP_VERSION = "1.49.4"
+APP_VERSION = "1.49.5"
 
 app = FastAPI(
     title="OdyssAI-X (odyssai.eu)",
