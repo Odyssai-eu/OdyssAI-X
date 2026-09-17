@@ -13,9 +13,10 @@ description: CoeOS is a separate gateway that routes each request to the best mo
 > cloud provider with your own keys. The inference itself happens here.
 
 CoeOS used to live inside the OdyssAI-X dashboard. It is now its **own
-product** (its own container, port 4600, its own console — *Theseus*). Everything about
-configuring axes, keys, users and quotas is in the CoeOS user guide:
-[`doc/USER-GUIDE.md`](https://github.com/Odyssai-eu/coeos/blob/main/doc/USER-GUIDE.md).
+product** ([Odyssai-eu/coeos](https://github.com/Odyssai-eu/coeos): client, Guardian, infra) whose router
+runs as its own container — the **box**, [Odyssai-eu/coeos-box](https://github.com/Odyssai-eu/coeos-box), port 4600, console *Theseus*.
+Everything about configuring axes, keys, users and quotas is in the box guide:
+[`doc/USER-GUIDE.md`](https://github.com/Odyssai-eu/coeos-box/blob/main/doc/USER-GUIDE.md).
 This page covers only the engine side.
 
 ## What this engine exposes to CoeOS
@@ -35,7 +36,7 @@ is keyless by design.
 
 1. Make sure the models you want CoeOS to route to are **loaded** here (a
    replica pool is the natural fit — see [Multi-user serving](multi-user-serving.md)).
-2. Give CoeOS the engine's address:
+2. Give the CoeOS box (`coeos-box`, the router container of the product) the engine's address:
 
 ```bash
 curl -X PUT http://<coeos-host>:4600/admin/platform/providers/odyssai \
@@ -75,4 +76,4 @@ The response headers say who answered: `x-coeos-axis`, `x-coeos-model`,
 
 - [Multi-user serving](multi-user-serving.md) — replica pools, the usual backend for CoeOS axes.
 - [API](../API.md) — the full `/v1` and `/admin` surface of this engine.
-- [CoeOS user guide](https://github.com/Odyssai-eu/coeos/blob/main/doc/USER-GUIDE.md) — axes, keys, users, guarantees.
+- [CoeOS user guide](https://github.com/Odyssai-eu/coeos-box/blob/main/doc/USER-GUIDE.md) — axes, keys, users, guarantees.
