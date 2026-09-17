@@ -26,7 +26,7 @@
   - VLM — a vision model served by `mlx-vlm` on one node, proxied by the orchestrator.
 
 Versions this repo is validated against (`requirements-node.txt`): **mlx 0.32.0 ·
-mlx-lm 0.31.3 · transformers 5.9.0**. Do not float them.
+mlx-lm 0.31.3 · transformers 5.10.0**. Do not float them.
 
 ---
 

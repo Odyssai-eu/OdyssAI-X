@@ -60,7 +60,7 @@ scripts/bootstrap-node.sh user@node.lan            # default models dir: ~/mlx-m
 scripts/bootstrap-node.sh user@node.lan /Volumes/models/odyssai
 ```
 
-It checks SSH + Python, creates `~/mlx-cluster` with a pinned venv (`requirements-node.txt`: `mlx 0.32.0`, `mlx-lm 0.31.3`, `transformers 5.9.0`, …), copies the runner and patches, **installs the vendored model modules into the venv's `mlx_lm/models/`**, runs a smoke import, and sets up the optional `mlx-vlm` venv (`~/.venvs/mlx-vlm`, Python 3.12). Re-run it after any `pip` upgrade on the node — upgrading `mlx-lm` silently removes the vendored modules.
+It checks SSH + Python, creates `~/mlx-cluster` with a pinned venv (`requirements-node.txt`: `mlx 0.32.0`, `mlx-lm 0.31.3`, `transformers 5.10.0`, …), copies the runner and patches, **installs the vendored model modules into the venv's `mlx_lm/models/`**, runs a smoke import, and sets up the optional `mlx-vlm` venv (`~/.venvs/mlx-vlm`, Python 3.12). Re-run it after any `pip` upgrade on the node — upgrading `mlx-lm` silently removes the vendored modules.
 
 **2. Pin the GPU memory budget on each node** (persistent `iogpu.wired_limit_mb`; needs the node's password, so it is a deliberate step, not automated):
 
