@@ -91,7 +91,7 @@ Liste tous les modèles loadés + aliases cloud. Chaque entrée inclut
 }
 ```
 
-Le **Companion model picker** affiche `family` (nom court sans org + quant)
+Le **model picker de CoeOS** affiche `family` (nom court sans org + quant)
 comme label primaire, et la pastille de runtime `kind` (Telemak / Argo /
 cloud).
 
@@ -247,7 +247,7 @@ code complexe). Non overridable pour les modèles qui honorent
 
 Tous les modèles always-think (et les modèles en mode thinking) ont leur
 contenu `<think>…</think>` **extrait** du `content` visible et routé dans
-`delta.reasoning_content` (canal replié dans Companion).
+`delta.reasoning_content` (canal replié dans le client CoeOS).
 
 Décision partagée `_should_filter_think(model_id, enable_thinking)` :
 - `enable_thinking:false` + modèle honore le flag (Qwen3.5/3.6) → pas de

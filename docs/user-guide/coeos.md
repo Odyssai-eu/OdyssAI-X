@@ -150,7 +150,7 @@ Available axes: `creative`, `legal_rgpd`, `legal_complex`, `reasoning`, `calc`,
 ### Seeing which model answered
 
 The response exposes the model actually used. Compatible clients (e.g.
-Companion) display it: **`CoeOS · python — MiniMax-M3`**.
+the CoeOS client) display it: **`CoeOS · python — MiniMax-M3`**.
 
 ---
 

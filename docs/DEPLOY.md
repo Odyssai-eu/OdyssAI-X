@@ -8,7 +8,7 @@ HA setups are out of scope.
 ## Architecture
 
 ```
-clients (Companion, curl, Continue.dev, Aider, Claude Code, …)
+clients (CoeOS, curl, Continue.dev, Aider, Claude Code, …)
     ↓ HTTP :8000   (single entry point)
 <docker-host> — Docker container 'odyssai-odysseus'
     ↓ SSH (your operator user) — uses host's ~/.ssh mounted ro
@@ -170,7 +170,7 @@ See https://odyssai.eu/docs/api/endpoints/ for the full list.
 The full catalogue is at `GET /v1/models` (editable via dashboard or
 `PUT /admin/providers/{id}`). You publish whatever alias names you want
 per pool (e.g. `my-cluster`, `<lab>-fast`, …) and per cloud provider
-(`or:claude-haiku`, `or:gpt-5`, etc.). One alias = one Companion
+(`or:claude-haiku`, `or:gpt-5`, etc.). One alias = one CoeOS
 picker entry.
 
 ## Persistence
@@ -201,13 +201,13 @@ No system service to install. The mechanism:
 1. **Operator opens the gate** via Dashboard → Settings → Crew →
    "Open gate". This puts the engine in pairing mode for 5 minutes
    (configurable).
-2. **Companion (or any client) scans the LAN** over HTTP:
+2. **CoeOS (or any client) scans the LAN** over HTTP:
    - Detects its local interfaces → list of subnets (typically /24)
    - Probes each IP on port 8000, endpoint
      `/.well-known/inference-engine.json` (timeout 1.5 s per IP,
      concurrency 50)
    - A `200` with `vendor === "odyssai.eu"` → engine found
-3. **Companion calls `POST /admin/pair`** without admin auth (gate
+3. **CoeOS calls `POST /admin/pair`** without admin auth (gate
    open) → receives a crew token + engine metadata
 4. **Gate auto-closes** on first successful pair (or after 5 min)
 

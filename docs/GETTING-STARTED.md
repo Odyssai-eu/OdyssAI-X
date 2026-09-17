@@ -249,7 +249,7 @@ This is the production path but the setup is more involved:
 
 ## Next steps
 
-- **Pair Companion** — install [Companion](https://github.com/Odyssai-eu/Companion) and point it at this engine for a chat UI with memory, projects, skills, and the rest.
+- **Pair CoeOS** — install [CoeOS](https://github.com/Odyssai-eu/coeos) and point it at this engine for a chat UI with memory, projects, skills, and the rest.
 - **Multi-cluster setups** — cluster keys in `topology.yaml` are
   arbitrary (`default`, `chat`, `coder`, `reasoner`, `vision`, `mon-mac`
   — anything works). Define several entries to run multiple pools side
