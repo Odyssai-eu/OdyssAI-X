@@ -8,8 +8,8 @@ OdyssAI-X is the **engine** layer of [**OdyssAI**](https://odyssai.eu), the open
 
 ```
 ┌──────────────────────────────────────────────────────────────┐
-│  Clients  (CoeOS/Theseus · Claude Code · IDE agents ·        │
-│            OpenAI/Anthropic SDKs · any HTTP client)          │
+│  Clients  (Claude Code · IDE agents · OpenAI/Anthropic SDKs  │
+│            · any HTTP client — directly, or through CoeOS)   │
 │         ↓  HTTP  ─  /v1/chat/completions  ·  /v1/messages    │
 ├──────────────────────────────────────────────────────────────┤
 │  OdyssAI-X  (control plane + dashboard, this repo)  :8000    │
@@ -38,11 +38,13 @@ OdyssAI-X is the **engine** layer of [**OdyssAI**](https://odyssai.eu), the open
 
 | Component | Repo | Role |
 |---|---|---|
-| **OdyssAI-X** (engine) | this repo | distributed / replica / VLM inference, OpenAI+Anthropic API, dashboard |
-| **CoeOS** (client + router) | [Odyssai-eu/coeos](https://github.com/Odyssai-eu/coeos) | the client (Theseus UI, memory, agents) and routing box; consumes this engine. MIT |
-| **Guardian** (sidecar) | [Odyssai-eu/odyssai-guardian](https://github.com/Odyssai-eu/odyssai-guardian) | confidential-content detection before a message leaves for a cloud provider. MIT |
+| **OdyssAI-X** (engine) | this repo | distributed / replica / VLM MLX inference on Apple Silicon; OpenAI + Anthropic API; dashboard. AGPL-3.0 |
+| **CoeOS** (gateway) | [Odyssai-eu/coeos](https://github.com/Odyssai-eu/coeos) | self-hosted BYOK router by competence axis, on this engine or the cloud; console *Theseus*. MIT |
+| **Guardian** (sidecar) | [Odyssai-eu/odyssai-guardian](https://github.com/Odyssai-eu/odyssai-guardian) | confidential-content detection called by CoeOS's Confidential Guard add-on. MIT |
 | **odyssai-services** | [Odyssai-eu/odyssai-services](https://github.com/Odyssai-eu/odyssai-services) | sidecar cockpit + bench tool (stress / sweep) |
-| **mlx-swift-lm** | [Odyssai-eu/mlx-swift-lm](https://github.com/Odyssai-eu/mlx-swift-lm) | fork of ml-explore's Swift LM stack, MIT |
+| **mlx-swift-lm** | [Odyssai-eu/mlx-swift-lm](https://github.com/Odyssai-eu/mlx-swift-lm) | fork of ml-explore's Swift LM stack. MIT |
+
+*CoeOS SE* (the cloud-only simple edition) was discontinued on 2026-08-08 — its router lives on in CoeOS. *Companion*, the former chat client, is folded into CoeOS.
 
 ## Install
 
@@ -104,7 +106,7 @@ Full walkthrough, node roles, budgets and gotchas: [`AGENTS.md`](AGENTS.md) and 
 - [`docs/API.md`](docs/API.md) — endpoints (`/v1/*`, `/admin/*`), cluster kinds, routing, capability contract.
 - [`docs/DEPLOY.md`](docs/DEPLOY.md) — deploying code changes (container vs nodes); [`docs/RUNBOOK-argo-v4.md`](docs/RUNBOOK-argo-v4.md) — operating a JACCL cluster.
 - [`docs/user-guide/`](docs/user-guide/) — multi-user serving (replica), CoeOS; [`docs/bug-reports/`](docs/bug-reports/) — upstream issues we hit and how.
-- [CoeOS](https://github.com/Odyssai-eu/coeos) — the client and router that sits on this engine. Docs site: [odyssai.eu/docs](https://odyssai.eu/docs/).
+- [CoeOS](https://github.com/Odyssai-eu/coeos) — the gateway that routes your tools' requests to this engine or the cloud, per skill. Docs site: [odyssai.eu/docs](https://odyssai.eu/docs/).
 
 ## Status
 
