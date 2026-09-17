@@ -256,6 +256,6 @@ This is the production path but the setup is more involved:
   by side (e.g. a big reasoner pool and a code-tuned smaller pool).
   The API exposes them under `/admin/clusters/<id>/…`. The user-facing
   aliases in `/v1/models` are editable separately from the dashboard.
-- **Capability contract** — your engine publishes `/.well-known/inference-engine.json` and `/v1/models` with `x_odyssai` blocks. Clients (Companion, IDE plugins) use this to know what each model supports.
+- **Capability contract** — your engine publishes `/.well-known/inference-engine.json` and `/v1/models` with `x_odyssai` blocks. Clients (CoeOS, IDE plugins) use this to know what each model supports.
 
 If you get stuck, open an issue with your `topology.yaml` (redact SSH targets if sharing) and the output of `curl /admin/version` + the error you're seeing.
