@@ -140,7 +140,13 @@ echo "[4/5] Installing custom model modules on $NODE…"
 echo "[5/6] Smoke test on $NODE…"
 ssh $SSH_OPTS "$NODE" "
   cd $REMOTE_DIR
-  ./.venv/bin/python -c 'import mlx.core; import mlx_lm; print(\"OK\", mlx.core.__version__, mlx_lm.__version__)'
+  ./.venv/bin/python -c '
+import mlx.core, mlx_lm
+# The vendored modules live in site-packages/mlx_lm/models/ (step 4). If any of
+# these fail, a `pip install -U mlx-lm` on this node wiped them: re-run step 4.
+import mlx_lm.models.glm5_next, mlx_lm.models.qwen4_exp, mlx_lm.models.deepseek_v4
+from patches import apply_mlx_patches
+print(\"OK\", mlx.core.__version__, mlx_lm.__version__, \"+ vendored modules + patches\")'
 "
 
 # 6. VLM serving venv (mlx-vlm at ~/.venvs/mlx-vlm) so this node can serve

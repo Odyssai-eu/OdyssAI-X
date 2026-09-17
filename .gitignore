@@ -19,6 +19,7 @@ docs/*
 !docs/README.md
 !docs/GETTING-STARTED.md
 !docs/DEPLOY.md
+!docs/API.md
 !docs/RUNBOOK-argo-v4.md
 !docs/bug-reports/
 # Public user-guide chapters (mirrored into the guide and the site content).
@@ -42,7 +43,7 @@ scripts/odysseus.db-*
 # Local deploy script — defaults to the maintainer's prod hosts +
 # carries operator-specific bumps + push targets. An operator running
 # their own Odysseus instance writes their own version (cp from local
-# OR uses the documented hot-patch flow in INSTALL-CLUSTER.md / DEPLOY.md).
+# OR uses the documented hot-patch flow in DEPLOY.md).
 # Kept on disk for the maintainer; not tracked.
 scripts/deploy.sh
 

@@ -41,8 +41,8 @@ Easiest path. The cluster is just your own machine. JACCL is skipped because `wo
 
 ```bash
 # 1. Clone
-git clone https://github.com/Odyssai-eu/Odysseus.git
-cd Odysseus
+git clone https://github.com/Odyssai-eu/OdyssAI-X.git
+cd OdyssAI-X
 
 # 2. Enable Remote Login on macOS
 #    System Settings → General → Sharing → Remote Login → ON

@@ -21,3 +21,8 @@ blobfile>=3.2
 # Hugging Face support — used by the runner when loading directly from
 # a repo id (the dashboard's "Download from Hugging Face" path).
 huggingface_hub>=0.28
+# Pinned to what the vendored model modules (scripts/mlx_models/) are validated
+# against. transformers 4.x cannot load the glm5_next / deepseek_v4 configs.
+transformers==5.9.0
+safetensors==0.7.0
+numpy==2.4.6

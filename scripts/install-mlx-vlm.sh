@@ -3,7 +3,7 @@
 # install-mlx-vlm.sh — provision the single-node VLM serving venv on a node.
 #
 # Mirrors the manual steps that stood up mlx_vlm.server on .29:
-#   1. create a dedicated python3.12 venv at /Users/admin/.venvs/mlx-vlm
+#   1. create a dedicated python3.12 venv at ~/.venvs/mlx-vlm on the node
 #      (NOT the python3.11 cluster venv ~/mlx-cluster/.venv — never touched)
 #   2. pip install mlx-vlm pinned to the merged VL commit + torch/torchvision
 #   3. apply scripts/patches/mlx_vlm_thinking_mode_disabled.patch (see below)
@@ -32,7 +32,7 @@
 #   scripts/install-mlx-vlm.sh admin@192.168.86.30
 #
 # Env overrides:
-#   VLM_VENV      target venv path      (default /Users/admin/.venvs/mlx-vlm)
+#   VLM_VENV      target venv path      (default <remote $HOME>/.venvs/mlx-vlm)
 #   MLX_VLM_REF   git ref of mlx-vlm    (default ecc457b)
 #   PY312         python3.12 executable (default python3.12)
 set -euo pipefail
@@ -43,7 +43,13 @@ if [[ -z "$SSH_TARGET" ]]; then
   exit 2
 fi
 
-VLM_VENV="${VLM_VENV:-/Users/admin/.venvs/mlx-vlm}"
+# Resolve the node's HOME once (the operator user is whatever SSH_TARGET says —
+# not necessarily `admin`). The remote script below is an UNQUOTED heredoc, so
+# these expand locally into a plain string; a literal $HOME would not survive
+# the Python patch step that gets this path substituted in.
+REMOTE_HOME="$(ssh -o ConnectTimeout=10 -o BatchMode=yes "$SSH_TARGET" 'printf %s "$HOME"')"
+REMOTE_USER="$(ssh -o ConnectTimeout=10 -o BatchMode=yes "$SSH_TARGET" 'id -un')"
+VLM_VENV="${VLM_VENV:-$REMOTE_HOME/.venvs/mlx-vlm}"
 MLX_VLM_REF="${MLX_VLM_REF:-ecc457b}"
 PY312="${PY312:-python3.12}"
 MLX_VLM_SPEC="git+https://github.com/Blaizzy/mlx-vlm.git@${MLX_VLM_REF}"
@@ -56,7 +62,7 @@ echo "[install-mlx-vlm] target=$SSH_TARGET venv=$VLM_VENV ref=$MLX_VLM_REF"
 # first, then send it (no remote var-expansion surprises).
 REMOTE_SCRIPT=$(cat <<REMOTE
 set -euo pipefail
-export HOME=/Users/admin USER=admin TMPDIR=/tmp
+export HOME=${REMOTE_HOME} USER=${REMOTE_USER} TMPDIR=/tmp
 export PATH=/usr/bin:/bin:/usr/sbin:/sbin:/usr/local/bin:/opt/homebrew/bin
 
 VENV="${VLM_VENV}"

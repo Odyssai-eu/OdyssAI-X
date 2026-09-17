@@ -24,7 +24,7 @@ Python code, you can also run it directly with the requirements
 installed in a venv:
 
 ```bash
-git clone https://github.com/Odyssai-eu/Odysseus.git
+git clone https://github.com/Odyssai-eu/OdyssAI-X.git
 cd Odysseus
 
 # Optional: native venv for running the API without Docker

@@ -38,7 +38,7 @@ clusters:
       # ssh: the orchestrator runs inside Docker, so `localhost` inside
       # the container is the container itself — NOT the Mac. To reach
       # your own Mac, enable Remote Login (System Settings → Sharing)
-      # and use `host.docker.internal` as the host. See AGENTS.md step 2.
+      # and use `host.docker.internal` as the host. See AGENTS.md §1 (Remote Login) and §4.
       #
       # ${ODYSSEUS_NODE_USER} is set by docker-compose.yml from the
       # host environment (defaults to $USER). Do NOT use ${USER}

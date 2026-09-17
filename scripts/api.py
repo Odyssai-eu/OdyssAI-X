@@ -233,7 +233,7 @@ RUNNER_MATCH_PATTERN = env_get("RUNNER_MATCH_PATTERN", "mlx-cluster/runner.py")
 # mlx_vlm.server processes. Feature-flagged: the multi-node VL load path
 # only activates with VLM_DISTRIBUTED_ENABLED=1 (default off = prod-safe).
 VLM_RUNNER_REMOTE = env_get("VLM_RUNNER_REMOTE", f"{REMOTE_CLUSTER_DIR}/vlm_runner.py")
-VLM_PYTHON_REMOTE = env_get("VLM_PYTHON_REMOTE", "/Users/admin/.venvs/mlx-vlm/bin/python")
+VLM_PYTHON_REMOTE = env_get("VLM_PYTHON_REMOTE", "$HOME/.venvs/mlx-vlm/bin/python")
 VLM_RUNNER_MATCH_PATTERN = env_get("VLM_RUNNER_MATCH_PATTERN", "mlx-cluster/vlm_runner.py")
 VLM_DISTRIBUTED_ENABLED = env_get("VLM_DISTRIBUTED_ENABLED", "0") == "1"
 # SIGTERM->SIGKILL grace for remote pkills/sweeps, in seconds (0.5s polls).
@@ -6503,7 +6503,7 @@ def _initial_default_config() -> Optional[dict]:
 #   major (1.7.2 → 2.0.0) — breaking API or topology change
 #
 # Use `./scripts/bump-version.sh patch|minor|major` to bump + auto-commit.
-APP_VERSION = "1.49.6"
+APP_VERSION = "1.50.0"
 
 app = FastAPI(
     title="OdyssAI-X (odyssai.eu)",
@@ -15733,7 +15733,7 @@ async def admin_connection_test(nodes: int = 1, cluster: str = "default"):
 #            tombstone the cluster def (same {_removed: true} mechanism as
 #            DELETE /admin/clusters/{id})
 # ──────────────────────────────────────────────────────────────────────────────
-VLM_DEFAULT_VENV = env_get("VLM_VENV", "/Users/admin/.venvs/mlx-vlm")
+VLM_DEFAULT_VENV = env_get("VLM_VENV", "$HOME/.venvs/mlx-vlm")
 VLM_DEFAULT_PORT = int(env_get("VLM_PORT", "8080") or "8080")
 # 600s default: a 327GB 6-bit VL takes ~200-240s to load and a bigger VL
 # (Q8 ~450GB, or a cold first Metal compile) needs more — 180 false-timed-out
@@ -15786,7 +15786,7 @@ def _vlm_launch_cmd(vlm_id: str, venv: str, model_path: str, port: int) -> str:
     # ssh target `admin@...`); PATH puts the venv first. All interpolated
     # values are shlex.quote'd — model_path may contain '/', slug is validated.
     return (
-        f"export HOME=/Users/admin USER=admin TMPDIR=/tmp "
+        f"export HOME=\"${{HOME:-/Users/$(id -un)}}\" USER=\"$(id -un)\" TMPDIR=/tmp "
         f"PATH={shlex.quote(venv_bin)}:/usr/bin:/bin:/usr/sbin:/sbin && "
         f"nohup {shlex.quote(server_bin)} "
         f"--model {shlex.quote(model_path)} "
@@ -16033,7 +16033,7 @@ def _dflash_launch_cmd(vlm_id: str, venv: str, model_path: str,
     server_bin = f"{venv_bin}/mlx-dspark"
     log = _vlm_log_path(vlm_id)
     return (
-        f"export HOME=/Users/admin USER=admin TMPDIR=/tmp "
+        f"export HOME=\"${{HOME:-/Users/$(id -un)}}\" USER=\"$(id -un)\" TMPDIR=/tmp "
         f"PATH={shlex.quote(venv_bin)}:/usr/bin:/bin:/usr/sbin:/sbin && "
         f"nohup {shlex.quote(server_bin)} serve "
         f"--model {shlex.quote(model_path)} "
@@ -16078,7 +16078,7 @@ def _dflash_pool_log_id(cluster_id: str, alias: str) -> str:
 # uvicorn/scipy/PIL). Engine owns the lifecycle exactly like dflash/vlm.
 INKLING_DEFAULT_PORT = int(env_get("INKLING_PORT", "8080") or "8080")
 INKLING_SERVER_REMOTE = env_get("INKLING_SERVER_REMOTE",
-                                "/Users/admin/mlx-cluster/inkling_server.py")
+                                f"{REMOTE_CLUSTER_DIR}/inkling_server.py")
 INKLING_WIRED_LIMIT_GB = float(env_get("INKLING_WIRED_LIMIT_GB", "460") or "460")
 
 
@@ -16089,7 +16089,7 @@ def _inkling_launch_cmd(vlm_id: str, venv: str, model_path: str, port: int) -> s
     py = f"{venv_bin}/python"
     log = _vlm_log_path(vlm_id)
     return (
-        f"export HOME=/Users/admin USER=admin TMPDIR=/tmp "
+        f"export HOME=\"${{HOME:-/Users/$(id -un)}}\" USER=\"$(id -un)\" TMPDIR=/tmp "
         f"PATH={shlex.quote(venv_bin)}:/usr/bin:/bin:/usr/sbin:/sbin && "
         f"nohup {shlex.quote(py)} {shlex.quote(INKLING_SERVER_REMOTE)} "
         f"--model {shlex.quote(model_path)} "
@@ -16155,7 +16155,7 @@ async def _launch_inkling_server(
 # the lifecycle exactly like inkling/dflash/vlm. Mirrors the inkling helpers.
 MUSE_DEFAULT_PORT = int(env_get("MUSE_PORT", "8081") or "8081")
 MUSE_SERVER_REMOTE = env_get("MUSE_SERVER_REMOTE",
-                             "/Users/admin/mlx-cluster/muse_glimmer_server.py")
+                             f"{REMOTE_CLUSTER_DIR}/muse_glimmer_server.py")
 # Right-sized for the ~33GB 8-bit model: wired holds it resident without paging,
 # cache_limit bounds MLX's freed-buffer cache so it doesn't climb to fill the
 # wired allowance under a long run (191GB wired for a 33GB model, 2026-08-13).
@@ -16170,7 +16170,7 @@ def _muse_launch_cmd(vlm_id: str, venv: str, model_path: str, port: int) -> str:
     py = f"{venv_bin}/python"
     log = _vlm_log_path(vlm_id)
     return (
-        f"export HOME=/Users/admin USER=admin TMPDIR=/tmp "
+        f"export HOME=\"${{HOME:-/Users/$(id -un)}}\" USER=\"$(id -un)\" TMPDIR=/tmp "
         f"PATH={shlex.quote(venv_bin)}:/usr/bin:/bin:/usr/sbin:/sbin && "
         f"nohup {shlex.quote(py)} {shlex.quote(MUSE_SERVER_REMOTE)} "
         f"--model {shlex.quote(model_path)} "
