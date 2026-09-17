@@ -9,7 +9,7 @@ description: Replica mode plus continuous batching — one endpoint, one full co
 > every Mac, let each Mac batch several conversations per forward pass, and hand
 > the whole thing to your users as one model name.
 
-Pipeline and tensor parallel (see [Inference modes](./inference-modes.md)) split
+Pipeline and tensor parallel (see [Getting started](../GETTING-STARTED.md), modes 2 and 3) split
 one model across the cluster so it fits. They serve **one request at a time**.
 When the model already fits one Mac and what you need is *users*, not *size*,
 use a **replica cluster**.
@@ -100,6 +100,12 @@ way.
 - **Not batched:** models whose caches have no batched merge (MiniMax-M3,
   DeepSeek-V4, Inkling), and any load with a drafter, DSpark or native MTP. Those
   fall back to one request at a time per replica.
+- **Long prompts block their replica.** Batching interleaves *decoding*, not
+  *prefill*: a ~10k-token prompt occupies its replica for the whole prefill
+  (measured: small requests landing on a replica mid-prefill wait ~17–20 s).
+  Long generations interleave fine (small requests keep ~2.5 s to first token
+  even with every replica busy). If your traffic mixes huge prompts and short
+  chats, give the huge ones their own cluster.
 - **Long generations.** The batched loop was pulled from production once
   (August 2026) for post-long-generation slowdowns and Metal buffer-cache growth.
   It is back as an explicit opt-in with a periodic cache purge. Watch a stream
@@ -122,6 +128,6 @@ way.
 
 ## Read next
 
-- [Inference modes](./inference-modes.md) — when you need sharding instead.
-- [The cluster](./cluster.md) — transports, wiring, topology.
-- [HTTP API](./api.md) — the load endpoint and the rest of the surface.
+- [Getting started](../GETTING-STARTED.md) — sharded modes (TCP ring, JACCL/RDMA) when the model does not fit one Mac.
+- [AGENTS.md](../../AGENTS.md) — the install checklist, replica section included.
+- [HTTP API](../API.md) — the load endpoint and the rest of the surface.
