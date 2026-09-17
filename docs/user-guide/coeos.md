@@ -5,14 +5,15 @@ description: CoeOS is a separate gateway that routes each request to the best mo
 
 # CoeOS on this engine
 
-> **In one sentence:** [CoeOS](https://github.com/Odyssai-eu/coeos) is a
-> self-hosted, bring-your-own-keys gateway. Your tools call one model, `CoeOS`;
-> it classifies the request on a **competence axis** (Python, debugging, GDPR,
-> writing, planning…) and relays it to the model proven best there — a model
-> served by **this engine**, or a cloud one. It does no inference itself.
+> **In one sentence:** [CoeOS](https://github.com/Odyssai-eu/coeos) is the
+> **smart client** of OdyssAI — a complete AI operating system with the smart
+> router built in. Your tools call one model, `CoeOS`; it classifies the request
+> on a **competence axis** (Python, debugging, GDPR, writing, planning…) and
+> sends it to the model proven best there — served by **this engine**, or by a
+> cloud provider with your own keys. The inference itself happens here.
 
-CoeOS used to live inside the OdyssAI-X dashboard. It is now its **own box**
-(its own container, port 4600, its own console — *Theseus*). Everything about
+CoeOS used to live inside the OdyssAI-X dashboard. It is now its **own
+product** (its own container, port 4600, its own console — *Theseus*). Everything about
 configuring axes, keys, users and quotas is in the CoeOS user guide:
 [`doc/USER-GUIDE.md`](https://github.com/Odyssai-eu/coeos/blob/main/doc/USER-GUIDE.md).
 This page covers only the engine side.

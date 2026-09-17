@@ -24,7 +24,7 @@ the website is the source of truth.
 - [**odyssai.eu/docs/architecture**](https://odyssai.eu/docs/architecture/overview/) — the stack, the cluster, inference modes.
 - [**odyssai.eu/docs/api**](https://odyssai.eu/docs/api/endpoints/) — endpoint reference + auth model.
 - [**odyssai.eu/docs/operate**](https://odyssai.eu/docs/operate/deploy/) — deploy, cluster health, troubleshooting.
-- [**CoeOS**](https://github.com/Odyssai-eu/coeos) — the gateway/router that sits on this engine; its user guide is [`doc/USER-GUIDE.md`](https://github.com/Odyssai-eu/coeos/blob/main/doc/USER-GUIDE.md) in that repo.
+- [**CoeOS**](https://github.com/Odyssai-eu/coeos) — the smart client and AI operating system (smart router included) that sits on this engine; its user guide is [`doc/USER-GUIDE.md`](https://github.com/Odyssai-eu/coeos/blob/main/doc/USER-GUIDE.md) in that repo.
 
 ## How to install Odysseus
 

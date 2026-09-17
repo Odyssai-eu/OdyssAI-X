@@ -8,7 +8,7 @@ When the model emits tool calls, `mlx_vlm.server`'s OpenAI-compat chat
 completion endpoint sets `choices[0].finish_reason = "stop"`. Per the
 OpenAI spec it should be `"tool_calls"` whenever `message.tool_calls` /
 `delta.tool_calls` is non-empty, otherwise agent loops in clients
-(Companion, LangChain, etc.) never trigger tool execution.
+(CoeOS, LangChain, etc.) never trigger tool execution.
 
 ## Reproduction
 
@@ -77,7 +77,7 @@ Source: https://platform.openai.com/docs/api-reference/chat/object#chat/object-c
 
 ## Impact
 
-Clients that implement an agent loop (Companion, LangChain, LangGraph,
+Clients that implement an agent loop (CoeOS, LangChain, LangGraph,
 autogen, OpenAI SDK auto-tool flows, …) gate the tool execution step on
 `finish_reason === "tool_calls"`. With `mlx_vlm.server` returning
 `"stop"`, these clients silently exit the loop after the first turn,

@@ -34,17 +34,14 @@ OdyssAI-X is the **engine** layer of [**OdyssAI**](https://odyssai.eu), the open
 - **Live admin dashboard** — clusters, pools, models, loads, Hugging Face download (incl. quant sub-folders), sync between nodes, logs.
 - **Capability contract** — `/.well-known/inference-engine.json` and per-model `x_odyssai` blocks (vision, tools, stream, context length).
 
-## The OdyssAI family
+## OdyssAI — two components
 
 | Component | Repo | Role |
 |---|---|---|
 | **OdyssAI-X** (engine) | this repo | distributed / replica / VLM MLX inference on Apple Silicon; OpenAI + Anthropic API; dashboard. AGPL-3.0 |
-| **CoeOS** (gateway) | [Odyssai-eu/coeos](https://github.com/Odyssai-eu/coeos) | self-hosted BYOK router by competence axis, on this engine or the cloud; console *Theseus*. MIT |
-| **Guardian** (sidecar) | [Odyssai-eu/odyssai-guardian](https://github.com/Odyssai-eu/odyssai-guardian) | confidential-content detection called by CoeOS's Confidential Guard add-on. MIT |
-| **odyssai-services** | [Odyssai-eu/odyssai-services](https://github.com/Odyssai-eu/odyssai-services) | sidecar cockpit + bench tool (stress / sweep) |
-| **mlx-swift-lm** | [Odyssai-eu/mlx-swift-lm](https://github.com/Odyssai-eu/mlx-swift-lm) | fork of ml-explore's Swift LM stack. MIT |
+| **CoeOS** (smart client) | [Odyssai-eu/coeos](https://github.com/Odyssai-eu/coeos) | a complete AI operating system with the **smart router built in**: every request goes to the model proven best at that skill — local on this engine, or cloud with your own keys. Users, tokens, quotas, console *Theseus*. MIT |
 
-*CoeOS SE* (the cloud-only simple edition) was discontinued on 2026-08-08 — its router lives on in CoeOS. *Companion*, the former chat client, is folded into CoeOS.
+Also in the organisation: [Guardian](https://github.com/Odyssai-eu/odyssai-guardian) (confidential-content detection before anything leaves for a cloud provider, MIT), [odyssai-services](https://github.com/Odyssai-eu/odyssai-services) (bench + sidecar tooling), [mlx-swift-lm](https://github.com/Odyssai-eu/mlx-swift-lm) (MIT).
 
 ## Install
 
@@ -106,7 +103,7 @@ Full walkthrough, node roles, budgets and gotchas: [`AGENTS.md`](AGENTS.md) and 
 - [`docs/API.md`](docs/API.md) — endpoints (`/v1/*`, `/admin/*`), cluster kinds, routing, capability contract.
 - [`docs/DEPLOY.md`](docs/DEPLOY.md) — deploying code changes (container vs nodes); [`docs/RUNBOOK-argo-v4.md`](docs/RUNBOOK-argo-v4.md) — operating a JACCL cluster.
 - [`docs/user-guide/`](docs/user-guide/) — multi-user serving (replica), CoeOS; [`docs/bug-reports/`](docs/bug-reports/) — upstream issues we hit and how.
-- [CoeOS](https://github.com/Odyssai-eu/coeos) — the gateway that routes your tools' requests to this engine or the cloud, per skill. Docs site: [odyssai.eu/docs](https://odyssai.eu/docs/).
+- [CoeOS](https://github.com/Odyssai-eu/coeos) — the smart client and AI operating system that sits on this engine (smart router included). Docs site: [odyssai.eu/docs](https://odyssai.eu/docs/).
 
 ## Status
 
