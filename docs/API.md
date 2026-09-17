@@ -92,7 +92,7 @@ Liste tous les modèles loadés + aliases cloud. Chaque entrée inclut
 ```
 
 Le **model picker de CoeOS** affiche `family` (nom court sans org + quant)
-comme label primaire, et la pastille de runtime `kind` (Telemak / Argo /
+comme label primaire, et la pastille de runtime `kind` (http-proxy / distribué / replica /
 cloud).
 
 #### `POST /v1/chat/completions`
@@ -178,7 +178,7 @@ Body : `system`, `messages`, `tools` (format Anthropic), `stream`,
 - `POST /admin/clusters/{id}/unload` — décharger
 - `GET /admin/status` — état agrégé de tous les pools actifs
 
-#### Clusters Telemak — lifecycle
+#### Clusters http-proxy (kind `telemak`) — lifecycle
 
 - `POST /admin/clusters/{id}/telemak/lifecycle`
   ```json
@@ -257,7 +257,7 @@ Décision partagée `_should_filter_think(model_id, enable_thinking)` :
 - `enable_thinking:true` (ou always-think) → filtre, route vers reasoning
 
 Comportement identique sur le chemin local (pool Argo) et le chemin proxy
-(Telemak).
+(pool http-proxy).
 
 ---
 
@@ -270,7 +270,7 @@ Comportement identique sur le chemin local (pool Argo) et le chemin proxy
 |---|---|---|
 | `jaccl` (Argo) | OK, deltas incrémentaux | aucun |
 | `http-proxy` cloud | Pass-through verbatim | aucun |
-| `http-proxy` LAN (Telemak) | Stream-to-unary si tools | `stream_tools_empty_deltas`, `finish_reason_stop_with_tools` |
+| `http-proxy` LAN | Stream-to-unary si tools | `stream_tools_empty_deltas`, `finish_reason_stop_with_tools` |
 
 Formats tool call reconnus par le runner :
 
