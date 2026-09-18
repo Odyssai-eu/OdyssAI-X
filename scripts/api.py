@@ -2441,6 +2441,16 @@ class RunnerProc:
             if ev.get("event") == "ready":
                 self.ready.set()
             self._on_event(ev)
+        # Rank-0 stdout EOF = the sole event producer is gone. Wake every
+        # listener NOW (2026-09-18). Before this, a generation whose rank 0
+        # died mid-stream only noticed at GEN_IDLE_TIMEOUT_S (120 s): the client
+        # sat on a silent SSE stream although the patched JACCL had made rank 0
+        # raise within 0.25 s of its peer's death.
+        try:
+            self._on_event({"event": "runner_exit", "rank": self.node.get("rank"),
+                            "rc": self.proc.poll()})
+        except Exception:
+            pass
 
     def send(self, obj: dict) -> bool:
         """Write a command to the runner's stdin. Returns True on success,
@@ -2862,6 +2872,13 @@ class RunnerPool:
         # watchdog reads (head-of-line fix, 2026-06-16).
         if ev.get("event") == "token":
             self.last_token_at = time.monotonic()
+        if ev.get("event") == "runner_exit":
+            # Fan out to every in-flight request: none of them will ever get
+            # another event from this producer.
+            if self._loop is not None:
+                for q in list(self._listeners.values()):
+                    self._loop.call_soon_threadsafe(q.put_nowait, ev)
+            return
         req_id = ev.get("id")
         if req_id and req_id in self._listeners:
             q = self._listeners[req_id]
@@ -3389,6 +3406,35 @@ class RunnerPool:
                             "(no events and rank-0 process is gone)"
                         )
                     continue  # loop top re-checks the no-progress deadline
+                if ev.get("event") == "runner_exit":
+                    # Rank 0 exited mid-generation and its stdout reader told us
+                    # at once. Two cases (2026-09-18):
+                    #  - a CONTROLLED exit: the patched JACCL raised "peer is
+                    #    gone" (a peer died) — rank 0's own state is clean, the
+                    #    sweeper purges and auto-reload brings the pool back;
+                    #    do NOT flip degraded, that would gate the self-recovery
+                    #    behind an operator reset;
+                    #  - anything else (native abort, wedge kill): same as the
+                    #    timeout path below — degraded, operator inspects.
+                    tail = ""
+                    for r in self.runners:
+                        if r.node.get("rank") == 0:
+                            tail = r.stderr_tail(40)
+                    controlled = "peer is gone" in tail
+                    if not controlled:
+                        self.degraded = True
+                        self.degraded_reason = "rank-0 died mid-generation"
+                        self.degraded_at = time.time()
+                        _mark_cluster_degraded(
+                            self.cluster, "rank-0 died mid-generation",
+                            {"alias": self.alias, "request_id": req_id,
+                             "rc": ev.get("rc")})
+                    raise RuntimeError(
+                        "runner died mid-generation (rank-0 process exited"
+                        f" rc={ev.get('rc')}"
+                        + (", a peer rank died — pool self-recovers" if controlled else "")
+                        + ")"
+                    )
                 if ev.get("event") == "token":
                     last_progress = time.monotonic()
                     seen_token = True
@@ -9977,6 +10023,28 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
                                                   if stream_loop else {})}}
                     yield f"data: {json.dumps(final)}\n\n".encode()
             yield b"data: [DONE]\n\n"
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            # The producer died or wedged mid-stream (e.g. "runner died
+            # mid-generation" once the patched JACCL made a peer's death
+            # visible, 2026-09-18). Tell the client instead of just closing
+            # the socket: a final chunk with finish_reason "error" and the
+            # reason, then [DONE], so CoeOS shows the truncation for what it
+            # is and can retry (the pool self-recovers behind it).
+            run_status = "error"
+            sys.stderr.write(f"[stream {completion_id}] ended with error: {e}\n")
+            err_chunk = {"id": completion_id, "object": "chat.completion.chunk",
+                         "created": created, "model": model_id,
+                         "choices": [{"index": 0, "delta": {},
+                                      "finish_reason": "error"}],
+                         "error": {"message": str(e), "type": "server_error",
+                                   "code": "runner_died"}}
+            try:
+                yield f"data: {json.dumps(err_chunk)}\n\n".encode()
+                yield b"data: [DONE]\n\n"
+            except Exception:
+                pass
         finally:
             _runs_finalize(completion_id)
             record_metric(client_ip, ntoks_total, elapsed_total, ttft_s, prompt_chars, model_id,
