@@ -5921,6 +5921,13 @@ def _apply_default_ttl_to_pools() -> None:
 # liveness-purged pool RELOAD itself from desired-state once the node is back.
 _AUTO_RELOAD_RETRIES: dict = {}     # (cid, alias) -> failed attempts while node WAS up
 _AUTO_RELOAD_MAX = 5
+# Purged aliases still waiting to come back: (cid, alias) -> first purge ts.
+# The docstring below always promised "retry next sweep" for a node still
+# down, but nothing re-called the helper after the purge tick — a pool purged
+# while its node was rebooting (or, 2026-09-18, while a Thunderbolt link was
+# down) never came back. The sweeper now re-runs the helper on every tick for
+# every pending entry until it reloads or exhausts its attempts.
+_AUTO_RELOAD_PENDING: dict = {}
 
 
 async def _node_reachable(ssh_target: str) -> bool:
@@ -5952,6 +5959,14 @@ async def _auto_reload_purged(cid: str, purged: list) -> None:
     # crash-loop of the macOS 26.5 wedge week). Degraded means "an operator or
     # the reset ladder must clear first"; the manual-load path already 409s on
     # it — the self-healing path must respect the same gate.
+    now_ts = time.time()
+    for a in purged:
+        _AUTO_RELOAD_PENDING.setdefault((cid, a), now_ts)
+    # Work on everything still pending for this cluster, not only this tick's
+    # purge — that is what makes "retry next sweep" true.
+    purged = [a for (c, a) in list(_AUTO_RELOAD_PENDING.keys()) if c == cid]
+    if not purged:
+        return
     if _cluster_is_degraded(cid):
         sys.stderr.write(
             f"[auto-reload] {cid}: cluster degraded — reload of {purged} "
@@ -5964,13 +5979,18 @@ async def _auto_reload_purged(cid: str, purged: list) -> None:
     cd_nodes = (get_cluster_def(cid) or {}).get("nodes") or []
     live_aliases = {a for a, _ in list_pools(cid)}
     for alias in purged:
+        key = (cid, alias)
         entry = desired.get(alias)
         if entry is None or alias in live_aliases:
+            _AUTO_RELOAD_PENDING.pop(key, None)   # gone from desired state, or back
             continue
         if entry.get("is_vlm") or entry.get("vlm_distributed"):
+            _AUTO_RELOAD_PENDING.pop(key, None)
             continue
-        key = (cid, alias)
         if _AUTO_RELOAD_RETRIES.get(key, 0) >= _AUTO_RELOAD_MAX:
+            if _AUTO_RELOAD_PENDING.pop(key, None) is not None:
+                sys.stderr.write(f"[auto-reload] {cid}[{alias}]: giving up after "
+                                 f"{_AUTO_RELOAD_MAX} failed attempts — manual load needed\n")
             continue
         indices = entry.get("node_indices") or list(range(int(entry.get("nodes") or 1)))
         ssh_targets = [cd_nodes[i].get("ssh") for i in indices
@@ -5994,9 +6014,10 @@ async def _auto_reload_purged(cid: str, purged: list) -> None:
                 await pool.start()
                 set_pool(cid, alias, pool)
             _AUTO_RELOAD_RETRIES.pop(key, None)
+            waited = time.time() - _AUTO_RELOAD_PENDING.pop(key, now_ts)
             sys.stderr.write(
                 f"[auto-reload] {cid}[{alias}]: pool self-recovered after runner "
-                f"death (node back up)\n"); sys.stderr.flush()
+                f"death (node/link back up, {waited:.0f}s after the purge)\n"); sys.stderr.flush()
         except Exception as e:
             if "rdma link(s) not usable" in str(e):
                 # The link is still down (link-watch stopped this pool, or a
@@ -6129,6 +6150,7 @@ async def _dead_pool_sweeper() -> None:
             seen_clusters = set()
             for cid, _alias, _pool in list_all_pools():
                 seen_clusters.add(cid)
+            retried: set = set()
             for cid in seen_clusters:
                 purged = await _purge_dead_pools(cid)
                 if purged:
@@ -6139,6 +6161,13 @@ async def _dead_pool_sweeper() -> None:
                     # Self-heal: reload the purged pools from desired-state once
                     # the node is back (transient drop recovery). See helper.
                     await _auto_reload_purged(cid, purged)
+                    retried.add(cid)
+            # Pending reloads (node or link still down at purge time): retry
+            # every tick, including for clusters that have no live pool left.
+            for cid in {c for (c, _a) in list(_AUTO_RELOAD_PENDING.keys())} - retried:
+                if cid in _WATCHDOG_RECOVERY_BY_CLUSTER:
+                    continue
+                await _auto_reload_purged(cid, [])
         except asyncio.CancelledError:
             return
         except Exception as e:
