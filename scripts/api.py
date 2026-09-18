@@ -3420,7 +3420,12 @@ class RunnerPool:
                     for r in self.runners:
                         if r.node.get("rank") == 0:
                             tail = r.stderr_tail(40)
-                    controlled = "peer is gone" in tail
+                    # Both patched-JACCL exits are controlled: "peer is gone"
+                    # (a peer died) and "no progress in" (the 600 s backstop:
+                    # lost UC frame / wedged peer — seen 2026-09-18 after 4.9 h
+                    # of a 5-node GLM-5.3 bench; ports and wired memory were
+                    # clean afterwards, so a reload is the right recovery).
+                    controlled = ("peer is gone" in tail) or ("[jaccl] no progress in" in tail)
                     if not controlled:
                         self.degraded = True
                         self.degraded_reason = "rank-0 died mid-generation"
