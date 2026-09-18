@@ -5951,7 +5951,10 @@ async def _auto_reload_purged(cid: str, purged: list) -> None:
     from desired-state); (b) skip while a node is unreachable — retry next sweep,
     no retry burned; (c) cap real failures so a permanently-broken node doesn't
     reload-loop; (d) RunnerPool text pools only (VLM restore lives elsewhere)."""
-    if not purged or cid in _WATCHDOG_RECOVERY_BY_CLUSTER:
+    # NB: the emptiness check is AFTER the merge with the pending queue below —
+    # the sweeper calls this with an empty list on retry ticks (link-cut test
+    # #2 of 2026-09-18 found the guard here, and no retry ever ran).
+    if cid in _WATCHDOG_RECOVERY_BY_CLUSTER:
         return
     # Degraded gate (2026-08-09, fix #1 of the cascade review). Without it, a
     # pool purged BECAUSE the cluster is sick gets reloaded onto the same sick
