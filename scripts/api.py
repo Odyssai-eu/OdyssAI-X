@@ -6018,6 +6018,15 @@ async def _auto_reload_purged(cid: str, purged: list) -> None:
                 set_pool(cid, alias, pool)
             _AUTO_RELOAD_RETRIES.pop(key, None)
             waited = time.time() - _AUTO_RELOAD_PENDING.pop(key, now_ts)
+            # The purge stamped this entry `down: true` in desired state; a
+            # self-recovered pool that is not re-saved stays stamped, and the
+            # next container restart (restore_down=False) skips it — GLM-5.3
+            # did not come back after the 15:43 and 17:17 restarts today
+            # because both followed an auto-reload. Re-save: live → no `down`.
+            try:
+                save_cluster_state_v2(cid)
+            except Exception as _e:
+                sys.stderr.write(f"[auto-reload] {cid}[{alias}]: state save failed: {_e}\n")
             sys.stderr.write(
                 f"[auto-reload] {cid}[{alias}]: pool self-recovered after runner "
                 f"death (node/link back up, {waited:.0f}s after the purge)\n"); sys.stderr.flush()
