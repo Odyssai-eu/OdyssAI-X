@@ -403,7 +403,8 @@ class RingImpl {
       }
 
       // Main loop
-      ProgressGuard _pg1(liveness_fds_, rank_, "reduce_scatter_wire"); // OdyssAI patch
+      ProgressGuard _pg1(
+          liveness_fds_, rank_, "reduce_scatter_wire"); // OdyssAI patch
       while (in_flight > 0) {
         ibv_wc wc[WC_NUM];
         int n = poll_wire(lw, WC_NUM, wc);
@@ -533,7 +534,8 @@ class RingImpl {
       // Main loop
       //
       // Keep going until we have no longer data in flight.
-      ProgressGuard _pg2(liveness_fds_, rank_, "reduce_scatter_wire"); // OdyssAI patch
+      ProgressGuard _pg2(
+          liveness_fds_, rank_, "reduce_scatter_wire"); // OdyssAI patch
       while (in_flight > 0) {
         ibv_wc wc[WC_NUM];
         int n = poll_wire(lw, WC_NUM, wc);

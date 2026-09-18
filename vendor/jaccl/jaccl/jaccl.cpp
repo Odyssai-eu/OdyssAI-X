@@ -215,7 +215,8 @@ SideChannel Config::get_side_channel() const {
 
   auto tcp =
       std::make_shared<TCPAllGather>(rank_, size_, get_coordinator().c_str());
-  auto fds = tcp->fds(); // OdyssAI patch: watched for peer death (PATCHES.md #1)
+  auto fds =
+      tcp->fds(); // OdyssAI patch: watched for peer death (PATCHES.md #1)
   return SideChannel(
       rank_,
       size_,

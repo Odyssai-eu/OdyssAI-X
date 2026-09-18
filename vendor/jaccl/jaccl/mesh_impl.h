@@ -27,8 +27,7 @@ class MeshImpl {
         connections_(conns),
         buffers_(buffers),
         scatter_buffers_(scatter_buffers),
-        staging_mem_(
-            std::make_unique<char[]>(MESH_PIPELINE * MAX_BUFFER_SIZE)),
+        staging_mem_(std::make_unique<char[]>(MESH_PIPELINE * MAX_BUFFER_SIZE)),
         liveness_fds_(std::move(liveness_fds)) {}
 
   MeshImpl() : rank_(0), size_(1) {}

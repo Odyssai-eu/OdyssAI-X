@@ -158,7 +158,12 @@ std::string describe_device(ibv_context* ctx) {
   ibv_port_attr pa;
   if (ibv().query_port(ctx, 1, &pa) == 0) {
     static const char* states[] = {
-        "NOP", "PORT_DOWN", "PORT_INIT", "PORT_ARMED", "PORT_ACTIVE", "ACTIVE_DEFER"};
+        "NOP",
+        "PORT_DOWN",
+        "PORT_INIT",
+        "PORT_ARMED",
+        "PORT_ACTIVE",
+        "ACTIVE_DEFER"};
     int st = static_cast<int>(pa.state);
     s << " (port " << (st >= 0 && st < 6 ? states[st] : "?") << ")";
   }
@@ -493,7 +498,10 @@ void check_peers_alive(std::span<const int> fds, int rank, const char* what) {
   }
 }
 
-ProgressGuard::ProgressGuard(std::span<const int> fds, int rank, const char* what)
+ProgressGuard::ProgressGuard(
+    std::span<const int> fds,
+    int rank,
+    const char* what)
     : fds_(fds),
       rank_(rank),
       what_(what),
@@ -513,8 +521,7 @@ void ProgressGuard::slow_tick() {
   check_peers_alive(fds_, rank_, what_);
   double timeout = progress_timeout_s();
   if (timeout > 0) {
-    double idle =
-        std::chrono::duration<double>(now - last_progress_).count();
+    double idle = std::chrono::duration<double>(now - last_progress_).count();
     if (idle > timeout) {
       std::ostringstream msg;
       msg << IBV_TAG << " no progress in " << what_ << " for " << (int)idle
