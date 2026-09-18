@@ -64,18 +64,29 @@ scripts/bootstrap-node.sh user@node.lan /Volumes/models/odyssai
 Expected: `[1/5]`…`[6/6]` then `✓ node bootstrapped.` The steps: SSH+Python check →
 copy `runner.py` + helpers + `patches/` + `requirements-node.txt` → pinned venv →
 **`install-model-modules.sh`** (copies `scripts/mlx_models/*.py` into the venv's
-`site-packages/mlx_lm/models/`) → **`install-jaccl.sh`** (replaces the wheel's
+`site-packages/mlx_lm/models/` and `scripts/patches/*.py` into `~/mlx-cluster/patches/`,
+md5-checked) → **`install-jaccl.sh`** (replaces the wheel's
 `libjaccl.dylib` with the patched build from `vendor/jaccl/build/`; built once with
 `scripts/build-jaccl.sh <node>` on any node that has cmake) → smoke import
 (`mlx_lm.models.glm5_next`, `qwen4_exp`, `deepseek_v4` + patches) → `mlx-vlm` venv
 (best-effort; a warning here only disables vision models on that node).
 
-**Trap — vendored modules and the patched JACCL live in `site-packages`.** Any
-`pip install -U mlx-lm` on a node deletes the modules; any `pip install -U mlx` puts
-the stock `libjaccl.dylib` back. Never upgrade them outside `requirements-node.txt`;
-after any pip change re-run `scripts/install-model-modules.sh user@node.lan` and
-`scripts/install-jaccl.sh user@node.lan` (or the whole bootstrap — idempotent).
-`scripts/install-jaccl.sh --check user@node.lan` reports stock vs patched.
+**Trap — vendored modules and the patched JACCL live in `site-packages`; the
+runtime patches live in `~/mlx-cluster/patches/`.** Any `pip install -U mlx-lm` on a
+node deletes the modules; any `pip install -U mlx` puts the stock `libjaccl.dylib`
+back. Never upgrade them outside `requirements-node.txt`; after any pip change re-run
+`scripts/install-model-modules.sh user@node.lan` and `scripts/install-jaccl.sh
+user@node.lan` (or the whole bootstrap — idempotent). The patches are not touched by
+pip but drift on their own: they are read by `runner.py` at spawn (`from patches import
+apply_mlx_patches`) and nothing re-copied them after the first bootstrap until
+2026-09-18, when a 5-node GLM-5.3 load died at the first request because one rank
+carried a June copy of `glm_moe_dsa_model.py`. `install-model-modules.sh` now syncs
+both sets; **after any commit to `scripts/mlx_models/` or `scripts/patches/`, run it
+on every node of the pool** — a multi-rank load with divergent versions across ranks
+is a silent-corruption class of bug. `scripts/install-model-modules.sh --check
+user@node.lan…` reports new / stale / ok per file and exits non-zero on drift;
+`scripts/install-jaccl.sh --check user@node.lan` reports stock vs patched. A running
+runner keeps what it imported: a synced file is picked up at the next load.
 
 **Trap — `models_dir` is per node.** Volumes are local; a model must be present at the
 same `<models_dir>/<org>/<name>/` on every node of the pool that serves it. The

@@ -13,7 +13,10 @@
 # plus, inside the venv's site-packages/mlx_lm/models/, the custom and vendored
 # architecture modules from scripts/mlx_models/ (step 4, via
 # scripts/install-model-modules.sh). Stock mlx-lm cannot resolve laguna,
-# hy_v3, deepseek_v4 or inkling_mm without them.
+# hy_v3, deepseek_v4 or inkling_mm without them. The same step 4 syncs
+# scripts/patches/*.py into ~/mlx-cluster/patches/ with the same md5 drift
+# report — re-run `scripts/install-model-modules.sh [--check] <node>` after
+# any change to either directory; a bootstrap-time copy alone drifts.
 #
 # This script puts them in place on a remote node. Run it from the repo
 # root for each node in your topology.
@@ -112,9 +115,11 @@ scp $SSH_OPTS -q \
   "$REPO_ROOT/requirements-node.txt" \
   "$NODE:$REMOTE_DIR/"
 
-# Patches directory (per-model fixes loaded at runner boot)
+# Patches directory (per-model fixes loaded at runner boot). The files are
+# synced in step 4 by install-model-modules.sh, md5-checked, so that a later
+# re-run reports and fixes drift instead of silently keeping a June copy
+# (the 2026-09-18 GLM-5.3 rank-4 crash on .33).
 ssh $SSH_OPTS "$NODE" "mkdir -p $REMOTE_DIR/patches"
-scp $SSH_OPTS -q "$REPO_ROOT/scripts/patches/"*.py "$NODE:$REMOTE_DIR/patches/"
 
 # 3. Create + populate the venv on the node, pinning via requirements-node.txt
 echo "[3/5] Setting up Python venv on $NODE (pinned via requirements-node.txt)…"
@@ -129,11 +134,13 @@ ssh $SSH_OPTS "$NODE" "
   ./.venv/bin/pip install --quiet -r requirements-node.txt
 "
 
-# 4. Custom / vendored mlx-lm model modules (laguna, hy_v3, deepseek_v4, …).
-# Must run AFTER the venv exists — they land inside site-packages/mlx_lm/models.
+# 4. Custom / vendored mlx-lm model modules (laguna, hy_v3, deepseek_v4, …)
+# and the runtime patches (scripts/patches/ → $REMOTE_DIR/patches/).
+# Must run AFTER the venv exists — the modules land inside
+# site-packages/mlx_lm/models and the syntax check uses the venv python.
 # Without this a fresh node loads stock mlx-lm and dies on "Model type X not
 # supported" for every architecture we had to port or vendor.
-echo "[4/5] Installing custom model modules on $NODE…"
+echo "[4/5] Installing custom model modules + runtime patches on $NODE…"
 "$REPO_ROOT/scripts/install-model-modules.sh" "$NODE"
 
 # 4b. Patched JACCL (vendor/jaccl, PATCHES.md): a drop-in libjaccl.dylib for the
