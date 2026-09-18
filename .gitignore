@@ -65,3 +65,4 @@ REVIEW_PROMPT
 
 # CodeOS tooling state (not repo content)
 .codeos/
+/vendor/jaccl/build/

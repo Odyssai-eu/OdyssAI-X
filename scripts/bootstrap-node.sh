@@ -136,6 +136,24 @@ ssh $SSH_OPTS "$NODE" "
 echo "[4/5] Installing custom model modules on $NODE…"
 "$REPO_ROOT/scripts/install-model-modules.sh" "$NODE"
 
+# 4b. Patched JACCL (vendor/jaccl, PATCHES.md): a drop-in libjaccl.dylib for the
+# mlx wheel that makes a dead rank visible to the survivors and names the
+# Thunderbolt link in init errors. Built once (scripts/build-jaccl.sh <node>)
+# into vendor/jaccl/build/; if that artefact is missing we try to build it on
+# this node (needs cmake), and otherwise leave the stock library with a warning
+# — only distributed jaccl pools are affected, everything else works as before.
+echo "[4b/5] Installing the patched JACCL on $NODE…"
+if [ ! -f "$REPO_ROOT/vendor/jaccl/build/libjaccl.dylib" ]; then
+  if ssh $SSH_OPTS "$NODE" 'command -v cmake >/dev/null 2>&1 || [ -x /opt/homebrew/bin/cmake ]'; then
+    "$REPO_ROOT/scripts/build-jaccl.sh" "$NODE" || echo "  ⚠ build-jaccl.sh failed — stock JACCL kept"
+  else
+    echo "  ⚠ no cmake on $NODE and no prebuilt vendor/jaccl/build/libjaccl.dylib — stock JACCL kept"
+  fi
+fi
+if [ -f "$REPO_ROOT/vendor/jaccl/build/libjaccl.dylib" ]; then
+  "$REPO_ROOT/scripts/install-jaccl.sh" "$NODE" || echo "  ⚠ install-jaccl.sh failed — stock JACCL kept"
+fi
+
 # 5. Smoke test
 echo "[5/6] Smoke test on $NODE…"
 ssh $SSH_OPTS "$NODE" "

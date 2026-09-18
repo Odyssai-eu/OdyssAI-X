@@ -2195,6 +2195,11 @@ def remote_cmd(node: dict, nodes: list[dict], model: str, mode: str, port: int,
         coord_ip = next(n for n in nodes if n["rank"] == COORDINATOR_RANK)["ssh"].split("@")[1]
         env["MLX_JACCL_COORDINATOR"] = f"{coord_ip}:{port}"
         env["MLX_IBV_DEVICES"] = "/tmp/mlx_jaccl_devices.json"
+        # Patched JACCL (vendor/jaccl, PATCHES.md #1): backstop timeout for a
+        # collective that makes no progress (lost UC frame / wedged peer).
+        # Peer death itself is detected in < 1 s via the side channel.
+        if os.environ.get("JACCL_PROGRESS_TIMEOUT_S"):
+            env["JACCL_PROGRESS_TIMEOUT_S"] = os.environ["JACCL_PROGRESS_TIMEOUT_S"]
     # Capacity-aware pipeline split (#9). When the orchestrator knows per-rank
     # RAM (via telemetry), pass it as a CSV of weights so the runner can size
     # each rank's layer count proportionally instead of doing the even split
@@ -2900,6 +2905,22 @@ class RunnerPool:
                     + "; ".join(problems)
                     + ". Rsync the model to every node before loading."
                 )
+        # RDMA edge preflight (jaccl only): a PORT_DOWN device or an
+        # unreachable peer alias is a guaranteed init death — refuse it here
+        # with the edge named, instead of "N rank(s) died during load".
+        if getattr(self, "backend", "jaccl") == "jaccl" and len(self.nodes) > 1:
+            try:
+                edge_problems = await _validate_rdma_edges(self.nodes)
+            except Exception as e:
+                sys.stderr.write(f"[api] rdma edge preflight skipped ({e})\n")
+                edge_problems = []
+            if edge_problems:
+                raise RuntimeError(
+                    "rdma link(s) not usable — " + "; ".join(edge_problems)
+                    + ". Check the Thunderbolt cable and port state (ibv_devinfo) "
+                    "and the link-local alias on both ends; rebooting the node "
+                    "renegotiates the link."
+                )
         port = random_ephemeral_port()
         devices = [n["rdma"] for n in sorted(self.nodes, key=lambda x: x["rank"])]
         devices_json = json.dumps(devices)
@@ -3010,6 +3031,7 @@ class RunnerPool:
                 # crashes the same way and we trash the macs further.
                 # Surface only the first matching tail for the reason.
                 combined = "\n".join(tail for _, _, tail in deaths)
+                cause = _attribute_jaccl_cause(deaths)
                 if _looks_like_jaccl_error(combined):
                     first_tail = next(
                         (t for _, _, t in deaths if _looks_like_jaccl_error(t)),
@@ -3019,11 +3041,13 @@ class RunnerPool:
                         self.cluster,
                         reason="JACCL/RDMA error during load",
                         details={"dead_ranks": [d[0] for d in deaths],
+                                 "cause": cause,
                                  "tail": first_tail[-500:]},
                     )
-                raise RuntimeError(
-                    f"{len(deaths)} rank(s) died during load — pool unusable.\n{death_report}"
-                )
+                headline = f"{len(deaths)} rank(s) died during load — pool unusable."
+                if cause:
+                    headline += f"\nCAUSE → {cause}"
+                raise RuntimeError(f"{headline}\n{death_report}")
             await asyncio.sleep(0.5)
 
         # Belt-and-braces: even if rank 0 is "ready", verify no other rank
@@ -6503,7 +6527,7 @@ def _initial_default_config() -> Optional[dict]:
 #   major (1.7.2 → 2.0.0) — breaking API or topology change
 #
 # Use `./scripts/bump-version.sh patch|minor|major` to bump + auto-commit.
-APP_VERSION = "1.50.0"
+APP_VERSION = "1.51.0"
 
 app = FastAPI(
     title="OdyssAI-X (odyssai.eu)",
@@ -6928,6 +6952,165 @@ def _enrich_caps_from_config(caps: dict, config: dict) -> None:
     # JSON mode: nearly universal via prompt; declare True for known instruct families.
     if caps.get("supports_tools"):
         caps["supports_json_mode"] = True
+
+
+async def _ssh_capture(ssh_target: str, remote_cmd: str,
+                       timeout: float = 10.0) -> tuple[int, str]:
+    """One non-interactive SSH round-trip; returns (rc, stdout). Raises on
+    timeout / spawn failure so callers can decide fail-open vs fail-closed."""
+    cmd = ["ssh", "-o", "ConnectTimeout=4", "-o", "BatchMode=yes",
+           ssh_target, remote_cmd]
+    proc = await asyncio.create_subprocess_exec(
+        *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+    )
+    try:
+        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+    except asyncio.TimeoutError:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+        raise
+    return proc.returncode or 0, (stdout or b"").decode("utf-8", "ignore")
+
+
+async def _validate_rdma_edges(nodes: list[dict],
+                               timeout: float = 10.0) -> list[str]:
+    """Pre-flight every RDMA edge of a jaccl topology before spawning ranks.
+
+    Measured on the Ultras (2026-09-18, scripts/jaccl/rdma_probe.c and
+    rdma_pair.c): on a device whose Thunderbolt port is PORT_DOWN,
+    ibv_open_device succeeds but ibv_alloc_pd returns NULL — that is every
+    "Couldn't allocate protection domain" we ever logged; and a peer whose
+    link-local address is not reachable on this cable fails the RTR
+    transition with errno 60 (July's errno 96 is the same resolution family).
+    Both used to surface as a rank death mid-init that also killed the other
+    ranks through the closed side channel ("Recv failed with errno=2"), and
+    both are visible BEFORE the load. So: per rank, one SSH to read the port
+    state and the link-local alias of every device in its `rdma` row, then
+    one SSH to ping each peer's alias through the exact interface of the edge
+    (`ping -b <en>`: a wrong cable answers nothing). Returns the list of bad
+    edges as human-readable strings; empty means every edge is usable.
+    Fail-open per rank on SSH errors (logged), like the layout probe.
+    """
+    ranked = sorted(nodes, key=lambda n: n["rank"])
+    size = len(ranked)
+    def _ssh_t(n):
+        return n.get("ssh") or (f"{n.get('user','admin')}@{n['ip']}" if n.get("ip") else None)
+    def _host(n):
+        return n.get("host") or _ssh_t(n) or f"rank{n['rank']}"
+    # Round 1 — port state + link-local alias of every device of every rank.
+    info: dict[int, dict[str, tuple[str, str]]] = {}
+    async def _round1(n):
+        devs = sorted({d for d in (n.get("rdma") or []) if d})
+        t = _ssh_t(n)
+        if not devs or not t:
+            return
+        loop = " ".join(shlex.quote(d) for d in devs)
+        remote = (
+            f"for d in {loop}; do en=${{d#rdma_}}; "
+            "st=$(ibv_devinfo -d \"$d\" 2>/dev/null | awk '/state:/{print $2; exit}'); "
+            "ip=$(ifconfig \"$en\" 2>/dev/null | awk '/inet 169\\.254/{print $2; exit}'); "
+            "echo \"$d ${st:-NO_DEVICE} ${ip:-none}\"; done"
+        )
+        try:
+            _, out = await _ssh_capture(t, remote, timeout)
+        except Exception as e:
+            sys.stderr.write(f"[api] rdma edge probe skipped on {_host(n)} ({e})\n")
+            return
+        info[n["rank"]] = {}
+        for line in out.splitlines():
+            parts = line.split()
+            if len(parts) == 3:
+                info[n["rank"]][parts[0]] = (parts[1], parts[2])
+    await asyncio.gather(*[_round1(n) for n in ranked])
+    problems: list[str] = []
+    pingable: dict[int, list[tuple[str, str, int, str]]] = {}   # rank → [(dev, peer_ip, peer_rank, peer_dev)]
+    for n in ranked:
+        r = n["rank"]
+        if r not in info:
+            continue
+        row = n.get("rdma") or []
+        for j, dev in enumerate(row):
+            if not dev or j == r or j >= size:
+                continue
+            peer = ranked[j]
+            peer_row = peer.get("rdma") or []
+            peer_dev = peer_row[r] if r < len(peer_row) else None
+            edge = f"{_host(n)} {dev} → {_host(peer)} {peer_dev or '?'}"
+            st, ip = info[r].get(dev, ("NO_DEVICE", "none"))
+            if st != "PORT_ACTIVE":
+                problems.append(f"{edge}: {st}")
+                continue
+            if ip == "none":
+                problems.append(f"{edge}: no link-local (169.254.x.x) alias on {dev[len('rdma_'):]}")
+                continue
+            pst, pip = info.get(peer.get("rank"), {}).get(peer_dev or "", ("?", "none"))
+            if pst == "PORT_ACTIVE" and pip != "none":
+                pingable.setdefault(r, []).append((dev, pip, j, peer_dev))
+    # Round 2 — reachability of each peer alias through this edge's interface.
+    async def _round2(n):
+        edges = pingable.get(n["rank"]) or []
+        t = _ssh_t(n)
+        if not edges or not t:
+            return
+        cmds = " ; ".join(
+            f"if ping -c1 -t1 -b {shlex.quote(dev[len('rdma_'):])} {shlex.quote(ip)} 2>/dev/null | grep -q ' 1 packets received'; "
+            f"then echo {shlex.quote(dev)} ok; else echo {shlex.quote(dev)} unreachable; fi"
+            for dev, ip, _, _ in edges
+        )
+        try:
+            _, out = await _ssh_capture(t, cmds, timeout)
+        except Exception as e:
+            sys.stderr.write(f"[api] rdma reachability probe skipped on {_host(n)} ({e})\n")
+            return
+        status = dict(line.split()[:2] for line in out.splitlines() if len(line.split()) >= 2)
+        for dev, ip, j, peer_dev in edges:
+            if status.get(dev) != "ok":
+                problems.append(
+                    f"{_host(n)} {dev} → {_host(ranked[j])} {peer_dev}: peer {ip} unreachable "
+                    f"on {dev[len('rdma_'):]} (wrong cable, or the peer's link-local alias is gone)")
+    await asyncio.gather(*[_round2(n) for n in ranked])
+    return problems
+
+
+def _attribute_jaccl_cause(deaths: list[tuple[int, int, str]]) -> Optional[str]:
+    """Name the rank whose JACCL error is the ROOT of a multi-rank death.
+
+    When one rank fails during init, JACCL's coordinator closes the TCP side
+    channel and every other rank dies with "[jaccl] Recv failed with errno=…"
+    (tcp.cpp) or, with the patched lib, "peer closed the side channel" /
+    "peer is gone". Those are collateral. The root is the rank whose tail has
+    a link-level error. Returns a one-line attribution or None."""
+    root_markers = (
+        "Couldn't allocate protection domain",
+        "Changing queue pair to RTR failed",
+        "Changing queue pair to RTS failed",
+        "Changing queue pair to INIT failed",
+        "Creating the queue pair failed",
+        "No IPv4-mapped GID",
+        "Could not find device",
+        "Could not open device",
+        "no progress in",
+    )
+    collateral_markers = (
+        "Recv failed with errno=", "Send failed with errno=",
+        "peer closed the side channel", "peer is gone",
+    )
+    roots, collateral = [], []
+    for rk, _, tail in sorted(deaths):
+        line = next((l.strip() for l in (tail or "").splitlines()
+                     if any(m in l for m in root_markers)), None)
+        if line:
+            roots.append((rk, line[-220:]))
+        elif any(m in (tail or "") for m in collateral_markers):
+            collateral.append(rk)
+    if not roots:
+        return None
+    msg = "; ".join(f"rank {rk}: {line}" for rk, line in roots)
+    if collateral:
+        msg += f" — rank(s) {', '.join(str(c) for c in collateral)} died of the closed side channel (collateral)"
+    return msg
 
 
 async def _validate_model_layout(ssh_target: str, model_path: str,

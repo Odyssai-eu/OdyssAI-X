@@ -25,8 +25,11 @@
     dispatch + session affinity. The throughput mode. No inter-node collective.
   - VLM — a vision model served by `mlx-vlm` on one node, proxied by the orchestrator.
 
-Versions this repo is validated against (`requirements-node.txt`): **mlx 0.32.0 ·
-mlx-lm 0.31.3 · transformers 5.10.0**. Do not float them.
+Versions this repo is validated against (`requirements-node.txt`): **mlx 0.32.2 ·
+mlx-lm 0.31.3 · transformers 5.10.0**. Do not float them. Distributed pools over RDMA
+run on a **patched JACCL** (`vendor/jaccl/`, see its `PATCHES.md`): a drop-in
+`libjaccl.dylib` for the mlx 0.32.2 wheel that makes a dead rank visible to the
+survivors and names the Thunderbolt link in every init error.
 
 ---
 
@@ -61,14 +64,18 @@ scripts/bootstrap-node.sh user@node.lan /Volumes/models/odyssai
 Expected: `[1/5]`…`[6/6]` then `✓ node bootstrapped.` The steps: SSH+Python check →
 copy `runner.py` + helpers + `patches/` + `requirements-node.txt` → pinned venv →
 **`install-model-modules.sh`** (copies `scripts/mlx_models/*.py` into the venv's
-`site-packages/mlx_lm/models/`) → smoke import (`mlx_lm.models.glm5_next`, `qwen4_exp`,
-`deepseek_v4` + patches) → `mlx-vlm` venv (best-effort; a warning here only disables
-vision models on that node).
+`site-packages/mlx_lm/models/`) → **`install-jaccl.sh`** (replaces the wheel's
+`libjaccl.dylib` with the patched build from `vendor/jaccl/build/`; built once with
+`scripts/build-jaccl.sh <node>` on any node that has cmake) → smoke import
+(`mlx_lm.models.glm5_next`, `qwen4_exp`, `deepseek_v4` + patches) → `mlx-vlm` venv
+(best-effort; a warning here only disables vision models on that node).
 
-**Trap — vendored modules live in `site-packages`.** Any `pip install -U mlx-lm` on a
-node deletes them; models then fail with an unknown `model_type`. Never upgrade
-`mlx-lm` outside `requirements-node.txt`; after any pip change re-run
-`scripts/install-model-modules.sh user@node.lan` (or the whole bootstrap — idempotent).
+**Trap — vendored modules and the patched JACCL live in `site-packages`.** Any
+`pip install -U mlx-lm` on a node deletes the modules; any `pip install -U mlx` puts
+the stock `libjaccl.dylib` back. Never upgrade them outside `requirements-node.txt`;
+after any pip change re-run `scripts/install-model-modules.sh user@node.lan` and
+`scripts/install-jaccl.sh user@node.lan` (or the whole bootstrap — idempotent).
+`scripts/install-jaccl.sh --check user@node.lan` reports stock vs patched.
 
 **Trap — `models_dir` is per node.** Volumes are local; a model must be present at the
 same `<models_dir>/<org>/<name>/` on every node of the pool that serves it. The
@@ -175,11 +182,29 @@ scripts/rdma-onboard.sh              # provisions the Thunderbolt network (vendo
 scripts/discover-rdma-wiring.py      # tells you which port sees which node → topology wiring
 ```
 
-Declare `backend: jaccl` + the wiring in `topology.yaml`. **Trap — queue-pair
-degradation:** after many load/unload cycles JACCL fails at init (`Couldn't allocate
-protection domain`, `Recv failed with errno=2`, or `Changing queue pair to RTR failed`).
-It is an upstream MLX/JACCL bug; reboot the affected nodes (dashboard → *Reboot all*,
-or `POST /admin/clusters/<id>/reboot-all`). `ring` never has this problem.
+Declare `backend: jaccl` + the wiring in `topology.yaml`.
+
+What the patched JACCL (`vendor/jaccl/PATCHES.md`) and the orchestrator do for you,
+measured with the libibverbs probes in `scripts/jaccl/` (2026-09-18):
+
+- **Before a load**, every edge of the wiring is checked from both ends (port
+  `PORT_ACTIVE`, link-local `169.254.x.x` alias present, peer alias reachable through
+  that exact interface). A bad edge refuses the load naming it:
+  `rdma link(s) not usable — ultra-256b rdma_en6 → ultra-256c rdma_en7: PORT_DOWN`.
+  Fix the cable / port, or reboot that node (a reboot renegotiates the Thunderbolt
+  link) — this, not "queue-pair degradation", is what `Couldn't allocate protection
+  domain` and `RTR failed with errno 60/96` always were.
+- **During a run**, a rank that dies (crash, SIGKILL, jetsam) is reported on every
+  survivor in under a second (`[jaccl] peer is gone: side channel to rank N closed…`)
+  instead of the stock behaviour, a silent spin at 100 % CPU forever. The runner exits
+  and the orchestrator's normal rank-death path recovers. A collective that makes no
+  progress at all (lost UC frame) fails after `JACCL_PROGRESS_TIMEOUT_S` (default 600).
+- When several ranks die at once the load error starts with `CAUSE → rank N: …`: the
+  rank with the link error; the others died of the closed side channel.
+
+Hard facts to keep in mind: 10 queue pairs per device (shared by all processes on the
+node), UC only (no RC, no retransmission), receive buffers must match the message
+size. `ring` (TCP) needs none of this and always works.
 
 ---
 
@@ -208,9 +233,12 @@ or `POST /admin/clusters/<id>/reboot-all`). `ring` never has this problem.
 - `scripts/runner.py` — per-node MLX runner (spawned over SSH); `scripts/patches/` —
   runtime model aliases; `scripts/mlx_models/` — vendored model modules.
 - `scripts/dashboard.html` — the admin SPA (served per request; hot-deployable).
-- `scripts/bootstrap-node.sh`, `install-model-modules.sh`, `install-mlx-vlm.sh`,
-  `wired-limit/`, `rdma-onboard.sh`, `odyssai-network-setup.sh`, `discover-rdma-wiring.py`
-  — node provisioning.
+- `scripts/bootstrap-node.sh`, `install-model-modules.sh`, `install-jaccl.sh`,
+  `build-jaccl.sh`, `install-mlx-vlm.sh`, `wired-limit/`, `rdma-onboard.sh`,
+  `odyssai-network-setup.sh`, `discover-rdma-wiring.py` — node provisioning.
+- `vendor/jaccl/` — JACCL (MLX v0.32.2) + our patches (`PATCHES.md`, `UPSTREAM.md`);
+  `scripts/jaccl/` — libibverbs probes (`rdma_probe.c`, `rdma_pair.c`) and the
+  2-rank smoke (`smoke_jaccl.py`) that measured every claim in §7.
 - `scripts/topology.py`, `config/topology.example.yaml` — topology schema + template.
 - `Dockerfile`, `docker-compose.yml`, `requirements.txt` (container),
   `requirements-node.txt` (nodes, pinned).

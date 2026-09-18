@@ -59,7 +59,7 @@ scripts/bootstrap-node.sh user@node.lan            # default models dir: ~/mlx-m
 scripts/bootstrap-node.sh user@node.lan /Volumes/models/odyssai
 ```
 
-It checks SSH + Python, creates `~/mlx-cluster` with a pinned venv (`requirements-node.txt`: `mlx 0.32.0`, `mlx-lm 0.31.3`, `transformers 5.10.0`, …), copies the runner and patches, **installs the vendored model modules into the venv's `mlx_lm/models/`**, runs a smoke import, and sets up the optional `mlx-vlm` venv (`~/.venvs/mlx-vlm`, Python 3.12). Re-run it after any `pip` upgrade on the node — upgrading `mlx-lm` silently removes the vendored modules.
+It checks SSH + Python, creates `~/mlx-cluster` with a pinned venv (`requirements-node.txt`: `mlx 0.32.2`, `mlx-lm 0.31.3`, `transformers 5.10.0`, …), copies the runner and patches, **installs the vendored model modules into the venv's `mlx_lm/models/`** and the **patched JACCL** (`vendor/jaccl/`, a drop-in `libjaccl.dylib` — see `vendor/jaccl/PATCHES.md`), runs a smoke import, and sets up the optional `mlx-vlm` venv (`~/.venvs/mlx-vlm`, Python 3.12). Re-run it after any `pip` upgrade on the node — upgrading `mlx-lm` silently removes the vendored modules, upgrading `mlx` puts the stock JACCL back.
 
 **2. Pin the GPU memory budget on each node** (persistent `iogpu.wired_limit_mb`; needs the node's password, so it is a deliberate step, not automated):
 
@@ -92,7 +92,7 @@ curl -s -X POST http://localhost:8000/admin/clusters/<id>/load -H 'content-type:
   -d '{"model":"<org>/<name>","nodes":4,"batch":true}'
 ```
 
-**Optional — RDMA over Thunderbolt 5** for distributed pools: cable the nodes in a full mesh, run `scripts/rdma-onboard.sh` on each (it provisions the Thunderbolt network the way `exo` proved it), declare `backend: jaccl` and the port wiring in `topology.yaml`. TCP `ring` needs none of this and always works.
+**Optional — RDMA over Thunderbolt 5** for distributed pools: cable the nodes in a full mesh, run `scripts/rdma-onboard.sh` on each (it provisions the Thunderbolt network the way `exo` proved it), declare `backend: jaccl` and the port wiring in `topology.yaml`. Every edge is checked before a load (port state, link-local alias, reachability through that cable) and a rank that dies mid-run is reported to the survivors in under a second instead of hanging them — see `AGENTS.md` §7 and `vendor/jaccl/PATCHES.md`. TCP `ring` needs none of this and always works.
 
 Full walkthrough, node roles, budgets and gotchas: [`AGENTS.md`](AGENTS.md) and [`docs/GETTING-STARTED.md`](docs/GETTING-STARTED.md).
 
@@ -115,4 +115,4 @@ Pull requests welcome — bug fixes, model support, capability blocks, performan
 
 ## Acknowledgments
 
-Built on Apple's [MLX](https://github.com/ml-explore/mlx), [`mlx-lm`](https://github.com/ml-explore/mlx-lm) and MLX distributed (JACCL). The Thunderbolt/RDMA network recipe in `scripts/odyssai-network-setup.sh` is vendored from [exo](https://github.com/exo-explore/exo) (Apache-2.0, attribution in the file header). Vision serving uses [`mlx-vlm`](https://github.com/Blaizzy/mlx-vlm).
+Built on Apple's [MLX](https://github.com/ml-explore/mlx), [`mlx-lm`](https://github.com/ml-explore/mlx-lm) and MLX distributed (JACCL — vendored at `vendor/jaccl/` from MLX v0.32.2, MIT, with our patches listed in `vendor/jaccl/PATCHES.md`). The Thunderbolt/RDMA network recipe in `scripts/odyssai-network-setup.sh` is vendored from [exo](https://github.com/exo-explore/exo) (Apache-2.0, attribution in the file header). Vision serving uses [`mlx-vlm`](https://github.com/Blaizzy/mlx-vlm).
