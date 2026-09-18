@@ -2909,8 +2909,14 @@ class RunnerPool:
         # unreachable peer alias is a guaranteed init death — refuse it here
         # with the edge named, instead of "N rank(s) died during load".
         if getattr(self, "backend", "jaccl") == "jaccl" and len(self.nodes) > 1:
+            _t_edges = time.time()
             try:
                 edge_problems = await _validate_rdma_edges(self.nodes)
+                n_edges = sum(1 for n in self.nodes for d in (n.get("rdma") or []) if d)
+                sys.stderr.write(
+                    f"[api] rdma edge preflight: {n_edges} edge(s) checked in "
+                    f"{time.time() - _t_edges:.1f}s — "
+                    f"{'all usable' if not edge_problems else str(len(edge_problems)) + ' problem(s)'}\n")
             except Exception as e:
                 sys.stderr.write(f"[api] rdma edge preflight skipped ({e})\n")
                 edge_problems = []
