@@ -6051,11 +6051,17 @@ async def _auto_reload_purged(cid: str, purged: list) -> None:
 # the dead-pool sweeper + auto-reload bring it back — the reload preflight
 # refuses while the link is down and retries (without burning attempts) until
 # it is renegotiated (cable reseat or node reboot).
-#   - port DOWN / device missing / alias gone → act on the first tick;
-#   - peer unreachable by ping only → two consecutive ticks (a ping can lose a
-#     packet under RDMA load on the same cable).
+#   - any problem must persist RDMA_LINK_WATCH_CONFIRM_TICKS consecutive ticks
+#     (default 2 = 60 s): a ping can lose a packet under RDMA load, ibv_devinfo
+#     can fail transiently; a real link drop lasts minutes;
+#   - a node whose every device reports NO_DEVICE is an inconclusive probe
+#     (handled in _validate_rdma_edges), never a verdict.
 _RDMA_LINK_WATCH_ENABLED = os.environ.get("RDMA_LINK_WATCH_ENABLED", "1") == "1"
 _RDMA_LINK_WATCH_INTERVAL_S = float(os.environ.get("RDMA_LINK_WATCH_INTERVAL_S", "30"))
+# Consecutive ticks a problem must persist before the pool is stopped. Two
+# (60 s) since 2026-09-18 16:59: a one-tick glitch stopped a healthy pool. A
+# real link drop lasts minutes (12:05 today: ~15 min until a reboot).
+_RDMA_LINK_WATCH_CONFIRM_TICKS = int(os.environ.get("RDMA_LINK_WATCH_CONFIRM_TICKS", "2"))
 _link_soft_misses: dict[tuple, int] = {}   # (cid, alias) -> consecutive ping-only misses
 _link_watch_seen: set = set()               # pools that logged their first clean tick
 
@@ -6095,14 +6101,14 @@ async def _rdma_link_watch_loop() -> None:
                         n_edges = sum(1 for n in nodes for d in (n.get("rdma") or []) if d)
                         sys.stderr.write(f"[link-watch] {cid}[{alias}]: watching {n_edges} edge(s), all usable\n")
                     continue
-                hard = [pr for pr in problems if _edge_problem_is_hard(pr)]
-                if not hard:
-                    n = _link_soft_misses.get(key, 0) + 1
-                    _link_soft_misses[key] = n
-                    if n < 2:
-                        sys.stderr.write(f"[link-watch] {cid}[{alias}]: peer unreachable "
-                                         f"({len(problems)} edge(s)) — confirming next tick\n")
-                        continue
+                n = _link_soft_misses.get(key, 0) + 1
+                _link_soft_misses[key] = n
+                if n < _RDMA_LINK_WATCH_CONFIRM_TICKS:
+                    kind = "hard" if any(_edge_problem_is_hard(pr) for pr in problems) else "ping"
+                    sys.stderr.write(f"[link-watch] {cid}[{alias}]: link problem seen ({kind}, "
+                                     f"{len(problems)} edge(s): {problems[0][:120]}) — "
+                                     f"confirming next tick ({n}/{_RDMA_LINK_WATCH_CONFIRM_TICKS})\n")
+                    continue
                 _link_soft_misses.pop(key, None)
                 edges = "; ".join(problems[:4]) + (" …" if len(problems) > 4 else "")
                 sys.stderr.write(
@@ -6722,7 +6728,7 @@ def _initial_default_config() -> Optional[dict]:
 #   major (1.7.2 → 2.0.0) — breaking API or topology change
 #
 # Use `./scripts/bump-version.sh patch|minor|major` to bump + auto-commit.
-APP_VERSION = "1.51.1"
+APP_VERSION = "1.51.2"
 
 app = FastAPI(
     title="OdyssAI-X (odyssai.eu)",
@@ -7213,11 +7219,21 @@ async def _validate_rdma_edges(nodes: list[dict],
         except Exception as e:
             sys.stderr.write(f"[api] rdma edge probe skipped on {_host(n)} ({e})\n")
             return
-        info[n["rank"]] = {}
+        parsed: dict[str, tuple[str, str]] = {}
         for line in out.splitlines():
             parts = line.split()
             if len(parts) == 3:
-                info[n["rank"]][parts[0]] = (parts[1], parts[2])
+                parsed[parts[0]] = (parts[1], parts[2])
+        # A node whose EVERY device reports NO_DEVICE did not lose four cables
+        # at once: ibv_devinfo (or the ssh) failed transiently. Seen 2026-09-18
+        # 16:59 on ultra-256d under RDMA load — the link watch stopped a healthy
+        # 5-node pool on it and the preflight found all 20 edges usable 22 s
+        # later. Treat it like an ssh error: inconclusive, skipped, logged.
+        if parsed and all(st == "NO_DEVICE" for st, _ in parsed.values()):
+            sys.stderr.write(f"[api] rdma edge probe inconclusive on {_host(n)}: "
+                             f"no device reported for {sorted(parsed)} — skipped this round\n")
+            return
+        info[n["rank"]] = parsed
     await asyncio.gather(*[_round1(n) for n in ranked])
     problems: list[str] = []
     pingable: dict[int, list[tuple[str, str, int, str]]] = {}   # rank → [(dev, peer_ip, peer_rank, peer_dev)]
