@@ -3425,7 +3425,8 @@ class RunnerPool:
                     # lost UC frame / wedged peer — seen 2026-09-18 after 4.9 h
                     # of a 5-node GLM-5.3 bench; ports and wired memory were
                     # clean afterwards, so a reload is the right recovery).
-                    controlled = ("peer is gone" in tail) or ("[jaccl] no progress in" in tail)
+                    controlled = (("peer is gone" in tail) or ("[jaccl] no progress in" in tail)
+                                  or str(getattr(self, "degraded_reason", "") or "").startswith("rdma link down"))
                     if not controlled:
                         self.degraded = True
                         self.degraded_reason = "rank-0 died mid-generation"
@@ -5849,9 +5850,13 @@ async def lifespan(app: FastAPI):
     # #40 — JACCL stability loop: keepalive health (WU2) → controlled recovery
     # (WU3), plus age-based preventive reload (WU1) for long-running jaccl pools.
     jaccl_task = asyncio.create_task(_jaccl_stability_loop())
+    # RDMA link watch — a dropped Thunderbolt link freezes a jaccl pool without
+    # any rank noticing; probe the edges while pools are up (2026-09-18).
+    link_task = asyncio.create_task(_rdma_link_watch_loop())
     try:
         yield
     finally:
+        link_task.cancel()
         ttl_task.cancel()
         dead_task.cancel()
         cancel_task.cancel()
@@ -5993,11 +5998,112 @@ async def _auto_reload_purged(cid: str, purged: list) -> None:
                 f"[auto-reload] {cid}[{alias}]: pool self-recovered after runner "
                 f"death (node back up)\n"); sys.stderr.flush()
         except Exception as e:
+            if "rdma link(s) not usable" in str(e):
+                # The link is still down (link-watch stopped this pool, or a
+                # cable/port is dead): not a reload failure, wait for the link
+                # like we wait for a node — retry next sweep, no attempt burned.
+                sys.stderr.write(
+                    f"[auto-reload] {cid}[{alias}]: waiting for the RDMA link — "
+                    f"{str(e).split(' — ', 1)[-1][:300]}\n")
+                sys.stderr.flush()
+                continue
             _AUTO_RELOAD_RETRIES[key] = _AUTO_RELOAD_RETRIES.get(key, 0) + 1
             sys.stderr.write(
                 f"[auto-reload] {cid}[{alias}] reload failed "
                 f"(retry {_AUTO_RELOAD_RETRIES[key]}/{_AUTO_RELOAD_MAX}): {e}\n")
             sys.stderr.flush()
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# RDMA link watch (2026-09-18). A Thunderbolt link can drop while a jaccl pool
+# is serving: no rank dies, nothing errors — UC has no way to report it — and
+# every rank freezes in its collective. Measured today at 4.9 h into a 5-node
+# GLM-5.3 bench (ultra-256b en6 ↔ ultra-256c en7 went `inactive` on both
+# ends): the patched JACCL's 600 s progress backstop was the first thing to
+# notice. The link itself is visible in seconds from the nodes (port state,
+# link-local alias, reachability through that exact interface — the same
+# probe the load preflight runs), so watch it while a pool is up: on a dead
+# edge, cancel the in-flight requests, stop the pool naming the edge, and let
+# the dead-pool sweeper + auto-reload bring it back — the reload preflight
+# refuses while the link is down and retries (without burning attempts) until
+# it is renegotiated (cable reseat or node reboot).
+#   - port DOWN / device missing / alias gone → act on the first tick;
+#   - peer unreachable by ping only → two consecutive ticks (a ping can lose a
+#     packet under RDMA load on the same cable).
+_RDMA_LINK_WATCH_ENABLED = os.environ.get("RDMA_LINK_WATCH_ENABLED", "1") == "1"
+_RDMA_LINK_WATCH_INTERVAL_S = float(os.environ.get("RDMA_LINK_WATCH_INTERVAL_S", "30"))
+_link_soft_misses: dict[tuple, int] = {}   # (cid, alias) -> consecutive ping-only misses
+_link_watch_seen: set = set()               # pools that logged their first clean tick
+
+
+def _edge_problem_is_hard(problem: str) -> bool:
+    return ("PORT_DOWN" in problem or "NO_DEVICE" in problem
+            or "no link-local" in problem or "PORT_INIT" in problem)
+
+
+async def _rdma_link_watch_loop() -> None:
+    if not _RDMA_LINK_WATCH_ENABLED:
+        sys.stderr.write("[link-watch] disabled via env\n")
+        return
+    sys.stderr.write(f"[link-watch] armed — every {_RDMA_LINK_WATCH_INTERVAL_S:.0f}s "
+                     f"on loaded jaccl pools\n")
+    while True:
+        try:
+            await asyncio.sleep(_RDMA_LINK_WATCH_INTERVAL_S)
+            for cid, alias, pool in list_all_pools():
+                if getattr(pool, "backend", "jaccl") != "jaccl":
+                    continue
+                nodes = getattr(pool, "nodes", None) or []
+                if len(nodes) < 2 or pool.alive_count() == 0:
+                    continue
+                if getattr(pool, "degraded", False) or cid in _WATCHDOG_RECOVERY_BY_CLUSTER:
+                    continue
+                try:
+                    problems = await _validate_rdma_edges(nodes, timeout=10.0)
+                except Exception as e:
+                    sys.stderr.write(f"[link-watch] {cid}[{alias}]: probe skipped ({e})\n")
+                    continue
+                key = (cid, alias)
+                if not problems:
+                    _link_soft_misses.pop(key, None)
+                    if key not in _link_watch_seen:
+                        _link_watch_seen.add(key)
+                        n_edges = sum(1 for n in nodes for d in (n.get("rdma") or []) if d)
+                        sys.stderr.write(f"[link-watch] {cid}[{alias}]: watching {n_edges} edge(s), all usable\n")
+                    continue
+                hard = [pr for pr in problems if _edge_problem_is_hard(pr)]
+                if not hard:
+                    n = _link_soft_misses.get(key, 0) + 1
+                    _link_soft_misses[key] = n
+                    if n < 2:
+                        sys.stderr.write(f"[link-watch] {cid}[{alias}]: peer unreachable "
+                                         f"({len(problems)} edge(s)) — confirming next tick\n")
+                        continue
+                _link_soft_misses.pop(key, None)
+                edges = "; ".join(problems[:4]) + (" …" if len(problems) > 4 else "")
+                sys.stderr.write(
+                    f"[link-watch] {cid}[{alias}]: RDMA LINK DOWN — {edges}. "
+                    f"Stopping the pool now (no rank can detect this itself: UC gives "
+                    f"no error); auto-reload retries until the link is back — reseat "
+                    f"the cable or reboot the PORT_DOWN node.\n")
+                pool.degraded_reason = f"rdma link down: {edges}"
+                # In-flight requests first: their streams end with an explicit
+                # error instead of waiting for the JACCL progress backstop.
+                for req_id in list(getattr(pool, "_listeners", {}).keys()):
+                    try:
+                        await pool.cancel(req_id)
+                    except Exception:
+                        pass
+                try:
+                    await pool.stop()
+                except Exception as e:
+                    sys.stderr.write(f"[link-watch] {cid}[{alias}]: stop failed: {e}\n")
+                # The dead-pool sweeper purges the registry entry and hands the
+                # alias to auto-reload (desired state untouched).
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            sys.stderr.write(f"[link-watch] tick error: {e}\n")
 
 
 async def _dead_pool_sweeper() -> None:
@@ -6584,7 +6690,7 @@ def _initial_default_config() -> Optional[dict]:
 #   major (1.7.2 → 2.0.0) — breaking API or topology change
 #
 # Use `./scripts/bump-version.sh patch|minor|major` to bump + auto-commit.
-APP_VERSION = "1.51.0"
+APP_VERSION = "1.51.1"
 
 app = FastAPI(
     title="OdyssAI-X (odyssai.eu)",
