@@ -36,12 +36,15 @@ OdyssAI-X is the **engine** layer of [**OdyssAI**](https://odyssai.eu), the open
 
 ## OdyssAI — two components
 
+OdyssAI is two pieces: **OdyssAI-X**, the engine, and **CoeOS**, the client — shipped as **Nemo**, the app, and the **CoeOS box**, the smart router behind it.
+
 | Component | Repo | Role |
 |---|---|---|
 | **OdyssAI-X** (engine) | this repo | distributed / replica / VLM MLX inference on Apple Silicon; OpenAI + Anthropic API; dashboard. AGPL-3.0 |
-| **CoeOS** (smart client) | [Odyssai-eu/coeos](https://github.com/Odyssai-eu/coeos) — **Nemo**, the app (signed, notarized macOS `.dmg`) · [Odyssai-eu/coeos-box](https://github.com/Odyssai-eu/coeos-box) — the router | a complete AI operating system with the **smart router built in**: every request goes to the model proven best at that skill — local on this engine, or cloud with your own keys. Nemo runs on your Mac; the box holds the router, users, tokens, quotas and the *Theseus* console. MIT |
+| **Nemo** (the CoeOS client) | [Odyssai-eu/coeos](https://github.com/Odyssai-eu/coeos) | a desktop AI operating system for one person: chat with visible reasoning and personal memory, cowork on documents, code with a panel of agents; every turn shows which model served it. Signed, notarized macOS app ([releases](https://github.com/Odyssai-eu/coeos/releases)). MIT |
+| **CoeOS box** (the smart router) | [Odyssai-eu/coeos-box](https://github.com/Odyssai-eu/coeos-box) | every request goes to the model proven best at that skill — local on the engine, or cloud with your own keys. Users, tokens, quotas, the *Theseus* console. MIT |
 
-Also in the organisation: [Guardian](https://github.com/Odyssai-eu/odyssai-guardian) (confidential-content detection before anything leaves for a cloud provider, MIT), [odyssai-services](https://github.com/Odyssai-eu/odyssai-services) (bench + sidecar tooling), [mlx-swift-lm](https://github.com/Odyssai-eu/mlx-swift-lm) (MIT).
+Also in the organisation: [Guardian](https://github.com/Odyssai-eu/odyssai-guardian) (confidential-content detection before anything leaves for a cloud provider, MIT), [CodeOS](https://github.com/Odyssai-eu/CodeOS) (a 100 % coding app, a version of opencode that keeps following upstream, MIT), [odyssai-services](https://github.com/Odyssai-eu/odyssai-services) (bench + sidecar tooling), [mlx-swift-lm](https://github.com/Odyssai-eu/mlx-swift-lm) (MIT).
 
 ## Install
 
@@ -103,7 +106,7 @@ Full walkthrough, node roles, budgets and gotchas: [`AGENTS.md`](AGENTS.md) and 
 - [`docs/API.md`](docs/API.md) — endpoints (`/v1/*`, `/admin/*`), cluster kinds, routing, capability contract.
 - [`docs/DEPLOY.md`](docs/DEPLOY.md) — deploying code changes (container vs nodes); [`docs/RUNBOOK-argo-v4.md`](docs/RUNBOOK-argo-v4.md) — operating a JACCL cluster.
 - [`docs/user-guide/`](docs/user-guide/) — multi-user serving (replica), CoeOS; [`docs/bug-reports/`](docs/bug-reports/) — upstream issues we hit and how.
-- [CoeOS](https://github.com/Odyssai-eu/coeos) — Nemo, the smart client that sits on this engine, and [coeos-box](https://github.com/Odyssai-eu/coeos-box), its router. Docs site: [odyssai.eu/docs](https://odyssai.eu/docs/).
+- [Nemo](https://github.com/Odyssai-eu/coeos) — the CoeOS client that sits on this engine, and the [CoeOS box](https://github.com/Odyssai-eu/coeos-box), its smart router. Docs site: [odyssai.eu/docs](https://odyssai.eu/docs/).
 
 ## Status
 
