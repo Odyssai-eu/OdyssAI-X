@@ -249,7 +249,7 @@ This is the production path but the setup is more involved:
 
 ## Next steps
 
-- **Pair CoeOS** — install [CoeOS](https://github.com/Odyssai-eu/coeos) and point it at this engine for a chat UI with memory, projects, skills, and the rest.
+- **Pair Nemo** — install [Nemo](https://github.com/Odyssai-eu/coeos/releases), the CoeOS client (a signed, notarized macOS app); it finds this engine on the LAN and gives you chat, cowork and code modes with memory and guardian.
 - **Multi-cluster setups** — cluster keys in `topology.yaml` are
   arbitrary (`default`, `chat`, `coder`, `reasoner`, `vision`, `mon-mac`
   — anything works). Define several entries to run multiple pools side

@@ -12,9 +12,9 @@ description: CoeOS is a separate gateway that routes each request to the best mo
 > sends it to the model proven best there — served by **this engine**, or by a
 > cloud provider with your own keys. The inference itself happens here.
 
-CoeOS used to live inside the OdyssAI-X dashboard. It is now its **own
-product** ([Odyssai-eu/coeos](https://github.com/Odyssai-eu/coeos): client, Guardian, infra) whose router
-runs as its own container — the **box**, [Odyssai-eu/coeos-box](https://github.com/Odyssai-eu/coeos-box), port 4600, console *Theseus*.
+CoeOS used to live inside the OdyssAI-X dashboard. It is now two public pieces:
+**Nemo**, the client ([Odyssai-eu/coeos](https://github.com/Odyssai-eu/coeos), a signed and notarized macOS app), and the router
+that runs as its own container — the **box**, [Odyssai-eu/coeos-box](https://github.com/Odyssai-eu/coeos-box), port 4600, console *Theseus*.
 Everything about configuring axes, keys, users and quotas is in the box guide:
 [`doc/USER-GUIDE.md`](https://github.com/Odyssai-eu/coeos-box/blob/main/doc/USER-GUIDE.md).
 This page covers only the engine side.
