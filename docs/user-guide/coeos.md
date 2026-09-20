@@ -39,7 +39,7 @@ is keyless by design.
 2. Give the CoeOS box (`coeos-box`, the router container of the product) the engine's address:
 
 ```bash
-curl -X PUT http://<coeos-host>:4600/admin/platform/providers/odyssai \
+curl -X PUT http://<coeos-host>:4600/admin/providers/odyssai \
   -H 'content-type: application/json' \
   -d '{"api_base":"http://<this-engine>:8000/v1"}'
 ```
