@@ -5945,6 +5945,79 @@ async def _node_reachable(ssh_target: str) -> bool:
     return await asyncio.to_thread(_probe)
 
 
+# ──────────────────────────────────────────────────────────────────────────────
+# Leaked-node auto-reboot after a rank died without a trace (2026-09-20).
+# Twice in two days (.30 on 09-18 18:33, .33 on 09-20 13:26) a Thunderbolt link
+# dropped mid-transfer and the rank at one end died of a SIGSEGV inside Apple's
+# libthunderboltrdma.dylib (tbt_post_recv <- jaccl post_recv <- all_gather):
+# no Python traceback, and ~140 GB of registered memory left wired on that
+# node until it reboots. The patched JACCL makes the other ranks raise within a
+# second and the pool is purged, but auto-reload then waits forever: the link
+# stays PORT_DOWN and the leaked node cannot host a shard again. The only
+# recovery is a reboot of that node, which also renegotiates the link — done
+# by hand on 09-18 and 09-20. Now automatic: on every auto-reload tick for a
+# pending pool, probe its nodes; a node with NO runner and wired memory above
+# WIRED_WARN_THRESHOLD is leaked → reboot it once (per-host cooldown shared
+# with the leak ladder), skip this tick; the next ticks wait for the node
+# (unreachable) and then reload. Env: LINK_LEAK_AUTO_REBOOT=0 disables.
+_LINK_LEAK_AUTO_REBOOT = os.environ.get("LINK_LEAK_AUTO_REBOOT", "1") == "1"
+# Wired memory a node with NO runner may hold before it is considered leaked.
+# An idle M3 Ultra sits at 4-9 GB; a leaked one at ~140 GB.
+_LINK_LEAK_WIRED_GB = float(os.environ.get("LINK_LEAK_WIRED_GB", "40"))
+
+
+async def _reboot_leaked_pool_nodes(cid: str, alias: str, cd_nodes: list,
+                                    indices: list) -> bool:
+    """Reboot the nodes of a pending pool that hold leaked wired memory with no
+    runner. Returns True when a reboot was issued (caller skips this tick)."""
+    if not _LINK_LEAK_AUTO_REBOOT:
+        return False
+    issued = False
+    for i in indices:
+        if not (0 <= i < len(cd_nodes)) or not cd_nodes[i].get("ssh"):
+            continue
+        n = cd_nodes[i]
+        host = {"id": n.get("host") or n["ssh"], "ssh": n["ssh"]}
+        try:
+            rc, out, _ = await asyncio.to_thread(
+                _ssh_exec, host["ssh"],
+                "echo R=$(ps -axo command | grep -c '[m]lx-cluster/runner.py'); "
+                "vm_stat | awk '/Pages wired/{print \"W=\" $4*16384}'", 10)
+        except Exception:
+            continue
+        if rc != 0:
+            continue
+        runners, wired = 0, 0.0
+        for line in (out or "").splitlines():
+            if line.startswith("R="):
+                runners = int(line[2:] or 0)
+            elif line.startswith("W="):
+                wired = float(line[2:] or 0)
+        if runners > 0 or wired <= _LINK_LEAK_WIRED_GB * 1024**3:
+            continue
+        now = time.time()
+        if now - _leak_reboot_last.get(host["id"], 0.0) < _LEAK_REBOOT_COOLDOWN_S:
+            sys.stderr.write(
+                f"[auto-reload] {cid}[{alias}]: {host['id']} holds {wired/1024**3:.0f} GB wired "
+                f"with no runner but was rebooted <{int(_LEAK_REBOOT_COOLDOWN_S)}s ago — "
+                f"not again, needs eyes\n")
+            continue
+        _leak_reboot_last[host["id"]] = now
+        sys.stderr.write(
+            f"[auto-reload] {cid}[{alias}]: {host['id']} holds {wired/1024**3:.0f} GB wired "
+            f"with no runner (a rank died without a trace — typically Apple's "
+            f"libthunderboltrdma segfault on a link drop): rebooting it to free the "
+            f"memory and renegotiate its links; reload resumes when it is back\n")
+        try:
+            res = await _reboot_one(host)
+            sys.stderr.write(f"[auto-reload] {cid}[{alias}]: reboot {host['id']} → {res.get('method')}"
+                             f"{(' ' + str(res.get('error'))) if res.get('error') else ''}\n")
+        except Exception as e:
+            sys.stderr.write(f"[auto-reload] {cid}[{alias}]: reboot {host['id']} failed: {e}\n")
+        issued = True
+    return issued
+
+
 async def _auto_reload_purged(cid: str, purged: list) -> None:
     """Reload liveness-purged pools from desired-state so they self-recover.
     Guards: (a) never resurrect an alias the operator explicitly unloaded (gone
@@ -5996,6 +6069,11 @@ async def _auto_reload_purged(cid: str, purged: list) -> None:
                                  f"{_AUTO_RELOAD_MAX} failed attempts — manual load needed\n")
             continue
         indices = entry.get("node_indices") or list(range(int(entry.get("nodes") or 1)))
+        # A node that leaked wired memory after a traceless rank death cannot
+        # serve again until it reboots — do it now, wait for it next ticks.
+        if entry.get("backend", "jaccl") == "jaccl" and len(indices) > 1:
+            if await _reboot_leaked_pool_nodes(cid, alias, cd_nodes, indices):
+                continue
         ssh_targets = [cd_nodes[i].get("ssh") for i in indices
                        if 0 <= i < len(cd_nodes) and cd_nodes[i].get("ssh")]
         reach = [await _node_reachable(s) for s in ssh_targets]
@@ -6737,7 +6815,7 @@ def _initial_default_config() -> Optional[dict]:
 #   major (1.7.2 → 2.0.0) — breaking API or topology change
 #
 # Use `./scripts/bump-version.sh patch|minor|major` to bump + auto-commit.
-APP_VERSION = "1.51.2"
+APP_VERSION = "1.51.3"
 
 app = FastAPI(
     title="OdyssAI-X (odyssai.eu)",
