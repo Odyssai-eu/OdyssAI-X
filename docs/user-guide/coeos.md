@@ -14,7 +14,7 @@ description: CoeOS is a separate gateway that routes each request to the best mo
 
 CoeOS used to live inside the OdyssAI-X dashboard. It is now two public pieces:
 **Nemo**, the client ([Odyssai-eu/coeos](https://github.com/Odyssai-eu/coeos), a signed and notarized macOS app), and the router
-that runs as its own container — the **box**, [Odyssai-eu/coeos-box](https://github.com/Odyssai-eu/coeos-box), port 4600, console *Theseus*.
+that runs as its own container — the **box**, [Odyssai-eu/coeos-box](https://github.com/Odyssai-eu/coeos-box), port 4600, the CoeOS console.
 Everything about configuring axes, keys, users and quotas is in the box guide:
 [`doc/USER-GUIDE.md`](https://github.com/Odyssai-eu/coeos-box/blob/main/doc/USER-GUIDE.md).
 This page covers only the engine side.
