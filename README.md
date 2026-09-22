@@ -44,7 +44,7 @@ OdyssAI is two pieces: **OdyssAI-X**, the engine, and **CoeOS**, the client — 
 | **Nemo** (the CoeOS client) | [Odyssai-eu/coeos](https://github.com/Odyssai-eu/coeos) | a desktop AI operating system for one person: chat with visible reasoning and personal memory, cowork on documents, code with a panel of agents; every turn shows which model served it. Signed, notarized macOS app ([releases](https://github.com/Odyssai-eu/coeos/releases)). MIT |
 | **CoeOS box** (the smart router) | [Odyssai-eu/coeos-box](https://github.com/Odyssai-eu/coeos-box) | every request goes to the model proven best at that skill — local on the engine, or cloud with your own keys. Users, tokens, quotas, the CoeOS console. MIT |
 
-Also in the organisation: [Guardian](https://github.com/Odyssai-eu/odyssai-guardian) (confidential-content detection before anything leaves for a cloud provider, MIT), [CodeOS](https://github.com/Odyssai-eu/CodeOS) (a 100 % coding app, a version of opencode that keeps following upstream; planner, coder, reviewer and sceptic on four different models routed by the CoeOS box, MIT), [odyssai-services](https://github.com/Odyssai-eu/odyssai-services) (bench + sidecar tooling), [mlx-swift-lm](https://github.com/Odyssai-eu/mlx-swift-lm) (MIT).
+Also in the organisation: [Guardian](https://github.com/Odyssai-eu/odyssai-guardian) (confidential-content detection before anything leaves for a cloud provider, MIT), [odyssai-services](https://github.com/Odyssai-eu/odyssai-services) (bench + sidecar tooling), [mlx-swift-lm](https://github.com/Odyssai-eu/mlx-swift-lm) (MIT).
 
 ## Install
 
