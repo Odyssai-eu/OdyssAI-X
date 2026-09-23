@@ -3720,7 +3720,8 @@ class VLMPool:
 
     def __init__(self, model_path: str, cluster: str, alias: str,
                  node_indices: list[int], upstream: str, port: int,
-                 ssh_target: str, host: str, pid: Optional[str] = None):
+                 ssh_target: str, host: str, pid: Optional[str] = None,
+                 venv: Optional[str] = None):
         # `model` is the concrete path — same contract as RunnerPool.model
         # (what /v1/models emits as `root`/`x_concrete`, what _route_pool
         # matches on, what capabilities read config.json from).
@@ -3742,6 +3743,9 @@ class VLMPool:
         self.upstream = (upstream or "").rstrip("/")
         self.port = int(port)
         self.pid = pid
+        # The venv the server was launched from — persisted so the startup
+        # restore relaunches from the same one, not VLM_DEFAULT_VENV.
+        self.venv = venv
         self.ssh_target = ssh_target
         self.host = host
         # Node topology in the same {rank, ssh, host, models_dir} shape the
@@ -3809,7 +3813,8 @@ class DFlashPool:
     def __init__(self, model_path: str, cluster: str, alias: str,
                  node_indices: list[int], upstream: str, port: int,
                  ssh_target: str, host: str, drafter: str,
-                 max_draft: int = 4, pid: Optional[str] = None):
+                 max_draft: int = 4, pid: Optional[str] = None,
+                 venv: Optional[str] = None):
         self.model = model_path
         self.model_path = model_path
         self.cluster = cluster
@@ -3825,6 +3830,8 @@ class DFlashPool:
         self.drafter = drafter
         self.max_draft = int(max_draft)
         self.num_draft_tokens = int(max_draft)
+        # Persisted so the startup restore relaunches from the same venv.
+        self.venv = venv
         self.runners: list = []
         self.upstream = (upstream or "").rstrip("/")
         self.port = int(port)
@@ -4554,6 +4561,7 @@ def save_cluster_state_v2(cluster_id: str, *,
                 "upstream": pool.upstream,
                 "ssh": pool.ssh_target,
                 "host": pool.host,
+                "venv": getattr(pool, "venv", None),
             })
             continue
         # dflash pool (B1): a single-node mlx-dspark serve proxied as a TEXT
@@ -4571,6 +4579,7 @@ def save_cluster_state_v2(cluster_id: str, *,
                 "host": pool.host,
                 "drafter": pool.drafter,
                 "max_draft": pool.max_draft,
+                "venv": getattr(pool, "venv", None),
             })
             continue
         pools_payload.append({
@@ -6815,7 +6824,7 @@ def _initial_default_config() -> Optional[dict]:
 #   major (1.7.2 → 2.0.0) — breaking API or topology change
 #
 # Use `./scripts/bump-version.sh patch|minor|major` to bump + auto-commit.
-APP_VERSION = "1.51.3"
+APP_VERSION = "1.51.4"
 
 app = FastAPI(
     title="OdyssAI-X (odyssai.eu)",
@@ -12970,11 +12979,12 @@ async def _read_raw_config(ssh: str, abspath: str) -> dict:
         return {}
 
 
-async def _vlm_venv_present(ssh: str) -> bool:
-    """Does the node carry the mlx-vlm serving venv? Its absence is why a
-    vision load silently sticks at 95% (mlx_vlm.server: No such file)."""
-    binp = f"{VLM_DEFAULT_VENV}/bin/mlx_vlm.server"
-    cmd = f"test -x {shlex.quote(binp)} && echo yes || echo no"
+async def _vlm_venv_present(ssh: str, venv: Optional[str] = None) -> bool:
+    """Does the node carry the mlx-vlm serving venv the load will launch from
+    (`venv`, else VLM_DEFAULT_VENV)? Its absence is why a vision load silently
+    sticks at 95% (mlx_vlm.server: No such file)."""
+    binp = f"{(venv or VLM_DEFAULT_VENV).strip().rstrip('/')}/bin/mlx_vlm.server"
+    cmd = f"test -x {_remote_path(binp)} && echo yes || echo no"
     try:
         out = await asyncio.to_thread(
             subprocess.run,
@@ -13022,7 +13032,8 @@ async def _coresidence_free_by_index(cluster_id: str, per_node: list[dict],
 
 async def _gather_preflight(cluster_id: str, model: str,
                             draft: Optional[str] = None,
-                            nodes: Optional[int] = None) -> dict:
+                            nodes: Optional[int] = None,
+                            venv: Optional[str] = None) -> dict:
     """Gather the facts + run the pure evaluator. Read-only, no GPU.
 
     `nodes`: intended pool size. The model/config probe runs on the node the
@@ -13058,7 +13069,7 @@ async def _gather_preflight(cluster_id: str, model: str,
     # Single source of truth (get_model_arch_meta / _model_capabilities use it
     # too) — recognises flattened `vision_*` configs, not just nested ones.
     is_vision = _config_is_vision(cfg)
-    vlm_present = await _vlm_venv_present(rank0) if is_vision else None
+    vlm_present = await _vlm_venv_present(rank0, venv) if is_vision else None
     draft_cfg = draft_size = None
     if draft:
         d_abs = _resolve_model_abspath(draft, base_dir)
@@ -13113,7 +13124,8 @@ async def _gather_preflight(cluster_id: str, model: str,
 @app.get("/admin/clusters/{cluster_id}/preflight")
 async def admin_cluster_preflight(cluster_id: str, model: str,
                                   draft: Optional[str] = None,
-                                  nodes: Optional[int] = None):
+                                  nodes: Optional[int] = None,
+                                  venv: Optional[str] = None):
     """Pro-loader pre-flight: verdict + node plan BEFORE loading. Read-only.
     The dashboard calls this on model pick to auto-select nodes + show the
     verdict; admin_cluster_load calls the same evaluator as a gate. Pass
@@ -13121,7 +13133,7 @@ async def admin_cluster_preflight(cluster_id: str, model: str,
     not rank0 (which may be busy with another pool and lack the model)."""
     if not cluster_exists(cluster_id):
         raise HTTPException(404, f"unknown cluster {cluster_id}")
-    return await _gather_preflight(cluster_id, model, draft, nodes=nodes)
+    return await _gather_preflight(cluster_id, model, draft, nodes=nodes, venv=venv)
 
 
 @app.put("/admin/clusters/{cluster_id}")
@@ -13919,7 +13931,8 @@ async def admin_cluster_load(cluster_id: str, req: ArgoLoadRequest):
     if not getattr(req, "force", False):
         try:
             _pf = await _gather_preflight(cluster_id, req.model,
-                                          getattr(req, "draft_model", None))
+                                          getattr(req, "draft_model", None),
+                                          venv=getattr(req, "venv", None))
         except Exception:
             _pf = None
         if _pf and not _pf.get("ok"):
@@ -14281,9 +14294,10 @@ async def admin_cluster_load(cluster_id: str, req: ArgoLoadRequest):
         _t_launch = time.time()
         try:
             async with get_admin_lock(cluster_id):
+                df_venv = getattr(req, "venv", None) or VLM_DEFAULT_VENV
                 ready, launched_pid, tail = await _launch_dflash_server(
                     df_ssh, log_id, df_model_path, df_drafter_path, df_port,
-                    (getattr(req, "venv", None) or VLM_DEFAULT_VENV), df_max_draft,
+                    df_venv, df_max_draft,
                     float(getattr(req, "ready_timeout_s", None) or VLM_READY_TIMEOUT_S),
                 )
                 if not ready:
@@ -14296,7 +14310,7 @@ async def admin_cluster_load(cluster_id: str, req: ArgoLoadRequest):
                     model_path=df_model_path, cluster=cluster_id, alias=alias,
                     node_indices=[df_index], upstream=df_upstream, port=df_port,
                     ssh_target=df_ssh, host=df_host, drafter=df_drafter_path,
-                    max_draft=df_max_draft, pid=launched_pid,
+                    max_draft=df_max_draft, pid=launched_pid, venv=df_venv,
                 )
                 dfpool.load_s = time.time() - _t_launch
                 set_pool(cluster_id, alias, dfpool)
@@ -14525,9 +14539,9 @@ async def admin_cluster_load(cluster_id: str, req: ArgoLoadRequest):
         _t_launch = time.time()
         try:
             async with get_admin_lock(cluster_id):
+                vlm_venv = getattr(req, "venv", None) or VLM_DEFAULT_VENV
                 ready, launched_pid, tail = await _launch_vlm_server(
-                    vlm_ssh, log_id, vlm_model_path, vlm_port,
-                    (getattr(req, "venv", None) or VLM_DEFAULT_VENV),
+                    vlm_ssh, log_id, vlm_model_path, vlm_port, vlm_venv,
                     float(getattr(req, "ready_timeout_s", None) or VLM_READY_TIMEOUT_S),
                 )
                 if not ready:
@@ -14541,6 +14555,7 @@ async def admin_cluster_load(cluster_id: str, req: ArgoLoadRequest):
                     model_path=vlm_model_path, cluster=cluster_id, alias=alias,
                     node_indices=[vlm_index], upstream=vlm_upstream, port=vlm_port,
                     ssh_target=vlm_ssh, host=vlm_host, pid=launched_pid,
+                    venv=vlm_venv,
                 )
                 vpool.load_s = time.time() - _t_launch
                 set_pool(cluster_id, alias, vpool)
@@ -16238,6 +16253,23 @@ async def admin_connection_test(nodes: int = 1, cluster: str = "default"):
 # ──────────────────────────────────────────────────────────────────────────────
 VLM_DEFAULT_VENV = env_get("VLM_VENV", "$HOME/.venvs/mlx-vlm")
 VLM_DEFAULT_PORT = int(env_get("VLM_PORT", "8080") or "8080")
+
+
+def _remote_path(path: str) -> str:
+    """Shell-quote a path for the node's shell while keeping a leading `$HOME`
+    (or `${HOME}`, `~`) expandable there.
+
+    A plain shlex.quote turns VLM_DEFAULT_VENV ("$HOME/.venvs/mlx-vlm") into the
+    literal '$HOME/...' — the node's shell never expands it, so the venv probe
+    always answered "absent" and every launcher using the default venv failed
+    with "No such file" (2026-09-23)."""
+    p = (path or "").strip()
+    for prefix in ("$HOME/", "${HOME}/", "~/"):
+        if p.startswith(prefix):
+            return '"$HOME"/' + shlex.quote(p[len(prefix):])
+    if p in ("$HOME", "${HOME}", "~"):
+        return '"$HOME"'
+    return shlex.quote(p)
 # 600s default: a 327GB 6-bit VL takes ~200-240s to load and a bigger VL
 # (Q8 ~450GB, or a cold first Metal compile) needs more — 180 false-timed-out
 # on the m3vl 6-bit (2026-07-02). Per-request ready_timeout_s still overrides.
@@ -16290,8 +16322,8 @@ def _vlm_launch_cmd(vlm_id: str, venv: str, model_path: str, port: int) -> str:
     # values are shlex.quote'd — model_path may contain '/', slug is validated.
     return (
         f"export HOME=\"${{HOME:-/Users/$(id -un)}}\" USER=\"$(id -un)\" TMPDIR=/tmp "
-        f"PATH={shlex.quote(venv_bin)}:/usr/bin:/bin:/usr/sbin:/sbin && "
-        f"nohup {shlex.quote(server_bin)} "
+        f"PATH={_remote_path(venv_bin)}:/usr/bin:/bin:/usr/sbin:/sbin && "
+        f"nohup {_remote_path(server_bin)} "
         f"--model {shlex.quote(model_path)} "
         f"--host 0.0.0.0 --port {int(port)} "
         f"--trust-remote-code "
@@ -16355,6 +16387,43 @@ async def _vlm_probe_ready(ip: str, port: int, timeout: float = 5.0) -> Optional
         return False
     data = body.get("data") if isinstance(body, dict) else None
     return bool(data)
+
+
+async def _remote_pid_alive(ssh_target: str, pid: str) -> Optional[bool]:
+    """True/False when the node answers, None when the probe itself fails
+    (ssh hiccup) — the caller must not treat an unknown as dead."""
+    if not re.fullmatch(r"[0-9]+", pid or ""):
+        return None
+    try:
+        rc, out, _ = await asyncio.to_thread(
+            _ssh_exec, ssh_target, f"kill -0 {pid} 2>/dev/null && echo alive || echo dead", 10)
+    except Exception:
+        return None
+    ans = (out or "").strip()
+    return True if ans == "alive" else False if ans == "dead" else None
+
+
+async def _await_launched_ready(ssh_target: str, ip: str, port: int,
+                                launched_pid: Optional[str],
+                                ready_timeout: float) -> bool:
+    """Poll /v1/models until the launched server is ready. Every ~15 s, check
+    the launched process is still alive and give up at once when it died (bad
+    venv, import error, OOM at load): without this a dead launch held the
+    caller for the whole ready_timeout (600 s) — at startup, a failed VL
+    restore blocked the orchestrator's lifespan that long."""
+    deadline = time.time() + ready_timeout
+    polls = 0
+    while time.time() < deadline:
+        if await _vlm_probe_ready(ip, port) is True:
+            return True
+        polls += 1
+        if launched_pid and polls % 5 == 0:
+            if await _remote_pid_alive(ssh_target, launched_pid) is False:
+                # The port may still have come up from that process just
+                # before it exited — one last probe decides.
+                return await _vlm_probe_ready(ip, port) is True
+        await asyncio.sleep(3.0)
+    return False
 
 
 async def _vlm_log_tail(ssh_target: str, vlm_id: str, lines: int = 40) -> str:
@@ -16466,12 +16535,8 @@ async def _launch_vlm_server(
     for line in (out or "").splitlines():
         if line.startswith("VLM_PID="):
             launched_pid = line.split("=", 1)[1].strip()
-    deadline = time.time() + ready_timeout
-    while time.time() < deadline:
-        state = await _vlm_probe_ready(ip, port)
-        if state is True:
-            return True, launched_pid, ""
-        await asyncio.sleep(3.0)
+    if await _await_launched_ready(ssh_target, ip, port, launched_pid, ready_timeout):
+        return True, launched_pid, ""
     tail = await _vlm_log_tail(ssh_target, log_id)
     return False, launched_pid, tail
 
@@ -16490,6 +16555,7 @@ async def _restore_vlm_pool(cluster_id: str, alias: str, entry: dict,
     (survived a bare API restart without a node reboot), adopt it in place."""
     model_path = entry["model"]
     port = int(entry.get("port") or VLM_DEFAULT_PORT)
+    venv = entry.get("venv") or VLM_DEFAULT_VENV
     topo = build_topology_from_indices(cluster_id, indices)
     ssh_target = entry.get("ssh") or topo[0]["ssh"]
     host = entry.get("host") or topo[0].get("host") or _host_id_from_ssh(ssh_target)
@@ -16504,7 +16570,7 @@ async def _restore_vlm_pool(cluster_id: str, alias: str, entry: dict,
     else:
         ready, pid, tail = await _launch_vlm_server(
             ssh_target, _vlm_pool_log_id(cluster_id, alias), model_path, port,
-            VLM_DEFAULT_VENV, VLM_READY_TIMEOUT_S,
+            venv, VLM_READY_TIMEOUT_S,
         )
         if not ready:
             sys.stderr.write(
@@ -16515,7 +16581,7 @@ async def _restore_vlm_pool(cluster_id: str, alias: str, entry: dict,
     return VLMPool(
         model_path=model_path, cluster=cluster_id, alias=alias,
         node_indices=indices, upstream=upstream, port=port,
-        ssh_target=ssh_target, host=host, pid=pid,
+        ssh_target=ssh_target, host=host, pid=pid, venv=venv,
     )
 
 
@@ -16537,8 +16603,8 @@ def _dflash_launch_cmd(vlm_id: str, venv: str, model_path: str,
     log = _vlm_log_path(vlm_id)
     return (
         f"export HOME=\"${{HOME:-/Users/$(id -un)}}\" USER=\"$(id -un)\" TMPDIR=/tmp "
-        f"PATH={shlex.quote(venv_bin)}:/usr/bin:/bin:/usr/sbin:/sbin && "
-        f"nohup {shlex.quote(server_bin)} serve "
+        f"PATH={_remote_path(venv_bin)}:/usr/bin:/bin:/usr/sbin:/sbin && "
+        f"nohup {_remote_path(server_bin)} serve "
         f"--model {shlex.quote(model_path)} "
         f"--mode dflash --drafter {shlex.quote(drafter_path)} "
         f"--max-draft {int(max_draft)} "
@@ -16593,8 +16659,8 @@ def _inkling_launch_cmd(vlm_id: str, venv: str, model_path: str, port: int) -> s
     log = _vlm_log_path(vlm_id)
     return (
         f"export HOME=\"${{HOME:-/Users/$(id -un)}}\" USER=\"$(id -un)\" TMPDIR=/tmp "
-        f"PATH={shlex.quote(venv_bin)}:/usr/bin:/bin:/usr/sbin:/sbin && "
-        f"nohup {shlex.quote(py)} {shlex.quote(INKLING_SERVER_REMOTE)} "
+        f"PATH={_remote_path(venv_bin)}:/usr/bin:/bin:/usr/sbin:/sbin && "
+        f"nohup {_remote_path(py)} {_remote_path(INKLING_SERVER_REMOTE)} "
         f"--model {shlex.quote(model_path)} "
         f"--host 0.0.0.0 --port {int(port)} "
         f"--wired-limit-gb {INKLING_WIRED_LIMIT_GB} "
@@ -16641,11 +16707,8 @@ async def _launch_inkling_server(
     for line in (out or "").splitlines():
         if line.startswith("VLM_PID="):
             launched_pid = line.split("=", 1)[1].strip()
-    deadline = time.time() + ready_timeout
-    while time.time() < deadline:
-        if await _vlm_probe_ready(ip, port) is True:
-            return True, launched_pid, ""
-        await asyncio.sleep(3.0)
+    if await _await_launched_ready(ssh_target, ip, port, launched_pid, ready_timeout):
+        return True, launched_pid, ""
     tail = await _vlm_log_tail(ssh_target, log_id)
     return False, launched_pid, tail
 
@@ -16674,8 +16737,8 @@ def _muse_launch_cmd(vlm_id: str, venv: str, model_path: str, port: int) -> str:
     log = _vlm_log_path(vlm_id)
     return (
         f"export HOME=\"${{HOME:-/Users/$(id -un)}}\" USER=\"$(id -un)\" TMPDIR=/tmp "
-        f"PATH={shlex.quote(venv_bin)}:/usr/bin:/bin:/usr/sbin:/sbin && "
-        f"nohup {shlex.quote(py)} {shlex.quote(MUSE_SERVER_REMOTE)} "
+        f"PATH={_remote_path(venv_bin)}:/usr/bin:/bin:/usr/sbin:/sbin && "
+        f"nohup {_remote_path(py)} {_remote_path(MUSE_SERVER_REMOTE)} "
         f"--model {shlex.quote(model_path)} "
         f"--host 0.0.0.0 --port {int(port)} "
         f"--wired-limit-gb {MUSE_WIRED_LIMIT_GB} "
@@ -16723,11 +16786,8 @@ async def _launch_muse_glimmer_server(
     for line in (out or "").splitlines():
         if line.startswith("VLM_PID="):
             launched_pid = line.split("=", 1)[1].strip()
-    deadline = time.time() + ready_timeout
-    while time.time() < deadline:
-        if await _vlm_probe_ready(ip, port) is True:
-            return True, launched_pid, ""
-        await asyncio.sleep(3.0)
+    if await _await_launched_ready(ssh_target, ip, port, launched_pid, ready_timeout):
+        return True, launched_pid, ""
     tail = await _vlm_log_tail(ssh_target, log_id)
     return False, launched_pid, tail
 
@@ -16748,11 +16808,8 @@ async def _launch_dflash_server(
     for line in (out or "").splitlines():
         if line.startswith("VLM_PID="):
             launched_pid = line.split("=", 1)[1].strip()
-    deadline = time.time() + ready_timeout
-    while time.time() < deadline:
-        if await _vlm_probe_ready(ip, port) is True:
-            return True, launched_pid, ""
-        await asyncio.sleep(3.0)
+    if await _await_launched_ready(ssh_target, ip, port, launched_pid, ready_timeout):
+        return True, launched_pid, ""
     tail = await _vlm_log_tail(ssh_target, log_id)
     return False, launched_pid, tail
 
@@ -16766,6 +16823,7 @@ async def _restore_dflash_pool(cluster_id: str, alias: str, entry: dict,
     drafter = entry.get("drafter")
     port = int(entry.get("port") or DFLASH_DEFAULT_PORT)
     max_draft = int(entry.get("max_draft") or DFLASH_MAX_DRAFT)
+    venv = entry.get("venv") or VLM_DEFAULT_VENV
     topo = build_topology_from_indices(cluster_id, indices)
     ssh_target = entry.get("ssh") or topo[0]["ssh"]
     host = entry.get("host") or topo[0].get("host") or _host_id_from_ssh(ssh_target)
@@ -16786,7 +16844,7 @@ async def _restore_dflash_pool(cluster_id: str, alias: str, entry: dict,
             return None
         ready, pid, tail = await _launch_dflash_server(
             ssh_target, _dflash_pool_log_id(cluster_id, alias), model_path,
-            drafter, port, VLM_DEFAULT_VENV, max_draft, VLM_READY_TIMEOUT_S,
+            drafter, port, venv, max_draft, VLM_READY_TIMEOUT_S,
         )
         if not ready:
             sys.stderr.write(
@@ -16798,7 +16856,7 @@ async def _restore_dflash_pool(cluster_id: str, alias: str, entry: dict,
         model_path=model_path, cluster=cluster_id, alias=alias,
         node_indices=indices, upstream=upstream, port=port,
         ssh_target=ssh_target, host=host, drafter=drafter,
-        max_draft=max_draft, pid=pid,
+        max_draft=max_draft, pid=pid, venv=venv,
     )
 
 
