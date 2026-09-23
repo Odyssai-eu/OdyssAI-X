@@ -6824,7 +6824,7 @@ def _initial_default_config() -> Optional[dict]:
 #   major (1.7.2 → 2.0.0) — breaking API or topology change
 #
 # Use `./scripts/bump-version.sh patch|minor|major` to bump + auto-commit.
-APP_VERSION = "1.51.4"
+APP_VERSION = "1.52.0"
 
 app = FastAPI(
     title="OdyssAI-X (odyssai.eu)",
@@ -8736,6 +8736,9 @@ def _cloud_entries_for_v1_models() -> list[dict]:
         if not _provider_enabled(prov):
             continue   # disabled providers don't publish aliases
         has_key = _cloud_provider_key(prov) is not None
+        is_decision = _provider_protocol(prov) == "systemone"
+        # A local decision service needs no key unless one is configured.
+        available = has_key or (is_decision and not prov.get("api_key_env"))
         for entry in (prov.get("published") or []):
             alias = entry.get("alias")
             if not alias:
@@ -8746,7 +8749,7 @@ def _cloud_entries_for_v1_models() -> list[dict]:
             # work them around in the proxy).
             quirks = list(PROVIDER_QUIRKS.get(prov_id, []))
             caps = {
-                "loaded": has_key,        # available if key is set
+                "loaded": available,      # available if key is set (or keyless decision service)
                 "loading": False,
                 "pool": prov_id,
                 "backend": "http-proxy",
@@ -8761,14 +8764,20 @@ def _cloud_entries_for_v1_models() -> list[dict]:
                 "supports_tools": declared.get("supports_tools"),
                 "supports_vision": declared.get("supports_vision"),
                 "supports_json_mode": declared.get("supports_json_mode"),
-                "supports_streaming": True,
+                "supports_streaming": not is_decision,
                 "estimated_tps": declared.get("estimated_tps"),
                 "estimated_load_s": 0,    # cloud = no load
-                "warm": has_key,
+                "warm": available,
                 "kv_cache_q8": False,
                 "admin_loadable": False,
                 "upstream": entry.get("upstream"),
             }
+            if is_decision:
+                # Typed decisions (choice/score/noul), not text generation:
+                # clients must call POST /v1/systemone, never chat.
+                caps["kind"] = "decision"
+                caps["endpoint"] = "/v1/systemone"
+                caps["supports_tools"] = False
             out.append({
                 "id": alias,
                 "object": "model",
@@ -8799,7 +8808,7 @@ class CloudProviderUpdate(BaseModel):
     # (most clouds + local OpenAI-compatible). "anthropic" = /v1/messages
     # (api.anthropic.com only, today). Determines which proxy path runs.
     # Defaults to "openai" so existing providers keep working.
-    protocol: Optional[str] = None       # "openai" | "anthropic"
+    protocol: Optional[str] = None       # "openai" | "anthropic" | "systemone"
 
 
 def _provider_enabled(prov: dict) -> bool:
@@ -8808,11 +8817,17 @@ def _provider_enabled(prov: dict) -> bool:
     return prov.get("enabled", True) is not False
 
 
+# "systemone" = typed-decision upstreams (TypeSafe Jev wire protocol,
+# POST {api_base}/systemone): Laya served by scripts/laya/laya_serve_local.py.
+# They don't generate text — only POST /v1/systemone reaches them.
+_PROVIDER_PROTOCOLS = ("openai", "anthropic", "systemone")
+
+
 def _provider_protocol(prov: dict) -> str:
     """Wire protocol the upstream speaks. Default 'openai' for backward
     compat with all existing providers (openrouter, openai, anthropic, …)."""
     p = (prov.get("protocol") or "openai").lower()
-    return p if p in ("openai", "anthropic") else "openai"
+    return p if p in _PROVIDER_PROTOCOLS else "openai"
 
 
 def _redact_provider(prov_id: str, prov: dict) -> dict:
@@ -9059,6 +9074,22 @@ PROVIDER_TEMPLATES = [
              "caps": {"context_length": 262144, "supports_tools": True}},
         ],
     },
+    {
+        "id": "laya",
+        "label": "Laya (decisions)",
+        "api_base": "",
+        "protocol": "systemone",
+        "api_key_env": "",
+        "hint": "Typed decisions (choice / score / noul) with calibrated "
+                "probabilities, TypeSafe Jev wire protocol. Point api_base at a "
+                "laya-serve host, e.g. http://host.lan:8790/v1 (see "
+                "scripts/laya/). Clients call POST /v1/systemone with the alias "
+                "as `model`; the alias never answers chat.",
+        "default_aliases": [
+            {"alias": "laya-multilingual", "upstream": "multilingual",
+             "caps": {"context_length": 1024, "family": "laya"}},
+        ],
+    },
 ]
 
 
@@ -9111,8 +9142,8 @@ async def admin_providers_upsert(provider_id: str, req: CloudProviderUpdate):
         cur["enabled"] = bool(req.enabled)
     if req.protocol is not None:
         p = req.protocol.lower()
-        if p not in ("openai", "anthropic"):
-            raise HTTPException(400, "protocol must be 'openai' or 'anthropic'")
+        if p not in _PROVIDER_PROTOCOLS:
+            raise HTTPException(400, "protocol must be 'openai', 'anthropic' or 'systemone'")
         cur["protocol"] = p
     if "api_base" not in cur or not cur["api_base"]:
         raise HTTPException(400, "api_base required")
@@ -9141,6 +9172,8 @@ async def admin_providers_test(provider_id: str):
     if not prov:
         raise HTTPException(404, f"unknown provider {provider_id}")
     has_key = _cloud_provider_key(prov) is not None
+    if _provider_protocol(prov) == "systemone":
+        return await _systemone_health(prov)
     models = await _list_upstream_models(prov)
     if not models:
         return {"ok": False, "models_count": 0,
@@ -9868,6 +9901,97 @@ def _strip_tool_calls_from_text(text: str) -> str:
     return out.strip()
 
 
+def _refuse_decision_alias(model: Optional[str], prov_id: str, prov: dict) -> None:
+    """A systemone alias answers typed questions, never a chat. Fail loudly
+    instead of forwarding a chat body to a decision server."""
+    if _provider_protocol(prov) == "systemone":
+        raise HTTPException(
+            400,
+            f"'{model}' is a decision model (provider '{prov_id}', protocol systemone): "
+            f"it answers typed questions, not chat. Use POST /v1/systemone "
+            f"with {{\"model\": \"{model}\", \"state\": ..., \"questions\": {{...}}}}.")
+
+
+def _systemone_aliases() -> list[tuple[str, dict, dict]]:
+    out = []
+    for prov_id, prov in get_cloud_providers().items():
+        if not _provider_enabled(prov) or _provider_protocol(prov) != "systemone":
+            continue
+        for entry in (prov.get("published") or []):
+            if entry.get("alias"):
+                out.append((prov_id, prov, entry))
+    return out
+
+
+async def _systemone_health(prov: dict) -> dict:
+    base = (prov.get("api_base") or "").rstrip("/")
+    root = base[:-3] if base.endswith("/v1") else base
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            r = await client.get(f"{root}/health")
+        if r.status_code == 200:
+            d = r.json()
+            return {"ok": True, "models_count": len(d.get("loaded") or []),
+                    "sample": d.get("loaded") or [], "device": d.get("device")}
+        return {"ok": False, "models_count": 0, "error": f"health HTTP {r.status_code}"}
+    except Exception as e:
+        return {"ok": False, "models_count": 0, "error": f"upstream unreachable: {e}"}
+
+
+@app.post("/v1/systemone")
+async def systemone(request: Request):
+    """Typed decisions (TypeSafe Jev wire protocol): `state` + `questions`
+    ({id: {type: choice|score|noul, instructions, criteria}}) → `answers`
+    with calibrated probabilities. Routed to a provider with
+    `protocol: systemone` (Laya). `model` is a published alias; when it is
+    absent or unknown and exactly one decision alias exists, that one serves
+    (SDKs written for Jev send their own model id)."""
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(400, "body must be JSON")
+    if not isinstance(body, dict) or not isinstance(body.get("questions"), dict) or not body["questions"]:
+        raise HTTPException(400, "body must be an object with a non-empty 'questions' object")
+    aliases = _systemone_aliases()
+    if not aliases:
+        raise HTTPException(404, "no decision model configured (add a provider with protocol 'systemone')")
+    want = body.get("model")
+    match = next((a for a in aliases if a[2]["alias"] == want), None)
+    if match is None:
+        if len(aliases) == 1:
+            match = aliases[0]
+        else:
+            raise HTTPException(404, {
+                "error": "unknown_decision_model", "model": want,
+                "available": [a[2]["alias"] for a in aliases]})
+    prov_id, prov, entry = match
+    fwd = dict(body)
+    fwd["model"] = entry.get("upstream") or entry["alias"]
+    headers = {"content-type": "application/json"}
+    key = _cloud_provider_key(prov)
+    if key:
+        headers["authorization"] = f"Bearer {key}"
+    url = f"{prov['api_base'].rstrip('/')}/systemone"
+    t0 = time.time()
+    try:
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            r = await client.post(url, json=fwd, headers=headers)
+    except Exception as e:
+        raise HTTPException(502, f"decision upstream '{prov_id}' unreachable: {e}")
+    try:
+        data = r.json()
+    except Exception:
+        raise HTTPException(502, f"decision upstream '{prov_id}' returned non-JSON (HTTP {r.status_code})")
+    if r.status_code != 200:
+        return JSONResponse(data, status_code=r.status_code)
+    if isinstance(data, dict):
+        data["model"] = entry["alias"]
+        data.setdefault("x_odyssai", {}).update({
+            "provider": prov_id, "upstream": fwd["model"],
+            "latency_ms": round((time.time() - t0) * 1000, 1)})
+    return data
+
+
 @app.post("/v1/chat/completions")
 async def chat_completions(req: ChatCompletionRequest, request: Request):
     # 0. Telemak passthrough? If the model id matches a kind=telemak cluster,
@@ -9891,6 +10015,7 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
     cloud = find_cloud_alias(req.model)
     if cloud:
         prov_id, prov, entry = cloud
+        _refuse_decision_alias(req.model, prov_id, prov)
         body = req.model_dump(exclude_none=True)
         return await _proxy_chat_completion(prov_id, prov, entry, body)
 
@@ -9902,7 +10027,7 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
         fb_alias = _cluster_fallback_for(req.model)
         if fb_alias:
             fb_cloud = find_cloud_alias(fb_alias)
-            if fb_cloud:
+            if fb_cloud and _provider_protocol(fb_cloud[1]) != "systemone":
                 prov_id, prov, entry = fb_cloud
                 body = req.model_dump(exclude_none=True)
                 sys.stderr.write(
@@ -10833,6 +10958,7 @@ async def anthropic_messages(req: AnthropicMessagesRequest, request: Request):
         prov_id, prov, entry = cloud_match
         if _provider_protocol(prov) == "anthropic":
             return await _proxy_anthropic_messages(prov_id, prov, entry, req, request)
+        _refuse_decision_alias(req.model, prov_id, prov)
         raise HTTPException(
             400,
             f"alias '{req.model}' is on an OpenAI-protocol provider ('{prov_id}'). "

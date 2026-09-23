@@ -2791,7 +2791,7 @@ function renderProviderSummary(p) {
   const srcLabel = src === 'config' ? '🔒 stored' : src === 'env' ? '$ env var' : '— not set';
   const srcColor = src === 'none' ? 'var(--rust-deep)' : 'var(--ink-2)';
   const protocol = (p.protocol || 'openai').toLowerCase();
-  const protoLabel = protocol === 'anthropic' ? '/v1/messages (Anthropic)' : '/v1/chat/completions (OpenAI)';
+  const protoLabel = protocol === 'anthropic' ? '/v1/messages (Anthropic)' : protocol === 'systemone' ? '/v1/systemone (decisions)' : '/v1/chat/completions (OpenAI)';
   return `
     <div style="display:flex;flex-direction:column;gap:6px;font-family:var(--font-mono);font-size:12px;color:var(--ink-2)">
       <div><span style="color:var(--ink-3)">api_base:</span> ${escapeHtml(p.api_base || '—')}</div>
@@ -2852,6 +2852,7 @@ function renderProviderForm(p, isNew) {
           <select class="ce-input mono" data-act="provider-edit-field" data-field="protocol">
             <option value="openai" ${protocol==='openai'?'selected':''}>OpenAI (/v1/chat/completions)</option>
             <option value="anthropic" ${protocol==='anthropic'?'selected':''}>Anthropic (/v1/messages)</option>
+            <option value="systemone" ${protocol==='systemone'?'selected':''}>Decisions (/v1/systemone, Laya)</option>
           </select>
         </div>
       </div>

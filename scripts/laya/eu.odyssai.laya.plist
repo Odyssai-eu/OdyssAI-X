@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>eu.odyssai.laya</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Users/admin/odyssai/laya/.venv/bin/python</string>
+    <string>/Users/admin/odyssai/laya/laya_serve_local.py</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>LAYA_PORT</key><string>8790</string>
+    <key>LAYA_DEVICE</key><string>mps</string>
+    <key>LAYA_MODELS</key><string>multilingual</string>
+    <key>LAYA_DEFAULT</key><string>multilingual</string>
+    <key>LAYA_MODELS_ROOT</key><string>/Volumes/models/odysseus/convaiinnovations</string>
+    <key>USE_TF</key><string>0</string>
+    <key>PYTORCH_ENABLE_MPS_FALLBACK</key><string>1</string>
+  </dict>
+  <key>WorkingDirectory</key><string>/Users/admin/odyssai/laya</string>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>ThrottleInterval</key><integer>30</integer>
+  <key>StandardOutPath</key><string>/Users/admin/odyssai/laya/laya.out.log</string>
+  <key>StandardErrorPath</key><string>/Users/admin/odyssai/laya/laya.err.log</string>
+</dict>
+</plist>

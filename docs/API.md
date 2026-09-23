@@ -156,6 +156,44 @@ curl -X POST http://localhost:8000/v1/messages \
 Body : `system`, `messages`, `tools` (format Anthropic), `stream`,
 `metadata.session_id` ou header `X-Session-Id`.
 
+#### `POST /v1/systemone` — décisions typées (Laya)
+
+Pas de génération de texte : un `state` et des questions typées
+(`choice` / `score` / `noul`) → des réponses avec probabilités et
+confiance. Même format que l'API Decisions de TypeSafe (Jev), donc les
+SDK Laya ou Jev pointent ici sans changement. Servi par un provider
+`protocol: "systemone"` (Laya sur max-64, `scripts/laya/`).
+
+```bash
+curl -X POST http://localhost:8000/v1/systemone -H 'content-type: application/json' -d '{
+  "model": "laya-multilingual",
+  "state": {"request": "Mon serveur de prod est tombé, les clients ne peuvent plus payer."},
+  "questions": {
+    "urgent": {"type": "noul",   "instructions": "Is `request` time-sensitive?"},
+    "team":   {"type": "choice", "instructions": "Which team handles `request`?",
+               "criteria": {"billing": "payments, invoices", "technical": "outages, bugs", "sales": "pricing"}}
+  }}'
+```
+
+Réponse : `answers.<id>` = `{type, choice|score|noul, probabilities, confidence}`,
+`usage`, et `x_odyssai.{provider, upstream, latency_ms}`. `model` absent ou
+inconnu → l'unique alias de décision s'il n'y en a qu'un, sinon 404 avec la
+liste. Dans `/v1/models`, ces alias portent `x_odyssai.kind = "decision"` et
+`endpoint = "/v1/systemone"` ; `/v1/chat/completions` et `/v1/messages`
+les refusent (400).
+
+Déclarer le provider (template `laya` dans le dashboard) :
+
+```bash
+curl -X PUT http://localhost:8000/admin/providers/laya -H 'content-type: application/json' -d '{
+  "api_base": "http://192.168.86.50:8790/v1", "protocol": "systemone",
+  "published": [{"alias": "laya-multilingual", "upstream": "multilingual"}]}'
+```
+
+Les probabilités sortent **non calibrées** (l'éditeur l'écrit : « ships
+over-confident ») : ajuster une température sur un jeu étiqueté avant de
+router sur la confiance.
+
 ---
 
 ### Admin (LAN-only, no auth par défaut)
