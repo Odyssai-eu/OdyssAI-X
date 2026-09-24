@@ -5061,6 +5061,49 @@ def _should_filter_think(model_id: Optional[str], enable_thinking) -> bool:
     return _model_auto_opens_think(model_id)
 
 
+# Per-model default sampling for PROXIED upstreams (VL/dflash pools, telemak
+# clusters) when the client sent none. mlx_vlm.server defaults to greedy
+# (temperature 0.0) and ignores generation_config, so a reasoning model
+# served there loops. Text RunnerProc pools don't come through here: they
+# use runner.py MODEL_SAMPLING_DEFAULTS (keep the two in sync by hand —
+# runner.py imports mlx at module top and cannot be imported in the
+# orchestrator container). Keyed by lowercase substring of the upstream
+# model id; first match wins. Only the authors' recommended values here —
+# no repetition penalty (it would mask a collapse, not fix it).
+_MODELS_SAMPLING_DEFAULT: dict[str, dict] = {
+    # MiMo (Xiaomi): README "Recommended sampling: temperature=1.0, top_p=0.95".
+    "mimo": {"temperature": 1.0, "top_p": 0.95},
+}
+
+
+def _apply_default_sampling(model_id: Optional[str], body: dict) -> dict:
+    """Fill the per-model default sampling into `body` (in place) for every
+    key the client left unset (absent or None). An explicit client value
+    always wins. Returns the {key: value} actually injected ({} when the
+    model has no entry)."""
+    if not model_id:
+        return {}
+    needle = model_id.lower()
+    for key, params in _MODELS_SAMPLING_DEFAULT.items():
+        if key in needle:
+            applied = {}
+            for k, v in params.items():
+                if body.get(k) is None:
+                    body[k] = v
+                    applied[k] = v
+            return applied
+    return {}
+
+
+def _log_proxy_sampling(label: str, upstream_model: Optional[str], forward_body: dict) -> None:
+    """Fill the per-model default sampling and trace what the client sent vs
+    what was injected — one stderr line per proxied request."""
+    client = {k: forward_body.get(k) for k in ("temperature", "top_p", "top_k", "min_p")
+              if forward_body.get(k) is not None}
+    applied = _apply_default_sampling(upstream_model, forward_body)
+    sys.stderr.write(f"[api] proxy sampling ({label}): client={client} defaults={applied}\n")
+
+
 def _default_reasoning_effort(model_id: Optional[str]) -> Optional[str]:
     """Per-model default `reasoning_effort` when the caller didn't pass one.
 
@@ -5316,6 +5359,19 @@ class ChatCompletionRequest(BaseModel):
     # THIS request (parity/perf reference lane, #72 Travail 4). None/True =
     # pool default. Ignored on pools without mtp_cfg.
     mtp_on: Optional[bool] = None
+    # Sampling (2026-09-24, docs/PLAN-2026-09-24-proxy-sampling.md). Declared so
+    # model_dump() keeps them: undeclared they were silently dropped by pydantic,
+    # so no proxied upstream ever received the client's sampling. None = "not
+    # sent" — never give these a numeric default (exclude_none=True would then
+    # send a value the client never set).
+    temperature: Optional[float] = None
+    top_p: Optional[float] = None
+    top_k: Optional[int] = None
+    min_p: Optional[float] = None
+    repetition_penalty: Optional[float] = None
+    presence_penalty: Optional[float] = None
+    frequency_penalty: Optional[float] = None
+    seed: Optional[int] = None
 
     @model_validator(mode="after")
     def _alias_max_completion_tokens(self) -> "ChatCompletionRequest":
@@ -6824,7 +6880,7 @@ def _initial_default_config() -> Optional[dict]:
 #   major (1.7.2 → 2.0.0) — breaking API or topology change
 #
 # Use `./scripts/bump-version.sh patch|minor|major` to bump + auto-commit.
-APP_VERSION = "1.52.0"
+APP_VERSION = "1.52.1"
 
 app = FastAPI(
     title="OdyssAI-X (odyssai.eu)",
@@ -15015,6 +15071,8 @@ async def _telemak_proxy_chat_completion(
         _re_default = _default_reasoning_effort(upstream_model)
         if _re_default:
             forward_body["reasoning_effort"] = _re_default
+    _log_proxy_sampling(f"{cluster_id}:{requested_short_id}" if requested_short_id else cluster_id,
+                        upstream_model, forward_body)
     forward_body["model"] = upstream_model
     if stream:
         # Ask the upstream for a trailing usage chunk (mlx_vlm.server and
@@ -15247,6 +15305,7 @@ async def _vlm_pool_proxy_chat_completion(pool, body: dict, stream: bool):
         _re_default = _default_reasoning_effort(upstream_model)
         if _re_default:
             forward_body["reasoning_effort"] = _re_default
+    _log_proxy_sampling(label, upstream_model, forward_body)
     forward_body["model"] = upstream_model
     if stream:
         _so = dict(forward_body.get("stream_options") or {})
