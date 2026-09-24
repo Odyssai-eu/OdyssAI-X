@@ -4928,7 +4928,14 @@ _MODELS_AUTO_OPEN_THINK = ("minimax", "qwen3.5", "qwen3.6", "step-3.7", "step3p7
                            # `content`. Honore enable_thinking (thinking-off →
                            # clean, pas de ghost) donc PAS dans _MODELS_IGNORE_*.
                            "deepseek-v4-1", "deepseek-v4.1", "deepseek-v41",
-                           "kimi-k3", "inkling")
+                           "kimi-k3", "inkling",
+                           # Qwen3.8-Flash-Next (qwen4_exp) — chat_template.jinja
+                           # primes `<think>\n` when thinking is on, the model
+                           # emits reasoning + `</think>` in clear (vérifié en
+                           # prod 2026-09-24 : reasoning_content vide, tout dans
+                           # `content`). Thinking-off → `<think>\n\n</think>`
+                           # vide, honoré → PAS dans _MODELS_IGNORE_*.
+                           "qwen3.8", "qwen3-8-flash")
 # Subset of _MODELS_AUTO_OPEN_THINK that IGNORES the `enable_thinking`
 # kwarg and always wraps reasoning in <think>...</think>. Per MiniMax M2
 # docs (2026-05-20 update): "The model's reasoning is wrapped in <think>
@@ -6931,7 +6938,7 @@ def _initial_default_config() -> Optional[dict]:
 #   major (1.7.2 → 2.0.0) — breaking API or topology change
 #
 # Use `./scripts/bump-version.sh patch|minor|major` to bump + auto-commit.
-APP_VERSION = "1.52.1"
+APP_VERSION = "1.52.2"
 
 app = FastAPI(
     title="OdyssAI-X (odyssai.eu)",
