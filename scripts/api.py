@@ -5303,7 +5303,15 @@ _MODELS_AUTO_OPEN_THINK = ("minimax", "qwen3.5", "qwen3.6", "step-3.7", "step3p7
                            # prod 2026-09-24 : reasoning_content vide, tout dans
                            # `content`). Thinking-off → `<think>\n\n</think>`
                            # vide, honoré → PAS dans _MODELS_IGNORE_*.
-                           "qwen3.8", "qwen3-8-flash")
+                           "qwen3.8", "qwen3-8-flash",
+                           # Step-5-Preview (model_type step4, fuite du 2026-09-20) —
+                           # chat_template.jinja termine le prompt par
+                           # `<|im_start|>assistant\n<think>` ; le modèle émet le
+                           # raisonnement + `</think>` en clair (vérifié 2026-09-24 sur
+                           # hades : reasoning_content vide, tout dans `content`).
+                           # Pas de kwarg enable_thinking dans le template
+                           # (reasoning_effort seulement) → aussi dans _MODELS_IGNORE_*.
+                           "step-5", "step5", "step4")
 # Subset of _MODELS_AUTO_OPEN_THINK that IGNORES the `enable_thinking`
 # kwarg and always wraps reasoning in <think>...</think>. Per MiniMax M2
 # docs (2026-05-20 update): "The model's reasoning is wrapped in <think>
@@ -5325,6 +5333,9 @@ _MODELS_AUTO_OPEN_THINK = ("minimax", "qwen3.5", "qwen3.6", "step-3.7", "step3p7
 # content (the exact Companion-ghost failure this list exists to avoid for
 # models that DO honor the flag — see Qwen3.5/3.6 note above).
 _MODELS_IGNORE_ENABLE_THINKING_FLAG = ("minimax-m2", "step-3.7", "step3p7",
+                                       # Step-5-Preview : toujours en thinking (pas de
+                                       # enable_thinking dans le template), comme Step-3.7.
+                                       "step-5", "step5", "step4",
                                        # K3 is always-thinking by design (reasoning_effort,
                                        # not enable_thinking) and emits its response envelope
                                        # in every mode — the filter must stay on to strip it.
