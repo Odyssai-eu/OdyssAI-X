@@ -33,7 +33,7 @@
 #
 # Env overrides:
 #   VLM_VENV      target venv path      (default <remote $HOME>/.venvs/mlx-vlm)
-#   MLX_VLM_REF   git ref of mlx-vlm    (default ecc457b)
+#   MLX_VLM_REF   git ref of mlx-vlm    (default v0.7.2 — 0.6.3 + mlx 0.32 crashes Qwen3.5 in server mode, mlx-vlm #1614)
 #   PY312         python3.12 executable (default python3.12)
 set -euo pipefail
 
@@ -50,7 +50,7 @@ fi
 REMOTE_HOME="$(ssh -o ConnectTimeout=10 -o BatchMode=yes "$SSH_TARGET" 'printf %s "$HOME"')"
 REMOTE_USER="$(ssh -o ConnectTimeout=10 -o BatchMode=yes "$SSH_TARGET" 'id -un')"
 VLM_VENV="${VLM_VENV:-$REMOTE_HOME/.venvs/mlx-vlm}"
-MLX_VLM_REF="${MLX_VLM_REF:-ecc457b}"
+MLX_VLM_REF="${MLX_VLM_REF:-v0.7.2}"
 PY312="${PY312:-python3.12}"
 MLX_VLM_SPEC="git+https://github.com/Blaizzy/mlx-vlm.git@${MLX_VLM_REF}"
 
