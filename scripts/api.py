@@ -3811,21 +3811,26 @@ async def _tcp_port_open(ip: str, port: int, timeout: float = 2.0) -> bool:
         return False
 
 
-async def _vlm_served_model(ip: str, port: int, timeout: float = 5.0) -> Optional[str]:
-    """Model id an mlx_vlm.server on ip:port advertises, or None when nothing
-    answers /v1/models."""
+async def _vlm_served_model(ip: str, port: int, wanted: str,
+                            timeout: float = 5.0) -> Optional[str]:
+    """What an mlx_vlm.server on ip:port serves, for adoption decisions.
+    None = nothing answers. Otherwise the id matching `wanted` if the server
+    lists it, else the first LOCAL path it lists (a loaded model — HF cache
+    entries are repo ids, not paths), else "<unknown>" (a server is up but
+    shows no loaded path: never adopted)."""
     import httpx
     try:
         async with httpx.AsyncClient(timeout=timeout) as client:
             r = await client.get(f"http://{ip}:{port}/v1/models")
-        data = (r.json() or {}).get("data") if r.status_code < 400 else None
-        if isinstance(data, list) and data and isinstance(data[0], dict):
-            mid = data[0].get("id")
-            if isinstance(mid, str) and mid:
-                return mid
+        if r.status_code >= 400:
+            return "<unknown>"
+        data = (r.json() or {}).get("data") or []
+        ids = [d.get("id") for d in data if isinstance(d, dict)]
+        return (_vlm_pick_model_id(ids, wanted)
+                or next((i for i in ids if isinstance(i, str) and i.startswith("/")), None)
+                or "<unknown>")
     except Exception:
-        pass
-    return None
+        return None
 
 
 def _same_model_path(served: str, wanted: str) -> bool:
@@ -3924,7 +3929,7 @@ class VLMReplicaPool:
         one. Raises on a foreign model on the port or a launch that never gets
         ready (the half-started server is killed so it can't hold RAM)."""
         c = self.children[i]
-        served = await _vlm_served_model(self._ip(i), c.port)
+        served = await _vlm_served_model(self._ip(i), c.port, c.model_path)
         if served is not None:
             if _same_model_path(served, c.model_path):
                 sys.stderr.write(
@@ -15756,6 +15761,22 @@ async def _telemak_proxy_chat_completion(
     return StreamingResponse(_gen(), media_type="text/event-stream")
 
 
+def _vlm_pick_model_id(ids: list, wanted: str) -> Optional[str]:
+    """mlx_vlm.server's /v1/models lists the node's Hugging Face cache FIRST
+    and appends the model(s) it actually loaded at the END (mlx-vlm 0.6.3
+    server/app.py models_endpoint). Taking data[0] sent a random cached repo
+    (a Qwen3.8 MTP drafter on the replica nodes, 2026-09-24) and the server
+    tried to load it. Match the id of the path this pool launched instead."""
+    ids = [i for i in ids if isinstance(i, str) and i]
+    for i in ids:
+        if i.rstrip("/") == wanted.rstrip("/"):
+            return i
+    for i in ids:
+        if i.startswith("/") and _same_model_path(i, wanted):
+            return i
+    return None
+
+
 async def _vlm_upstream_model_id(upstream: str, fallback: str) -> str:
     """Ask a VL pool's mlx_vlm.server what model id it serves (GET /v1/models).
     mlx_vlm.server advertises the checkpoint path it was launched with; we must
@@ -15767,9 +15788,9 @@ async def _vlm_upstream_model_id(upstream: str, fallback: str) -> str:
         async with httpx.AsyncClient(timeout=5.0) as client:
             r = await client.get(url)
         data = (r.json() or {}).get("data") if r.status_code < 400 else None
-        if isinstance(data, list) and data and isinstance(data[0], dict):
-            mid = data[0].get("id")
-            if isinstance(mid, str) and mid:
+        if isinstance(data, list):
+            mid = _vlm_pick_model_id([d.get("id") for d in data if isinstance(d, dict)], fallback)
+            if mid:
                 return mid
     except Exception:
         pass
@@ -17250,7 +17271,7 @@ async def _load_vlm_replica(cluster_id: str, alias: str, req, model_path: str,
     # (never adopt or kill a server this load didn't start).
     for n in topo:
         ip = _vlm_ip_from_ssh(n["ssh"])
-        served = await _vlm_served_model(ip, port)
+        served = await _vlm_served_model(ip, port, model_path)
         if served is not None and not _same_model_path(served, model_path):
             raise HTTPException(
                 409,

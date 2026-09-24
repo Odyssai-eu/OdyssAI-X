@@ -8,6 +8,8 @@ mlx_vlm.server instances on 127.0.0.1. No node, no model. Covers:
   5. streaming: in-flight counted until the stream is consumed
   6. adoption only when the port serves THIS model
   7. state: is_vlm_replica is saved and restored BEFORE is_replica
+  9. the model id sent upstream is the loaded path, not the first
+     (HF cache) entry of /v1/models
   8. an image in the latest user message to a text pool -> 400;
      an image in an older turn does not block
 Run: ODYSSAI_X_STATE_DIR=$(mktemp -d) CLUSTER_CONFIG_FILE=$(mktemp -d)/cc.json python3 scripts/test_vlm_replica.py
@@ -24,7 +26,7 @@ REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(REPO, "scripts"))
 import uvicorn  # noqa: E402
 from fastapi import FastAPI, Request  # noqa: E402
-from fastapi.responses import StreamingResponse  # noqa: E402
+from fastapi.responses import JSONResponse, StreamingResponse  # noqa: E402
 import api  # noqa: E402
 
 FAILS = []
@@ -50,12 +52,15 @@ def fake_server(name, port, served=MODEL, delay=0.4):
 
     @app.get("/v1/models")
     def models():
-        return {"data": [{"id": served}]}
+        # Real mlx_vlm.server order: HF cache repos first, loaded path last.
+        return {"data": [{"id": "kikekewl/Qwen3.8-Flash-Next-MLX-BF16-MTP-Drafter"}, {"id": served}]}
 
     @app.post("/v1/chat/completions")
     async def cc(r: Request):
         b = await r.json()
         HITS.setdefault(name, []).append(b)
+        if b.get("model") != served:
+            return JSONResponse({"detail": f"Failed to load model: {b.get('model')}"}, status_code=500)
         await asyncio.sleep(delay)
         if b.get("stream"):
             async def gen():
@@ -181,6 +186,11 @@ check("8 image in an older turn does not block", True, True)
 ANT = [{"role": "user", "content": [{"type": "image", "source": {"type": "base64", "data": "AAA"}}]}]
 check("8 anthropic image block detected", api._last_user_has_image(ANT), True)
 check("8 plain text not an image", api._last_user_has_image([{"role": "user", "content": "hi"}]), False)
+check("pick id: loaded path, not the HF cache entry",
+      api._vlm_pick_model_id(["org/cached-repo", MODEL], MODEL), MODEL)
+check("pick id: basename match on a local path",
+      api._vlm_pick_model_id(["org/cached", "/other/root/Fake-VL-Model"], MODEL), "/other/root/Fake-VL-Model")
+check("pick id: nothing matching -> None", api._vlm_pick_model_id(["org/cached"], MODEL), None)
 check("same model path by basename", api._same_model_path("/a/b/Fake-VL-Model/", MODEL), True)
 
 if FAILS:
