@@ -33,7 +33,8 @@
 #
 # Env overrides:
 #   VLM_VENV      target venv path      (default <remote $HOME>/.venvs/mlx-vlm)
-#   MLX_VLM_REF   git ref of mlx-vlm    (default v0.7.2 — 0.6.3 + mlx 0.32 crashes Qwen3.5 in server mode, mlx-vlm #1614)
+#   MLX_VLM_REF   git ref of mlx-vlm    (default b5952d7 = v0.7.2 + MiMo-V2.6-Flash-RL support #2327;
+#                 0.6.3 + mlx 0.32 crashes Qwen3.5 in server mode, mlx-vlm #1614)
 #   PY312         python3.12 executable (default python3.12)
 set -euo pipefail
 
@@ -50,7 +51,7 @@ fi
 REMOTE_HOME="$(ssh -o ConnectTimeout=10 -o BatchMode=yes "$SSH_TARGET" 'printf %s "$HOME"')"
 REMOTE_USER="$(ssh -o ConnectTimeout=10 -o BatchMode=yes "$SSH_TARGET" 'id -un')"
 VLM_VENV="${VLM_VENV:-$REMOTE_HOME/.venvs/mlx-vlm}"
-MLX_VLM_REF="${MLX_VLM_REF:-v0.7.2}"
+MLX_VLM_REF="${MLX_VLM_REF:-b5952d7c97da3cfc5014ff0a81bfe2e59d919cab}"
 PY312="${PY312:-python3.12}"
 MLX_VLM_SPEC="git+https://github.com/Blaizzy/mlx-vlm.git@${MLX_VLM_REF}"
 
@@ -96,6 +97,12 @@ fi
 #    pin is already satisfied, so re-runs are cheap.
 echo "[install-mlx-vlm] pip install \$SPEC torch torchvision"
 "\$VENV/bin/python" -m pip install "\$SPEC" torch torchvision
+# Several refs share the version string "0.7.2" (the v0.7.2 tag and the
+# b5952d7 main commit): pip then sees the requirement as satisfied and keeps
+# the OLD code (mimo_v2 was missing on .30-.33 on 2026-09-24). Reinstall
+# mlx-vlm itself from the exact ref, deps untouched. The patch step below
+# runs after, so it is re-applied on the fresh files.
+"\$VENV/bin/python" -m pip install --force-reinstall --no-deps "\$SPEC"
 
 # 3. smoke import — fails loudly if the VL model module isn't present.
 echo "[install-mlx-vlm] smoke import"
