@@ -5318,6 +5318,38 @@ class ChatMessage(BaseModel):
     tool_call_id: Optional[str] = None
 
 
+def _thinking_from_aliases(d: dict) -> Optional[bool]:
+    """Other spellings clients use for the thinking switch (2026-09-24).
+    Undeclared, pydantic dropped them silently and the model thought anyway.
+      - chat_template_kwargs.enable_thinking / .thinking  (vLLM / SGLang / LiteLLM)
+      - thinking: bool                                   (some OpenAI-compat clients)
+      - thinking: {"type": "enabled" | "disabled"}        (Anthropic shape)
+    Returns None when none of them is set."""
+    ctk = d.get("chat_template_kwargs")
+    if isinstance(ctk, dict):
+        for k in ("enable_thinking", "thinking"):
+            if isinstance(ctk.get(k), bool):
+                return ctk[k]
+    t = d.get("thinking")
+    if isinstance(t, bool):
+        return t
+    if isinstance(t, dict) and t.get("type") in ("enabled", "disabled"):
+        return t["type"] == "enabled"
+    return None
+
+
+def _effort_from_aliases(d: dict) -> Optional[Union[int, str]]:
+    """Other spellings of the effort dial: reasoning.effort (OpenRouter /
+    Responses shape) and chat_template_kwargs.reasoning_effort."""
+    r = d.get("reasoning")
+    if isinstance(r, dict) and r.get("effort") not in (None, ""):
+        return r["effort"]
+    ctk = d.get("chat_template_kwargs")
+    if isinstance(ctk, dict) and ctk.get("reasoning_effort") not in (None, ""):
+        return ctk["reasoning_effort"]
+    return None
+
+
 class ChatCompletionRequest(BaseModel):
     model: Optional[str] = None
     messages: list[ChatMessage]
@@ -5372,6 +5404,25 @@ class ChatCompletionRequest(BaseModel):
     presence_penalty: Optional[float] = None
     frequency_penalty: Optional[float] = None
     seed: Optional[int] = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def _thinking_effort_aliases(cls, data):
+        """Fold the alias spellings of thinking / effort into the two canonical
+        fields. The canonical field always wins when the client set it; the
+        aliases themselves are not kept (they never reach an upstream raw)."""
+        if not isinstance(data, dict):
+            return data
+        d = dict(data)
+        if d.get("enable_thinking") is None:
+            v = _thinking_from_aliases(d)
+            if v is not None:
+                d["enable_thinking"] = v
+        if d.get("reasoning_effort") in (None, ""):
+            e = _effort_from_aliases(d)
+            if e is not None:
+                d["reasoning_effort"] = e
+        return d
 
     @model_validator(mode="after")
     def _alias_max_completion_tokens(self) -> "ChatCompletionRequest":
@@ -8699,6 +8750,7 @@ async def _proxy_anthropic_messages(prov_id: str, prov: dict, entry: dict,
     # Build the upstream body. Pydantic gives us a clean dict; we just swap
     # the model id and drop our internal fields.
     body = req.model_dump(exclude_none=True)
+    body.pop("reasoning_effort", None)   # OdyssAI-X extension, unknown to Anthropic
     body["model"] = upstream_model
     body.pop("metadata", None)  # Anthropic accepts it, but we strip session-id hints
 
@@ -10822,6 +10874,15 @@ class AnthropicMessagesRequest(BaseModel):
     tool_choice: Optional[Any] = None
     stream: Optional[bool] = False
     temperature: Optional[float] = None
+    # 2026-09-24: declared so they reach the pool / upstream instead of being
+    # silently dropped by pydantic. `thinking` is Anthropic's own switch
+    # ({"type": "enabled", "budget_tokens": N} | {"type": "disabled"}).
+    top_p: Optional[float] = None
+    top_k: Optional[int] = None
+    thinking: Optional[dict] = None
+    # OdyssAI-X extension (same dial as chat's reasoning_effort). Never sent
+    # to api.anthropic.com (stripped in _proxy_anthropic_messages).
+    reasoning_effort: Optional[Union[int, str]] = None
     stop_sequences: Optional[list[str]] = None
     metadata: Optional[dict] = None  # we read user_id as a session id when present
 
@@ -11084,6 +11145,11 @@ async def anthropic_messages(req: AnthropicMessagesRequest, request: Request):
     oa_tools = _antc_tools_to_openai(req.tools)
     msg_id = "msg_" + uuid.uuid4().hex[:24]
     model_id = pool.model
+    # Client's thinking switch + effort (2026-09-24): until 1.52.1 both were
+    # dropped and every /v1/messages call ran with the template default and
+    # the model's default effort. None keeps that default.
+    _antc_thinking = _thinking_from_aliases({"thinking": req.thinking})
+    _antc_effort = req.reasoning_effort or _default_reasoning_effort(model_id)
     client_ip = request.client.host if request.client else "?"
     prompt_chars = sum(len(m.get("content") or "") for m in oa_messages)
     # Prefix-cache session id: header > metadata.user_id (Anthropic convention).
@@ -11100,11 +11166,11 @@ async def anthropic_messages(req: AnthropicMessagesRequest, request: Request):
         tool_calls: list[dict] = []
         session_meta: dict = {}
         t_start = time.time()
-        async for ev in pool.submit(None, req.max_tokens, None,
+        async for ev in pool.submit(None, req.max_tokens, _antc_thinking,
                                     messages=oa_messages, tools=oa_tools,
                                     session_id=session_id,
                                     request_id=msg_id,
-                                    reasoning_effort=_default_reasoning_effort(model_id)):
+                                    reasoning_effort=_antc_effort):
             # P8.1 — re-stamp per chunk (in-flight coverage, cf chat path).
             _CLUSTER_LAST_SERVED[pool.cluster] = time.time()
             if ev.get("event") == "token":
@@ -11178,11 +11244,11 @@ async def anthropic_messages(req: AnthropicMessagesRequest, request: Request):
             text_block_open = True
 
             tool_calls_final: list[dict] = []
-            async for ev in pool.submit(None, req.max_tokens, None,
+            async for ev in pool.submit(None, req.max_tokens, _antc_thinking,
                                         messages=oa_messages, tools=oa_tools,
                                         session_id=session_id,
                                         request_id=msg_id,
-                                        reasoning_effort=_default_reasoning_effort(model_id)):
+                                        reasoning_effort=_antc_effort):
                 # P8.1 — re-stamp per chunk (in-flight coverage, cf chat path).
                 _CLUSTER_LAST_SERVED[pool.cluster] = time.time()
                 if await request.is_disconnected():
