@@ -162,7 +162,7 @@ ssh -o ConnectTimeout=10 -o BatchMode=yes "$SSH_TARGET" "$VLM_VENV/bin/python -"
 #    server's generation thread then evaluates it and MLX raises "There is no
 #    Stream(gpu, N) in current thread" — every audio request fails with a 500.
 #    Materialising the codes where they are built fixes it. Reported upstream
-#    (Blaizzy/mlx-vlm); drop this step once the pinned ref carries the fix.
+#    (Blaizzy/mlx-vlm#2352); drop this step once the pinned ref carries the fix.
 echo "[install-mlx-vlm] applying MiMo audio_codes eval patch"
 AUDIO_PATCH_SCRIPT=$(cat <<'PYEOF'
 path = "VENV_PLACEHOLDER/lib/python3.12/site-packages/mlx_vlm/models/mimo_v2/processing.py"

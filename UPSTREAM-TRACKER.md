@@ -23,6 +23,7 @@ Rules for the table (the skill parses it):
 | ml-explore/mlx | 4278 | comment | JACCL never detects a lost peer (survivors at 100% CPU) | same as 3910; our 5-node measurements are posted | 2026-09-21 | none, follows #4530 | - |
 | ml-explore/mlx | 4192 | comment | SIGSEGV in tbt_post_recv on Thunderbolt link loss (Apple libthunderboltrdma) | anyone's result on macOS 27; Apple fix | 2026-09-21 | if nobody answers on 27: test one node in 27 ourselves (see docs/PLAN-jaccl) | 2026-10-05 |
 | ml-explore/mlx | 3467 | comment | RTR errno 22 after GID selection regression | fix merged upstream (our patch carries the workaround) | 2026-09-21 | none | - |
+| Blaizzy/mlx-vlm | 2352 | pr | MiMo-V2.6 audio requests fail across threads in mlx_vlm.server (`mx.eval(audio_codes)`) | review + merge; `install-mlx-vlm.sh` step 5 patches it locally until then | 2026-09-24 | when merged: bump the pin past it and drop step 5 | 2026-10-08 |
 | ml-explore/mlx-lm | 1788 | comment | Qwen3.8-Flash-Next (qwen4_exp) support | merge; we run our own carve-out (mlx_models/qwen4_exp) until then | 2026-09-21 | re-test against the branch when it merges, drop our carve-out | - |
 | exo-explore/exo | 1847 | issue | jaccl RDMA crashes on M3 Ultra (errno 2/60/22) | nothing more; solved on our side, kept for visibility (Alex Cheema call 2026-09-17) | 2026-09-21 | close it ourselves with a pointer to #4530 once merged | - |
 | exo-explore/exo | 1831 | issue | Mistral Large 3 support | dormant | 2026-09-21 | close if still silent at next pass | 2026-10-15 |
