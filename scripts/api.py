@@ -3790,6 +3790,351 @@ class VLMPool:
         self.runners.clear()
 
 
+VLM_REPLICA_WATCHDOG_S = float(env_get("VLM_REPLICA_WATCHDOG_S", "30"))
+VLM_REPLICA_BACKOFF_S = (60.0, 120.0, 300.0, 900.0)
+
+
+async def _tcp_port_open(ip: str, port: int, timeout: float = 2.0) -> bool:
+    """Is something listening on ip:port? A TCP connect is answered by the
+    kernel even while mlx_vlm.server is busy in a long prefill, so this is a
+    liveness test that a busy-but-healthy server always passes (an HTTP probe
+    could time out on it)."""
+    try:
+        _r, w = await asyncio.wait_for(asyncio.open_connection(ip, port), timeout)
+        w.close()
+        try:
+            await w.wait_closed()
+        except Exception:
+            pass
+        return True
+    except Exception:
+        return False
+
+
+async def _vlm_served_model(ip: str, port: int, timeout: float = 5.0) -> Optional[str]:
+    """Model id an mlx_vlm.server on ip:port advertises, or None when nothing
+    answers /v1/models."""
+    import httpx
+    try:
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            r = await client.get(f"http://{ip}:{port}/v1/models")
+        data = (r.json() or {}).get("data") if r.status_code < 400 else None
+        if isinstance(data, list) and data and isinstance(data[0], dict):
+            mid = data[0].get("id")
+            if isinstance(mid, str) and mid:
+                return mid
+    except Exception:
+        pass
+    return None
+
+
+def _same_model_path(served: str, wanted: str) -> bool:
+    a, b = served.rstrip("/"), wanted.rstrip("/")
+    return a == b or a.rsplit("/", 1)[-1] == b.rsplit("/", 1)[-1]
+
+
+class VLMReplicaPool:
+    """Replica (data-parallel) serving of a VISION model (#76, 2026-09-24):
+    one mlx_vlm.server per node of a `kind: replica` cluster, each holding a
+    full copy; a request goes to ONE server — session affinity, else the
+    least in-flight. The text ReplicaPool is untouched: its children are
+    RunnerProcs (token submit, runner-based healing), these are HTTP servers
+    proxied through `_vlm_pool_proxy_chat_completion`.
+
+    Children are plain VLMPool objects that are NOT registered in the pool
+    registry (only this parent is): `_route_pool` rule 3 matches by model path
+    over every registered pool, so registered members would bypass the
+    dispatch. They carry the parent alias so per-pool activity and response
+    `model` show the parent.
+
+    Liveness: TCP connect to the child's port before each dispatch (answered
+    by the kernel even during a long prefill) and every VLM_REPLICA_WATCHDOG_S
+    in the watchdog, which relaunches a dead child with backoff — or adopts a
+    server already serving THIS model on the port; a server serving another
+    model is never adopted nor killed. `alive_count()` keeps VLMPool's
+    sentinel (≥1) so the dead-pool purge never tears the servers down on a
+    transient probe miss; the per-replica truth is in `replica_stats()`."""
+
+    is_vlm = True
+    vlm_proxy = True
+    is_vlm_replica = True
+
+    def __init__(self, model_path: str, cluster: str, alias: str,
+                 node_indices: list[int], port: int, venv: str,
+                 ready_timeout: Optional[float] = None):
+        self.model = model_path
+        self.model_path = model_path
+        self.cluster = cluster
+        self.alias = alias or cluster
+        self.node_indices = list(node_indices)
+        self.nodes_count = len(self.node_indices)
+        self.mode = "vlm-replica"
+        self.use_ap = False
+        self.kv_q8 = False
+        self.batch = False
+        self.draft_model: Optional[str] = None
+        self.num_draft_tokens = 4
+        self.runners: list = []
+        self.backend = "http-proxy"
+        self.port = int(port)
+        self.venv = venv
+        self.ready_timeout = float(ready_timeout or VLM_READY_TIMEOUT_S)
+        try:
+            self.nodes = build_topology_from_indices(cluster, self.node_indices)
+        except Exception:
+            self.nodes = []
+        self.children: list[VLMPool] = []
+        for i, idx in enumerate(self.node_indices):
+            n = self.nodes[i] if i < len(self.nodes) else {}
+            ssh = n.get("ssh") or ""
+            host = n.get("host") or _host_id_from_ssh(ssh)
+            ip = _vlm_ip_from_ssh(ssh) if ssh else ""
+            self.children.append(VLMPool(
+                model_path=model_path, cluster=cluster, alias=self.alias,
+                node_indices=[idx], upstream=f"http://{ip}:{self.port}",
+                port=self.port, ssh_target=ssh, host=host, pid=None, venv=venv))
+        self._live: set[int] = set()
+        self._inflight: dict[int, int] = {i: 0 for i in range(len(self.children))}
+        self._affinity: dict[str, tuple[int, float]] = {}
+        self._dispatch_lock = asyncio.Lock()
+        self._heal: dict[int, dict] = {
+            i: {"attempts": 0, "next_at": 0.0, "restarts": 0, "restarting": False,
+                "last_error": None, "died_at": None}
+            for i in range(len(self.children))}
+        self._watchdog_task: Optional[asyncio.Task] = None
+        self._stopping = False
+        self.started_at: Optional[float] = None
+        self.load_s: Optional[float] = None
+        self.last_used_at: float = time.time()
+        self.last_token_at: float = time.monotonic()
+        self.ttl_seconds: int = 0
+        self.degraded: bool = False
+        self.degraded_reason: Optional[str] = None
+        self.degraded_at: Optional[float] = None
+        self.maintenance: bool = False
+
+    def _log_id(self, i: int) -> str:
+        return _vlm_pool_log_id(self.cluster, f"{self.alias}-r{i}")
+
+    def _ip(self, i: int) -> str:
+        return _vlm_ip_from_ssh(self.children[i].ssh_target)
+
+    async def _start_child(self, i: int) -> None:
+        """Adopt a server already serving this model on the port, else launch
+        one. Raises on a foreign model on the port or a launch that never gets
+        ready (the half-started server is killed so it can't hold RAM)."""
+        c = self.children[i]
+        served = await _vlm_served_model(self._ip(i), c.port)
+        if served is not None:
+            if _same_model_path(served, c.model_path):
+                sys.stderr.write(
+                    f"[vlm-replica] {self.cluster}[{self.alias}] replica {i} "
+                    f"({c.host}): {c.upstream} already serves this model — adopted\n")
+                return
+            raise RuntimeError(
+                f"{c.host}:{c.port} already serves another model ({served}) — "
+                f"not touching it")
+        ready, pid, tail = await _launch_vlm_server(
+            c.ssh_target, self._log_id(i), c.model_path, c.port, c.venv,
+            self.ready_timeout)
+        if not ready:
+            try:
+                await c.stop()
+            except Exception:
+                pass
+            raise RuntimeError(
+                f"mlx_vlm.server not ready on {c.upstream} ({c.host}). "
+                f"Log tail: {(tail or '')[-600:]}")
+        c.pid = pid
+
+    def _note_failure(self, i: int, err) -> None:
+        h = self._heal[i]
+        h["died_at"] = time.time()
+        h["last_error"] = str(err)[:300]
+        h["next_at"] = time.time() + VLM_REPLICA_BACKOFF_S[
+            min(h["attempts"], len(VLM_REPLICA_BACKOFF_S) - 1)]
+        h["attempts"] += 1
+
+    async def start(self):
+        t0 = time.time()
+        results = await asyncio.gather(
+            *(self._start_child(i) for i in range(len(self.children))),
+            return_exceptions=True)
+        for i, res in enumerate(results):
+            if isinstance(res, Exception):
+                sys.stderr.write(
+                    f"[vlm-replica] {self.cluster}[{self.alias}] replica {i} "
+                    f"({self.children[i].host}) failed to start: {res}\n")
+                self._note_failure(i, res)
+            else:
+                self._live.add(i)
+        if not self._live:
+            raise RuntimeError(
+                f"vlm replica pool {self.cluster}[{self.alias}]: no replica started — "
+                + "; ".join(str(r)[:200] for r in results if isinstance(r, Exception)))
+        self.started_at = time.time()
+        self.load_s = self.started_at - t0
+        sys.stderr.write(
+            f"[vlm-replica] {self.cluster}[{self.alias}] up: "
+            f"{len(self._live)}/{len(self.children)} replicas in {self.load_s:.1f}s\n")
+        self._stopping = False
+        self._watchdog_task = asyncio.create_task(self._watchdog())
+
+    async def _watchdog(self):
+        while not self._stopping:
+            try:
+                await asyncio.sleep(VLM_REPLICA_WATCHDOG_S)
+                if self._stopping:
+                    return
+                for i, c in enumerate(self.children):
+                    up = await _tcp_port_open(self._ip(i), c.port)
+                    if i in self._live and not up:
+                        self._live.discard(i)
+                        self._note_failure(i, "port closed")
+                        sys.stderr.write(
+                            f"[vlm-replica] {self.cluster}[{self.alias}] replica {i} "
+                            f"({c.host}) down (port {c.port} closed)\n")
+                    elif i not in self._live:
+                        h = self._heal[i]
+                        if h.get("restarting") or time.time() < h["next_at"]:
+                            continue
+                        h["restarting"] = True
+                        try:
+                            await self._start_child(i)
+                            self._live.add(i)
+                            h.update({"attempts": 0, "restarting": False,
+                                      "restarts": h["restarts"] + 1,
+                                      "last_error": None})
+                            sys.stderr.write(
+                                f"[vlm-replica] {self.cluster}[{self.alias}] replica "
+                                f"{i} ({c.host}) back\n")
+                        except Exception as e:
+                            h["restarting"] = False
+                            self._note_failure(i, e)
+            except asyncio.CancelledError:
+                return
+            except Exception as e:
+                sys.stderr.write(f"[vlm-replica] watchdog error: {e}\n")
+
+    async def _pick(self, session_id: Optional[str], exclude: set) -> int:
+        """Choose a replica AND reserve a slot on it (in-flight +1) under the
+        dispatch lock, so a burst of concurrent requests sees each other's
+        reservations instead of all picking the same idle replica."""
+        async with self._dispatch_lock:
+            now = time.time()
+            for s in [s for s, (_, ts) in self._affinity.items()
+                      if now - ts > REPLICA_AFFINITY_TTL_S]:
+                self._affinity.pop(s, None)
+            live = sorted(i for i in self._live if i not in exclude)
+            if not live:
+                raise HTTPException(
+                    503, f"vlm replica pool {self.cluster}[{self.alias}]: no live replica")
+            least = min(self._inflight[i] for i in live)
+            if session_id and session_id in self._affinity:
+                home, _ = self._affinity[session_id]
+                # Stay home unless it is clearly busier than the least-busy one.
+                if home in live and self._inflight[home] <= least + 1:
+                    self._affinity[session_id] = (home, now)
+                    self._inflight[home] += 1
+                    return home
+            idx = min(live, key=lambda i: self._inflight[i])
+            if session_id:
+                self._affinity[session_id] = (idx, now)
+            self._inflight[idx] += 1
+            return idx
+
+    async def dispatch(self, body: dict, stream: bool, session_id: Optional[str] = None):
+        """Proxy one chat request to one replica. A replica whose port is
+        closed, or whose upstream is unreachable before any byte reached the
+        client, is marked down and the request goes to another one. Once a
+        stream has started, an upstream failure is the stream's own SSE error
+        (the client already has a 200)."""
+        tried: set = set()
+        while True:
+            idx = await self._pick(session_id, tried)     # slot reserved
+            tried.add(idx)
+            c = self.children[idx]
+            released = False
+
+            def _release(i=idx):
+                nonlocal released
+                if not released:
+                    released = True
+                    self._inflight[i] = max(0, self._inflight[i] - 1)
+            if not await _tcp_port_open(self._ip(idx), c.port):
+                _release()
+                self._live.discard(idx)
+                self._note_failure(idx, "port closed at dispatch")
+                if session_id:
+                    self._affinity.pop(session_id, None)
+                continue
+            try:
+                resp = await _vlm_pool_proxy_chat_completion(
+                    c, body, stream, label=self.alias)
+            except HTTPException as e:
+                _release()
+                if e.status_code == 502:
+                    self._live.discard(idx)
+                    self._note_failure(idx, e.detail)
+                    if session_id:
+                        self._affinity.pop(session_id, None)
+                    continue
+                raise
+            except Exception:
+                _release()
+                raise
+            self.last_used_at = time.time()
+            self.last_token_at = time.monotonic()
+            if isinstance(resp, StreamingResponse):
+                orig = resp.body_iterator
+
+                async def _counted():
+                    try:
+                        async for chunk in orig:
+                            yield chunk
+                    finally:
+                        _release()
+                resp.body_iterator = _counted()
+            else:
+                _release()
+            return resp
+
+    def alive_count(self) -> int:
+        return max(1, len(self._live))
+
+    def is_idle(self) -> bool:
+        return not self.maintenance and all(v == 0 for v in self._inflight.values())
+
+    def replica_stats(self) -> list[dict]:
+        now = time.time()
+        out = []
+        for i, c in enumerate(self.children):
+            h = self._heal.get(i, {})
+            row = {"index": i, "node": self.node_indices[i], "host": c.host,
+                   "live": i in self._live, "busy_count": self._inflight.get(i, 0),
+                   "restarts": h.get("restarts", 0), "upstream": c.upstream}
+            if i not in self._live:
+                row.update({
+                    "restarting": bool(h.get("restarting")),
+                    "attempts": h.get("attempts", 0),
+                    "next_retry_in_s": (None if h.get("restarting")
+                                        else max(0.0, round(h.get("next_at", 0.0) - now, 1))),
+                    "fatal": False,
+                    "last_error": h.get("last_error"),
+                    "died_at": h.get("died_at"),
+                })
+            out.append(row)
+        return out
+
+    async def stop(self):
+        self._stopping = True
+        t = self._watchdog_task
+        if t is not None and not t.done():
+            t.cancel()
+        await asyncio.gather(*(c.stop() for c in self.children), return_exceptions=True)
+        self._live.clear()
+
+
 class DFlashPool:
     """A single-node `mlx-dspark serve --mode dflash` server, engine-managed and
     proxied under a cluster as a TEXT pool (B1, 2026-08-06).
@@ -4527,6 +4872,19 @@ def save_cluster_state_v2(cluster_id: str, *,
         # checked BEFORE is_vlm because VLMDistPool also carries is_vlm=True
         # (badge), but has no port/upstream and restores through start(),
         # not through the mlx_vlm.server relaunch.
+        # VL replica (#76): own key, checked FIRST — it must never be restored
+        # as a text ReplicaPool (runner.py on a vision checkpoint, N nodes).
+        if getattr(pool, "is_vlm_replica", False):
+            pools_payload.append({
+                "alias": alias,
+                "model": pool.model,
+                "is_vlm_replica": True,
+                "node_indices": list(pool.node_indices),
+                "nodes": pool.nodes_count,
+                "port": pool.port,
+                "venv": getattr(pool, "venv", None),
+            })
+            continue
         if getattr(pool, "is_replica", False):
             pools_payload.append({
                 "alias": alias,
@@ -5806,6 +6164,16 @@ async def _restore_cluster_pools(cid: str, leaked_hosts: Optional[set] = None,
             # (ssh-spawned ranks). Gated on the same feature flag as the load
             # path — with the flag off the entry is skipped, never mis-restored
             # as a text RunnerPool.
+            if entry.get("is_vlm_replica"):
+                vrpool = VLMReplicaPool(
+                    model_path=entry["model"], cluster=cid, alias=alias,
+                    node_indices=indices,
+                    port=int(entry.get("port") or VLM_DEFAULT_PORT),
+                    venv=entry.get("venv") or VLM_DEFAULT_VENV)
+                await vrpool.start()
+                set_pool(cid, alias, vrpool)
+                restored.append(alias)
+                continue
             if entry.get("is_replica"):
                 rpool = ReplicaPool(
                     model=entry["model"], cluster=cid, alias=alias,
@@ -6938,7 +7306,7 @@ def _initial_default_config() -> Optional[dict]:
 #   major (1.7.2 → 2.0.0) — breaking API or topology change
 #
 # Use `./scripts/bump-version.sh patch|minor|major` to bump + auto-commit.
-APP_VERSION = "1.52.2"
+APP_VERSION = "1.53.0"
 
 app = FastAPI(
     title="OdyssAI-X (odyssai.eu)",
@@ -10016,6 +10384,42 @@ def _strip_tool_calls_from_text(text: str) -> str:
     return out.strip()
 
 
+_IMAGE_PART_TYPES = ("image_url", "input_image", "image")
+
+
+def _last_user_has_image(messages) -> bool:
+    """Does the LATEST user message carry an image part? Only the latest one:
+    an image from an older turn (history kept after switching to a text
+    model) must not turn every following turn into a 400."""
+    for m in reversed(list(messages or [])):
+        role = m.get("role") if isinstance(m, dict) else getattr(m, "role", None)
+        if role != "user":
+            continue
+        content = m.get("content") if isinstance(m, dict) else getattr(m, "content", None)
+        if not isinstance(content, list):
+            return False
+        for part in content:
+            t = part.get("type") if isinstance(part, dict) else getattr(part, "type", None)
+            if t in _IMAGE_PART_TYPES:
+                return True
+        return False
+    return False
+
+
+def _refuse_image_on_text_pool(model: Optional[str], pool, messages) -> None:
+    """400 instead of silently dropping an image sent to a pool that cannot see
+    (#76 unit 1: the text runner flattened it away and answered blind)."""
+    if getattr(pool, "is_vlm", False) or not _last_user_has_image(messages):
+        return
+    vision = sorted({(alias if alias != DEFAULT_ALIAS else cid)
+                     for cid, alias, p in list_all_pools() if getattr(p, "is_vlm", False)})
+    hint = (f" Vision models loaded now: {', '.join(vision)}." if vision
+            else " No vision model is loaded right now.")
+    raise HTTPException(
+        400, f"'{model}' is a text model and cannot read images; the image in the "
+             f"last message would be ignored.{hint}")
+
+
 def _refuse_decision_alias(model: Optional[str], prov_id: str, prov: dict) -> None:
     """A systemone alias answers typed questions, never a chat. Fail loudly
     instead of forwarding a chat body to a decision server."""
@@ -10188,6 +10592,11 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
     # dflash pool (B1) is ALSO a single-node OpenAI server proxied via
     # http-proxy — same relay path, but it's a TEXT pool (is_vlm=False) so it
     # skips the vision-only guard below and routes as normal chat.
+    _refuse_image_on_text_pool(req.model, pool, req.messages)
+    if getattr(pool, "is_vlm_replica", False):
+        body = req.model_dump(exclude_none=True)
+        _vr_sid = (request.headers.get("x-session-id") or req.session_id)
+        return await pool.dispatch(body, bool(req.stream), session_id=_vr_sid)
     if (getattr(pool, "is_vlm", False) and getattr(pool, "vlm_proxy", True)) \
             or getattr(pool, "is_dflash", False):
         body = req.model_dump(exclude_none=True)
@@ -11125,6 +11534,7 @@ async def anthropic_messages(req: AnthropicMessagesRequest, request: Request):
             f"use POST /v1/chat/completions (the OpenAI shape) for it; the "
             f"Anthropic /v1/messages surface is not supported for VL pools.",
         )
+    _refuse_image_on_text_pool(req.model, pool, req.messages)
 
     # Request classification (same logic as /v1/chat/completions).
     # Anthropic shape always has max_tokens, no need to guard for None.
@@ -13880,10 +14290,13 @@ async def admin_cluster_status(cluster_id: str):
             "mode": pool.mode,
             "tokens_since_load": int(getattr(pool, "tokens_produced", 0)),
             "is_vlm": bool(getattr(pool, "is_vlm", False)),
-            "is_replica": bool(getattr(pool, "is_replica", False)),
+            "is_replica": bool(getattr(pool, "is_replica", False)
+                               or getattr(pool, "is_vlm_replica", False)),
+            "is_vlm_replica": bool(getattr(pool, "is_vlm_replica", False)),
             "batch": bool(getattr(pool, "batch", False)),
             "replicas": (pool.replica_stats()
-                         if getattr(pool, "is_replica", False) else None),
+                         if (getattr(pool, "is_replica", False)
+                             or getattr(pool, "is_vlm_replica", False)) else None),
             "use_ap": pool.use_ap,
             "nodes": pool.nodes_count,
             "node_indices": list(pool.node_indices)
@@ -14385,6 +14798,13 @@ async def admin_cluster_load(cluster_id: str, req: ArgoLoadRequest):
     # takes those. node_indices = ALL cluster nodes.
     if get_cluster_def(cluster_id).get("kind") == "replica":
         _rep_indices = list(range(len(get_cluster_def(cluster_id).get("nodes") or [])))
+        # #76 — a VISION checkpoint on a replica cluster: one mlx_vlm.server per
+        # node (VLMReplicaPool), never text RunnerPools (which would load it
+        # text-only or die). force=true keeps the old text behaviour.
+        _rep_arch = await get_model_arch_meta(rank0_ssh, model_abspath)
+        if _rep_arch.get("is_vision") and not getattr(req, "force", False):
+            return await _load_vlm_replica(cluster_id, alias, req, model_abspath,
+                                           _rep_indices, rank0_ssh)
         # Feed the SAME loading-progress state the distributed and VLM paths
         # use (mirror of the 2026-07-08 VLM fix). Without it /status reports
         # `loading: null` for the whole fan-out, so the dashboard shows no
@@ -15356,7 +15776,8 @@ async def _vlm_upstream_model_id(upstream: str, fallback: str) -> str:
     return fallback
 
 
-async def _vlm_pool_proxy_chat_completion(pool, body: dict, stream: bool):
+async def _vlm_pool_proxy_chat_completion(pool, body: dict, stream: bool,
+                                          label: Optional[str] = None):
     """Proxy a /v1/chat/completions request to a VL pool's mlx_vlm.server
     (Argo-VLM fold). Mirrors `_telemak_proxy_chat_completion` — body forward,
     `<think>` → reasoning_content split, usage-chunk passthrough — but pointed
@@ -15369,7 +15790,7 @@ async def _vlm_pool_proxy_chat_completion(pool, body: dict, stream: bool):
     upstream = (getattr(pool, "upstream", "") or "").rstrip("/")
     if not upstream:
         raise HTTPException(400, f"VL pool {pool.alias!r}: missing upstream URL")
-    label = pool.alias                       # response `model` the client sees
+    label = label or pool.alias              # response `model` the client sees
     upstream_model = await _vlm_upstream_model_id(upstream, pool.model)
     # Shared think-filter decision with the telemak path + local pool.
     auto_think = _should_filter_think(upstream_model, body.get("enable_thinking"))
@@ -16804,6 +17225,69 @@ def _vlm_pool_log_id(cluster_id: str, alias: str) -> str:
     same `[a-z0-9-]` slug shape _vlm_log_path/_vlm_launch_cmd expect."""
     raw = f"{cluster_id}-{alias}-vlm"
     return re.sub(r"[^a-z0-9-]", "-", raw.lower())[:41].strip("-") or "vlm"
+
+
+async def _load_vlm_replica(cluster_id: str, alias: str, req, model_path: str,
+                            indices: list[int], rank0_ssh: str) -> dict:
+    """Load path for #76: a vision model on a `kind: replica` cluster. Same
+    capacity floor as the text replica (every node holds a full copy), then
+    one mlx_vlm.server per node under the cluster admin lock."""
+    port = int(getattr(req, "vlm_port", None) or VLM_DEFAULT_PORT)
+    venv = getattr(req, "venv", None) or VLM_DEFAULT_VENV
+    size = await get_model_size_bytes(rank0_ssh, model_path)
+    caps = _node_load_ceilings(cluster_id, len(indices))
+    if size and not getattr(req, "force", False):
+        tight = [c for c in caps if c["ceiling"] and size > c["ceiling"]]
+        if tight:
+            raise HTTPException(
+                409,
+                f"{cluster_id}: refusing to load — {req.model} is {size / 1e9:.1f} GB "
+                f"and every replica holds a full copy; "
+                + "; ".join(f"{c['host']} can pin {c['ceiling'] / 1e9:.1f} GB" for c in tight)
+                + ". Load it on nodes with more memory.")
+    topo = build_topology_from_indices(cluster_id, indices)
+    # A foreign server already on the port of any node → refuse up front
+    # (never adopt or kill a server this load didn't start).
+    for n in topo:
+        ip = _vlm_ip_from_ssh(n["ssh"])
+        served = await _vlm_served_model(ip, port)
+        if served is not None and not _same_model_path(served, model_path):
+            raise HTTPException(
+                409,
+                f"{n.get('host')}:{port} already serves {served} — unload it first "
+                f"or pick another vlm_port")
+    state = _loading_state_for(cluster_id)
+    _begin_loading(state, req.model, len(indices), size,
+                   estimate_load_s(req.model, size, cluster_id, 1))
+    try:
+        async with get_admin_lock(cluster_id):
+            old = get_pool(cluster_id, alias)
+            if old is not None:
+                try:
+                    await old.stop()
+                except Exception as e:
+                    sys.stderr.write(f"[api] stop of old pool '{alias}' failed: {e}\n")
+                del_pool(cluster_id, alias)
+            vrpool = VLMReplicaPool(
+                model_path=model_path, cluster=cluster_id, alias=alias,
+                node_indices=indices, port=port, venv=venv,
+                ready_timeout=float(getattr(req, "ready_timeout_s", None) or VLM_READY_TIMEOUT_S))
+            try:
+                await vrpool.start()
+            except RuntimeError as e:
+                raise HTTPException(503, str(e))
+            set_pool(cluster_id, alias, vrpool)
+            save_cluster_state_v2(cluster_id)
+    finally:
+        _end_loading(state)
+    return {
+        "loaded": True, "cluster": cluster_id, "alias": alias,
+        "is_vlm": True, "is_vlm_replica": True, "dispatched": "vlm-replica-pool",
+        "model": model_path, "nodes": len(indices), "port": port,
+        "replicas": vrpool.replica_stats(), "load_s": vrpool.load_s,
+        "note": (f"{req.model} servi en REPLICA VISION sur {len(indices)} nodes — "
+                 f"un mlx_vlm.server par node, affinité de session puis moins chargé."),
+    }
 
 
 async def _restore_vlm_pool(cluster_id: str, alias: str, entry: dict,
