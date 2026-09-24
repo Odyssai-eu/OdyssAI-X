@@ -14,6 +14,7 @@
     <key>LAYA_DEVICE</key><string>mps</string>
     <key>LAYA_MODELS</key><string>multilingual</string>
     <key>LAYA_DEFAULT</key><string>multilingual</string>
+    <key>LAYA_MAX_LEN</key><string>0</string>
     <key>LAYA_MODELS_ROOT</key><string>/Volumes/models/odysseus/convaiinnovations</string>
     <key>USE_TF</key><string>0</string>
     <key>PYTORCH_ENABLE_MPS_FALLBACK</key><string>1</string>

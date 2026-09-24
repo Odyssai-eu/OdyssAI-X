@@ -15,6 +15,8 @@ LAYA_API_KEY/LAYA_THREADS/LAYA_LOG_LEVEL):
                     laya-typed-decisions   (default /Volumes/models/odysseus/convaiinnovations)
   LAYA_MODELS       checkpoints to preload (default multilingual)
   LAYA_DEFAULT      checkpoint used when a request names none (default multilingual)
+  LAYA_MAX_LEN      context window in tokens for the preloaded checkpoints
+                    (0 = checkpoint default, 1024 for multilingual; up to 8192)
 """
 import os
 
@@ -43,6 +45,14 @@ def build_router():
         max_loaded=int(os.environ.get("LAYA_MAX_LOADED", "1")),
     )
     router.preload(preload)
+    # Context window of the preloaded checkpoints. The shipped config says
+    # 1024 tokens for multilingual (mmBERT accepts up to 8192): a bench answer
+    # longer than that was cut silently and a fact at its end was never seen
+    # (2026-09-24). LAYA_MAX_LEN raises it; head_max_len (option budget) stays.
+    max_len = int(os.environ.get("LAYA_MAX_LEN", "0") or 0)
+    if max_len:
+        for name in preload:
+            router.load(name).cfg["max_len"] = max_len
     return router
 
 
