@@ -4078,7 +4078,12 @@ class VLMReplicaPool:
                     c, body, stream, label=self.alias)
             except HTTPException as e:
                 _release()
-                if e.status_code == 502:
+                # 502 covers both "refused" and "read timeout". Only a closed
+                # port means the replica is gone; a slow one (cold load of a
+                # big checkpoint, long generation) is alive — marking it dead
+                # sent the same slow request down every replica in turn
+                # (Qwen3.8-27B-VL bf16 on .30-.33, 2026-09-24).
+                if e.status_code == 502 and not await _tcp_port_open(self._ip(idx), c.port):
                     self._live.discard(idx)
                     self._note_failure(idx, e.detail)
                     if session_id:
