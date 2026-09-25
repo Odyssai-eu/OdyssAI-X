@@ -272,6 +272,15 @@ def sharded_vlm_load(path: str, group):
             n_layers = len(model.language_model.model.layers)
             _shard_lm_pipeline(model, group, n_layers)
         else:
+            # #78 — the replicated-indexer sharder is written for MiniMax-M3's
+            # layout; applied to another type it crashes or corrupts silently.
+            # The engine refuses such loads (VLM_DIST_SUPPORTED in api.py);
+            # this is the backstop for a forced load.
+            if shard_mode != "upstream" and model_type != "minimax_m3_vl":
+                raise RuntimeError(
+                    f"vlm_runner: model_type {model_type!r} has no distributed split "
+                    f"(tensor = minimax_m3_vl, pipeline = {sorted(_PIPELINE_MODEL_TYPES)}); "
+                    f"serve it on one node or on a replica cluster")
             log(f"rank {group.rank()} sharding language_model "
                 f"(tensor, {shard_mode})")
             if shard_mode == "upstream":

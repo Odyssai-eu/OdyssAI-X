@@ -236,6 +236,12 @@ VLM_RUNNER_REMOTE = env_get("VLM_RUNNER_REMOTE", f"{REMOTE_CLUSTER_DIR}/vlm_runn
 VLM_PYTHON_REMOTE = env_get("VLM_PYTHON_REMOTE", "$HOME/.venvs/mlx-vlm/bin/python")
 VLM_RUNNER_MATCH_PATTERN = env_get("VLM_RUNNER_MATCH_PATTERN", "mlx-cluster/vlm_runner.py")
 VLM_DISTRIBUTED_ENABLED = env_get("VLM_DISTRIBUTED_ENABLED", "0") == "1"
+# #78 — the ONLY model types vlm_runner.py knows how to split across nodes:
+# tensor-parallel = its in-repo MiniMax-M3 sharder (replicated MSA indexer),
+# pipeline = _PIPELINE_MODEL_TYPES. Any other VL type would get the MiniMax
+# sharder applied blindly (crash at load, or a model that answers garbage).
+# Keep in sync with scripts/vlm_runner.py.
+VLM_DIST_SUPPORTED: dict[str, str] = {"minimax_m3_vl": "tensor", "qwen3_5_moe": "pipeline"}
 # SIGTERM->SIGKILL grace for remote pkills/sweeps, in seconds (0.5s polls).
 # 12s default: big-model clean exits need the room for free_metal; ranks stuck
 # in a collective ignore SIGTERM regardless (the wired-guard covers that case).
@@ -3217,7 +3223,8 @@ class RunnerPool:
                      context_limit: Optional[int] = None,
                      ignore_eos: bool = False,
                      clear_thinking: Optional[bool] = None,
-                     mtp_on: Optional[bool] = None) -> AsyncIterator[dict]:
+                     mtp_on: Optional[bool] = None,
+                     sampling: Optional[dict] = None) -> AsyncIterator[dict]:
         # Concurrent submits are allowed: the runner side handles serialisation
         # (single-rank uses BatchGenerator for true parallelism; multi-rank
         # serialises in the gen loop but tokens are routed by req_id).
@@ -3246,6 +3253,11 @@ class RunnerPool:
         # Anti-loop detect-and-stop (runner-side, default ON). Identical on
         # every rank via the broadcast, so multi-rank pools break in lockstep.
         req["anti_loop"] = bool(anti_loop)
+        # Client/per-model sampling (#77). Only VLMDistPool callers pass it:
+        # vlm_runner.py reads these keys, and without them mlx-vlm decodes
+        # greedy. Text RunnerProc pools keep runner.py MODEL_SAMPLING_DEFAULTS.
+        if sampling:
+            req.update({k: v for k, v in sampling.items() if v is not None})
         # Per-request KV-cache quantization override (2026-08-09, bench A/B):
         # the runner already reads req["kv_q8"] with the pool's load-time value
         # as fallback — None here = keep that default; an explicit bool lets a
@@ -5481,6 +5493,23 @@ def _apply_default_sampling(model_id: Optional[str], body: dict) -> dict:
     return {}
 
 
+_VLM_RUNNER_SAMPLING_KEYS = ("temperature", "top_p", "top_k", "min_p",
+                             "repetition_penalty", "seed")
+
+
+def _vlmdist_sampling_kw(pool, req) -> dict:
+    """#77 — sampling for a distributed VL pool (vlm_runner.py ranks, driven
+    through RunnerPool.submit). {} for every other pool, so the text path is
+    unchanged. Client values win; the per-model default fills the rest; one
+    `[api] proxy sampling` trace line, same as the proxied pools."""
+    if not getattr(pool, "is_vlm_dist", False):
+        return {}
+    s = {k: getattr(req, k, None) for k in _VLM_RUNNER_SAMPLING_KEYS}
+    s = {k: v for k, v in s.items() if v is not None}
+    _log_proxy_sampling(f"{pool.cluster}[{pool.alias}] vlm-dist", pool.model, s)
+    return {"sampling": s} if s else {}
+
+
 def _log_proxy_sampling(label: str, upstream_model: Optional[str], forward_body: dict) -> None:
     """Fill the per-model default sampling and trace what the client sent vs
     what was injected — one stderr line per proxied request."""
@@ -7327,7 +7356,7 @@ def _initial_default_config() -> Optional[dict]:
 #   major (1.7.2 → 2.0.0) — breaking API or topology change
 #
 # Use `./scripts/bump-version.sh patch|minor|major` to bump + auto-commit.
-APP_VERSION = "1.53.0"
+APP_VERSION = "1.53.1"
 
 app = FastAPI(
     title="OdyssAI-X (odyssai.eu)",
@@ -10690,6 +10719,7 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
         try:
             async for ev in pool.submit(None, req.max_tokens or 512, req.enable_thinking,
                                         anti_loop=(req.anti_loop is not False),
+                                        **_vlmdist_sampling_kw(pool, req),
                                         kv_q8=req.kv_q8,
                                         context_limit=req.context_limit,
                                         ignore_eos=bool(req.ignore_eos),
@@ -10841,6 +10871,7 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
             }
             async for ev in pool.submit(None, req.max_tokens or 512, req.enable_thinking,
                                         anti_loop=(req.anti_loop is not False),
+                                        **_vlmdist_sampling_kw(pool, req),
                                         kv_q8=req.kv_q8,
                                         context_limit=req.context_limit,
                                         ignore_eos=bool(req.ignore_eos),
@@ -15163,6 +15194,15 @@ async def admin_cluster_load(cluster_id: str, req: ArgoLoadRequest):
         # vlm_runner.py ranks over ring/TCP instead of clamping to one node.
         # Whole path additive: flag off => exact pre-existing behavior.
         if len(node_indices) > 1 and VLM_DISTRIBUTED_ENABLED:
+            _vd_mt = (arch.get("model_type") or "").lower()
+            if _vd_mt not in VLM_DIST_SUPPORTED and not getattr(req, "force", False):
+                raise HTTPException(
+                    409,
+                    f"{cluster_id}: {req.model} (model_type {_vd_mt or '?'}) cannot be "
+                    f"split across {len(node_indices)} nodes — the distributed VL runner "
+                    f"only knows " + ", ".join(f"{k} ({v})" for k, v in VLM_DIST_SUPPORTED.items())
+                    + ". Load it on ONE node (mlx_vlm.server) if it fits, or on a "
+                      "`kind: replica` cluster (one full copy per node).")
             vlm_model_path = _vlm_resolve_model_path(req.model, base_dir)
             async with get_admin_lock(cluster_id):
                 old = get_pool(cluster_id, alias)
@@ -15813,6 +15853,100 @@ async def _vlm_upstream_model_id(upstream: str, fallback: str) -> str:
     return fallback
 
 
+# ── Anti-loop for PROXIED streams (VL/dflash pools, 2026-09-25) ──────────────
+# runner.py stops a looping generation from the token ids (_detect_loop /
+# _detect_loop_large); a pool served by mlx_vlm.server never goes through it,
+# so a looping MiMo on the replica cluster ran to max_tokens (1.3 M on the TMB
+# bench). Same detector, same thresholds, on the RELAYED TEXT: pseudo-tokens =
+# words and punctuation marks. Stream only — a non-streamed request is
+# answered in one piece by the upstream and cannot be cut mid-way.
+_AL_CHECK_EVERY_CHARS = 256
+_AL_MIN_SPAN, _AL_MAX_PERIOD, _AL_MIN_REPEATS, _AL_WINDOW = 48, 64, 4, 640
+_AL_L_MAX_PERIOD, _AL_L_MIN_REPEATS = 1024, 4
+_AL_L_WINDOW = _AL_L_MAX_PERIOD * (_AL_L_MIN_REPEATS + 1)
+# A run of the same punctuation char ("--------", "=====", "|||") is ONE
+# pseudo-token, as a real tokenizer merges it; one token per char made every
+# markdown rule look like a period-1 loop (365 false hits on the TMB corpus).
+_AL_TOKEN_RE = re.compile(r"\w+|([^\w\s])\1*")
+
+
+def _al_small(ids: list) -> Optional[tuple]:
+    n = len(ids)
+    if n < _AL_MIN_SPAN:
+        return None
+    tail = ids[-_AL_WINDOW:]
+    n = len(tail)
+    for p in range(1, _AL_MAX_PERIOD + 1):
+        if n < 2 * p:
+            break
+        r = 1
+        while (n - (r + 1) * p >= 0
+               and tail[n - (r + 1) * p: n - r * p] == tail[n - r * p: n - (r - 1) * p]):
+            r += 1
+        if r >= max(_AL_MIN_REPEATS, -(-_AL_MIN_SPAN // p)):
+            return p, r
+    return None
+
+
+def _al_large(ids: list) -> Optional[tuple]:
+    if len(ids) < (_AL_MAX_PERIOD + 1) * _AL_L_MIN_REPEATS:
+        return None
+    tail = ids[-_AL_L_WINDOW:]
+    n = len(tail)
+    last = tail[-1]
+    for p in range(_AL_MAX_PERIOD + 1, min(_AL_L_MAX_PERIOD, n // 2) + 1):
+        if tail[-1 - p] != last:
+            continue
+        r = 1
+        while (n - (r + 1) * p >= 0
+               and tail[n - (r + 1) * p: n - r * p] == tail[n - r * p: n - (r - 1) * p]):
+            r += 1
+        if r >= _AL_L_MIN_REPEATS:
+            return p, r
+    return None
+
+
+def _detect_text_loop(text: str) -> Optional[tuple]:
+    """(period, repeats) in pseudo-tokens when the tail of `text` loops."""
+    ids = [m.group(0) for m in _AL_TOKEN_RE.finditer(text[-80000:])]
+    return _al_small(ids) or _al_large(ids)
+
+
+class _SSELoopGuard:
+    """Accumulates the text an OpenAI SSE stream carries (content and
+    reasoning deltas) and checks it for a loop every few hundred chars."""
+
+    def __init__(self):
+        self.buf = b""
+        self.text = ""
+        self.since = 0
+
+    def feed(self, chunk) -> Optional[tuple]:
+        self.buf += chunk if isinstance(chunk, bytes) else str(chunk).encode()
+        while b"\n" in self.buf:
+            line, self.buf = self.buf.split(b"\n", 1)
+            line = line.strip()
+            if not line.startswith(b"data: {"):
+                continue
+            try:
+                d = json.loads(line[6:])
+            except Exception:
+                continue
+            for ch in d.get("choices") or []:
+                de = ch.get("delta") or {}
+                for k in ("content", "reasoning_content", "reasoning"):
+                    v = de.get(k)
+                    if isinstance(v, str) and v:
+                        self.text += v
+                        self.since += len(v)
+        if len(self.text) > 200_000:
+            self.text = self.text[-120_000:]
+        if self.since >= _AL_CHECK_EVERY_CHARS:
+            self.since = 0
+            return _detect_text_loop(self.text)
+        return None
+
+
 async def _vlm_pool_proxy_chat_completion(pool, body: dict, stream: bool,
                                           label: Optional[str] = None):
     """Proxy a /v1/chat/completions request to a VL pool's mlx_vlm.server
@@ -16055,12 +16189,33 @@ async def _vlm_pool_proxy_chat_completion(pool, body: dict, stream: bool,
         # #61 — progress ticks (+~1 token per SSE delta) and guaranteed
         # finalize on every exit path (done, upstream error, client
         # disconnect) without touching _gen's control flow.
+        # Anti-loop (2026-09-25): a proven loop closes _gen — the upstream
+        # connection drops and mlx_vlm cancels the generation, same path as
+        # a Cancel — then the client gets a clean stop. `anti_loop: false`
+        # in the request opts out, as on the runner path.
+        guard = _SSELoopGuard() if body.get("anti_loop") is not False else None
+        agen = _gen()
+        _status = "done"
         try:
-            async for _chunk in _gen():
+            async for _chunk in agen:
                 _runs_tick(_rid)
                 yield _chunk
+                hit = guard.feed(_chunk) if guard is not None else None
+                if hit:
+                    await agen.aclose()
+                    _status = "anti_loop"
+                    sys.stderr.write(
+                        f"[api] anti-loop ({label}): period {hit[0]} × {hit[1]} "
+                        f"pseudo-tokens — upstream stream closed\n")
+                    yield ("data: " + json.dumps({
+                        "object": "chat.completion.chunk", "model": label,
+                        "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+                        "x_odyssai": {"anti_loop": {"period": hit[0], "repeats": hit[1]}},
+                    }) + "\n\n").encode()
+                    yield b"data: [DONE]\n\n"
+                    return
         finally:
-            _runs_finalize(_rid)
+            _runs_finalize(_rid, status=_status)
 
     return StreamingResponse(_gen_tracked(), media_type="text/event-stream")
 
