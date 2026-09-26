@@ -5397,6 +5397,13 @@ _MODELS_REASONING_EFFORT_MAP = {
     # maps to low. Callers wanting mid-budget must pass "high".
     "glm-5-3": {"minimal": "low", "medium": "max"},
     "glm-5.3": {"minimal": "low", "medium": "max"},
+    # Qwen3.8-Flash-Next (qwen4_exp): template VALIDATES the value and raises
+    # jinja2.exceptions.TemplateError on anything outside xhigh/medium/low —
+    # which killed the WHOLE batched rank-0 process (every in-flight request
+    # on that replica) the first time the bench sent its "high" default
+    # (2026-09-26, replica pool qwen3-8-flash-next). "high" has no equivalent
+    # short of the top bucket; map it there. "minimal" -> low.
+    "qwen3.8-flash-next": {"minimal": "low", "high": "xhigh"},
 }
 
 
@@ -7360,7 +7367,7 @@ def _initial_default_config() -> Optional[dict]:
 #   major (1.7.2 → 2.0.0) — breaking API or topology change
 #
 # Use `./scripts/bump-version.sh patch|minor|major` to bump + auto-commit.
-APP_VERSION = "1.53.2"
+APP_VERSION = "1.53.3"
 
 app = FastAPI(
     title="OdyssAI-X (odyssai.eu)",
