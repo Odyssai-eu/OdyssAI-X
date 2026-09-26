@@ -65,7 +65,10 @@ class TextArgs(BaseModelArgs):
     ple_embed_dim: int = 2560
     ple_layer_ids: list = field(default_factory=lambda: [2])
     ple_conv_kernel_size: int = 4
-    seed: int = 0
+    # Hash seed of the n-gram tables. Not in config.json; the reference uses
+    # 1234, and every checkpoint we hold carries layer_multipliers built at
+    # 1234 (checked 2026-09-26, forge #92). sanitize() refuses a mismatch.
+    seed: int = 1234
     eos_token_id: Any = 248044
     partial_rotary_factor: float = 0.25
     rope_parameters: dict = field(default_factory=dict)
@@ -556,6 +559,13 @@ _MASK64 = (1 << 64) - 1
 _GAMMA = 0x9E3779B97F4A7C15
 _M1, _M2 = 0xBF58476D1CE4E5B9, 0x94D049BB133111EB
 _PRIME_1 = 10007
+
+
+_NGRAM_CONST_KEYS = (
+    "ple_embedding.layer_multipliers",
+    "ple_embedding.ngram_heads_vocab_sizes",
+    "ple_embedding.ngram_heads_offsets",
+)
 
 
 def _splitmix64(v: int) -> int:
@@ -1123,8 +1133,32 @@ class Model(nn.Module):
             if k.endswith("conv1d.weight") and v.ndim == 3 and v.shape[1] == 1:
                 v = v.transpose(0, 2, 1)
 
+            if k.endswith(_NGRAM_CONST_KEYS):
+                self._check_ngram_constant(k, v)
             out[k] = v
         return out
+
+    def _check_ngram_constant(self, k, v):
+        """Refuse a checkpoint whose n-gram hash constants differ from the ones
+        rebuilt from the config: the forward uses the rebuilt copies, so a
+        mismatch (wrong seed) would read the wrong n-gram rows without error."""
+        obj = self
+        try:
+            for part in k.split(".")[:-1]:
+                obj = obj[int(part)] if part.isdigit() else getattr(obj, part)
+        except (AttributeError, IndexError, KeyError, TypeError):
+            return
+        name = k.rsplit(".", 1)[1]
+        expected = getattr(obj, {"layer_multipliers": "_mults",
+                                 "ngram_heads_vocab_sizes": "_sizes",
+                                 "ngram_heads_offsets": "_offsets"}[name], None)
+        if expected is None:
+            return
+        if v.shape != expected.shape or not mx.array_equal(v.astype(mx.int64), expected):
+            raise ValueError(
+                f"qwen4_exp: {k} in the checkpoint differs from the value rebuilt "
+                f"with seed={self.args.text.seed}; set text_config.seed to the seed the "
+                f"checkpoint was built with")
 
     @property
     def quant_predicate(self):
