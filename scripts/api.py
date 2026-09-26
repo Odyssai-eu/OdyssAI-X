@@ -16786,8 +16786,10 @@ async def admin_cluster_unload(
     if not body_force and last and (time.time() - last) < UNLOAD_GUARD_S:
         raise HTTPException(409, {
             "error": "unload_guard",
-            "message": f"cluster served a request {time.time()-last:.1f}s ago "
-                       f"(guard {UNLOAD_GUARD_S:.0f}s); pass force:true to override",
+            "message": f"not a fault — safety guard: cluster served a request "
+                       f"{time.time()-last:.1f}s ago (guard {UNLOAD_GUARD_S:.0f}s), "
+                       f"protecting it from being cut mid-generation; "
+                       f"pass force:true to override",
         })
     # kind=telemak: proxy to upstream /admin/unload. Optional `model` in
     # the body targets a specific loaded model; absent → unload all.
