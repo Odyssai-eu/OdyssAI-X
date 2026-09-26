@@ -65,7 +65,7 @@ def read_model_meta(config: dict, size_bytes: int) -> dict:
           or (config.get("text_config") or {}).get("model_type") or "").lower()
     is_vision = bool(
         "_vl" in mt or "_vision" in mt or "vision" in mt
-        or "vision_config" in config or "vision_tower_config" in config
+        or config.get("vision_config") or config.get("vision_tower_config")
     )
 
     # Quantization: mlx `quantization` key, else inferencerlabs-style

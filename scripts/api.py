@@ -923,8 +923,12 @@ def _config_is_vision(cfg: dict) -> bool:
         return False
     if "_vl" in mt or "_vision" in mt or "vision" in mt:
         return True
-    if ("vision_config" in cfg or "vision_tower_config" in cfg
-            or "audio_config" in cfg):
+    # A key set to null is not a modality: mlx-community's text-only Gemma-4
+    # conversions keep `"audio_config": null` (and drop every vision/audio
+    # weight), which routed them to mlx_vlm.server and died on "Missing 211
+    # parameters" (2026-09-26).
+    if (cfg.get("vision_config") or cfg.get("vision_tower_config")
+            or cfg.get("audio_config")):
         return True
     # Flattened vision tower — need several vision_* fields so a lone stray
     # key can't trip it.
@@ -7356,7 +7360,7 @@ def _initial_default_config() -> Optional[dict]:
 #   major (1.7.2 → 2.0.0) — breaking API or topology change
 #
 # Use `./scripts/bump-version.sh patch|minor|major` to bump + auto-commit.
-APP_VERSION = "1.53.1"
+APP_VERSION = "1.53.2"
 
 app = FastAPI(
     title="OdyssAI-X (odyssai.eu)",
