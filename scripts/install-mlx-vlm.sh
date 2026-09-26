@@ -33,8 +33,9 @@
 #
 # Env overrides:
 #   VLM_VENV      target venv path      (default <remote $HOME>/.venvs/mlx-vlm)
-#   MLX_VLM_REF   git ref of mlx-vlm    (default 698bc4b = main 2026-09-24: MiMo-V2.6 text #2327,
-#                 native MXFP4 load #2337, image/video/audio #2338, batching #2339;
+#   MLX_VLM_REF   git ref of mlx-vlm    (default 8702083 = main 2026-09-24, 0.7.3: MiMo-V2.6 text #2327,
+#                 native MXFP4 load #2337, image/video/audio #2338, batching #2339,
+#                 MiMo audio across server threads #2352;
 #                 0.6.3 + mlx 0.32 crashes Qwen3.5 in server mode, mlx-vlm #1614)
 #   MLX_VLM_SPEC  full pip spec, overrides the git URL built from MLX_VLM_REF
 #                 (e.g. a wheel path on the node when its GitHub link is slow)
@@ -54,7 +55,7 @@ fi
 REMOTE_HOME="$(ssh -o ConnectTimeout=10 -o BatchMode=yes "$SSH_TARGET" 'printf %s "$HOME"')"
 REMOTE_USER="$(ssh -o ConnectTimeout=10 -o BatchMode=yes "$SSH_TARGET" 'id -un')"
 VLM_VENV="${VLM_VENV:-$REMOTE_HOME/.venvs/mlx-vlm}"
-MLX_VLM_REF="${MLX_VLM_REF:-698bc4b778a1b57935db9d9a970271b06cd58ef4}"
+MLX_VLM_REF="${MLX_VLM_REF:-87020830d4dde238f111ade6d592f204a89cd527}"
 PY312="${PY312:-python3.12}"
 MLX_VLM_SPEC="${MLX_VLM_SPEC:-git+https://github.com/Blaizzy/mlx-vlm.git@${MLX_VLM_REF}}"
 
@@ -156,37 +157,5 @@ PYEOF
 )
 PATCH_SCRIPT="${PATCH_SCRIPT//VENV_PLACEHOLDER/$VLM_VENV}"
 ssh -o ConnectTimeout=10 -o BatchMode=yes "$SSH_TARGET" "$VLM_VENV/bin/python -" <<<"$PATCH_SCRIPT"
-
-# 5. MiMo-V2.6 audio patch (2026-09-24, same idempotent string-replace style).
-#    MiMoV2Processor builds `audio_codes` lazily on the request thread; the
-#    server's generation thread then evaluates it and MLX raises "There is no
-#    Stream(gpu, N) in current thread" — every audio request fails with a 500.
-#    Materialising the codes where they are built fixes it. Reported upstream
-#    (Blaizzy/mlx-vlm#2352); drop this step once the pinned ref carries the fix.
-echo "[install-mlx-vlm] applying MiMo audio_codes eval patch"
-AUDIO_PATCH_SCRIPT=$(cat <<'PYEOF'
-path = "VENV_PLACEHOLDER/lib/python3.12/site-packages/mlx_vlm/models/mimo_v2/processing.py"
-try:
-    with open(path) as f:
-        content = f.read()
-except FileNotFoundError:
-    print("[install-mlx-vlm] WARNING: mimo_v2/processing.py absent (ref without MiMo multimodal) — skipping")
-    raise SystemExit(0)
-old = "            audio_codes = mx.concatenate(codes, axis=1).T\n"
-new = old + "            mx.eval(audio_codes)  # built on the request thread, used on the generation thread\n"
-if new in content or "mx.eval(audio_codes)" in content:
-    print("[install-mlx-vlm] audio patch already applied, skipping")
-elif old not in content:
-    print("[install-mlx-vlm] WARNING: audio patch target not found (upstream file changed?) — skipping")
-else:
-    import shutil
-    shutil.copy(path, path + ".bak-mimo-audio-patch")
-    with open(path, "w") as f:
-        f.write(content.replace(old, new))
-    print("[install-mlx-vlm] audio patch applied")
-PYEOF
-)
-AUDIO_PATCH_SCRIPT="${AUDIO_PATCH_SCRIPT//VENV_PLACEHOLDER/$VLM_VENV}"
-ssh -o ConnectTimeout=10 -o BatchMode=yes "$SSH_TARGET" "$VLM_VENV/bin/python -" <<<"$AUDIO_PATCH_SCRIPT"
 
 echo "[install-mlx-vlm] done on $SSH_TARGET"
