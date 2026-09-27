@@ -746,6 +746,12 @@ def validate_cluster_def(cluster_id: str, new_def: dict) -> Optional[str]:
     if kind == "replica":
         return None
 
+    # Decision (#95): nodes that serve decision models (typed questions →
+    # calibrated probabilities over POST /v1/systemone). One single-node
+    # decision server per pool, no collective, no backend constraint.
+    if kind == "decision":
+        return None
+
     if kind != "mlx-distributed":
         return f"unknown kind: {kind}"
     if backend not in ("jaccl", "ring"):
@@ -2603,6 +2609,13 @@ def _sweep_orphan_runners(cluster_id: str,
     nodes = cd.get("nodes") or []
     if not nodes:
         return {"cluster": cluster_id, "swept": [], "note": "no nodes defined"}
+    # A decision cluster (#95) never runs runner.py / vlm_runner.py, and its
+    # nodes can be shared with other clusters (ultra-96b is also telomnis):
+    # sweeping them would kill THOSE clusters' runners. Its own server is
+    # stopped by port (DecisionPool.stop).
+    if cd.get("kind") == "decision":
+        return {"cluster": cluster_id, "swept": [], "warnings": [],
+                "note": "decision cluster: no runner to sweep"}
     pattern = shlex.quote(RUNNER_MATCH_PATTERN)
     pattern_vlm = shlex.quote(VLM_RUNNER_MATCH_PATTERN)
     # The sweep does three things in one SSH round-trip per node:
@@ -4245,6 +4258,81 @@ class DFlashPool:
         self.runners.clear()
 
 
+class DecisionPool:
+    """A decision model served single-node by scripts/decision/decision_serve.py
+    (#95, 2026-09-27): typed questions in, calibrated option probabilities out,
+    over the TypeSafe/Jev wire protocol (POST /v1/systemone). No text is
+    generated, so it is never a chat pool: chat routes refuse it (400) and only
+    /v1/systemone reaches it.
+
+    Engine-owned lifecycle like DFlashPool (ssh launch, kill by script+port,
+    persisted, adopted or relaunched at restore) with its OWN markers:
+      * ``is_vlm = False`` — never persisted as a VL pool, or the restore would
+        relaunch mlx_vlm.server on these weights (their config has a
+        vision_config);
+      * ``is_decision = True`` — own persistence/restore branch, `kind: decision`
+        in /v1/models, the dashboard badge.
+    """
+
+    is_vlm = False
+    is_decision = True
+
+    def __init__(self, model_path: str, cluster: str, alias: str,
+                 node_indices: list[int], upstream: str, port: int,
+                 ssh_target: str, host: str, pid: Optional[str] = None,
+                 venv: Optional[str] = None, decision_cfg: Optional[dict] = None):
+        self.model = model_path
+        self.model_path = model_path
+        self.cluster = cluster
+        self.alias = alias or cluster
+        self.node_indices: Optional[list[int]] = list(node_indices) if node_indices else None
+        self.nodes_count = 1
+        self.mode = "decision"
+        self.use_ap = False
+        self.kv_q8 = False
+        self.draft_model: Optional[str] = None
+        self.num_draft_tokens = 0
+        self.venv = venv
+        self.decision_cfg = dict(decision_cfg or {})
+        self.runners: list = []
+        self.upstream = (upstream or "").rstrip("/")
+        self.port = int(port)
+        self.pid = pid
+        self.ssh_target = ssh_target
+        self.host = host
+        try:
+            self.nodes = build_topology_from_indices(cluster, list(node_indices))
+        except Exception:
+            self.nodes = [{"rank": 0, "ssh": ssh_target, "host": host, "rdma": None}]
+        self.started_at: Optional[float] = time.time()
+        self.load_s: Optional[float] = None
+        self.last_used_at: float = time.time()
+        self.last_token_at: float = time.monotonic()
+        self.ttl_seconds: int = 0
+        self.backend: str = "http-proxy"
+        self.degraded: bool = False
+        self.degraded_reason: Optional[str] = None
+        self.degraded_at: Optional[float] = None
+
+    def alive_count(self) -> int:
+        """External server, no local runner children: report 1 so the dead-pool
+        sweeper never purges it (same as DFlashPool)."""
+        return 1
+
+    async def stop(self):
+        """SIGTERM → grace → SIGKILL of the decision server on THIS port."""
+        try:
+            await asyncio.to_thread(
+                _ssh_exec, self.ssh_target, _decision_kill_cmd(self.port), 30,
+            )
+        except Exception as e:
+            sys.stderr.write(
+                f"[decision-pool] {self.cluster}[{self.alias}] kill on "
+                f"{self.ssh_target} failed: {e}\n"
+            )
+        self.runners.clear()
+
+
 class InklingPool:
     """A single-node native Inkling server (scripts/inkling_server.py), engine-
     managed and proxied under a cluster as a MULTIMODAL pool (2026-08-10).
@@ -4946,6 +5034,23 @@ def save_cluster_state_v2(cluster_id: str, *,
                 "ssh": pool.ssh_target,
                 "host": pool.host,
                 "venv": getattr(pool, "venv", None),
+            })
+            continue
+        # Decision pool (#95): own key, never is_vlm (the restore would relaunch
+        # mlx_vlm.server on weights whose config carries a vision_config).
+        if getattr(pool, "is_decision", False):
+            pools_payload.append({
+                "alias": alias,
+                "model": pool.model,
+                "is_decision": True,
+                "node_indices": indices,
+                "nodes": 1,
+                "port": pool.port,
+                "upstream": pool.upstream,
+                "ssh": pool.ssh_target,
+                "host": pool.host,
+                "venv": getattr(pool, "venv", None),
+                "decision_cfg": getattr(pool, "decision_cfg", None),
             })
             continue
         # dflash pool (B1): a single-node mlx-dspark serve proxied as a TEXT
@@ -6276,6 +6381,14 @@ async def _restore_cluster_pools(cid: str, leaked_hosts: Optional[set] = None,
                     set_pool(cid, alias, dfpool)
                     restored.append(alias)
                 continue
+            # Decision pool (#95): adopt the decision server if it serves this
+            # model, else relaunch it. Never a RunnerPool, never mlx_vlm.
+            if entry.get("is_decision"):
+                dpool = await _restore_decision_pool(cid, alias, entry, indices)
+                if dpool is not None:
+                    set_pool(cid, alias, dpool)
+                    restored.append(alias)
+                continue
             pool = RunnerPool(
                 model=entry["model"],
                 mode=entry.get("mode", "pipeline"),
@@ -6431,7 +6544,11 @@ async def lifespan(app: FastAPI):
         # and if that relaunch fails the pool is lost. RunnerPool + VLMDistPool
         # ARE ssh-child ranks that die with the container, so they DO need the
         # graceful stop (frees Metal wired + JACCL queue pairs cleanly).
+        # The decision server (#95) is the same kind of detached nohup process,
+        # adopted in place at boot by _restore_decision_pool: keep it running.
         def _is_nohup_vlm(p):
+            if getattr(p, "is_decision", False):
+                return True
             return getattr(p, "is_vlm", False) and not getattr(p, "is_vlm_dist", False)
         _stop_targets = [p for p in (([_pool] if _pool is not None else []) +
                                      [p for _, _, p in list_all_pools()])
@@ -9400,6 +9517,9 @@ def _redact_provider(prov_id: str, prov: dict) -> dict:
 # toggles (per-pool TTL default, cache hints, etc.) without a schema bump.
 class ServerSettingsUpdate(BaseModel):
     enable_thinking_default: Optional[bool] = None
+    # Decision models (#95): absolute paths or folder names. Only these load on
+    # a `kind: decision` cluster, and they load nowhere else. [] clears.
+    decision_models: Optional[list[str]] = None
     pool_ttl_seconds_default: Optional[int] = None
     # KV cache controls — set globally, override per request via the load
     # endpoint. Q8 default ON for big-MoE workloads (Qwen397B, Hy3, GLM-5.1)
@@ -9476,6 +9596,7 @@ async def admin_settings_get():
         "pool_ttl_seconds_default": int(s.get("pool_ttl_seconds_default") or 0),
         "kv_q8_default": get_kv_q8_default(),
         "system_prefix_text": get_system_prefix_text(),
+        "decision_models": decision_models_tagged(),
     }
 
 
@@ -9513,6 +9634,9 @@ async def admin_settings_update(req: ServerSettingsUpdate):
             s["kv_q8_default"] = bool(req.kv_q8_default)
         if req.system_prefix_text is not None:
             s["system_prefix_text"] = str(req.system_prefix_text)
+        if req.decision_models is not None:
+            s["decision_models"] = [str(x).strip().rstrip("/") for x in req.decision_models
+                                    if str(x).strip()]
         cfg["settings"] = s
     # Propagate to live pools so the change takes effect immediately, not
     # only after next load.
@@ -10154,6 +10278,20 @@ async def list_models(include_unloaded: bool = False):
             # VLMDistPool reports its real transport and rank count.
             alias_caps["backend"] = getattr(pool, "backend", "http-proxy")
             alias_caps["nodes"] = int(getattr(pool, "nodes_count", 1) or 1)
+        # Decision pool (#95): typed decisions, never chat. Same markers as the
+        # cloud systemone aliases so clients filter them the same way; the
+        # checkpoint's vision_config must not advertise image input.
+        if getattr(pool, "is_decision", False):
+            dcfg = getattr(pool, "decision_cfg", {}) or {}
+            alias_caps.update({
+                "kind": "decision", "endpoint": "/v1/systemone",
+                "supports_tools": False, "supports_vision": False,
+                "supports_streaming": False, "modalities": ["text"],
+                "is_vlm": False, "vlm": False,
+                "backend": "http-proxy", "nodes": 1,
+                "decision_prompt_version": dcfg.get("prompt_version"),
+                "decision_readout": dcfg.get("readout"),
+            })
         data.append({
             "id": alias, "object": "model",
             "created": _now(), "owned_by": f"odyssai-{pool_name}",
@@ -10492,6 +10630,17 @@ def _refuse_decision_alias(model: Optional[str], prov_id: str, prov: dict) -> No
             f"with {{\"model\": \"{model}\", \"state\": ..., \"questions\": {{...}}}}.")
 
 
+def _refuse_decision_pool(model: Optional[str], pool) -> None:
+    """Same refusal for a decision model loaded on a decision cluster (#95):
+    it has no chat surface, only POST /v1/systemone."""
+    if getattr(pool, "is_decision", False):
+        raise HTTPException(
+            400,
+            f"'{model}' is a decision model (cluster '{pool.cluster}'): it answers typed "
+            f"questions, not chat. Use POST /v1/systemone with "
+            f"{{\"model\": \"{pool.alias}\", \"state\": ..., \"questions\": {{...}}}}.")
+
+
 def _systemone_aliases() -> list[tuple[str, dict, dict]]:
     out = []
     for prov_id, prov in get_cloud_providers().items():
@@ -10518,6 +10667,37 @@ async def _systemone_health(prov: dict) -> dict:
         return {"ok": False, "models_count": 0, "error": f"upstream unreachable: {e}"}
 
 
+DECISION_REQUEST_TIMEOUT_S = float(env_get("DECISION_REQUEST_TIMEOUT_S", "600") or "600")
+
+
+async def _systemone_local(cluster_id: str, alias: str, pool, body: dict):
+    """Forward a /v1/systemone request to a local decision pool (#95). The node
+    server runs one MLX worker: requests queue there, hence the long timeout
+    (a bench judge sends whole answers as state)."""
+    fwd = dict(body)
+    fwd["model"] = alias
+    _CLUSTER_LAST_SERVED[pool.cluster] = time.time()   # unload guard, like chat
+    pool.last_used_at = time.time()
+    t0 = time.time()
+    try:
+        async with httpx.AsyncClient(timeout=DECISION_REQUEST_TIMEOUT_S) as client:
+            r = await client.post(f"{pool.upstream}/v1/systemone", json=fwd)
+    except Exception as e:
+        raise HTTPException(502, f"decision pool '{alias}' ({pool.upstream}) unreachable: {e}")
+    try:
+        data = r.json()
+    except Exception:
+        raise HTTPException(502, f"decision pool '{alias}' returned non-JSON (HTTP {r.status_code})")
+    if r.status_code != 200:
+        return JSONResponse(data, status_code=r.status_code)
+    if isinstance(data, dict):
+        data["model"] = alias
+        data.setdefault("x_odyssai", {}).update({
+            "cluster": cluster_id, "pool": alias, "node": pool.host,
+            "latency_ms": round((time.time() - t0) * 1000, 1)})
+    return data
+
+
 @app.post("/v1/systemone")
 async def systemone(request: Request):
     """Typed decisions (TypeSafe Jev wire protocol): `state` + `questions`
@@ -10533,17 +10713,29 @@ async def systemone(request: Request):
     if not isinstance(body, dict) or not isinstance(body.get("questions"), dict) or not body["questions"]:
         raise HTTPException(400, "body must be an object with a non-empty 'questions' object")
     aliases = _systemone_aliases()
-    if not aliases:
-        raise HTTPException(404, "no decision model configured (add a provider with protocol 'systemone')")
+    local = [(cid, alias, p) for cid, alias, p in list_all_pools() if getattr(p, "is_decision", False)]
+    if not aliases and not local:
+        raise HTTPException(404, "no decision model available (load one on a 'decision' cluster, "
+                                 "or add a provider with protocol 'systemone')")
     want = body.get("model")
-    match = next((a for a in aliases if a[2]["alias"] == want), None)
-    if match is None:
-        if len(aliases) == 1:
-            match = aliases[0]
+    # Local decision pools first (#95): alias, else concrete model path.
+    lmatch = next((x for x in local if x[1] == want), None) \
+        or next((x for x in local if want and x[2].model == want), None)
+    match = None if lmatch else next((a for a in aliases if a[2]["alias"] == want), None)
+    if lmatch is None and match is None:
+        # "Exactly one decision model → it serves" (Jev SDKs send their own id)
+        # counts local pools AND cloud aliases together.
+        if len(local) + len(aliases) == 1:
+            if local:
+                lmatch = local[0]
+            else:
+                match = aliases[0]
         else:
             raise HTTPException(404, {
                 "error": "unknown_decision_model", "model": want,
-                "available": [a[2]["alias"] for a in aliases]})
+                "available": [x[1] for x in local] + [a[2]["alias"] for a in aliases]})
+    if lmatch is not None:
+        return await _systemone_local(lmatch[0], lmatch[1], lmatch[2], body)
     prov_id, prov, entry = match
     fwd = dict(body)
     fwd["model"] = entry.get("upstream") or entry["alias"]
@@ -10653,6 +10845,7 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
     # dflash pool (B1) is ALSO a single-node OpenAI server proxied via
     # http-proxy — same relay path, but it's a TEXT pool (is_vlm=False) so it
     # skips the vision-only guard below and routes as normal chat.
+    _refuse_decision_pool(req.model, pool)
     _refuse_image_on_text_pool(req.model, pool, req.messages)
     if getattr(pool, "is_vlm_replica", False):
         body = req.model_dump(exclude_none=True)
@@ -11597,6 +11790,7 @@ async def anthropic_messages(req: AnthropicMessagesRequest, request: Request):
             f"use POST /v1/chat/completions (the OpenAI shape) for it; the "
             f"Anthropic /v1/messages surface is not supported for VL pools.",
         )
+    _refuse_decision_pool(req.model, pool)
     _refuse_image_on_text_pool(req.model, pool, req.messages)
 
     # Request classification (same logic as /v1/chat/completions).
@@ -13453,7 +13647,7 @@ class ClusterConfigUpdate(BaseModel):
     models_dir: Optional[str] = None
     # Full editable definition
     name: Optional[str] = None
-    kind: Optional[str] = None        # "mlx-distributed" | "telemak"
+    kind: Optional[str] = None        # "mlx-distributed" | "replica" | "decision" | "telemak"
     backend: Optional[str] = None     # "jaccl" | "ring" | "http-proxy"
     nodes: Optional[list[ClusterNodeIn]] = None
     # Upstream URL — required for kind=telemak (http-proxy passthrough to a
@@ -13794,6 +13988,44 @@ async def _gather_preflight(cluster_id: str, model: str,
     abspath = _resolve_model_abspath(model, base_dir)
     cfg = await _read_raw_config(rank0, abspath)
     size = await get_model_size_bytes(rank0, abspath)
+    # Decision models (#95): judged on their own terms, never as a VL chat model
+    # (their config may carry a vision_config).
+    _gb = lambda b: round(b / 1024 ** 3, 1)
+    _is_dec_cluster = get_cluster_def(cluster_id).get("kind") == "decision"
+    _tagged = _is_decision_tagged(model, abspath)
+    if _is_dec_cluster or _tagged:
+        _blk: list[str] = []
+        _dcfg = None
+        if not _is_dec_cluster:
+            _blk.append("modèle tagué 'decision' : à charger sur un cluster de kind 'decision'")
+        elif not _tagged:
+            _blk.append("cluster decision : seuls les modèles tagués dans settings.decision_models "
+                        "s'y chargent")
+        else:
+            _dcfg = await _read_decision_config(rank0, abspath)
+            if _dcfg is None:
+                _blk.append("pas de decision_config.json lisible — pas un modèle de décision")
+            elif not _decision_format_ok(_dcfg):
+                _blk.append(f"format de décision non supporté ({_dcfg.get('prompt_version')}/"
+                            f"{_dcfg.get('readout')})")
+            if size <= 0:
+                _blk.append("taille 0 — modèle absent du node cible ou volume non monté")
+            elif per_node:
+                _bud = int(per_node[0].get("wired_limit_bytes")
+                           or (per_node[0].get("ram_bytes", 0) * 0.75))
+                if _bud and size * 1.10 > _bud:
+                    _blk.append(f"{_gb(size)} GB ne tient pas dans le budget wired du node "
+                                f"({_gb(_bud)} GB)")
+        _ok = not _blk
+        return {
+            "ok": _ok, "verdict": "OK" if _ok else "REFUSÉ",
+            "model": {"model_type": cfg.get("model_type"), "size_bytes": size,
+                      "size_gb": _gb(size), "is_vision": False, "is_decision": True,
+                      "decision": _dcfg, "supported": _ok},
+            "plan": {"ok": _ok, "nodes": 1, "mode": "decision", "indices": [0]},
+            "selection": None, "draft": None, "warnings": [], "blockers": _blk,
+            "summary": (f"OK : modèle de décision {_gb(size)} GB, servi via /v1/systemone"
+                        if _ok else "REFUSÉ — " + "; ".join(_blk))}
     # Single source of truth (get_model_arch_meta / _model_capabilities use it
     # too) — recognises flattened `vision_*` configs, not just nested ones.
     is_vision = _config_is_vision(cfg)
@@ -14327,8 +14559,8 @@ async def admin_cluster_status(cluster_id: str):
     # this whole day was about (mtp_cfg on VLMPool, 2026-07-08).
     _vlm_probe_targets = {
         a: p for a, p in all_loaded
-        if getattr(p, "is_vlm", False)
-        and not getattr(p, "is_vlm_dist", False)
+        if ((getattr(p, "is_vlm", False) and not getattr(p, "is_vlm_dist", False))
+            or getattr(p, "is_decision", False))   # #95: same /v1/models probe
         and getattr(p, "ssh_target", None)
     }
     _vlm_alive_by_alias: dict[str, int] = {}
@@ -14353,6 +14585,8 @@ async def admin_cluster_status(cluster_id: str):
             "mode": pool.mode,
             "tokens_since_load": int(getattr(pool, "tokens_produced", 0)),
             "is_vlm": bool(getattr(pool, "is_vlm", False)),
+            "is_decision": bool(getattr(pool, "is_decision", False)),
+            "endpoint": "/v1/systemone" if getattr(pool, "is_decision", False) else None,
             "is_replica": bool(getattr(pool, "is_replica", False)
                                or getattr(pool, "is_vlm_replica", False)),
             "is_vlm_replica": bool(getattr(pool, "is_vlm_replica", False)),
@@ -14580,6 +14814,14 @@ async def admin_cluster_load_options(cluster_id: str, model: str):
         # Single-node http-proxy: no node selection.
         return {"data": [{"label": "1", "nodes": [0], "mode": "solo",
                           "fits": True, "reason": ""}], "model_meta": {}}
+    if cd.get("kind") == "decision":
+        # One decision server per pool, on one node (#95).
+        return {"data": [{"label": "1", "nodes": [i], "mode": "decision",
+                          "fits": True, "reason": ""}
+                         for i in range(len(cd.get("nodes") or []))][:1] or
+                        [{"label": "1", "nodes": [0], "mode": "decision",
+                          "fits": False, "reason": "no nodes"}],
+                "model_meta": {"is_decision": True}}
     cluster_max = len(cd.get("nodes", []))
     effective_max = min(get_cluster_max_nodes(cluster_id, default=cluster_max), cluster_max)
 
@@ -14640,6 +14882,108 @@ async def admin_cluster_load_options(cluster_id: str, model: str):
     }
 
 
+async def _decision_cluster_load(cluster_id: str, cd: dict, req: "ArgoLoadRequest") -> dict:
+    """Load on a `kind: decision` cluster (#95): only models tagged in
+    settings.decision_models, whose decision_config.json declares a readout the
+    vendored code implements. Launches decision_serve.py on one node over ssh
+    and registers a DecisionPool (served only through POST /v1/systemone)."""
+    nodes = cd.get("nodes") or []
+    if not nodes:
+        raise HTTPException(400, f"{cluster_id}: decision cluster has no nodes")
+    if not _is_decision_tagged(req.model, _resolve_model_abspath(req.model, models_dir_for(cluster_id))):
+        raise HTTPException(409, {
+            "error": "not_a_tagged_decision_model",
+            "message": f"{cluster_id} is a decision cluster: only models tagged in "
+                       f"settings.decision_models load here, and '{req.model}' is not tagged.",
+        })
+    alias = (req.alias.strip().lower() if req.alias else _derive_pool_alias(cluster_id, req.model))
+    if not alias or "/" in alias or " " in alias or len(alias) > 64:
+        raise HTTPException(400, f"invalid alias {alias!r}")
+    if find_cloud_alias(alias):
+        raise HTTPException(409, f"alias {alias!r} is already published by a cloud provider — "
+                                 f"pass another alias")
+    if alias in {a for a, _ in list_pools(cluster_id)}:
+        raise HTTPException(409, f"{cluster_id} alias {alias!r} is already loaded — unload it first")
+    if req.node_indices:
+        idx = int(req.node_indices[0])
+        if not (0 <= idx < len(nodes)):
+            raise HTTPException(400, f"node index {idx} out of range [0..{len(nodes) - 1}]")
+    else:
+        busy = {_host_to_index(cluster_id, n.get("host"))
+                for _, p in list_pools(cluster_id) for n in (p.nodes or []) if n.get("host")}
+        free = [i for i in range(len(nodes)) if i not in busy]
+        if not free:
+            raise HTTPException(409, f"{cluster_id}: every node already serves a decision model — "
+                                     f"unload one, or pass node_indices and vlm_port")
+        idx = free[0]
+    topo = build_topology_from_indices(cluster_id, [idx])
+    ssh_target = topo[0]["ssh"]
+    host = topo[0].get("host") or _host_id_from_ssh(ssh_target)
+    base_dir = topo[0].get("models_dir") or models_dir_for(cluster_id)
+    model_abspath = _resolve_model_abspath(req.model, base_dir)
+    dcfg = await _read_decision_config(ssh_target, model_abspath)
+    if dcfg is None:
+        raise HTTPException(422, f"{model_abspath} has no readable decision_config.json on {host} "
+                                 f"— not a decision model")
+    if not _decision_format_ok(dcfg):
+        raise HTTPException(422, {
+            "error": "unsupported_decision_format",
+            "message": f"prompt_version={dcfg.get('prompt_version')!r} readout={dcfg.get('readout')!r} "
+                       f"is not implemented by the vendored readout",
+            "known": sorted(f"{p}/{r}" for p, r in DECISION_KNOWN_FORMATS),
+        })
+    venv = getattr(req, "venv", None) or DECISION_DEFAULT_VENV
+    py = f"{venv.rstrip('/')}/bin/python"
+    rc, out, _ = await asyncio.to_thread(
+        _ssh_exec, ssh_target,
+        f"test -x {_remote_path(py)} && test -f {_remote_path(DECISION_SERVER_REMOTE)} "
+        f"&& echo ok || echo missing", 15)
+    if (out or "").strip() != "ok":
+        raise HTTPException(422, f"decision server not installed on {host} (venv {venv}, "
+                                 f"{DECISION_SERVER_REMOTE}) — run scripts/decision/install-decision.sh")
+    port = int(getattr(req, "vlm_port", None) or DECISION_DEFAULT_PORT)
+    ip = _vlm_ip_from_ssh(ssh_target)
+    upstream = f"http://{ip}:{port}"
+    if await _vlm_probe_ready(ip, port) is not None:
+        raise HTTPException(409, f"{upstream} already answers — port in use on {host}; unload "
+                                 f"the pool there first or pick another vlm_port")
+    size_bytes = await get_model_size_bytes(ssh_target, model_abspath)
+    loading_state = _loading_state_for(cluster_id)
+    _begin_loading(loading_state, req.model, 1, size_bytes,
+                   estimate_load_s(req.model, size_bytes, cluster_id, 1))
+    t0 = time.time()
+    try:
+        async with get_admin_lock(cluster_id):
+            ready, pid, tail = await _launch_decision_server(
+                ssh_target, _decision_pool_log_id(cluster_id, alias), model_abspath,
+                alias, port, venv,
+                float(getattr(req, "ready_timeout_s", None) or VLM_READY_TIMEOUT_S))
+            if not ready:
+                try:  # never leave a half-started server holding the weights
+                    await asyncio.to_thread(_ssh_exec, ssh_target, _decision_kill_cmd(port), 30)
+                except Exception:
+                    pass
+                raise HTTPException(503, f"decision server did not become ready on {upstream} "
+                                         f"(node {host}). Log tail:\n{tail}")
+            pool = DecisionPool(
+                model_path=model_abspath, cluster=cluster_id, alias=alias,
+                node_indices=[idx], upstream=upstream, port=port,
+                ssh_target=ssh_target, host=host, pid=pid, venv=venv, decision_cfg=dcfg)
+            pool.load_s = time.time() - t0
+            set_pool(cluster_id, alias, pool)
+            save_cluster_state_v2(cluster_id)
+    finally:
+        _end_loading(loading_state)
+    return {
+        "loaded": True, "cluster": cluster_id, "alias": alias, "is_decision": True,
+        "dispatched": "decision-pool", "model": model_abspath, "upstream": upstream,
+        "node": host, "node_index": idx, "pid": pid, "load_s": pool.load_s,
+        "decision": {k: dcfg.get(k) for k in ("prompt_version", "readout", "max_one_pass")},
+        "note": f"{req.model} serves typed decisions on {host}: POST /v1/systemone "
+                f"with model={alias!r}. Chat endpoints refuse it.",
+    }
+
+
 @app.post("/admin/clusters/{cluster_id}/load")
 async def admin_cluster_load(cluster_id: str, req: ArgoLoadRequest):
     if not cluster_exists(cluster_id):
@@ -14653,6 +14997,18 @@ async def admin_cluster_load(cluster_id: str, req: ArgoLoadRequest):
     if cd.get("kind") == "telemak":
         await _telemak_reconcile_models_dir(cluster_id, cd)
         return await _telemak_proxy_load(cluster_id, cd, req)
+    # Decision models (#95): dispatched BEFORE the preflight and every other
+    # branch — their config.json can carry a vision_config (Eikos: qwen3_5), so
+    # the vision / replica paths would take them for a VL chat model.
+    if cd.get("kind") == "decision":
+        return await _decision_cluster_load(cluster_id, cd, req)
+    if _is_decision_tagged(req.model, _resolve_model_abspath(req.model, models_dir_for(cluster_id))):
+        raise HTTPException(409, {
+            "error": "decision_model_on_non_decision_cluster",
+            "message": f"'{req.model}' is tagged as a decision model (settings.decision_models): "
+                       f"it answers typed questions, not chat. Load it on a cluster of kind "
+                       f"'decision'.",
+        })
     # ── Pre-flight gate (pro loader) ──────────────────────────────────────
     # Evaluate size / format / support / vision-venv / capacity BEFORE
     # committing — refuse a load that will 100% fail (model absent from the
@@ -17585,6 +17941,171 @@ def _dflash_pool_log_id(cluster_id: str, alias: str) -> str:
     [a-z0-9-] shape _vlm_log_path expects."""
     raw = f"{cluster_id}-{alias}-dflash"
     return re.sub(r"[^a-z0-9-]", "-", raw.lower())[:41].strip("-") or "dflash"
+
+
+# ── Decision models (#95, 2026-09-27) ─────────────────────────────────────────
+# scripts/decision/decision_serve.py (+ the vendored MIT readout) is installed on
+# a node by scripts/decision/install-decision.sh into its own venv. The engine
+# launches it over ssh (the ssh session can read the external models volume; a
+# launchd agent needed a manual TCC grant per node) and owns its lifecycle.
+DECISION_DEFAULT_PORT = int(env_get("DECISION_PORT", "8095") or "8095")
+DECISION_DEFAULT_VENV = env_get("DECISION_VENV", "$HOME/odyssai/decision/.venv")
+DECISION_SERVER_REMOTE = env_get("DECISION_SERVER_REMOTE",
+                                 "$HOME/odyssai/decision/decision_serve.py")
+# (prompt_version, readout) pairs the vendored readout implements. Anything else
+# is refused: answering with a prompt format the weights were not trained on
+# would return wrong probabilities without any error.
+DECISION_KNOWN_FORMATS = frozenset({
+    ("letter-v1-semif", "letter-logit"),
+    ("letter-v1-ours", "letter-logit"),
+})
+
+
+def _decision_launch_cmd(log_id: str, venv: str, model_path: str,
+                         alias: str, port: int) -> str:
+    """nohup decision_serve.py with the decision venv python. Echoes VLM_PID=$!
+    (the shared launch/probe helpers read that marker). `--port N --host` keeps
+    a space after the port for the kill pattern."""
+    py = f"{venv.rstrip('/')}/bin/python"
+    log = _vlm_log_path(log_id)
+    return (
+        f"export HOME=\"${{HOME:-/Users/$(id -un)}}\" USER=\"$(id -un)\" TMPDIR=/tmp "
+        f"HF_HUB_OFFLINE=1 PATH=/usr/bin:/bin:/usr/sbin:/sbin && "
+        f"nohup {_remote_path(py)} {_remote_path(DECISION_SERVER_REMOTE)} "
+        f"--model {shlex.quote(model_path)} --name {shlex.quote(alias)} "
+        f"--port {int(port)} --host 0.0.0.0 "
+        f"> {log} 2>&1 & "
+        f"echo VLM_PID=$!"
+    )
+
+
+def _decision_kill_cmd(port: int) -> str:
+    """SIGTERM → grace → SIGKILL of decision_serve.py on THIS port only (the
+    `( |$)` after the port keeps 8095 from matching 80950)."""
+    pattern = shlex.quote(f"decision_serve.py.*--port {int(port)}( |$)")
+    return (
+        f"if pgrep -f {pattern} >/dev/null 2>&1; then "
+        f"  pkill -TERM -f {pattern} 2>/dev/null; "
+        f"  for i in $(seq 1 {_SWEEP_GRACE_ITERS}); do "
+        f"    pgrep -f {pattern} >/dev/null 2>&1 || break; "
+        f"    sleep 0.5; "
+        f"  done; "
+        f"  if pgrep -f {pattern} >/dev/null 2>&1; then "
+        f"    pkill -9 -f {pattern}; echo 'killed (SIGKILL)'; "
+        f"  else echo 'cleaned (SIGTERM)'; fi; "
+        f"else echo 'no process'; fi"
+    )
+
+
+def _decision_pool_log_id(cluster_id: str, alias: str) -> str:
+    raw = f"{cluster_id}-{alias}-decision"
+    return re.sub(r"[^a-z0-9-]", "-", raw.lower())[:41].strip("-") or "decision"
+
+
+def decision_models_tagged() -> list[str]:
+    """Models the operator tagged as decision models (settings.decision_models):
+    absolute paths or folder names. Only these load on a `kind: decision`
+    cluster, and they load nowhere else."""
+    s = (_load_cluster_config().get("settings") or {})
+    v = s.get("decision_models") or []
+    return [str(x).strip().rstrip("/") for x in v if str(x).strip()] if isinstance(v, list) else []
+
+
+def _is_decision_tagged(model: Optional[str], model_abspath: Optional[str] = None) -> bool:
+    tags = decision_models_tagged()
+    if not tags or not model:
+        return False
+    cands = {model.strip().rstrip("/")}
+    if model_abspath:
+        cands.add(model_abspath.rstrip("/"))
+    cands |= {c.rsplit("/", 1)[-1] for c in list(cands)}
+    return any(t in cands or t.rsplit("/", 1)[-1] in cands for t in tags)
+
+
+async def _read_decision_config(ssh_target: str, model_abspath: str) -> Optional[dict]:
+    """decision_config.json of a model folder on the node, or None when absent /
+    unreadable (not a decision model)."""
+    cmd = f"cat {shlex.quote(model_abspath.rstrip('/') + '/decision_config.json')} 2>/dev/null"
+    try:
+        rc, out, _ = await asyncio.to_thread(_ssh_exec, ssh_target, cmd, 15)
+    except Exception:
+        return None
+    if rc != 0 or not (out or "").strip():
+        return None
+    try:
+        cfg = json.loads(out)
+    except Exception:
+        return None
+    return cfg if isinstance(cfg, dict) else None
+
+
+def _decision_format_ok(cfg: dict) -> bool:
+    return (cfg.get("prompt_version"), cfg.get("readout")) in DECISION_KNOWN_FORMATS
+
+
+async def _launch_decision_server(
+    ssh_target: str, log_id: str, model_path: str, alias: str,
+    port: int, venv: str, ready_timeout: float,
+) -> tuple[bool, Optional[str], str]:
+    """Launch decision_serve.py on a node and poll /v1/models until it lists the
+    model (the server keeps the list empty until the weights are loaded).
+    Returns (ready, launched_pid, log_tail)."""
+    ip = _vlm_ip_from_ssh(ssh_target)
+    launch = _decision_launch_cmd(log_id, venv, model_path, alias, port)
+    launched_pid: Optional[str] = None
+    rc, out, err = await asyncio.to_thread(_ssh_exec, ssh_target, launch, 20)
+    if rc != 0:
+        return False, None, (err or out or "").strip()[-4000:]
+    for line in (out or "").splitlines():
+        if line.startswith("VLM_PID="):
+            launched_pid = line.split("=", 1)[1].strip()
+    if await _await_launched_ready(ssh_target, ip, port, launched_pid, ready_timeout):
+        return True, launched_pid, ""
+    tail = await _vlm_log_tail(ssh_target, log_id)
+    return False, launched_pid, tail
+
+
+async def _restore_decision_pool(cluster_id: str, alias: str, entry: dict,
+                                 indices: list[int]) -> Optional["DecisionPool"]:
+    """Startup restore of a persisted decision pool. Adopt the server in place
+    only if it serves THIS model; a different model on the port is never
+    adopted nor killed (restore skipped, logged)."""
+    model_path = entry["model"]
+    port = int(entry.get("port") or DECISION_DEFAULT_PORT)
+    venv = entry.get("venv") or DECISION_DEFAULT_VENV
+    topo = build_topology_from_indices(cluster_id, indices)
+    ssh_target = entry.get("ssh") or topo[0]["ssh"]
+    host = entry.get("host") or topo[0].get("host") or _host_id_from_ssh(ssh_target)
+    ip = _vlm_ip_from_ssh(ssh_target)
+    upstream = entry.get("upstream") or f"http://{ip}:{port}"
+    pid = None
+    served = await _vlm_served_model(ip, port, model_path)
+    if served == "<unknown>":
+        # Up but listing nothing: a decision server still loading its weights
+        # (the list stays empty until then). Give it the ready window, re-check.
+        await _await_launched_ready(ssh_target, ip, port, None, VLM_READY_TIMEOUT_S)
+        served = await _vlm_served_model(ip, port, model_path)
+    if served is not None and served != "<unknown>" and _same_model_path(served, model_path):
+        sys.stderr.write(f"[api] decision pool restore ({cluster_id}:{alias}): "
+                         f"{upstream} already serving — adopting in place\n")
+    elif served is not None:
+        sys.stderr.write(f"[api] decision pool restore ({cluster_id}:{alias}) skipped — "
+                         f"{upstream} answers with another model ({served}); not touching it\n")
+        return None
+    else:
+        ready, pid, tail = await _launch_decision_server(
+            ssh_target, _decision_pool_log_id(cluster_id, alias), model_path,
+            alias, port, venv, VLM_READY_TIMEOUT_S)
+        if not ready:
+            sys.stderr.write(f"[api] decision pool restore ({cluster_id}:{alias}) failed — "
+                             f"server did not become ready. Log tail:\n{tail}\n")
+            return None
+    return DecisionPool(
+        model_path=model_path, cluster=cluster_id, alias=alias,
+        node_indices=indices, upstream=upstream, port=port,
+        ssh_target=ssh_target, host=host, pid=pid, venv=venv,
+        decision_cfg=entry.get("decision_cfg"),
+    )
 
 
 # ── Inkling native multimodal server (2026-08-10) ─────────────────────────────

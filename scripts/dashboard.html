@@ -2142,6 +2142,7 @@ function renderSettingsGeneral() {
   const ttl = Number(s.pool_ttl_seconds_default || 0);
   const kvQ8 = s.kv_q8_default !== false;  // default true
   const sysPrefix = s.system_prefix_text || "";
+  const decisionModels = Array.isArray(s.decision_models) ? s.decision_models : [];
   const sysPrefixTokens = Math.ceil(sysPrefix.length / 4);  // rough estimate (chars/4)
   return `
     <div style="display:flex;flex-direction:column;gap:20px">
@@ -2180,6 +2181,14 @@ function renderSettingsGeneral() {
               <input type="checkbox" data-act="general-toggle-kv-q8" ${kvQ8?"checked":""}/>
               <span style="font-family:var(--font-mono);font-size:12px;color:${kvQ8?'var(--blue-deep)':'var(--ink-3)'}">${kvQ8?'ON':'OFF'}</span>
             </label>
+          </div>
+
+          <div style="display:flex;flex-direction:column;gap:8px;padding:10px 12px;background:var(--surface-2);border-radius:8px">
+            <div>
+              <div style="font-size:13px;font-weight:600">Decision models</div>
+              <div style="font-size:11px;color:var(--ink-3);margin-top:2px">One per line — folder name (<span class="mono">Eikos-27B</span>) or absolute path. Only these load on a cluster of kind <span class="mono">decision</span>, and they load nowhere else. Served through <span class="mono">POST /v1/systemone</span>.</div>
+            </div>
+            <textarea class="ce-input mono" rows="3" data-act="general-set-decision-models" placeholder="Eikos-27B" style="width:100%;resize:vertical">${escapeHtml(decisionModels.join("\n"))}</textarea>
           </div>
         </div>
       </div>
@@ -2344,11 +2353,12 @@ function renderArgoForm() {
           <div class="field">
             <div class="field-label">Kind</div>
             <select class="ce-input mono" data-act="argo-edit-kind">
-              <option value="mlx-distributed" ${f.kind!=="replica"?"selected":""}>mlx-distributed (1 modèle réparti sur les nodes)</option>
+              <option value="mlx-distributed" ${f.kind!=="replica"&&f.kind!=="decision"?"selected":""}>mlx-distributed (1 modèle réparti sur les nodes)</option>
               <option value="replica" ${f.kind==="replica"?"selected":""}>replica (1 copie par node, débit concurrent)</option>
+              <option value="decision" ${f.kind==="decision"?"selected":""}>decision (modèles de décision tagués, POST /v1/systemone)</option>
             </select>
           </div>
-          <div class="field" ${f.kind==="replica"?"hidden":""}>
+          <div class="field" ${f.kind==="replica"||f.kind==="decision"?"hidden":""}>
             <div class="field-label">Backend</div>
             <select class="ce-input mono" data-act="argo-edit-backend">
               <option value="ring" ${f.backend!=="jaccl"?"selected":""}>ring (TCP/IP)</option>
@@ -4084,7 +4094,12 @@ function renderArgoPoolsList(a) {
     const replicaPill = p.is_replica
       ? `<span class="kind-pill" style="background:${degraded ? "var(--amber-soft)" : "var(--slate-blue-soft, #e8ecf5)"};color:${degraded ? "var(--amber-deep)" : "var(--slate-blue, #4a5b8a)"}" title="${escapeHtml("Replica pool — one full copy per node, least-busy dispatch + session affinity" + (p.batch ? ". Continuous batching ON inside each replica" : ". One request at a time per replica (batch off)") + (degraded ? "\n" + healTip : ""))}">replica${degraded ? ` ${liveN}/${reps.length}` : ""}${p.batch ? " · batch" : ""}</span>`
       : "";
-    const kindPill = (isVlmPool
+    // #95 — decision model: typed decisions over POST /v1/systemone, never chat.
+    // Shown instead of "VLM" (its checkpoint can carry a vision_config).
+    const isDecisionPool = !!(p.is_decision || p.mode === "decision");
+    const kindPill = (isDecisionPool
+      ? `<span class="kind-pill" style="background:#6b4fa0" title="Decision model — typed questions (choice/score/noul) → calibrated probabilities. Call POST /v1/systemone with model=${escapeHtml(p.alias)}; chat endpoints refuse it.">decision</span>`
+      : isVlmPool
       ? `<span class="kind-pill vlm" title="VL model — mlx_vlm.server, single node">VLM</span>`
       : "") + replicaPill + mtpPill;
     // #61 — per-pool activity. The aggregate Activity hero only showed the
@@ -6432,6 +6447,23 @@ async function handleAct(e) {
       toast(`Pool TTL → ${ttl}s ${ttl === 0 ? '(disabled)' : ''}`, "ok");
     } catch (e) {
       toast(`Save failed: ${e.message}`, "err");
+    }
+    return;
+  }
+  if (act === "general-set-decision-models") {
+    if (e.type !== "change") return;
+    const list = (el.value || "").split("\n").map(x => x.trim()).filter(Boolean);
+    try {
+      const r = await fetch("/admin/settings", {
+        method: "PUT",
+        headers: { "content-type": "application/json", ...authHeaders() },
+        body: JSON.stringify({ decision_models: list }),
+      });
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      state.server_settings = await r.json();
+      toast(`Decision models → ${list.length ? list.join(", ") : "none"}`, "ok");
+    } catch (e2) {
+      toast(`Save failed: ${e2.message}`, "err");
     }
     return;
   }
