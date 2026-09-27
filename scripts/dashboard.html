@@ -924,6 +924,76 @@ select.ce-input { appearance: none; -webkit-appearance: none; background-image: 
 
 /* Engine tab */
 
+/* ─── Simple / Expert mode (#90) ──────────────────────────────────
+   One class on <body>, set before the first render and never touched by
+   render(). Markup is tagged, not duplicated: .x-expert = full-interface
+   only, .x-simple = the two simple-only blocks (quick load, Connect). */
+body.simple-mode .x-expert { display: none !important; }
+body.expert-mode .x-simple { display: none !important; }
+
+.mode-toggle {
+  display: inline-flex; align-items: center; gap: 8px; padding: 7px 12px 7px 10px;
+  border: 1px solid var(--line); border-radius: 999px; background: var(--surface);
+  font-size: 11px; font-weight: 600; color: var(--ink-2); letter-spacing: 0.04em; text-transform: uppercase;
+}
+.mode-toggle .track {
+  position: relative; width: 26px; height: 15px; border-radius: 999px; background: var(--ink-4);
+  transition: background 0.15s; flex-shrink: 0;
+}
+.mode-toggle .knob {
+  position: absolute; top: 2px; left: 2px; width: 11px; height: 11px; border-radius: 50%;
+  background: white; transition: left 0.15s;
+}
+.mode-toggle.on { color: var(--blue-deep); border-color: var(--blue-border); background: var(--blue-soft); }
+.mode-toggle.on .track { background: var(--blue); }
+.mode-toggle.on .knob { left: 13px; }
+
+/* Simple quick-load row */
+.quick-load .ql-row { display: flex; flex-direction: row; align-items: flex-end; gap: 14px; flex-wrap: wrap; margin-top: 14px; }
+.quick-load .ql-row .field { flex: 1; min-width: 220px; }
+.quick-load .ql-hint { font-size: 12px; color: var(--ink-2); margin-top: 10px; line-height: 16px; }
+.quick-load .ql-hint.warn { color: var(--rust-deep); }
+
+/* Connect card */
+.connect-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; margin-top: 14px; }
+.connect-url {
+  display: flex; flex-direction: row; align-items: center; gap: 10px; padding: 10px 12px;
+  background: var(--surface-2); border: 1px solid var(--line); border-radius: 8px; min-width: 0;
+}
+.connect-url .stack { display: flex; flex-direction: column; gap: 2px; flex: 1; min-width: 0; }
+.connect-url .cap { font-size: 10px; font-weight: 600; color: var(--ink-2); letter-spacing: 0.06em; text-transform: uppercase; }
+.connect-url .val { font-family: var(--font-mono); font-size: 12px; color: var(--ink); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.connect-note .mono { font-family: var(--font-mono); color: var(--ink); word-break: break-all; }
+.connect-curl {
+  margin: 12px 0 0; padding: 12px 14px; background: var(--surface-2); border: 1px solid var(--line); border-radius: 8px;
+  font-family: var(--font-mono); font-size: 11.5px; line-height: 1.5; color: var(--ink); white-space: pre; overflow-x: auto;
+}
+
+/* ─── Phone width ────────────────────────────────────────────────
+   Desktop rendering is unchanged; below 760 px the page gets 16 px
+   gutters, wrapping rows and a stacked status split. */
+@media (max-width: 760px) {
+  .header { flex-wrap: wrap; gap: 12px; padding: 14px 16px; }
+  .header-actions { flex-wrap: wrap; gap: 8px; }
+  .header-actions .pill-meta { display: none; }
+  .ribbon { padding: 0 16px; overflow-x: auto; }
+  .ribbon .tab { padding: 12px 14px; flex-shrink: 0; }
+  .main { padding: 16px 16px 24px; gap: 16px; }
+  .section { padding: 18px 16px; }
+  .section-head { flex-wrap: wrap; }
+  .quick-actions { flex-wrap: wrap; }
+  .h1-cluster h1 { font-size: 24px; line-height: 28px; }
+  .h1-cluster .topo { flex-wrap: wrap; }
+  .split-2 { flex-direction: column; gap: 20px; padding: 18px 16px; }
+  .split-2 > .col-telemetry { width: auto; }
+  .form-row { flex-wrap: wrap; }
+  .metrics-row { flex-wrap: wrap; row-gap: 12px; }
+  .connect-grid { grid-template-columns: minmax(0, 1fr); }
+  .pool-row { flex-wrap: wrap; row-gap: 6px; }
+  .node-row .row1 { flex-wrap: wrap; }
+  .footer { padding: 16px; flex-wrap: wrap; gap: 6px; }
+}
+
 </style>
 </head>
 <body>
@@ -1148,6 +1218,30 @@ function signOut() {
   setAuthToken('');
   showAuthOverlay();
 }
+
+// ─── Simple / Expert mode (#90) ─────────────────────────────────────
+// Simple by default: cluster state, quick load, what runs, the test chat and
+// the API URL. "Expert mode" reveals the full interface. The choice is a
+// class on <body> (outside #root, so render() never resets it) persisted in
+// localStorage; absent or unreadable storage = simple.
+const EXPERT_MODE_KEY = "odyssai.expert_mode";
+function isExpertMode() { return document.body.classList.contains("expert-mode"); }
+function applyExpertMode(on) {
+  document.body.classList.toggle("expert-mode", !!on);
+  document.body.classList.toggle("simple-mode", !on);
+}
+function setExpertMode(on) {
+  try {
+    if (on) localStorage.setItem(EXPERT_MODE_KEY, "1");
+    else localStorage.removeItem(EXPERT_MODE_KEY);
+  } catch (e) { /* storage blocked: the mode still applies to this page */ }
+  applyExpertMode(on);
+}
+(function initExpertMode() {
+  let on = false;
+  try { on = localStorage.getItem(EXPERT_MODE_KEY) === "1"; } catch (e) { on = false; }
+  applyExpertMode(on);  // before the first render, so the page never flashes the other mode
+})();
 
 // ─── Refresh ────────────────────────────────────────────────────────
 async function refreshAll() {
@@ -1594,6 +1688,7 @@ function render() {
         ${renderActiveRuns()}
         ${renderRunnerLogs()}
         ${renderRecentActivity()}
+        ${renderConnectCard()}
         ${renderFooter()}
       </div>
       ${state.settings_open ? renderSettings() : ""}
@@ -3563,7 +3658,8 @@ function renderHeader() {
         <div class="pill-meta mono" title="ODO — tokens produits par tous les pools locaux (cumul persistant)" style="letter-spacing:0.02em">ODO <b>${fmtTok(state.version_info.odometer)}</b></div>` : ""}
         ${renderHealthPill()}
         <div class="pill-meta">${escapeHtml(location.host || ".141:8000")}</div>
-        <button class="icon-btn" data-act="settings" title="Settings">${Icon.settings}</button>
+        <button class="mode-toggle ${isExpertMode() ? "on" : ""}" data-act="toggle-expert" aria-pressed="${isExpertMode() ? "true" : "false"}" title="${isExpertMode() ? "Back to the simple view" : "Show the full interface: replicas, MTP, drafters, providers, bench, logs, downloads, settings"}"><span class="track"><span class="knob"></span></span><span>Expert mode</span></button>
+        <button class="icon-btn x-expert" data-act="settings" title="Settings">${Icon.settings}</button>
       </div>
     </div>
   `;
@@ -3628,7 +3724,7 @@ function renderRibbon() {
   return `
     <div class="ribbon">
       ${tabs}
-      <button class="tab add" data-act="add-cluster">
+      <button class="tab add x-expert" data-act="add-cluster">
         ${Icon.plus}
         <span class="name">Add Argo</span>
       </button>
@@ -3665,8 +3761,86 @@ function renderArgoCard() {
       ${renderLoadingBanner(a, cid)}
       ${renderArgoPoolsList(a)}
       ${renderStatusSplit(a, cid)}
+      ${renderQuickLoad(a)}
       ${renderLoadConfig(a)}
     </section>
+  `;
+}
+
+// ─── Simple-mode quick load (#90) ─────────────────────────────────────
+// One picker + one button. Nodes are chosen automatically (smallest topology
+// that fits, pipeline split) and every other knob keeps its SERVER default:
+// the body is {model, nodes, mode:"pipeline"} only — whatever the expert form
+// currently holds (drafter, MTP, transport, KV Q8, batch) is NOT sent.
+// Semantics are the engine's, stated plainly in the UI: a no-alias load names
+// the pool after the model, so a model that is already running is refused
+// here (re-loading it would restart it mid-generation), and a different model
+// loads NEXT TO the running ones (RAM permitting; the engine refuses with a
+// 409 when a distributed pool holds the nodes).
+function quickLoadModels() {
+  return (state.default_models || []).filter(m => !/draft|dspark|dflash|backbone/i.test(m.id));
+}
+// Live truth for "is it running": the cluster status pools (refreshed every
+// poll), not the models scan's is_loaded (only refreshed on Refresh/boot).
+function quickLoadRunning(cid) {
+  const st = clusterState(cid);
+  return new Set((st?.pools || []).map(p => p.model).filter(Boolean));
+}
+function quickLoadPlan(cid, m) {
+  if (!m) return { ok: false, reason: "No model found in this cluster's models directory." };
+  if (quickLoadRunning(cid).has(m.id)) return { ok: false, reason: "Already running on this cluster (see Pools above)." };
+  const opt = optimalNodesForModel(cid, m.id);
+  const nodes = opt != null ? opt : clusterMaxNodes(cid);
+  const fit = computeFitCheck(cid, m.id, nodes, "pipeline");
+  if (fit.fits === false) return { ok: false, nodes, reason: "Too big for this cluster: " + fit.reason };
+  return { ok: true, nodes, sized: fit.fits === true };
+}
+function renderQuickLoad(a) {
+  const cid = state.selected_cluster;
+  const f = state.pending_form;
+  const busy = state.busy_default_load || !!a?.loading;
+  const models = quickLoadModels();
+  const runningSet = quickLoadRunning(cid);
+  if (!models.find(m => m.id === f.simple_model)) {
+    f.simple_model = (models.find(m => !runningSet.has(m.id)) || models[0] || {}).id || null;
+  }
+  const sel = models.find(m => m.id === f.simple_model) || null;
+  const plan = quickLoadPlan(cid, sel);
+  const running = (a?.pools || []).length;
+  const opts = models.map(m => {
+    const size = (m.size_bytes && m.size_bytes > 0) ? ` — ${(m.size_bytes / 1024 ** 3).toFixed(1)} GB` : "";
+    return `<option value="${escapeHtml(m.id)}" ${m.id === f.simple_model ? "selected" : ""}>${escapeHtml(m.id.split("/").pop())}${size}${runningSet.has(m.id) ? " (running)" : ""}</option>`;
+  }).join("");
+  let hint;
+  if (!plan.ok) {
+    hint = `<div class="ql-hint warn">${escapeHtml(plan.reason)}</div>`;
+  } else {
+    const n = plan.nodes;
+    hint = `<div class="ql-hint">${n} node${n > 1 ? "s" : ""}, chosen automatically${plan.sized ? " (smallest that fits)" : " (model size unknown: all nodes)"} · default settings${
+      running ? ` · loads next to the ${running} running model${running > 1 ? "s" : ""} if memory allows — Stop one above to free memory` : ""}</div>`;
+  }
+  return `
+    <div class="section quick-load x-simple" style="border-bottom:none">
+      <div class="section-head">
+        <div class="section-stack">
+          <div class="section-title">Load a model</div>
+          <div class="section-sub">Pick a model found on this cluster's disk, then Load</div>
+        </div>
+      </div>
+      <div class="ql-row">
+        <div class="field">
+          <div class="field-label">Model</div>
+          <div class="field-shell">
+            <select class="text" data-act="simple-model" ${busy ? "disabled" : ""}>
+              ${models.length ? opts : "<option>no model found</option>"}
+            </select>
+            ${Icon.chevDown}
+          </div>
+        </div>
+        <button class="btn btn-primary" data-act="simple-load" ${(busy || !plan.ok) ? "disabled" : ""}>${Icon.play}<span>${busy ? "Loading…" : "Load"}</span></button>
+      </div>
+      ${hint}
+    </div>
   `;
 }
 
@@ -3863,13 +4037,13 @@ function renderTelemakHomeCard(a, cid, label) {
           </div>
           <div class="quick-actions">
             <button class="btn btn-sm" data-act="refresh">${Icon.refresh}<span>Refresh</span></button>
-            <button class="btn btn-sm" data-act="cluster-settings" data-cluster="${cid}">${Icon.settings}<span>Cluster settings</span></button>
-            <span style="width:1px;align-self:stretch;background:var(--line);margin:2px 4px"></span>
-            <span style="align-self:center;font-size:11px;color:var(--ink-3);margin-right:2px">Service</span>
-            <button class="btn btn-sm" data-act="telemak-lifecycle" data-cluster="${cid}" data-life="start" title="Bootstrap the Telemak launchd service on its Mac (use after Quit)">${Icon.play || ""}<span>Start</span></button>
-            <button class="btn btn-sm" data-act="telemak-lifecycle" data-cluster="${cid}" data-life="stop" title="SIGTERM the process — KeepAlive relaunches it (soft bounce)"><span>Stop</span></button>
-            <button class="btn btn-sm" data-act="telemak-lifecycle" data-cluster="${cid}" data-life="restart" title="Kill + relaunch atomically — frees a wedged generation slot">${Icon.refresh}<span>Restart</span></button>
-            <button class="btn btn-sm btn-destructive" data-act="telemak-lifecycle" data-cluster="${cid}" data-life="quit" title="Boot the service out — stays DOWN until you press Start">${Icon.x || ""}<span>Quit</span></button>
+            <button class="btn btn-sm x-expert" data-act="cluster-settings" data-cluster="${cid}">${Icon.settings}<span>Cluster settings</span></button>
+            <span class="x-expert" style="width:1px;align-self:stretch;background:var(--line);margin:2px 4px"></span>
+            <span class="x-expert" style="align-self:center;font-size:11px;color:var(--ink-3);margin-right:2px">Service</span>
+            <button class="btn btn-sm x-expert" data-act="telemak-lifecycle" data-cluster="${cid}" data-life="start" title="Bootstrap the Telemak launchd service on its Mac (use after Quit)">${Icon.play || ""}<span>Start</span></button>
+            <button class="btn btn-sm x-expert" data-act="telemak-lifecycle" data-cluster="${cid}" data-life="stop" title="SIGTERM the process — KeepAlive relaunches it (soft bounce)"><span>Stop</span></button>
+            <button class="btn btn-sm x-expert" data-act="telemak-lifecycle" data-cluster="${cid}" data-life="restart" title="Kill + relaunch atomically — frees a wedged generation slot">${Icon.refresh}<span>Restart</span></button>
+            <button class="btn btn-sm btn-destructive x-expert" data-act="telemak-lifecycle" data-cluster="${cid}" data-life="quit" title="Boot the service out — stays DOWN until you press Start">${Icon.x || ""}<span>Quit</span></button>
           </div>
         </div>
       </div>
@@ -4113,7 +4287,7 @@ function renderArgoPoolsList(a) {
       actPill = `<span style="color:var(--ink-3);font-size:10px;letter-spacing:0.04em;text-transform:uppercase">idle</span>`;
     }
     return `
-      <div style="display:flex;align-items:center;gap:12px;padding:8px 12px;background:var(--surface);border:1px solid var(--line);border-radius:6px;font-family:var(--font-mono);font-size:12px">
+      <div class="pool-row" style="display:flex;align-items:center;gap:12px;padding:8px 12px;background:var(--surface);border:1px solid var(--line);border-radius:6px;font-family:var(--font-mono);font-size:12px">
         <span style="font-weight:600;color:var(--ink);min-width:80px">${escapeHtml(p.alias)}${aliasIsDefault && conc ? ' &rarr;' : ''}</span>
         ${kindPill}
         <span style="color:var(--ink-2);flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${escapeHtml(conc)}</span>
@@ -4141,18 +4315,19 @@ function renderArgoPoolsList(a) {
       <div class="section-head">
         <div class="section-stack">
           <div class="section-title">Pools (${pools.length})</div>
-          <div class="section-sub">${
+          <div class="section-sub x-expert">${
             free.length === 0
               ? "all nodes occupied — a new pool will co-reside (RAM permitting)"
               : `free nodes: ${free.map(i => "#" + i).join(", ")} · occupied nodes can also co-reside`
           }</div>
+          <div class="section-sub x-simple">Models running on this cluster · Stop unloads one</div>
         </div>
-        <button class="btn btn-sm ${canAdd?'':'btn-disabled'}" data-act="default-add-toggle" ${canAdd?'':'disabled'}>${Icon.plus}<span>${f.default_add_open ? 'Cancel add' : 'Add pool'}</span></button>
+        <button class="btn btn-sm x-expert ${canAdd?'':'btn-disabled'}" data-act="default-add-toggle" ${canAdd?'':'disabled'}>${Icon.plus}<span>${f.default_add_open ? 'Cancel add' : 'Add pool'}</span></button>
       </div>
       <div style="display:flex;flex-direction:column;gap:6px;margin-top:12px">
         ${rows}
       </div>
-      ${f.default_add_open && canAdd ? renderArgoAddPoolForm(a, free) : ''}
+      ${f.default_add_open && canAdd ? `<div class="x-expert">${renderArgoAddPoolForm(a, free)}</div>` : ''}
     </div>
   `;
 }
@@ -4441,10 +4616,10 @@ function renderArgoHeader(a) {
         </div>
         <div class="quick-actions">
           <button class="btn btn-sm" data-act="refresh">${Icon.refresh}<span>Refresh</span></button>
-          <button class="btn btn-sm" data-act="cluster-settings" data-cluster="${state.selected_cluster||''}">${Icon.settings}<span>Cluster settings</span></button>
-          <button class="btn btn-sm" data-act="default-cancel" style="color:var(--rust)">${Icon.cancel}<span>Cancel</span></button>
-          <button class="btn btn-sm" data-act="default-hardreset" style="color:var(--rust)">${Icon.hardReset}<span>Hard reset</span></button>
-          <button class="btn btn-dark btn-sm" data-act="default-unload" ${loaded?"":"disabled"}>${Icon.pause}<span>Stop</span></button>
+          <button class="btn btn-sm x-expert" data-act="cluster-settings" data-cluster="${state.selected_cluster||''}">${Icon.settings}<span>Cluster settings</span></button>
+          <button class="btn btn-sm x-expert" data-act="default-cancel" style="color:var(--rust)">${Icon.cancel}<span>Cancel</span></button>
+          <button class="btn btn-sm x-expert" data-act="default-hardreset" style="color:var(--rust)">${Icon.hardReset}<span>Hard reset</span></button>
+          <button class="btn btn-dark btn-sm x-expert" data-act="default-unload" ${loaded?"":"disabled"}>${Icon.pause}<span>Stop</span></button>
         </div>
       </div>
     </div>
@@ -4567,7 +4742,7 @@ function renderStateTimeline(a) {
   else if (loaded) active = "waiting";
   const phases = ["idle", "loading", "waiting", "running"];
   return `
-    <div class="state-timeline">
+    <div class="state-timeline x-expert">
       ${phases.map((p, i) => {
         const isActive = p === active;
         const isPast = phases.indexOf(active) > i;
@@ -4598,7 +4773,7 @@ function renderMetricsRow(a) {
   const loaded = !!a.loaded;
   const tps = loaded && a.recent_avg_tps ? a.recent_avg_tps.toFixed(1) : "—";
   return `
-    <div class="metrics-row">
+    <div class="metrics-row x-expert">
       <div class="col">
         <div class="cap">tok/s · last 10</div>
         <div class="val${loaded?"":" muted"}">${tps}</div>
@@ -4626,7 +4801,7 @@ function renderMetricsRow(a) {
 function renderMetaRow(a) {
   const loaded = !!a.loaded;
   return `
-    <div class="meta-row">
+    <div class="meta-row x-expert">
       <div class="item"><span class="cap">Mode</span><span class="val">${loaded ? escapeHtml(a.mode || "—") : "—"}</span></div>
       <div class="sep"></div>
       <div class="item"><span class="cap">KV cache</span><span class="val">${loaded ? (a.kv_q8 ? "Q8" : "f16") : "—"}</span></div>
@@ -4662,7 +4837,7 @@ function renderGlobalRam(a, clusterId) {
     ? `${gbBytes(modelB).toFixed(0)}GB / ${totalGb.toFixed(0)}GB`
     : `— / ${totalGb.toFixed(0)}GB`;
   return `
-    <div class="global-ram">
+    <div class="global-ram x-expert">
       <div class="gr-row">
         <div class="gr-label">Global</div>
         <div class="gr-stack">
@@ -4823,7 +4998,7 @@ function optimalNodesForModel(cluster, selectedModel) {
 // default_models.size_bytes. Returns {fits, reason?, modelGB, ramGB, requiredGB}.
 // `fits === null` means we don't have enough info to decide (size unknown
 // for instance) — in that case the UI doesn't block but warns.
-function computeFitCheck(cluster, selectedModel, nodes) {
+function computeFitCheck(cluster, selectedModel, nodes, modeOverride) {
   const modelList = state.cluster_models?.[cluster] || state.default_models || [];
   const m = (modelList || []).find(x => x.id === selectedModel);
   if (!m || !m.size_bytes) {
@@ -4845,7 +5020,9 @@ function computeFitCheck(cluster, selectedModel, nodes) {
   // Pipeline mode splits capacity-aware on heterogeneous clusters — the
   // backend exposes its (higher) ceiling separately. Tensor stays on the
   // even-split bound.
-  const mode = state.pending_form?.default_mode || "pipeline";
+  // modeOverride: the simple quick-load always loads in pipeline, whatever
+  // the expert form currently says.
+  const mode = modeOverride || state.pending_form?.default_mode || "pipeline";
   const loadableBytes = (mode === "pipeline" && cap.max_loadable_pipeline_bytes)
     ? cap.max_loadable_pipeline_bytes
     : cap.max_loadable_bytes;
@@ -4893,7 +5070,7 @@ function renderLoadConfig(a) {
   const configChanged = isLoadConfigChanged(a, f);
   const fitCheck = computeFitCheck(state.selected_cluster, selectedModel, selectedNodes);
   return `
-    <div class="section tint">
+    <div class="section tint x-expert">
       <div class="section-head">
         <div class="section-stack">
           <div class="section-title">Load configuration</div>
@@ -5312,7 +5489,7 @@ function renderRunnerLogs() {
   // does the obvious thing on the active cluster without a select menu.
   const targetCluster = state.default || cluster || "main";
   return `
-    <div class="section">
+    <div class="section x-expert">
       <div class="section-head logs-head">
         <div style="display:flex;align-items:center;gap:12px">
           <div class="section-title">Runner logs</div>
@@ -5628,7 +5805,7 @@ function renderActiveRuns() {
   const runs = state.runs || [];
   if (runs.length === 0) return ""; // hide when empty
   return `
-    <section class="cluster-card">
+    <section class="cluster-card x-expert">
       <div style="display:flex;flex-direction:row;align-items:center;justify-content:space-between;padding:22px 36px;border-bottom:1px solid var(--line)">
         <div class="section-stack">
           <div style="display:flex;flex-direction:row;align-items:center;gap:10px">
@@ -5720,7 +5897,7 @@ function renderRecentActivity() {
   ];
 
   return `
-    <section class="cluster-card">
+    <section class="cluster-card x-expert">
       <div class="activity-head">
         <div class="left">
           <h2>Recent activity</h2>
@@ -5775,6 +5952,50 @@ function renderActivityRow(m) {
       <div class="c-tps">${tps ? tps.toFixed(1) : "—"}</div>
       <div class="c-ttft">${ttftMs != null ? (ttftMs >= 1000 ? (ttftMs/1000).toFixed(1)+" s" : ttftMs+" ms") : "—"}</div>
     </div>
+  `;
+}
+
+// ─── Connect card (#90, simple mode) ──────────────────────────────────
+// The two base URLs + one curl, so Claude Code / Codex / any SDK can be
+// pointed at the engine without opening Settings → Endpoints (which keeps
+// the per-client recipes in expert mode).
+function connectExampleModel() {
+  const aliasOf = id => (clusterState(id)?.pools || []).map(p => p.alias).find(Boolean);
+  return aliasOf(state.selected_cluster)
+    || CLUSTERS.map(c => aliasOf(c.id)).find(Boolean)
+    || "<model-id>";
+}
+function renderConnectCard() {
+  const openaiBase = endpointBaseUrl();
+  const anthropicBase = openaiBase.replace(/\/v1\/?$/, "");
+  const model = connectExampleModel();
+  const curl =
+`curl ${openaiBase}/chat/completions \\
+  -H "Content-Type: application/json" \\
+  -d '{"model": "${model}", "messages": [{"role": "user", "content": "Hello"}]}'`;
+  const urlRow = (cap, val) => `
+    <div class="connect-url">
+      <div class="stack"><div class="cap">${cap}</div><div class="val" title="${escapeHtml(val)}">${escapeHtml(val)}</div></div>
+      <button class="btn btn-xs" data-act="copy-curl" data-v="${escapeHtml(val)}">Copy</button>
+    </div>`;
+  return `
+    <section class="cluster-card x-simple">
+      <div class="section" style="border-bottom:none">
+        <div class="section-head">
+          <div class="section-stack">
+            <div class="section-title">Connect</div>
+            <div class="section-sub">OpenAI- and Anthropic-compatible API · no key needed on a LAN install (pass any value)</div>
+          </div>
+          <button class="btn btn-xs" data-act="copy-curl" data-v="${escapeHtml(curl)}">Copy curl</button>
+        </div>
+        <div class="connect-grid">
+          ${urlRow("OpenAI base URL · Codex, OpenAI SDKs", openaiBase)}
+          ${urlRow("Anthropic base URL · Claude Code", anthropicBase)}
+        </div>
+        <pre class="connect-curl">${escapeHtml(curl)}</pre>
+        <div class="section-sub connect-note" style="margin-top:10px">Claude Code: <span class="mono">ANTHROPIC_BASE_URL=${escapeHtml(anthropicBase)} ANTHROPIC_AUTH_TOKEN=dummy claude --model ${escapeHtml(model)}</span> · per-client recipes: Expert mode → Settings → Endpoints</div>
+      </div>
+    </section>
   `;
 }
 
@@ -5860,6 +6081,7 @@ async function handleAct(e) {
   if (act === "pick-cluster") { pickCluster(el.dataset.cluster); return; }
   if (act === "add-cluster")  { state.settings_open = true; state.settings_tab = "clusters"; render(); return; }
   if (act === "settings")     { state.settings_open = true; render(); return; }
+  if (act === "toggle-expert") { setExpertMode(!isExpertMode()); render(); return; }
   if (act === "odo-reset") {
     const cur = state.version_info?.odometer;
     if (!confirm(`Remettre l'odomètre à zéro ?${cur != null ? `\n(compteur actuel : ${Number(cur).toLocaleString("fr-FR")} tokens)` : ""}`)) return;
@@ -7056,6 +7278,23 @@ async function handleAct(e) {
     const allOn = nodes.every(n => f.default_targets[n.host]);
     nodes.forEach(n => f.default_targets[n.host] = !allOn);
     render(); return;
+  }
+
+  // Simple-mode quick load (#90) — see renderQuickLoad for the contract.
+  if (act === "simple-model") { f.simple_model = el.value; if (e.type === "change") render(); return; }
+  if (act === "simple-load") {
+    const cid = state.selected_cluster;
+    const m = quickLoadModels().find(x => x.id === f.simple_model);
+    const plan = quickLoadPlan(cid, m);
+    if (!plan.ok) { toast(plan.reason, "err"); return; }
+    state.busy_default_load = true; render();
+    try {
+      const r = await postJson(`/admin/clusters/${encodeURIComponent(cid)}/load`,
+                               { model: m.id, nodes: plan.nodes, mode: "pipeline" });
+      const secs = (typeof r.load_s === "number") ? ` in ${r.load_s.toFixed(1)}s` : "";
+      toast(`${r.alias || m.id.split("/").pop()} loaded${secs} — try it in the chat below`, "ok");
+    } catch (err) { toast("load failed: " + err.message, "err"); }
+    state.busy_default_load = false; refreshAll(); loadModelLists(); return;
   }
 
   // Default actions
