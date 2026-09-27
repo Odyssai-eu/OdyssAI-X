@@ -17972,8 +17972,9 @@ DECISION_SERVER_REMOTE = env_get("DECISION_SERVER_REMOTE",
 # is refused: answering with a prompt format the weights were not trained on
 # would return wrong probabilities without any error.
 DECISION_KNOWN_FORMATS = frozenset({
-    ("letter-v1-semif", "letter-logit"),
+    ("letter-v1-semif", "letter-logit"),     # Eikos family (MLX letter readout)
     ("letter-v1-ours", "letter-logit"),
+    ("julia-v1", "julia-markers"),           # Supersonic Labs Julia (PyTorch marker head)
 })
 
 
@@ -18039,20 +18040,38 @@ def _is_decision_tagged(model: Optional[str], model_abspath: Optional[str] = Non
 
 
 async def _read_decision_config(ssh_target: str, model_abspath: str) -> Optional[dict]:
-    """decision_config.json of a model folder on the node, or None when absent /
-    unreadable (not a decision model)."""
-    cmd = f"cat {shlex.quote(model_abspath.rstrip('/') + '/decision_config.json')} 2>/dev/null"
-    try:
-        rc, out, _ = await asyncio.to_thread(_ssh_exec, ssh_target, cmd, 15)
-    except Exception:
+    """The decision format of a model folder on the node, or None (not a decision
+    model). Mirrors decision_serve.read_decision_config: decision_config.json (letter
+    readout), else julia_config.json + inference-policy.json (Julia)."""
+    root = model_abspath.rstrip("/")
+
+    async def _cat(name: str) -> Optional[dict]:
+        cmd = f"cat {shlex.quote(root + '/' + name)} 2>/dev/null"
+        try:
+            rc, out, _ = await asyncio.to_thread(_ssh_exec, ssh_target, cmd, 15)
+        except Exception:
+            return None
+        if rc != 0 or not (out or "").strip():
+            return None
+        try:
+            d = json.loads(out)
+        except Exception:
+            return None
+        return d if isinstance(d, dict) else None
+
+    cfg = await _cat("decision_config.json")
+    if cfg is not None:
+        return {**cfg, "backend": "letter"}
+    jc = await _cat("julia_config.json")
+    if jc is None:
         return None
-    if rc != 0 or not (out or "").strip():
-        return None
-    try:
-        cfg = json.loads(out)
-    except Exception:
-        return None
-    return cfg if isinstance(cfg, dict) else None
+    if jc.get("architecture") != "JuliaDecisionModel" or jc.get("format_version") != 1:
+        return {"prompt_version": f"julia-unknown:{jc.get('architecture')}/{jc.get('format_version')}",
+                "readout": "julia-markers", "backend": "julia"}
+    pol = await _cat("inference-policy.json") or {}
+    return {"prompt_version": "julia-v1", "readout": "julia-markers", "backend": "julia",
+            "max_one_pass": 20, "max_length": pol.get("max_length"),
+            "head_length": pol.get("head_length")}
 
 
 def _decision_format_ok(cfg: dict) -> bool:

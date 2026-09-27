@@ -87,6 +87,12 @@ def stop_fake(port):
 
 def fake_ssh(target, cmd, timeout=30):
     CALLS.append(cmd)
+    if cmd.startswith("cat ") and "Julia-Test" in cmd:
+        if "julia_config.json" in cmd:
+            return 0, json.dumps({"format_version": 1, "architecture": "JuliaDecisionModel"}), ""
+        if "inference-policy.json" in cmd:
+            return 0, json.dumps({"max_length": 8192, "head_length": 512}), ""
+        return 1, "", ""
     if "decision_config.json" in cmd and cmd.startswith("cat "):
         if "Not-A-Decision" in cmd:
             return 1, "", ""
@@ -250,6 +256,19 @@ async def main():
         check("17 no decision_config.json → 422", r.status_code, 422)
         r = await c.post("/admin/clusters/dec/load", json={"model": "Weird-Format"})
         check("17 unknown decision format → 422", r.status_code, 422)
+
+        # 20. a Julia checkpoint (julia_config.json, no decision_config.json) loads as a decision pool
+        await c.put("/admin/settings", json={"decision_models": ["Julia-Test"]})
+        r = await c.post("/admin/clusters/dec/load", json={"model": "Julia-Test"})
+        check("20 julia model loads", r.status_code, 200)
+        jb = r.json()
+        check("20 julia format recognised", (jb.get("decision") or {}).get("prompt_version"), "julia-v1")
+        jp = api.get_pool("dec", jb.get("alias"))
+        check("20 julia pool backend kept", (jp.decision_cfg or {}).get("backend") if jp else None, "julia")
+        r = await c.get("/v1/models")
+        ent = next((m for m in r.json()["data"] if m["id"] == jb.get("alias")), {})
+        check("20 /v1/models shows julia readout", ent.get("x_odyssai", {}).get("decision_readout"), "julia-markers")
+        await c.post(f"/admin/clusters/dec/unload?alias={jb.get('alias')}", json={"force": True})
 
         # 18. kind validation accepts 'decision'
         check("18 validate kind decision", api.validate_cluster_def("dec2", 

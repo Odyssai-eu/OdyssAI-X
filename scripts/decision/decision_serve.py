@@ -1,14 +1,19 @@
 #!/usr/bin/env python3
-"""decision_serve — typed-decision server for OdyssAI-X decision pools (MLX, one node).
+"""decision_serve — typed-decision server for OdyssAI-X decision pools (one node).
 
-Serves a *decision model* (weights that answer typed questions by reading the next-token
-logits over option letters, e.g. Eikos-27B) behind the TypeSafe / Jev wire protocol that
-OdyssAI-X already routes: `POST /v1/systemone` (and `/v1/evaluate`), `GET /health`.
+Serves a *decision model* behind the TypeSafe / Jev wire protocol that OdyssAI-X already
+routes: `POST /v1/systemone` (and `/v1/evaluate`), `GET /health`. Two model formats:
 
-- Readout: the vendored, byte-identical `decision_core.py` + `mlx_decide.py` (MIT, see
-  UPSTREAM.md). Nothing is imported from the model folder: it only provides the weights,
-  `decision_config.json` and `calib.json`. An unknown `prompt_version` / `readout` is
-  refused at start instead of being answered with a format the weights were not trained on.
+- `letter` (MLX): next-token logits over option letters, e.g. Eikos-27B. Readout = the
+  vendored, byte-identical `decision_core.py` + `mlx_decide.py` (MIT). The folder ships
+  `decision_config.json` + `calib.json`.
+- `julia` (PyTorch, MPS or CPU): Supersonic Labs' encoder + marker head, e.g. Julia-1.
+  Runtime = the vendored, byte-identical `julia/` package (Apache-2.0), pure PyTorch path
+  only. The folder ships `julia_config.json` + `inference-policy.json`; the weights are
+  checked against its `weights_sha256` before loading.
+
+Nothing is imported from the model folder (see UPSTREAM.md). An unknown format is refused
+at start instead of being answered with a format the weights were not trained on.
 - Threads: MLX keeps a default stream per thread, and a graph built on one thread fails
   when evaluated on another ("There is no Stream(gpu, N) in current thread", mlx-vlm#2352).
   The model is therefore loaded and run on ONE worker thread; HTTP handler threads only
@@ -44,17 +49,33 @@ def log(msg: str) -> None:
     print(f"[decision_serve] {msg}", flush=True)
 
 
+JULIA_PROMPT_VERSION, JULIA_READOUT = "julia-v1", "julia-markers"
+
+
 def read_decision_config(model_dir: str) -> dict:
+    """The model's decision format. `backend` is 'letter' (decision_config.json) or 'julia'
+    (julia_config.json, architecture JuliaDecisionModel, format_version 1)."""
     path = os.path.join(model_dir, "decision_config.json")
-    try:
+    if os.path.exists(path):
         cfg = json.load(open(path))
-    except FileNotFoundError:
-        raise SystemExit(f"not a decision model: {path} is missing")
-    pv, ro = cfg.get("prompt_version"), cfg.get("readout")
-    if pv not in KNOWN_PROMPT_VERSIONS or ro not in KNOWN_READOUTS:
-        raise SystemExit(f"unsupported decision model: prompt_version={pv!r} readout={ro!r} "
-                         f"(known: {sorted(KNOWN_PROMPT_VERSIONS)} / {sorted(KNOWN_READOUTS)})")
-    return cfg
+        pv, ro = cfg.get("prompt_version"), cfg.get("readout")
+        if pv not in KNOWN_PROMPT_VERSIONS or ro not in KNOWN_READOUTS:
+            raise SystemExit(f"unsupported decision model: prompt_version={pv!r} readout={ro!r} "
+                             f"(known: {sorted(KNOWN_PROMPT_VERSIONS)} / {sorted(KNOWN_READOUTS)})")
+        return {**cfg, "backend": "letter"}
+    jpath = os.path.join(model_dir, "julia_config.json")
+    if os.path.exists(jpath):
+        jc = json.load(open(jpath))
+        if jc.get("architecture") != "JuliaDecisionModel" or jc.get("format_version") != 1:
+            raise SystemExit(f"unsupported Julia checkpoint: architecture={jc.get('architecture')!r} "
+                             f"format_version={jc.get('format_version')!r}")
+        pol_path = os.path.join(model_dir, "inference-policy.json")
+        pol = json.load(open(pol_path)) if os.path.exists(pol_path) else {}
+        return {"backend": "julia", "prompt_version": JULIA_PROMPT_VERSION, "readout": JULIA_READOUT,
+                "max_one_pass": 20, "max_length": pol.get("max_length"),
+                "head_length": pol.get("head_length") or 512,
+                "weights_sha256": pol.get("weights_sha256")}
+    raise SystemExit(f"not a decision model: no decision_config.json nor julia_config.json in {model_dir}")
 
 
 def format_answer(q: dict, probs: dict) -> dict:
@@ -70,13 +91,96 @@ def format_answer(q: dict, probs: dict) -> dict:
     return {"type": "choice", "choice": top, "probabilities": probs, "confidence": probs[top]}
 
 
-class Worker(threading.Thread):
-    """Owns MLX: loads the model and runs every decision on this one thread."""
+class LetterBackend:
+    """Letter-logit readout (MLX): every question of a request in one pass over the shared
+    prefix, exactly as upstream serve.py decide_all."""
+    device = "mlx"
 
-    def __init__(self, model_dir: str, sym: bool, factory=None):
+    def __init__(self, decider, dc):
+        self.decider, self.dc = decider, dc
+
+    def dist_items(self, state, items):
+        if len(items) == 1:
+            q, opts = items[0]
+            p, n = self.decider.dist(state, q, opts)
+            return [(p, n, {})]
+        return [(p, n, {}) for p, n in self.decider.dist_many_cached(state, items)]
+
+
+class JuliaBackend:
+    """Julia marker-head readout (PyTorch): one batch for all questions of a request. Rows
+    are encoded once with the model's own `sequence()` so a state cut at max_length is
+    reported (`truncated`) instead of silently scored on a prefix."""
+
+    def __init__(self, engine, dc, device: str):
+        self.engine, self.dc, self.device = engine, dc, device
+
+    def dist_items(self, state, items):
+        import math
+        from julia.data import sequence
+        rows, orders = [], []
+        for q, opts in items:
+            if not 2 <= len(opts) <= 20:
+                raise ValueError(f"Julia reads 2-20 options per question (got {len(opts)})")
+            if q.get("type") in ("noul", "boolean"):
+                order = ["no", "yes"]                        # Julia reads [false, true]
+                descs = dict(opts)
+                # No criteria → Julia's literal "false"/"true" (its trained form), not the
+                # "yes"/"no" placeholders options_of fills in for the letter readout.
+                options = ([descs["no"], descs["yes"]] if q.get("criteria")
+                           else ["false", "true"])
+                qtype = "noul"
+            else:
+                order = [lab for lab, _ in opts]
+                options = [desc or lab for lab, desc in opts]
+                qtype = "score" if q.get("type") == "score" else "choice"
+            row = {"state": state, "question": str(q.get("instructions") or ""),
+                   "type": qtype, "options": options}
+            row["_encoded"] = sequence(self.engine.tokenizer, row, self.engine.collate.max_length,
+                                       self.engine.collate.head_length)
+            rows.append(row)
+            orders.append(order)
+        out = []
+        for row, order, z in zip(rows, orders, self.engine.logits(rows)):
+            m = max(z)
+            e = [math.exp(x - m) for x in z]
+            t = sum(e)
+            probs = {lab: v / t for lab, v in zip(order, e)}
+            enc = row["_encoded"]
+            out.append((probs, len(enc["ids"]), {"truncated": True} if enc.get("truncated") else {}))
+        return out
+
+
+def _load_julia(model_dir: str, cfg: dict):
+    import hashlib
+    import torch
+    want = cfg.get("weights_sha256")
+    if want:
+        h = hashlib.sha256()
+        with open(os.path.join(model_dir, "model.safetensors"), "rb") as f:
+            for chunk in iter(lambda: f.read(1 << 24), b""):
+                h.update(chunk)
+        if h.hexdigest() != want:
+            raise RuntimeError(f"model.safetensors sha256 {h.hexdigest()} != inference-policy {want}")
+    device = os.environ.get("DECISION_DEVICE") or (
+        "mps" if torch.backends.mps.is_available() else "cpu")
+    from julia.inference import TransformerEngine
+    engine = TransformerEngine(model_dir, device=device, max_length=cfg.get("max_length"),
+                               head_length=int(cfg.get("head_length") or 512))
+    import decision_core
+    return JuliaBackend(engine, decision_core, device)
+
+
+class Worker(threading.Thread):
+    """Owns the model: loads it and runs every decision on this one thread (MLX keeps a
+    stream per thread; PyTorch MPS likes a single owner too)."""
+
+    def __init__(self, model_dir: str, sym: bool, factory=None, cfg: dict | None = None):
         super().__init__(daemon=True, name="mlx-decider")
         self.model_dir, self.sym = model_dir, sym
-        self._factory = factory  # tests: returns (decider, decision_core module) without MLX
+        self.cfg = dict(cfg or {"backend": "letter"})
+        # tests: returns (decider, decision_core) for a letter backend, or a backend object
+        self._factory = factory
         self.jobs: "queue.Queue[tuple]" = queue.Queue()
         self.ready = threading.Event()
         self.error: str | None = None
@@ -88,15 +192,19 @@ class Worker(threading.Thread):
         try:
             t0 = time.perf_counter()
             if self._factory:
-                self.decider, self.dc = self._factory()
+                made = self._factory()
+                self.backend = made if hasattr(made, "dist_items") else LetterBackend(*made)
+            elif self.cfg.get("backend") == "julia":
+                self.backend = _load_julia(self.model_dir, self.cfg)
             else:
                 from mlx_decide import MLXDecider  # sets PROMPT_STYLE, then imports decision_core
-                self.decider = MLXDecider(self.model_dir)
                 import decision_core
-                self.dc = decision_core
+                self.backend = LetterBackend(MLXDecider(self.model_dir), decision_core)
+                self.decider = self.backend.decider
                 self._pin_weights()
+            self.dc = self.backend.dc
             log(f"model loaded in {time.perf_counter() - t0:.1f} s ({self.model_dir}), "
-                f"prompt={self.dc.PROMPT_VERSION}, one pass up to {self.dc.MAX_ONE_PASS} options")
+                f"backend={self.cfg.get('backend')} device={getattr(self.backend, 'device', '?')}")
             self._decide_all("warm-up", {"w": {"type": "noul", "instructions": "Is this a warm-up?",
                                                "criteria": {"true": "yes", "false": "no"}}})
         except BaseException as e:  # noqa: BLE001 — report and let the server answer 503
@@ -153,19 +261,15 @@ class Worker(threading.Thread):
             items.append((q, opts))
             if self.sym:
                 items.append((q, list(reversed(opts))))
-        if len(items) == 1:
-            q, opts = items[0]
-            res = [self.decider.dist(state, q, opts)]
-        else:
-            res = self.decider.dist_many_cached(state, items)
+        res = self.backend.dist_items(state, items)
         out = {}
         for name, k, _opts in idx:
-            probs, n = res[k]
+            probs, n, extra = res[k]
             if self.sym:
-                p2, n2 = res[k + 1]
+                p2, n2, _ = res[k + 1]
                 probs = {x: 0.5 * (probs[x] + p2[x]) for x in probs}
                 n += n2
-            out[name] = (format_answer(questions[name], probs), n)
+            out[name] = ({**format_answer(questions[name], probs), **extra}, n)
         return out
 
     def submit(self, state, questions: dict) -> dict:
@@ -205,7 +309,9 @@ def make_handler(worker: Worker, name: str, cfg: dict):
             if self.path not in ("/health", "/v1/health"):
                 return self._send(404, {"error": "not found"})
             self._send(200 if ok else 503, {
-                "ok": ok, "model": name, "loaded": [name] if ok else [], "device": "mlx",
+                "ok": ok, "model": name, "loaded": [name] if ok else [],
+                "device": getattr(getattr(worker, "backend", None), "device", None),
+                "backend": worker.cfg.get("backend"),
                 "version": VERSION, "kind": "decision", "prompt_version": cfg.get("prompt_version"),
                 "readout": cfg.get("readout"), "loading": not worker.ready.is_set(),
                 "error": worker.error, "busy": worker.busy, "queued": worker.jobs.qsize(),
@@ -250,7 +356,7 @@ def main() -> None:
     model_dir = os.path.abspath(a.model)
     cfg = read_decision_config(model_dir)
     name = a.name or os.path.basename(model_dir.rstrip("/"))
-    worker = Worker(model_dir, a.sym)
+    worker = Worker(model_dir, a.sym, cfg=cfg)
     worker.start()
     ThreadingHTTPServer.request_queue_size = 256
     srv = ThreadingHTTPServer((a.host, a.port), make_handler(worker, name, cfg))

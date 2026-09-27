@@ -162,5 +162,67 @@ code, r = post(b + "/v1/systemone", {"state": "s", "questions": {"q": {"type": "
 check("decision 503 after load failure", code == 503)
 srv.shutdown()
 
+# --- Julia backend (fake engine, real julia.data.sequence encoding) -----------------------
+try:
+    import torch  # noqa: F401  (julia.data imports torch)
+    HAVE_TORCH = True
+except Exception:
+    HAVE_TORCH = False
+
+if HAVE_TORCH:
+    class FakeTok:
+        mask_token, mask_token_id, cls_token_id, sep_token_id, pad_token_id = "[MASK]", 4, 1, 2, 0
+
+        def __call__(self, text, add_special_tokens=False):
+            return {"input_ids": [10 + (ord(c) % 50) for c in text]}
+
+    class FakeCollate:
+        max_length, head_length = 256, 64
+
+    class FakeJuliaEngine:
+        """Option 1 wins (logit 2.0, others 0.0); records the rows it scored."""
+        def __init__(self):
+            self.tokenizer, self.collate, self.rows = FakeTok(), FakeCollate(), []
+
+        def logits(self, rows):
+            self.rows = rows
+            return [[0.0] + [2.0] + [0.0] * (len(r["options"]) - 2) for r in rows]
+
+    fj_engine = FakeJuliaEngine()
+    wj = ds.Worker("/nonexistent", False, cfg={"backend": "julia"},
+                   factory=lambda: ds.JuliaBackend(fj_engine, decision_core, "cpu"))
+    wj.start(); wj.ready.wait(5)
+    srvj = ThreadingHTTPServer(("127.0.0.1", 0), ds.make_handler(wj, "julia-test", {"backend": "julia"}))
+    threading.Thread(target=srvj.serve_forever, daemon=True).start()
+    bj = f"http://127.0.0.1:{srvj.server_address[1]}"
+    code, r = post(bj + "/v1/systemone", {"state": "I was charged twice.", "questions": {
+        "team": {"type": "choice", "instructions": "Which team?", "criteria": {"billing": "Billing", "shipping": "Shipping", "access": "Access"}},
+        "ok": {"type": "noul", "instructions": "Refund?", "criteria": {"true": "refund", "false": "no refund"}},
+        "bare": {"type": "noul", "instructions": "Urgent?"},
+        "sev": {"type": "score", "instructions": "Severity?", "criteria": ["low", "mid", "high"]}}})
+    check("julia: 200", code == 200, r)
+    a = r.get("answers", {})
+    check("julia: choice picks the highest logit (option 2 = shipping)", a.get("team", {}).get("choice") == "shipping")
+    check("julia: noul options sent as [false, true]", fj_engine.rows[1]["options"] == ["no refund", "refund"])
+    check("julia: noul true = second logit", a.get("ok", {}).get("value") is True)
+    check("julia: noul without criteria uses literal false/true", fj_engine.rows[2]["options"] == ["false", "true"])
+    check("julia: score index", a.get("sev", {}).get("score") == 1)
+    check("julia: one batch for all questions", len(fj_engine.rows) == 4)
+    check("julia: input tokens counted", r["usage"]["input_tokens"] > 0)
+    code, r = post(bj + "/v1/systemone", {"state": "x" * 2000, "questions": {
+        "q": {"type": "choice", "instructions": "?", "criteria": {"a": "A", "b": "B"}}}})
+    check("julia: state beyond max_length flagged truncated", r["answers"]["q"].get("truncated") is True, r)
+    code, r = post(bj + "/v1/systemone", {"state": "s", "questions": {
+        "q": {"type": "choice", "instructions": "?", "criteria": {f"o{i}": f"O{i}" for i in range(21)}}}})
+    check("julia: more than 20 options → 422", code == 422)
+    srvj.shutdown()
+    with tempfile.TemporaryDirectory() as d:
+        json.dump({"format_version": 1, "architecture": "JuliaDecisionModel"}, open(os.path.join(d, "julia_config.json"), "w"))
+        json.dump({"max_length": 8192, "head_length": 512, "weights_sha256": "ab"}, open(os.path.join(d, "inference-policy.json"), "w"))
+        c = ds.read_decision_config(d)
+        check("julia config detected", (c["backend"], c["prompt_version"], c["readout"], c["max_length"]) == ("julia", "julia-v1", "julia-markers", 8192))
+else:
+    print("SKIP julia backend tests (no torch)")
+
 print("all OK" if not FAILS else f"{len(FAILS)} FAILED: {FAILS}")
 sys.exit(1 if FAILS else 0)
