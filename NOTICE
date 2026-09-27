@@ -5,15 +5,30 @@ Licensed under the GNU Affero General Public License v3.0 (see LICENSE).
 
 This product includes software developed by third parties. AGPL-3.0 is
 one-way compatible with the Apache License 2.0, so the Apache-2.0-licensed
-component below may be, and is, redistributed as part of this AGPL-3.0 work;
-its original license and attribution are preserved:
+files below may be, and are, redistributed as part of this AGPL-3.0 work;
+their original license and attribution are preserved.
 
-* scripts/odyssai-network-setup.sh (the Thunderbolt/RDMA network recipe, installed
-  on cluster nodes as the eu.odyssai.networksetup LaunchDaemon payload) is derived
-  from exo (https://github.com/exo-explore/exo),
-  Copyright 2025 Exo Technologies Ltd,
-  licensed under the Apache License, Version 2.0.
-  Source commit: 09f9ea313f72e261f40a94cea4c0e3681b31af23 (2026-06-03).
-  The file header carries a "MODIFIED" notice describing the changes.
-  scripts/rdma-onboard.sh (the guard driver around that recipe) credits the same
-  mechanism.
+exo (https://github.com/exo-explore/exo)
+  Copyright 2025 Exo Technologies Ltd
+  Licensed under the Apache License, Version 2.0; a copy of the license is in
+  vendor/exo/LICENSE. exo ships no NOTICE file. Provenance, upstream paths and
+  the list of modifications for each file: vendor/exo/UPSTREAM.md. Each file
+  below carries an Apache-2.0 header and a "Modified by OdyssAI" line.
+
+  From upstream commit f0d1371d89a7f899e96977014cce7307a53682f2 (2026-04-28):
+  * scripts/auto_parallel.py (derived from
+    src/exo/worker/engines/mlx/auto_parallel.py, modified)
+  * scripts/patches/opt_batch_gen.py (copied, code unmodified)
+  * scripts/patches/standard_yarn_rope.py (copied, code unmodified)
+  * scripts/patches/__init__.py (portions derived, modified)
+
+  From upstream commit 09f9ea313f72e261f40a94cea4c0e3681b31af23 (2026-06-03),
+  the LaunchDaemon script embedded in app/EXO/EXO/Services/NetworkSetupHelper.swift:
+  * scripts/odyssai-network-setup.sh (the Thunderbolt/RDMA network recipe,
+    installed on cluster nodes as the eu.odyssai.networksetup LaunchDaemon
+    payload; portions derived, modified)
+  * scripts/odyssai-network-guard-exoloc.sh (portions derived, modified)
+
+  scripts/rdma-onboard.sh (the guard driver around that recipe) and
+  scripts/exo_stubs.py (an import shim for auto_parallel.py) credit exo but
+  contain no exo code; see vendor/exo/UPSTREAM.md.

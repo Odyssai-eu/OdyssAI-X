@@ -4,8 +4,12 @@
 #
 # Portions derived from exo (https://github.com/exo-explore/exo), specifically the
 # LaunchDaemon setup script embedded in app/EXO/EXO/Services/NetworkSetupHelper.swift
-# (lines 16-69), Copyright 2025 Exo Technologies Ltd, Apache License 2.0.
-# Source commit: 09f9ea313f72e261f40a94cea4c0e3681b31af23 (2026-06-03). MODIFIED:
+# (lines 16-69), Copyright 2025 Exo Technologies Ltd, licensed under the Apache
+# License, Version 2.0 (http://www.apache.org/licenses/LICENSE-2.0; a copy ships
+# in vendor/exo/LICENSE), distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR
+# CONDITIONS OF ANY KIND. Provenance in vendor/exo/UPSTREAM.md.
+# Source commit: 09f9ea313f72e261f40a94cea4c0e3681b31af23 (2026-06-03).
+# Modified by OdyssAI (odyssai.eu), 2026 (AGPL-3.0 for our changes, see NOTICE):
 # Odyssai identity (location/services/support dir), dynamic bridge-service resolution
 # before teardown (fixes exo's hardcoded-English-name locale bug), bridge port skipped
 # by device not by localized name, management+Wi-Fi services recreated before the TB
