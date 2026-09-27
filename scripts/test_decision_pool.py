@@ -115,6 +115,12 @@ async def fake_size(ssh, path):
 
 
 api._ssh_exec = fake_ssh
+RUNS = []
+_orig_register = api._runs_register
+def _rec_register(rid, **kw):
+    RUNS.append((rid, kw))
+    return _orig_register(rid, **kw)
+api._runs_register = _rec_register
 api.get_model_size_bytes = fake_size
 PORT = free_port()
 api.DECISION_DEFAULT_PORT = PORT
@@ -166,6 +172,9 @@ async def main():
         check("6 answer from the decision server", d["answers"]["act"]["choice"], "go")
         check("6 model is the alias", d["model"], alias)
         check("6 x_odyssai names the cluster", d.get("x_odyssai", {}).get("cluster"), "dec")
+        check("6 registered as a run for the dashboard",
+              (RUNS[-1][1].get("pool_alias"), RUNS[-1][1].get("client")) if RUNS else None, (alias, "decision"))
+        check("6 run finalized (no active run left)", RUNS[-1][0] in api._active_runs, False)
 
         # 7. unknown model id, single decision model overall → it serves
         r = await c.post("/v1/systemone", json={**q, "model": "typesafe/jev-latest"})

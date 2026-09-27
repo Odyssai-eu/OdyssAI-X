@@ -7484,7 +7484,7 @@ def _initial_default_config() -> Optional[dict]:
 #   major (1.7.2 → 2.0.0) — breaking API or topology change
 #
 # Use `./scripts/bump-version.sh patch|minor|major` to bump + auto-commit.
-APP_VERSION = "1.53.4"
+APP_VERSION = "1.53.5"
 
 app = FastAPI(
     title="OdyssAI-X (odyssai.eu)",
@@ -10679,11 +10679,27 @@ async def _systemone_local(cluster_id: str, alias: str, pool, body: dict):
     _CLUSTER_LAST_SERVED[pool.cluster] = time.time()   # unload guard, like chat
     pool.last_used_at = time.time()
     t0 = time.time()
+    # Registered as an in-flight run so the dashboard shows the pool busy and
+    # the runs history keeps it (no text is generated: output_tokens counts the
+    # answered questions once done, never a tok/s figure).
+    rid = f"dec-{uuid.uuid4().hex[:8]}"
+    _runs_register(rid, model=alias, cluster=pool.cluster, pool_alias=alias,
+                   client="decision", max_tokens=0, kind="unary")
+    status = "error"
     try:
-        async with httpx.AsyncClient(timeout=DECISION_REQUEST_TIMEOUT_S) as client:
-            r = await client.post(f"{pool.upstream}/v1/systemone", json=fwd)
-    except Exception as e:
-        raise HTTPException(502, f"decision pool '{alias}' ({pool.upstream}) unreachable: {e}")
+        try:
+            async with httpx.AsyncClient(timeout=DECISION_REQUEST_TIMEOUT_S) as client:
+                r = await client.post(f"{pool.upstream}/v1/systemone", json=fwd)
+        except Exception as e:
+            raise HTTPException(502, f"decision pool '{alias}' ({pool.upstream}) unreachable: {e}")
+        if r.status_code == 200:
+            status = "done"
+            run = _active_runs.get(rid)
+            if run is not None:
+                run["output_tokens"] = len(fwd.get("questions") or {})
+                run["elapsed_s"] = round(time.time() - t0, 2)
+    finally:
+        _runs_finalize(rid, status=status)
     try:
         data = r.json()
     except Exception:
