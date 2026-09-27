@@ -1,172 +1,301 @@
-# AGENTS.md — OdyssAI-X: install and operate it, step by step
+# AGENTS.md: install and operate OdyssAI-X, step by step
 
-> For an agent (or a human at a terminal) landing here with a Mac and a goal:
-> **a working `/v1/chat/completions` served by your own Apple Silicon machines.**
-> Every step below is a command, what it must print, and the trap behind it.
-> Internal dev conventions and the live production layout are in `CLAUDE.md`.
+> **Pre-release (1.54.0):** `install.sh` lands with #82, `odyssai nodes` with #80 (node advertiser: #79), `odyssai doctor` with #81; until they ship, use the manual path in §B. Every other command below exists today.
 
-**macOS / Apple Silicon only.** There is no installer app; this file is the installer.
-
----
-
-## 0. What you are building
-
-- **Server** — one Mac (a Mac mini is enough) running the orchestrator in Docker
-  (`odyssai-odysseus`, port **8000**): API, dashboard, cluster/pool lifecycle. It
-  never runs inference; it SSHes into nodes to spawn runners.
-- **Nodes** — the Macs that hold the models. Each gets `~/mlx-cluster` (pinned
-  Python 3.11 venv + `runner.py` + vendored model modules), optionally
-  `~/.venvs/mlx-vlm` (Python 3.12) for vision models. The server may also be a node.
-- **Three pool kinds**, chosen per cluster:
-  - `mlx-distributed` — one model split across nodes (pipeline or tensor parallel),
-    backend `ring` (TCP, always works) or `jaccl` (RDMA over Thunderbolt 5, ~2× faster,
-    needs cabling).
-  - `replica` — N independent single-node copies, continuous batching, least-busy
-    dispatch + session affinity. The throughput mode. No inter-node collective.
-  - VLM — a vision model served by `mlx-vlm` on one node, proxied by the orchestrator.
-
-Versions this repo is validated against (`requirements-node.txt`): **mlx 0.32.2 ·
-mlx-lm 0.31.3 · transformers 5.10.0**. Do not float them. Distributed pools over RDMA
-run on a **patched JACCL** (`vendor/jaccl/`, see its `PATCHES.md`): a drop-in
-`libjaccl.dylib` for the mlx 0.32.2 wheel that makes a dead rank visible to the
-survivors and names the Thunderbolt link in every init error.
+For an agent (or a human at a terminal) with a set of Macs and one goal: **a working
+`/v1/chat/completions` served by those Macs.** Every step is one command, the output
+it must print, and what to do when it does not. Run the steps in order. Do not skip
+a step and do not improvise one: when a failure branch says "stop", report the
+failing line to the human and wait.
 
 ---
 
-## 1. Prerequisites — check before anything else
+## Assumes
+
+Check each item before step 1. If one is not true, stop and tell the human which one.
+
+| Item | Requirement |
+|---|---|
+| Hardware | Apple Silicon Macs (`uname -m` prints `arm64`). One **server** runs the orchestrator; one or more **nodes** hold the models. The server may also be a node. |
+| macOS | Same macOS version on every node. For RDMA over Thunderbolt: macOS 26.2 or later. |
+| Accounts | An **admin** account on every node. The human knows its password: the installer asks for it once (root LaunchDaemons). |
+| Management LAN | Every node and the server on the same Ethernet LAN (one subnet, multicast allowed: nodes announce themselves over Bonjour). |
+| Node software | Xcode Command Line Tools and Homebrew on every node, licence accepted (`git --version` runs without a licence prompt). |
+| SSH | Remote Login ON on every node; from the server, `ssh admin@<node>` works without a password prompt. |
+| Server | Docker Desktop installed and running; `git`, `curl` and `jq` available. |
+| TB5 wiring (RDMA only) | Thunderbolt 5 cables in a full mesh (N nodes, N(N-1)/2 cables) and RDMA enabled once per node in recoveryOS (`rdma_ctl enable`, then reboot). Without this, use `backend: ring` (TCP), which needs nothing. |
+
+Names used below: nodes `node-a.local`, `node-b.local` (their Bonjour names; any
+ssh target works), user `admin`, cluster id `default`. Replace them with yours.
+
+---
+
+## The sequence at a glance
 
 ```bash
-uname -m                      # arm64  (Intel is unsupported)
-python3.11 --version          # on every node; `brew install python@3.11` if missing
-docker --version              # on the server: Docker Desktop, running
-ssh user@node.lan hostname    # from the server, no password prompt, for every node
-```
-
-If `ssh` prompts for a password: `ssh-copy-id user@node.lan`. Remote Login must be ON
-on each node (System Settings → General → Sharing → Remote Login).
-
-**Trap — the Xcode licence gate.** After an Xcode / Command Line Tools update a node's
-`/usr/bin/python3` and `git` refuse to run until the licence is re-accepted; automation
-then fails with "You have not agreed to the Xcode license agreements". Test with
-`ssh user@node.lan 'git --version'`; fix (needs the node password):
-`ssh -t user@node.lan 'sudo xcodebuild -license accept'`. The orchestrator's own
-probes use the venv Python and are immune, but `brew`/`git`/`pip` on the node are not.
-
----
-
-## 2. Bootstrap every node
-
-```bash
-scripts/bootstrap-node.sh user@node.lan                     # models dir defaults to ~/mlx-models
-scripts/bootstrap-node.sh user@node.lan /Volumes/models/odyssai
-```
-
-Expected: `[1/5]`…`[6/6]` then `✓ node bootstrapped.` The steps: SSH+Python check →
-copy `runner.py` + helpers + `patches/` + `requirements-node.txt` → pinned venv →
-**`install-model-modules.sh`** (copies `scripts/mlx_models/*.py` into the venv's
-`site-packages/mlx_lm/models/` and `scripts/patches/*.py` into `~/mlx-cluster/patches/`,
-md5-checked) → **`install-jaccl.sh`** (replaces the wheel's
-`libjaccl.dylib` with the patched build from `vendor/jaccl/build/`; built once with
-`scripts/build-jaccl.sh <node>` on any node that has cmake) → smoke import
-(`mlx_lm.models.glm5_next`, `qwen4_exp`, `deepseek_v4` + patches) → `mlx-vlm` venv
-(best-effort; a warning here only disables vision models on that node).
-
-**Trap — vendored modules and the patched JACCL live in `site-packages`; the
-runtime patches live in `~/mlx-cluster/patches/`.** Any `pip install -U mlx-lm` on a
-node deletes the modules; any `pip install -U mlx` puts the stock `libjaccl.dylib`
-back. Never upgrade them outside `requirements-node.txt`; after any pip change re-run
-`scripts/install-model-modules.sh user@node.lan` and `scripts/install-jaccl.sh
-user@node.lan` (or the whole bootstrap — idempotent). The patches are not touched by
-pip but drift on their own: they are read by `runner.py` at spawn (`from patches import
-apply_mlx_patches`) and nothing re-copied them after the first bootstrap until
-2026-09-18, when a 5-node GLM-5.3 load died at the first request because one rank
-carried a June copy of `glm_moe_dsa_model.py`. `install-model-modules.sh` now syncs
-both sets; **after any commit to `scripts/mlx_models/` or `scripts/patches/`, run it
-on every node of the pool** — a multi-rank load with divergent versions across ranks
-is a silent-corruption class of bug. `scripts/install-model-modules.sh --check
-user@node.lan…` reports new / stale / ok per file and exits non-zero on drift;
-`scripts/install-jaccl.sh --check user@node.lan` reports stock vs patched. A running
-runner keeps what it imported: a synced file is picked up at the next load.
-
-**Trap — `models_dir` is per node.** Volumes are local; a model must be present at the
-same `<models_dir>/<org>/<name>/` on every node of the pool that serves it. The
-dashboard's *Sync* rsyncs from one node to the others.
-
----
-
-## 3. Pin the GPU memory budget (per node, deliberate)
-
-`iogpu.wired_limit_mb` decides how much unified memory MLX may wire; it does **not**
-survive a reboot, so a tuned node silently falls back to the macOS default. Install
-the LaunchDaemon (asks for the node password — that is why it is not automated):
-
-```bash
-scripts/wired-limit/install.sh user@node.lan 250880     # ≈245 GB on a 256 GB Mac
-scripts/wired-limit/install.sh user@node.lan 491520     # ≈480 GB on a 512 GB Mac
-```
-
-The orchestrator reads the effective limit through telemetry and refuses loads that
-would not fit (`preflight_refused`) instead of letting macOS jetsam the runner.
-
----
-
-## 4. Describe the cluster and start the server
-
-```bash
-mkdir -p ~/.odysseus
-cp config/topology.example.yaml ~/.odysseus/topology.yaml
-$EDITOR ~/.odysseus/topology.yaml
+# on each node (from the server, over ssh)
+ssh -t admin@node-a.local 'curl -fsSL https://raw.githubusercontent.com/Odyssai-eu/OdyssAI-X/main/install.sh | sh'
+# on the server
+git clone https://github.com/Odyssai-eu/OdyssAI-X.git && cd OdyssAI-X
+mkdir -p ~/.odysseus && cp config/topology.example.yaml ~/.odysseus/topology.yaml
 docker compose up -d
-curl -s http://localhost:8000/health        # {"status":"idle","version":"…"}
-```
-
-`topology.yaml` = clusters → pools → nodes (`ssh`, `models_dir`), plus `backend`
-(`ring` | `jaccl`) and, for `jaccl`, the Thunderbolt port wiring. Cluster ids are yours
-(`default`, `chat`, `reasoner`, …) and become `/admin/clusters/<id>/…`.
-
-- **Single Mac:** the ssh target is `${ODYSSEUS_NODE_USER}@host.docker.internal` —
-  inside the container `localhost` is the container, not your Mac.
-- `/admin/*` is open on a trusted LAN. Exposing :8000 beyond it? set
-  `ODYSSAI_X_ADMIN_TOKEN` (legacy `ODYSSEUS_ADMIN_TOKEN`) → `Authorization: Bearer`.
-- The container mounts `~/.ssh` (read-only) to reach the nodes and `~/.odysseus` for
-  the topology; persisted state lives in the `odysseus-data` volume.
-
-Verify the mesh before loading anything:
-
-```bash
-curl -s http://localhost:8000/admin/nodes/telemetry | jq '.hosts[] | {host, ssh_ok, ram_total_bytes}'
-```
-
-Every node must be `ssh_ok: true` with a non-zero RAM figure.
-
----
-
-## 5. First model
-
-1. **Download** — dashboard `http://localhost:8000/` → Models → Download, or
-   `POST /admin/downloads`. Accepts `org/name` and `org/name/<quant-subfolder>`
-   (many MLX repos ship `4bit/`, `6bit/`, `8bit/` in one repo). Files land at
-   `<models_dir>/<spec>/` with `config.json` at the root of the model directory.
-2. **Check fit** — `GET /admin/clusters/<id>/load-options?model=<org/name>`: lists node
-   counts that fit with the per-rank budget and why one does not.
-3. **Load** — `POST /admin/clusters/<id>/load` `{"model":"<org/name>","nodes":1}`.
-   First load: 30 s – 5 min. `GET /admin/status` → the pool shows `alive = nodes`.
-4. **Chat** —
-
-```bash
-curl -s http://localhost:8000/v1/models | jq '.data[].id'
+curl -s http://localhost:8000/health
+odyssai nodes
+scripts/discover-rdma-wiring.py 0=admin@node-a.local 1=admin@node-b.local   # RDMA only
+$EDITOR ~/.odysseus/topology.yaml
+docker compose restart
+odyssai doctor --json                                                        # stop on any FAIL
+curl -s -X POST http://localhost:8000/admin/downloads -H 'content-type: application/json' \
+  -d '{"repo":"mlx-community/Qwen3-30B-A3B-4bit","targets":["node-a"]}'
+curl -s -X POST http://localhost:8000/admin/clusters/default/load -H 'content-type: application/json' \
+  -d '{"model":"mlx-community/Qwen3-30B-A3B-4bit","nodes":1}'
 curl -s http://localhost:8000/v1/chat/completions -H 'content-type: application/json' \
   -d '{"model":"<alias>","messages":[{"role":"user","content":"Say ok."}],"max_tokens":20}'
 ```
 
-Reasoning models return their thinking in `reasoning_content` and the answer in
-`content` (per-model tag handling is built in — GLM, DeepSeek, Qwen, Kimi…).
+The steps below give, for each line, the expected output and the failure branch.
 
 ---
 
-## 6. Replica mode — throughput
+## A. Install
 
-Create the cluster with **Kind = replica** (dashboard → Argo form → Kind), one node
+### A1. Bootstrap every node
+
+Run once per node, from the server:
+
+```bash
+ssh -t admin@node-a.local 'curl -fsSL https://raw.githubusercontent.com/Odyssai-eu/OdyssAI-X/main/install.sh | sh'
+```
+
+It installs, on that node: the pinned Python venv (`~/mlx-cluster`, versions from
+`requirements-node.txt`), the patched JACCL, the vendored model modules and runtime
+patches, the GPU wired-memory daemon, the Bonjour advertiser (`_odyssai._tcp`), then
+runs `odyssai doctor` in node mode and prints the next step.
+
+- **Expected:** one line per check, all `OK`, then the next-step line. Exit code 0.
+  A second run prints `already up to date` and changes nothing.
+- **Password prompt:** the installer asks for the node's admin password once. An
+  agent does not type passwords: hand the prompt to the human, or have the human run
+  the same command in their own terminal.
+- **`WARN` (exit 1):** read the fix sentence on the line, report it, continue.
+- **`FAIL` (exit 2):** stop. Report the `FAIL` line (it names the check and the fix)
+  to the human. After the fix, re-run the same command; it is idempotent.
+- **`ssh` asks for a password:** the SSH row of Assumes is not met. Stop.
+
+### A2. Start the server
+
+```bash
+git clone https://github.com/Odyssai-eu/OdyssAI-X.git && cd OdyssAI-X
+mkdir -p ~/.odysseus && cp config/topology.example.yaml ~/.odysseus/topology.yaml
+docker compose up -d
+curl -s http://localhost:8000/health
+```
+
+- **Expected:** `{"status":"idle","version":"…","admin_auth_enabled":false}`.
+- **Connection refused:** the container is still starting. Retry every 5 s for 60 s;
+  then run `docker compose logs --tail 50` and stop with that output.
+- `/admin/*` is open on a trusted LAN. If port 8000 is reachable beyond it, set
+  `ODYSSAI_X_ADMIN_TOKEN` before `docker compose up -d` and send
+  `Authorization: Bearer <token>` on every `/admin/*` call.
+
+### A3. List the nodes
+
+```bash
+odyssai nodes
+```
+
+Same data as `curl -s http://localhost:8000/v1/nodes/discovered`: one row per node that
+advertises `_odyssai._tcp` (host, ip, chip, RAM, RDMA interfaces, API port, last seen).
+
+- **Expected:** one row per node bootstrapped in A1.
+- **A node is missing:** re-run A1 for that node and read its doctor output; the
+  failing check is named there. If A1 is all `OK` and the row is still missing after
+  30 s, multicast does not cross your LAN: write that node into the topology by its
+  ssh target by hand (A4), which is always supported.
+
+### A4. Describe the cluster
+
+Write `~/.odysseus/topology.yaml` with one entry per node listed in A3. The ssh target
+is `admin@<host>`; `models_dir` is the directory on that node where models live.
+
+TCP (`ring`), two nodes:
+
+```yaml
+clusters:
+  default:
+    backend: ring
+    pools:
+      - size: 1
+        nodes:
+          - {rank: 0, id: node-a, ssh: admin@node-a.local, models_dir: /Users/admin/mlx-models}
+      - size: 2
+        nodes:
+          - {rank: 0, id: node-a, ssh: admin@node-a.local, models_dir: /Users/admin/mlx-models}
+          - {rank: 1, id: node-b, ssh: admin@node-b.local, models_dir: /Users/admin/mlx-models}
+```
+
+RDMA (`jaccl`): first, **the human**, at the console of each node (the script
+refuses to run over SSH), provisions the Thunderbolt network once from a checkout of
+this repository:
+
+```bash
+sudo scripts/rdma-onboard.sh --apply --console --expect <number of cabled TB ports on this node>
+```
+
+Exit code 0 means ready, 10 means reboot this node once and re-run, 1 means a guard
+refused: stop and report its output. Then, from the server:
+
+```bash
+scripts/discover-rdma-wiring.py 0=admin@node-a.local 1=admin@node-b.local
+```
+
+- **Expected:** one `rdma_to:` block per node. Set `backend: jaccl` and paste each
+  block under its node in the pool that uses those nodes.
+- **Non-zero exit, `X cannot reach Y`:** the cable between X and Y is missing, loose
+  or on a disabled port. Stop and report the line.
+
+Single Mac as its own node: the ssh target is
+`${ODYSSEUS_NODE_USER}@host.docker.internal` (inside the container `localhost` is the
+container); the example topology shows it.
+
+Apply the file:
+
+```bash
+docker compose restart
+```
+
+### A5. Doctor, cluster mode: stop on any FAIL
+
+```bash
+odyssai doctor --json
+```
+
+Runs the cluster checks in the engine (`GET /admin/doctor`): every node reachable, venv
+and pinned `mlx`, patched JACCL, model modules and patches in sync with the server,
+wired-memory limit, disk, Hugging Face cache and, for `jaccl`, every RDMA edge of the
+topology from both ends (port active, link-local alias, peer reachable through that
+cable). One entry per check with `OK`, `WARN` or `FAIL` and a one-sentence fix.
+
+- **Exit 0:** continue.
+- **Exit 1 (`WARN` only):** report the warnings, continue.
+- **Exit 2 (any `FAIL`):** stop. Do not load a model. Report each `FAIL` entry
+  verbatim; an edge failure reads like
+  `FAIL rdma edge node-a en3 -> node-b en5: peer unreachable - check the cable on en3`.
+  After the fix, run A5 again.
+
+### A6. First model
+
+A small model that fits one node, used as the install check:
+
+```bash
+curl -s -X POST http://localhost:8000/admin/downloads -H 'content-type: application/json' \
+  -d '{"repo":"mlx-community/Qwen3-30B-A3B-4bit","targets":["node-a"]}'
+curl -s http://localhost:8000/admin/downloads | jq '.data[] | {repo, status, size, error}'
+```
+
+- **Expected:** `{"id":"…"}`, then `status` goes from `running` to `completed` (poll
+  every 30 s). `targets` are host ids: the ssh host without its domain suffix
+  (`admin@node-a.local` gives `node-a`). Gated repositories need `"hf_token":"…"`.
+- **`status: failed`:** stop and report `error`.
+
+```bash
+curl -s "http://localhost:8000/admin/clusters/default/load-options?model=mlx-community/Qwen3-30B-A3B-4bit" | jq
+curl -s -X POST http://localhost:8000/admin/clusters/default/load -H 'content-type: application/json' \
+  -d '{"model":"mlx-community/Qwen3-30B-A3B-4bit","nodes":1}'
+curl -s http://localhost:8000/admin/clusters/default/status | jq '{loaded, loading, model, nodes}'
+```
+
+- **Expected:** `load-options` lists `1` among the node counts that fit. The load
+  returns, then `status` shows `"loaded": true` and `"loading": null` (30 s to 5 min).
+- **HTTP 422 `preflight_refused`:** the load would fail; `blockers` says why (model
+  missing on that node, does not fit, vision venv missing). Stop and report `blockers`.
+  Do not pass `force`.
+- **HTTP 409 `cluster_degraded`:** stop and report `message`.
+
+### A7. First request
+
+```bash
+curl -s http://localhost:8000/v1/models | jq -r '.data[].id'
+curl -s http://localhost:8000/v1/chat/completions -H 'content-type: application/json' \
+  -d '{"model":"<alias from /v1/models>","messages":[{"role":"user","content":"Say ok."}],"max_tokens":20}'
+```
+
+- **Expected:** a `choices[0].message.content` that answers. Reasoning models put their
+  thinking in `reasoning_content` and the answer in `content`.
+- The install is done. Anything that speaks OpenAI `chat/completions` or Anthropic
+  `messages` can use `http://<server>:8000/v1`.
+
+---
+
+## B. Manual path (no installer)
+
+Use this while `install.sh`, `odyssai nodes` and `odyssai doctor` are not shipped, or
+to drive the nodes from a checkout. It replaces A1, A3 and A5; A2, A4, A6 and A7 are
+unchanged.
+
+1. **Bootstrap each node from the server** (pushes over ssh, idempotent):
+
+   ```bash
+   scripts/bootstrap-node.sh admin@node-a.local                  # models dir: ~/mlx-models
+   scripts/bootstrap-node.sh admin@node-a.local /Volumes/models  # or your own
+   ```
+
+   Expected: `[1/5]` to `[6/6]`, then `✓ admin@node-a.local bootstrapped.` A line with
+   `⚠` about JACCL means the stock JACCL was kept (RDMA pools lose the patches listed
+   in `vendor/jaccl/PATCHES.md`); a line with `⚠` about `mlx-vlm` disables vision
+   models on that node only. `ERROR: python3.11 not found`: `brew install python@3.11`
+   on the node, re-run.
+
+2. **Pin the GPU memory budget** (asks for the node password; not automated):
+
+   ```bash
+   scripts/wired-limit/install.sh admin@node-a.local 250880    # about 245 GB on a 256 GB Mac
+   ```
+
+3. **Check instead of doctor:**
+
+   ```bash
+   scripts/install-model-modules.sh --check admin@node-a.local admin@node-b.local
+   scripts/install-jaccl.sh --check admin@node-a.local
+   curl -s http://localhost:8000/admin/nodes/telemetry | jq '.hosts[] | {host, ssh_ok, ram_total_bytes}'
+   ```
+
+   Expected: no `new` or `stale` file, JACCL `patched`, every node `ssh_ok: true` with
+   a non-zero RAM figure. Anything else: stop and report it. For `jaccl`, every edge is
+   also checked before each load and a bad edge refuses the load by name.
+
+---
+
+## C. Traps behind the steps
+
+- **Xcode licence.** After an Xcode or Command Line Tools update, a node's
+  `/usr/bin/python3` and `git` refuse to run until the licence is accepted again, and
+  `brew`/`git`/`pip` automation on that node fails. Test: `ssh admin@node-a.local 'git
+  --version'`. Fix (human, needs the password): `ssh -t admin@node-a.local 'sudo
+  xcodebuild -license accept'`. The orchestrator's own probes use the venv Python and
+  are not affected.
+- **Never `pip install -U mlx` or `mlx-lm` on a node.** Upgrading `mlx-lm` deletes the
+  vendored model modules; upgrading `mlx` puts the stock `libjaccl.dylib` back. Versions
+  come from `requirements-node.txt` only. After any pip change, re-run A1 (or B1).
+- **Keep the nodes identical.** Runtime patches live in `~/mlx-cluster/patches/` and
+  are read at each runner spawn. After any change to `scripts/mlx_models/` or
+  `scripts/patches/`, sync every node of the pool (`scripts/install-model-modules.sh
+  admin@<node>…`): ranks running different versions of a model file corrupt output
+  silently. A running runner keeps what it imported; a synced file is used at the next
+  load.
+- **`models_dir` is per node.** Volumes are not shared; a model must exist at the same
+  `<models_dir>/<org>/<name>/` on every node of the pool that serves it. The
+  dashboard's *Sync* copies it from one node to the others.
+- **The wired-memory limit** (`iogpu.wired_limit_mb`) does not survive a reboot on its
+  own; the daemon from A1 (or B2) re-applies it. The orchestrator reads the effective
+  limit and refuses loads that would not fit (`preflight_refused`) instead of letting
+  macOS kill the runner.
+
+---
+
+## D. Throughput: replica mode
+
+Create the cluster with **Kind = replica** (dashboard, cluster form, Kind), one node
 entry per Mac that holds the model, then:
 
 ```bash
@@ -175,86 +304,70 @@ curl -s -X POST http://localhost:8000/admin/clusters/<id>/load -H 'content-type:
 ```
 
 `batch: true` turns on continuous batching inside each replica (without it a replica
-serves one request at a time). Requests are dispatched least-busy; a `session_id`
+serves one request at a time). Requests go to the least busy replica; a `session_id`
 keeps a conversation on its home replica so its KV cache is reused. Dead replicas are
-restarted with backoff and re-admitted; the pool stays up as long as one replica lives.
-Known limit: batching interleaves *decode*, not *prefill* — a very large prompt
-(~10k+ tokens) occupies its replica for the prefill duration.
+restarted with backoff and re-admitted; the pool stays up while one replica lives.
+Known limit: batching interleaves *decode*, not *prefill*: a very large prompt (about
+10k tokens and more) occupies its replica for the prefill duration.
 
 ---
 
-## 7. Optional — RDMA over Thunderbolt 5 (distributed pools)
+## E. What RDMA gives you, and its limits
 
-Only for `mlx-distributed` clusters that need more than TCP. Full mesh of TB5 cables
-(N nodes → N·(N−1)/2 cables), then on each node:
-
-```bash
-scripts/rdma-onboard.sh              # provisions the Thunderbolt network (vendored exo recipe)
-scripts/discover-rdma-wiring.py      # tells you which port sees which node → topology wiring
-```
-
-Declare `backend: jaccl` + the wiring in `topology.yaml`.
-
-What the patched JACCL (`vendor/jaccl/PATCHES.md`) and the orchestrator do for you,
-measured with the libibverbs probes in `scripts/jaccl/` (2026-09-18):
+Measured with the libibverbs probes in `scripts/jaccl/` on two M3 Ultras (2026-09-18):
 
 - **Before a load**, every edge of the wiring is checked from both ends (port
   `PORT_ACTIVE`, link-local `169.254.x.x` alias present, peer alias reachable through
-  that exact interface). A bad edge refuses the load naming it:
-  `rdma link(s) not usable — ultra-256b rdma_en6 → ultra-256c rdma_en7: PORT_DOWN`.
-  Fix the cable / port, or reboot that node (a reboot renegotiates the Thunderbolt
-  link) — this, not "queue-pair degradation", is what `Couldn't allocate protection
-  domain` and `RTR failed with errno 60/96` always were.
-- **During a run**, a rank that dies (crash, SIGKILL, jetsam) is reported on every
-  survivor in under a second (`[jaccl] peer is gone: side channel to rank N closed…`)
-  instead of the stock behaviour, a silent spin at 100 % CPU forever. The runner exits
-  and the orchestrator's normal rank-death path recovers. A collective that makes no
-  progress at all (lost UC frame) fails after `JACCL_PROGRESS_TIMEOUT_S` (default 600).
-- When several ranks die at once the load error starts with `CAUSE → rank N: …`: the
+  that interface). A bad edge refuses the load and names it, for example
+  `rdma link(s) not usable - node-b rdma_en6 -> node-c rdma_en7: PORT_DOWN`. Fix the
+  cable or port, or reboot that node (a reboot renegotiates the Thunderbolt link).
+- **During a run**, a rank that dies (crash, SIGKILL, memory pressure) is reported on
+  every survivor within a second (`[jaccl] peer is gone: side channel to rank N
+  closed…`) instead of a silent spin at 100 % CPU. The runner exits and the
+  orchestrator's rank-death path recovers. A collective that makes no progress at all
+  fails after `JACCL_PROGRESS_TIMEOUT_S` (default 600).
+- When several ranks die at once, the load error starts with `CAUSE -> rank N: …`: the
   rank with the link error; the others died of the closed side channel.
 
-Hard facts to keep in mind: 10 queue pairs per device (shared by all processes on the
-node), UC only (no RC, no retransmission), receive buffers must match the message
-size. `ring` (TCP) needs none of this and always works.
+Limits: 10 queue pairs per device (shared by all processes on the node), UC only (no
+RC, no retransmission), receive buffers must match the message size. `ring` (TCP)
+needs none of this.
 
 ---
 
-## 8. Operating rules that prevent the classic incidents
+## F. Operating rules that prevent the classic incidents
 
 - **Never load a second model on a node that is serving one** unless both fit with
-  headroom: macOS jetsam kills the *loading* runner silently (`exit=255`, no traceback).
-  An unload that answers `409` means "busy" — stop, do not force.
+  headroom: macOS kills the *loading* runner silently (`exit=255`, no traceback). An
+  unload that answers `409` means "busy": stop, do not force.
 - **One orchestrator per set of physical nodes.** Two servers pointing at the same Macs
   fight for memory and purge each other's pools.
-- **Xcode updates re-arm the licence** on every node that has Xcode.app (see §1).
-- **Model dirs are per node** (§2); a `preflight_refused: taille 0` means the model is
-  missing on *that* node or the path has a stale sub-folder suffix.
-- **Do not edit `runner.py` / `api.py` / the Dockerfile to install** — they are release
-  artefacts; configuration is `topology.yaml`, env vars, and the scripts above.
-- Deploying a code change: `api.py` → `docker cp` into the container + restart (drops
-  live pools, they restore); `runner.py` → `scp` to every node's `~/mlx-cluster/`
-  (takes effect at the next runner spawn). Keep the nodes identical.
+- **Do not edit `runner.py`, `api.py` or the Dockerfile to install.** Configuration is
+  `topology.yaml`, environment variables and the scripts above.
+- Deploying a code change: `api.py` goes into the container (`docker cp` + restart;
+  live pools are restored); `runner.py` goes to every node's `~/mlx-cluster/` (used at
+  the next runner spawn). Keep the nodes identical.
 
 ---
 
-## 9. Repo map
+## G. Repo map
 
-- `scripts/api.py` — the orchestrator (FastAPI): `/v1/*`, `/admin/*`, dashboard, pools
+- `scripts/api.py`: the orchestrator (FastAPI): `/v1/*`, `/admin/*`, dashboard, pools
   (`RunnerPool`, `ReplicaPool`, VLM proxy pools), downloader, preflight, persistence.
-- `scripts/runner.py` — per-node MLX runner (spawned over SSH); `scripts/patches/` —
-  runtime model aliases; `scripts/mlx_models/` — vendored model modules.
-- `scripts/dashboard.html` — the admin SPA (served per request; hot-deployable).
-- `scripts/bootstrap-node.sh`, `install-model-modules.sh`, `install-jaccl.sh`,
-  `build-jaccl.sh`, `install-mlx-vlm.sh`, `wired-limit/`, `rdma-onboard.sh`,
-  `odyssai-network-setup.sh`, `discover-rdma-wiring.py` — node provisioning.
-- `vendor/jaccl/` — JACCL (MLX v0.32.2) + our patches (`PATCHES.md`, `UPSTREAM.md`);
-  `scripts/jaccl/` — libibverbs probes (`rdma_probe.c`, `rdma_pair.c`) and the
-  2-rank smoke (`smoke_jaccl.py`) that measured every claim in §7.
-- `scripts/topology.py`, `config/topology.example.yaml` — topology schema + template.
+- `scripts/runner.py`: per-node MLX runner (spawned over SSH); `scripts/patches/`:
+  runtime model patches; `scripts/mlx_models/`: vendored model modules.
+- `scripts/dashboard.html`: the admin page (served per request).
+- Node provisioning: `scripts/bootstrap-node.sh`, `install-model-modules.sh`,
+  `install-jaccl.sh`, `build-jaccl.sh`, `install-mlx-vlm.sh`, `wired-limit/`,
+  `rdma-onboard.sh`, `odyssai-network-setup.sh`, `discover-rdma-wiring.py`.
+- `vendor/jaccl/`: JACCL (MLX v0.32.2) and our patches (`PATCHES.md`, `UPSTREAM.md`);
+  `scripts/jaccl/`: libibverbs probes and the 2-rank smoke test behind section E.
+- `vendor/exo/`: licence and provenance of the files derived from exo (see `NOTICE`).
+- `scripts/topology.py`, `config/topology.example.yaml`: topology schema and template.
 - `Dockerfile`, `docker-compose.yml`, `requirements.txt` (container),
   `requirements-node.txt` (nodes, pinned).
-- `docs/` — `GETTING-STARTED.md`, `API.md`, `DEPLOY.md`, `RUNBOOK-argo-v4.md`,
-  `user-guide/` (replica, CoeOS), `bug-reports/`. (Internal notes are not shipped.)
+- `docs/`: `GETTING-STARTED.md`, `API.md`, `DEPLOY.md`, `RUNBOOK-argo-v4.md`,
+  `user-guide/`, `bug-reports/`.
 
 ## Conventions
 
