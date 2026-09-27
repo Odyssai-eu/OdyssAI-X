@@ -82,6 +82,7 @@ class Worker(threading.Thread):
         self.error: str | None = None
         self.busy = False
         self.served = 0
+        self.wired: dict = {}
 
     def run(self) -> None:
         try:
@@ -93,6 +94,7 @@ class Worker(threading.Thread):
                 self.decider = MLXDecider(self.model_dir)
                 import decision_core
                 self.dc = decision_core
+                self._pin_weights()
             log(f"model loaded in {time.perf_counter() - t0:.1f} s ({self.model_dir}), "
                 f"prompt={self.dc.PROMPT_VERSION}, one pass up to {self.dc.MAX_ONE_PASS} options")
             self._decide_all("warm-up", {"w": {"type": "noul", "instructions": "Is this a warm-up?",
@@ -116,6 +118,24 @@ class Worker(threading.Thread):
                 self.busy = False
                 self.served += 1
                 done.set()
+
+    def _pin_weights(self) -> None:
+        """Wire the weights for the life of the process, as mlx_lm does around every
+        generation (`wired_limit`). The readout calls the model directly, so without
+        this macOS evicts the Metal buffers of a model close to the node's working
+        set: seen 2026-09-27 on ultra-96b with Eikos-27B bf16 (55 GB) — GPU at 97 %
+        while its resident memory swung 30 → 6.6 GB and each request took minutes."""
+        import mlx.core as mx
+        from mlx.utils import tree_reduce
+        if not mx.metal.is_available():
+            return
+        rec = mx.device_info()["max_recommended_working_set_size"]
+        model_bytes = tree_reduce(
+            lambda acc, x: acc + x.nbytes if isinstance(x, mx.array) else acc, self.decider.model, 0)
+        mx.set_wired_limit(rec)
+        self.wired = {"model_gb": round(model_bytes / 1e9, 1), "wired_limit_gb": round(rec / 1e9, 1)}
+        log(f"weights wired: model {self.wired['model_gb']} GB, wired limit {self.wired['wired_limit_gb']} GB"
+            + (" — close to the limit, expect pressure" if model_bytes > 0.9 * rec else ""))
 
     def _decide_all(self, state, questions: dict) -> dict:
         """Same batching as upstream serve.py decide_all: every question of the request in one
@@ -189,7 +209,7 @@ def make_handler(worker: Worker, name: str, cfg: dict):
                 "version": VERSION, "kind": "decision", "prompt_version": cfg.get("prompt_version"),
                 "readout": cfg.get("readout"), "loading": not worker.ready.is_set(),
                 "error": worker.error, "busy": worker.busy, "queued": worker.jobs.qsize(),
-                "served": worker.served})
+                "served": worker.served, "wired": worker.wired})
 
         def do_POST(self):
             if self.path not in ("/v1/systemone", "/v1/evaluate"):
