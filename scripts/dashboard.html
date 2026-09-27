@@ -969,6 +969,74 @@ body.expert-mode .x-simple { display: none !important; }
   font-family: var(--font-mono); font-size: 11.5px; line-height: 1.5; color: var(--ink); white-space: pre; overflow-x: auto;
 }
 
+/* Render containers (see render()): layout-neutral wrappers. */
+.part { display: contents; }
+
+/* ─── Test chat (#91) ─────────────────────────────────────────────── */
+.chat-layout { display: flex; flex-direction: row; min-height: 460px; }
+.chat-side {
+  width: 260px; flex-shrink: 0; border-right: 1px solid var(--line); background: var(--surface-2);
+  display: flex; flex-direction: column; min-height: 0;
+}
+.chat-side-head { display: flex; flex-direction: row; align-items: center; justify-content: space-between; gap: 8px; padding: 18px 16px 12px; }
+.chat-list { display: flex; flex-direction: column; gap: 4px; padding: 0 8px 12px; overflow-y: auto; max-height: 560px; }
+.chat-list .chat-empty-list { font-size: 12px; color: var(--ink-2); padding: 6px 8px; }
+.chat-item { display: flex; flex-direction: row; align-items: stretch; border: 1px solid transparent; border-radius: 8px; }
+.chat-item:hover { background: var(--surface); border-color: var(--line); }
+.chat-item.active { background: var(--surface); border-color: var(--blue-border); }
+.chat-open {
+  flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 2px; padding: 8px 4px 8px 10px;
+  background: transparent; border: none; text-align: left; color: var(--ink);
+}
+.chat-open .t { font-size: 12px; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.chat-open .m { font-family: var(--font-mono); font-size: 10.5px; color: var(--ink-2); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.chat-open .s { font-size: 10.5px; color: var(--ink-3); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.chat-del { flex-shrink: 0; width: 30px; background: transparent; border: none; color: var(--ink-3); border-radius: 0 8px 8px 0; display: flex; align-items: center; justify-content: center; }
+.chat-del:hover { color: var(--rust); background: var(--rust-soft); }
+
+.chat-main { flex: 1; min-width: 0; display: flex; flex-direction: column; }
+.chat-head { display: flex; flex-direction: row; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; padding: 18px 24px 14px; border-bottom: 1px solid var(--line); }
+.chat-controls { display: flex; flex-direction: row; align-items: center; gap: 10px; flex-wrap: wrap; }
+.chat-model-shell { padding: 6px 6px 6px 12px; min-width: 240px; max-width: 360px; }
+.chat-model-shell select { font-family: var(--font-mono); font-size: 12px; }
+.chat-model-shell .icon-btn { width: 26px; height: 26px; border: none; background: transparent; flex-shrink: 0; }
+.mode-toggle.small { padding: 5px 10px 5px 8px; font-size: 10px; }
+
+.chat-msgs { flex: 1; display: flex; flex-direction: column; gap: 14px; padding: 18px 24px; overflow-y: auto; max-height: 560px; min-height: 260px; }
+.chat-hint { margin: auto; text-align: center; font-size: 13px; color: var(--ink-2); max-width: 420px; line-height: 1.5; }
+.chat-msg { display: flex; flex-direction: column; gap: 6px; max-width: 88%; }
+.chat-msg.user { align-self: flex-end; align-items: flex-end; }
+.chat-msg.assistant { align-self: flex-start; }
+.chat-bubble {
+  padding: 10px 14px; border-radius: 12px; font-size: 13.5px; line-height: 1.55;
+  white-space: pre-wrap; word-break: break-word; overflow-wrap: anywhere;
+}
+.chat-msg.user .chat-bubble { background: var(--blue); color: white; border-bottom-right-radius: 4px; }
+.chat-msg.assistant .chat-bubble { background: var(--surface-2); border: 1px solid var(--line); color: var(--ink); border-bottom-left-radius: 4px; }
+.chat-msg.assistant .chat-bubble:empty { display: none; }
+.chat-think { display: flex; flex-direction: column; gap: 6px; align-items: flex-start; }
+.chat-think-toggle {
+  display: inline-flex; align-items: center; gap: 6px; padding: 3px 10px; border-radius: 999px;
+  border: 1px solid var(--violet-soft); background: var(--violet-soft); color: var(--violet);
+  font-size: 11px; font-weight: 600;
+}
+.chat-think-body {
+  padding: 8px 12px; border-left: 2px solid var(--violet-soft); color: var(--ink-2);
+  font-size: 12.5px; line-height: 1.5; white-space: pre-wrap; word-break: break-word; overflow-wrap: anywhere;
+  max-height: 320px; overflow-y: auto;
+}
+.chat-meta { font-family: var(--font-mono); font-size: 10.5px; color: var(--ink-2); }
+.chat-meta.err { color: var(--rust-deep); white-space: pre-wrap; word-break: break-word; }
+
+.chat-form { display: flex; flex-direction: row; align-items: flex-end; gap: 10px; padding: 14px 24px 18px; border-top: 1px solid var(--line); }
+.chat-form textarea {
+  flex: 1; min-width: 0; resize: vertical; min-height: 44px; max-height: 240px;
+  padding: 10px 12px; border: 1px solid var(--line); border-radius: 8px; background: var(--surface);
+  font: inherit; font-size: 13.5px; color: var(--ink); outline: none;
+}
+.chat-form textarea:focus { border-color: var(--blue-border); box-shadow: 0 0 0 3px var(--blue-soft); }
+.chat-form .btn { flex-shrink: 0; }
+
 /* ─── Phone width ────────────────────────────────────────────────
    Desktop rendering is unchanged; below 760 px the page gets 16 px
    gutters, wrapping rows and a stacked status split. */
@@ -990,6 +1058,14 @@ body.expert-mode .x-simple { display: none !important; }
   .metrics-row { flex-wrap: wrap; row-gap: 12px; }
   .connect-grid { grid-template-columns: minmax(0, 1fr); }
   .pool-row { flex-wrap: wrap; row-gap: 6px; }
+  .chat-layout { flex-direction: column; min-height: 0; }
+  .chat-side { width: auto; border-right: none; border-bottom: 1px solid var(--line); }
+  .chat-list { max-height: 180px; }
+  .chat-head, .chat-msgs, .chat-form { padding-left: 16px; padding-right: 16px; }
+  .chat-model-shell { min-width: 0; max-width: none; flex: 1; }
+  .chat-controls { width: 100%; }
+  .chat-msg { max-width: 100%; }
+  .chat-msgs { max-height: 70vh; }
   .node-row .row1 { flex-wrap: wrap; }
   .footer { padding: 16px; flex-wrap: wrap; gap: 6px; }
 }
@@ -1679,21 +1755,41 @@ function render() {
     };
   }
 
-  $("root").innerHTML = `
-    <div class="stage">
-      ${renderHeader()}
-      ${renderRibbon()}
-      <div class="main">
-        ${renderClusterCard()}
-        ${renderActiveRuns()}
-        ${renderRunnerLogs()}
-        ${renderRecentActivity()}
-        ${renderConnectCard()}
-        ${renderFooter()}
+  // The page skeleton is built ONCE; each render then rewrites only its own
+  // containers. #chat-host (the test chat, #91) is never rewritten, so the
+  // poll can't wipe an answer mid-stream, drop the textarea focus (and the
+  // phone keyboard) or close a thinking block. The .part wrappers are
+  // display:contents, so the layout is the same as when everything sat
+  // directly in .stage / .main.
+  if (!$("main-dyn")) {
+    $("root").innerHTML = `
+      <div class="stage">
+        <div id="top" class="part"></div>
+        <div class="main">
+          <div id="main-dyn" class="part"></div>
+          <div id="chat-host" class="part"></div>
+          <div id="main-after" class="part"></div>
+        </div>
+        <div id="modal-host" class="part"></div>
       </div>
-      ${state.settings_open ? renderSettings() : ""}
-    </div>
+    `;
+  }
+  $("top").innerHTML = `
+    ${renderHeader()}
+    ${renderRibbon()}
   `;
+  $("main-dyn").innerHTML = `
+    ${renderClusterCard()}
+    ${renderActiveRuns()}
+    ${renderRunnerLogs()}
+    ${renderRecentActivity()}
+  `;
+  $("main-after").innerHTML = `
+    ${renderConnectCard()}
+    ${renderFooter()}
+  `;
+  $("modal-host").innerHTML = state.settings_open ? renderSettings() : "";
+  chatMount();
   attachHandlers();
 
   // Restore focus + cursor in inputs after the innerHTML wipe. Without
@@ -5953,6 +6049,528 @@ function renderActivityRow(m) {
       <div class="c-ttft">${ttftMs != null ? (ttftMs >= 1000 ? (ttftMs/1000).toFixed(1)+" s" : ttftMs+" ms") : "—"}</div>
     </div>
   `;
+}
+
+// ─── Test chat (#91) ─────────────────────────────────────────────────
+// A minimal chat to TRY a loaded model, not a client: no system prompt, no
+// sampling knobs, no files, no export. History lives in this browser only
+// (localStorage, the CHAT_MAX most recent chats); nothing server-side.
+//
+// Built once into #chat-host, which render() never rewrites. Everything a
+// model or a user wrote goes to the DOM through textContent, never innerHTML
+// (the admin token sits in this origin's localStorage).
+const CHAT_STORE_KEY = "odyssai.chat.history.v1";
+const CHAT_THINK_KEY = "odyssai.chat.thinking";
+const CHAT_MAX = 50;
+// The engine's max_tokens default is 512, which a thinking model can spend
+// entirely on its reasoning. A test chat wants whole answers.
+const CHAT_MAX_TOKENS = 4096;
+// Per-message caps for what is STORED (the page keeps the full text), so 50
+// chats of long reasoning can't exhaust the ~5 MB localStorage quota.
+const CHAT_STORE_CONTENT_MAX = 60000;
+const CHAT_STORE_REASONING_MAX = 12000;
+
+const chat = {
+  list: [],            // [{id, title, model, created, updated, messages:[...]}], newest first
+  deleted: new Set(),  // ids deleted in this tab: never resurrected by a merge
+  currentId: null,     // null = a new chat, created on its first message
+  models: [],          // loaded, chat-capable /v1/models entries
+  modelsErr: null,
+  modelsSig: null,     // what the model list was built from (see chatMount)
+  inflight: null,      // {ctrl, chatId, msg}
+  built: false,
+  el: {},
+};
+
+function _chatId() { return "c" + Date.now().toString(36) + Math.random().toString(36).slice(2, 8); }
+function _chatShortModel(m) { return String(m || "").split("/").pop() || "—"; }
+function _chatIsCloud(m) { return String(m?.owned_by || "").startsWith("odyssai-cloud-"); }
+function _chatFmtS(s) { return s == null ? "—" : (s < 10 ? s.toFixed(2) : s.toFixed(1)) + " s"; }
+
+function chatStoreRead() {
+  try {
+    const raw = localStorage.getItem(CHAT_STORE_KEY);
+    const v = raw ? JSON.parse(raw) : [];
+    return Array.isArray(v) ? v.filter(c => c && typeof c.id === "string" && Array.isArray(c.messages)) : [];
+  } catch (e) { return []; }
+}
+function _chatForStore(c) {
+  const cut = (s, n) => (typeof s === "string" && s.length > n) ? s.slice(0, n) + "\n[… truncated in the saved copy]" : s;
+  // `_el` is the message's live DOM node: page-only, never stored.
+  return { ...c, messages: c.messages.map(({ _el, ...m }) => ({
+    ...m, content: cut(m.content, CHAT_STORE_CONTENT_MAX), reasoning: cut(m.reasoning, CHAT_STORE_REASONING_MAX),
+  })) };
+}
+function _isQuotaError(e) {
+  return !!e && (e.name === "QuotaExceededError" || e.name === "NS_ERROR_DOM_QUOTA_REACHED" || e.code === 22 || e.code === 1014);
+}
+// Merge with what another tab may have written since (by id, newest
+// `updated` wins, deletions from this tab stick), keep the CHAT_MAX most
+// recent, write. On a quota error drop the oldest chat that is not the open
+// one and retry. Any other storage failure (private mode, blocked storage)
+// leaves the in-page list alone: the chat still works, it just won't
+// survive a reload.
+function chatStoreSave() {
+  const byId = new Map();
+  for (const c of chatStoreRead()) if (!chat.deleted.has(c.id)) byId.set(c.id, c);
+  for (const c of chat.list) {
+    const other = byId.get(c.id);
+    if (!other || (other.updated || 0) <= (c.updated || 0)) byId.set(c.id, c);
+  }
+  chat.list = [...byId.values()].sort((a, b) => (b.updated || 0) - (a.updated || 0)).slice(0, CHAT_MAX);
+  for (;;) {
+    try { localStorage.setItem(CHAT_STORE_KEY, JSON.stringify(chat.list.map(_chatForStore))); return true; }
+    catch (e) {
+      if (!_isQuotaError(e)) return false;
+      let i = chat.list.length - 1;
+      while (i >= 0 && chat.list[i].id === chat.currentId) i--;
+      if (i < 0) return false;
+      chat.list.splice(i, 1);
+    }
+  }
+}
+
+function chatThinkingOn() {
+  try {
+    const v = localStorage.getItem(CHAT_THINK_KEY);
+    if (v === "1") return true;
+    if (v === "0") return false;
+  } catch (e) { /* fall through to the server default */ }
+  return !!state.server_settings?.enable_thinking_default;
+}
+function chatSetThinking(on) {
+  try { localStorage.setItem(CHAT_THINK_KEY, on ? "1" : "0"); } catch (e) { /* page-only */ }
+  chatSyncControls();
+}
+
+function chatCurrent() { return chat.list.find(c => c.id === chat.currentId) || null; }
+function chatSummary(c) {
+  const answers = c.messages.filter(m => m.role === "assistant" && m.metrics);
+  const rates = answers.map(m => m.metrics.tps).filter(x => typeof x === "number" && x > 0);
+  const toks = answers.reduce((s, m) => s + (m.metrics.tokens || 0), 0);
+  const avg = rates.length ? rates.reduce((a, b) => a + b, 0) / rates.length : null;
+  return `${c.messages.length} msg${c.messages.length > 1 ? "s" : ""} · ${avg != null ? avg.toFixed(1) + " tok/s avg" : "— tok/s"} · ${toks} tok`;
+}
+
+function chatMetricsText(msg) {
+  const m = msg.metrics || {};
+  const parts = [_chatShortModel(m.model || msg.model)];
+  parts.push("TTFT " + _chatFmtS(m.ttft_s));
+  parts.push(m.tokens != null ? `${m.tokens} tok` : (m.chunks ? `~${m.chunks} chunks` : "— tok"));
+  parts.push(m.tps != null ? `${m.tps.toFixed(1)} tok/s` : "— tok/s");
+  parts.push(_chatFmtS(m.duration_s));
+  if (m.finish === "length") parts.push("cut at max tokens");
+  if (m.stopped) parts.push("stopped");
+  return parts.join(" · ");
+}
+
+// ── DOM ──
+function chatMount() {
+  const host = $("chat-host");
+  if (!host) return;
+  if (!chat.built) chatBuild(host);
+  else if (!host.contains(chat.el.card)) host.appendChild(chat.el.card);
+  // Refresh the model picker when what is loaded changes (a Load / Stop in
+  // this page or elsewhere), so a model can be tried right after loading it.
+  const sig = JSON.stringify([
+    Object.entries(state.cluster_status || {}).map(([id, st]) => [id, (st?.pools || []).map(p => p.alias), (st?.models_loaded || [])]),
+    (state.cloud_providers || []).length,
+  ]);
+  if (sig !== chat.modelsSig) { chat.modelsSig = sig; chatLoadModels(); }
+  chatSyncControls();
+}
+
+function chatBuild(host) {
+  const card = document.createElement("section");
+  card.className = "cluster-card chat-card";
+  card.innerHTML = `
+    <div class="chat-layout">
+      <aside class="chat-side">
+        <div class="chat-side-head">
+          <div class="section-title">Chats</div>
+          <button class="btn btn-xs" type="button" data-chat="new">${Icon.plus}<span>New chat</span></button>
+        </div>
+        <div class="chat-list"></div>
+      </aside>
+      <div class="chat-main">
+        <div class="chat-head">
+          <div class="section-stack">
+            <div class="section-title">Try a model</div>
+            <div class="section-sub">Test chat · the history stays in this browser</div>
+          </div>
+          <div class="chat-controls">
+            <button class="mode-toggle small" type="button" data-chat="think" title="Ask the model to reason first (enable_thinking). Local models only; cloud models decide for themselves."><span class="track"><span class="knob"></span></span><span>Thinking</span></button>
+            <div class="field-shell chat-model-shell">
+              <select aria-label="Model" data-chat="model"></select>
+              <button class="icon-btn" type="button" data-chat="reload-models" title="Refresh the list of loaded models">${Icon.refresh}</button>
+            </div>
+          </div>
+        </div>
+        <div class="chat-msgs" aria-live="polite"></div>
+        <form class="chat-form">
+          <textarea rows="2" aria-label="Message" placeholder="Ask something. Enter sends, Shift+Enter adds a line."></textarea>
+          <button class="btn btn-primary" type="submit" data-chat="send">Send</button>
+        </form>
+      </div>
+    </div>`;
+  chat.el = {
+    card,
+    list: card.querySelector(".chat-list"),
+    msgs: card.querySelector(".chat-msgs"),
+    model: card.querySelector('[data-chat="model"]'),
+    think: card.querySelector('[data-chat="think"]'),
+    form: card.querySelector(".chat-form"),
+    text: card.querySelector("textarea"),
+    send: card.querySelector('[data-chat="send"]'),
+  };
+  card.querySelector('[data-chat="new"]').addEventListener("click", () => chatOpen(null));
+  card.querySelector('[data-chat="reload-models"]').addEventListener("click", () => chatLoadModels());
+  chat.el.think.addEventListener("click", () => chatSetThinking(!chatThinkingOn()));
+  chat.el.model.addEventListener("change", () => { chatSyncControls(); chat.el.text.focus(); });
+  chat.el.form.addEventListener("submit", (e) => { e.preventDefault(); if (chat.inflight) chatStop(); else chatSend(); });
+  chat.el.text.addEventListener("keydown", (e) => {
+    if (e.key === "Enter" && !e.shiftKey && !e.isComposing) { e.preventDefault(); if (!chat.inflight) chatSend(); }
+  });
+  host.appendChild(card);
+  chat.built = true;
+  chat.list = chatStoreRead().sort((a, b) => (b.updated || 0) - (a.updated || 0)).slice(0, CHAT_MAX);
+  chatRenderList();
+  chatRenderMessages();
+}
+
+function chatSyncControls() {
+  if (!chat.built) return;
+  const sel = chat.models.find(m => m.id === chat.el.model.value);
+  const cloud = sel ? _chatIsCloud(sel) : false;
+  const on = chatThinkingOn();
+  chat.el.think.classList.toggle("on", on && !cloud);
+  chat.el.think.disabled = cloud;
+  chat.el.think.setAttribute("aria-pressed", on && !cloud ? "true" : "false");
+  const busy = !!chat.inflight;
+  chat.el.send.textContent = busy ? "Stop" : "Send";
+  chat.el.send.classList.toggle("btn-primary", !busy);
+  chat.el.send.classList.toggle("btn-dark", busy);
+  chat.el.send.disabled = !busy && !sel;
+}
+
+async function chatLoadModels() {
+  try {
+    const r = await fetch("/v1/models", { cache: "no-store", headers: { ...authHeaders() } });
+    if (!r.ok) throw new Error("HTTP " + r.status);
+    const j = await r.json();
+    chat.models = (j?.data || []).filter(m => m && m.id && m.x_odyssai && m.x_odyssai.loaded === true
+                                            && m.x_odyssai.kind !== "decision");
+    chat.modelsErr = null;
+  } catch (e) {
+    chat.modelsErr = String(e?.message || e);
+  }
+  chatRenderModelOptions();
+}
+
+function chatRenderModelOptions() {
+  if (!chat.built) return;
+  const s = chat.el.model;
+  const prev = s.value || chatCurrent()?.model || "";
+  s.textContent = "";
+  const local = chat.models.filter(m => !_chatIsCloud(m));
+  const cloud = chat.models.filter(m => _chatIsCloud(m));
+  const addGroup = (label, items) => {
+    if (!items.length) return;
+    const g = document.createElement("optgroup");
+    g.label = label;
+    for (const m of items) {
+      const o = document.createElement("option");
+      o.value = m.id;
+      const where = m.x_odyssai?.cluster_label ? ` · ${m.x_odyssai.cluster_label}` : "";
+      o.textContent = m.id + where;
+      g.appendChild(o);
+    }
+    s.appendChild(g);
+  };
+  addGroup("Loaded on this engine", local);
+  addGroup("Cloud providers (may be billed)", cloud);
+  if (!chat.models.length) {
+    const o = document.createElement("option");
+    o.value = "";
+    o.textContent = chat.modelsErr ? `model list unavailable (${chat.modelsErr})` : "no model loaded";
+    s.appendChild(o);
+  }
+  if (chat.models.find(m => m.id === prev)) s.value = prev;
+  else if (local[0]) s.value = local[0].id;
+  chatSyncControls();
+}
+
+function chatRenderList() {
+  const box = chat.el.list;
+  box.textContent = "";
+  if (!chat.list.length) {
+    const d = document.createElement("div");
+    d.className = "chat-empty-list";
+    d.textContent = "No chat yet.";
+    box.appendChild(d);
+    return;
+  }
+  for (const c of chat.list) {
+    const item = document.createElement("div");
+    item.className = "chat-item" + (c.id === chat.currentId ? " active" : "");
+    const open = document.createElement("button");
+    open.type = "button";
+    open.className = "chat-open";
+    const when = new Date(c.updated || c.created || Date.now());
+    const t = document.createElement("span"); t.className = "t"; t.textContent = c.title || "Untitled";
+    const m = document.createElement("span"); m.className = "m";
+    m.textContent = `${_chatShortModel(c.model)} · ${when.toLocaleDateString([], { month: "short", day: "numeric" })} ${when.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}`;
+    const s = document.createElement("span"); s.className = "s"; s.textContent = chatSummary(c);
+    open.append(t, m, s);
+    open.title = `${c.title || ""}\n${c.model || ""}`;
+    open.addEventListener("click", () => chatOpen(c.id));
+    const del = document.createElement("button");
+    del.type = "button";
+    del.className = "chat-del";
+    del.title = "Delete this chat";
+    del.setAttribute("aria-label", "Delete chat");
+    del.innerHTML = Icon.trash;  // static icon markup, no user data
+    del.addEventListener("click", () => chatDelete(c.id));
+    item.append(open, del);
+    box.appendChild(item);
+  }
+}
+
+function chatThinkLabel(refs, msg, streaming) {
+  const n = (msg.reasoning || "").length;
+  const verb = refs.tbody.hidden ? "Show thinking" : "Hide thinking";
+  refs.tbtn.textContent = streaming && !msg.content ? `Thinking… · ${verb.toLowerCase()} (${n} chars)` : `${verb} (${n} chars)`;
+  refs.tbtn.setAttribute("aria-expanded", refs.tbody.hidden ? "false" : "true");
+}
+
+function chatMsgEl(msg) {
+  const wrap = document.createElement("div");
+  wrap.className = "chat-msg " + (msg.role === "user" ? "user" : "assistant");
+  const bubble = document.createElement("div");
+  bubble.className = "chat-bubble";
+  bubble.textContent = msg.content || "";
+  if (msg.role === "user") { wrap.appendChild(bubble); return wrap; }
+  // Thinking: collapsed by default, one toggle per answer.
+  const think = document.createElement("div");
+  think.className = "chat-think";
+  const tbtn = document.createElement("button");
+  tbtn.type = "button";
+  tbtn.className = "chat-think-toggle";
+  const tbody = document.createElement("div");
+  tbody.className = "chat-think-body";
+  tbody.hidden = true;
+  tbody.textContent = msg.reasoning || "";
+  think.append(tbtn, tbody);
+  think.hidden = !msg.reasoning;
+  const meta = document.createElement("div");
+  meta.className = "chat-meta";
+  wrap.append(think, bubble, meta);
+  const refs = { think, tbtn, tbody, bubble, meta };
+  wrap._refs = refs;
+  tbtn.addEventListener("click", () => { tbody.hidden = !tbody.hidden; chatThinkLabel(refs, msg, chat.inflight?.msg === msg); });
+  chatPaintAnswer(wrap, msg, false);
+  return wrap;
+}
+
+function chatPaintAnswer(wrap, msg, streaming) {
+  const r = wrap._refs;
+  if (!r) return;
+  if (r.bubble.textContent !== (msg.content || "")) r.bubble.textContent = msg.content || "";
+  if (msg.reasoning) {
+    r.think.hidden = false;
+    if (r.tbody.textContent !== msg.reasoning) r.tbody.textContent = msg.reasoning;
+    chatThinkLabel(r, msg, streaming);
+  }
+  r.meta.className = "chat-meta" + (msg.error ? " err" : "");
+  if (msg.error) r.meta.textContent = (msg.metrics ? chatMetricsText(msg) + "\n" : "") + "Error: " + msg.error;
+  else if (streaming) r.meta.textContent = `${_chatShortModel(msg.model)} · ${msg.content || msg.reasoning ? "streaming…" : "waiting for the first token…"}`;
+  else r.meta.textContent = msg.metrics ? chatMetricsText(msg) : "";
+}
+
+function chatRenderMessages() {
+  const box = chat.el.msgs;
+  box.textContent = "";
+  const c = chatCurrent();
+  if (!c || !c.messages.length) {
+    const h = document.createElement("div");
+    h.className = "chat-hint";
+    h.textContent = "Pick a loaded model and ask something. Under each answer: the model, time to first token, tokens, tok/s and total time.";
+    box.appendChild(h);
+    return;
+  }
+  for (const m of c.messages) {
+    const el = chatMsgEl(m);
+    m._el = el;
+    box.appendChild(el);
+  }
+  box.scrollTop = box.scrollHeight;
+}
+
+function chatOpen(id) {
+  chat.currentId = id;
+  const c = chatCurrent();
+  if (c && chat.models.find(m => m.id === c.model)) chat.el.model.value = c.model;
+  chatRenderList();
+  chatRenderMessages();
+  chatSyncControls();
+}
+
+function chatDelete(id) {
+  const c = chat.list.find(x => x.id === id);
+  if (!c) return;
+  if (!confirm(`Delete this chat?\n\n"${(c.title || "Untitled").slice(0, 80)}"\n\nIt is removed from this browser; this cannot be undone.`)) return;
+  if (chat.inflight && chat.inflight.chatId === id) chatStop();
+  chat.deleted.add(id);
+  chat.list = chat.list.filter(x => x.id !== id);
+  if (chat.currentId === id) chat.currentId = null;
+  chatStoreSave();
+  chatRenderList();
+  chatRenderMessages();
+}
+
+function chatStop() {
+  if (chat.inflight) { try { chat.inflight.ctrl.abort(); } catch (e) { /* already done */ } }
+}
+
+async function chatSend() {
+  const text = chat.el.text.value.trim();
+  const model = chat.el.model.value;
+  if (!text || !model || chat.inflight) return;
+  const entry = chat.models.find(m => m.id === model);
+  let c = chatCurrent();
+  const now = Date.now();
+  if (!c) {
+    c = { id: _chatId(), title: text.replace(/\s+/g, " ").slice(0, 60), model, created: now, updated: now, messages: [] };
+    chat.list.unshift(c);
+    chat.currentId = c.id;
+    chat.el.msgs.textContent = "";
+  }
+  // History sent to the model: the exchanges that got an answer (role and
+  // content only). A question whose answer failed is left out with it, so
+  // the roles keep alternating (strict chat templates reject user, user).
+  const history = [];
+  for (let i = 0; i + 1 < c.messages.length; i++) {
+    const q = c.messages[i], a = c.messages[i + 1];
+    if (q.role === "user" && a.role === "assistant" && a.content && !a.error) {
+      history.push({ role: "user", content: q.content }, { role: "assistant", content: a.content });
+      i++;
+    }
+  }
+  const userMsg = { role: "user", content: text };
+  const msg = { role: "assistant", content: "", reasoning: "", model };
+  c.messages.push(userMsg, msg);
+  c.model = model;
+  c.updated = now;
+  chat.el.text.value = "";
+  for (const m of [userMsg, msg]) { m._el = chatMsgEl(m); chat.el.msgs.appendChild(m._el); }
+  chat.el.msgs.scrollTop = chat.el.msgs.scrollHeight;
+  chatStoreSave();
+  chatRenderList();
+
+  const body = {
+    model,
+    messages: [...history, { role: "user", content: text }],
+    stream: true,
+    stream_options: { include_usage: true },
+    max_tokens: CHAT_MAX_TOKENS,
+  };
+  // Explicit bool for local models (the engine's default is a setting the
+  // simple view hides); cloud providers decide thinking on their side.
+  if (entry && !_chatIsCloud(entry)) body.enable_thinking = chatThinkingOn();
+
+  const ctrl = new AbortController();
+  chat.inflight = { ctrl, chatId: c.id, msg };
+  chatSyncControls();
+  const t0 = performance.now();
+  let tFirst = null, chunks = 0, usage = null, served = null, finish = null;
+  const paint = () => {
+    if (!msg._el) return;
+    const box = chat.el.msgs;
+    const atBottom = box.scrollHeight - box.scrollTop - box.clientHeight < 40;
+    chatPaintAnswer(msg._el, msg, true);
+    if (atBottom) box.scrollTop = box.scrollHeight;
+  };
+  paint();
+  const onChunk = (j) => {
+    if (j.error) throw new Error(typeof j.error === "string" ? j.error : (j.error.message || JSON.stringify(j.error)));
+    if (j.model) served = j.model;
+    if (j.usage) usage = j.usage;
+    const ch = Array.isArray(j.choices) ? j.choices[0] : null;
+    if (!ch) return;
+    const d = ch.delta || ch.message || {};
+    const r = d.reasoning_content || d.reasoning || "";
+    const t = typeof d.content === "string" ? d.content : "";
+    if (r || t) {
+      if (tFirst == null) tFirst = performance.now();
+      chunks++;
+      if (r) msg.reasoning += r;
+      if (t) msg.content += t;
+    }
+    if (ch.finish_reason) finish = ch.finish_reason;
+  };
+  try {
+    const res = await fetch("/v1/chat/completions", {
+      method: "POST",
+      headers: { "content-type": "application/json", ...authHeaders() },
+      body: JSON.stringify(body),
+      signal: ctrl.signal,
+    });
+    if (!res.ok) {
+      const raw = await res.text();
+      let detail = raw;
+      try { const j = JSON.parse(raw); detail = j.detail?.message || j.detail || j.error?.message || j.error || raw; } catch (e) { /* plain text */ }
+      throw new Error(`HTTP ${res.status}: ${typeof detail === "string" ? detail : JSON.stringify(detail)}`.slice(0, 600));
+    }
+    if (!(res.headers.get("content-type") || "").includes("text/event-stream")) {
+      onChunk(await res.json());   // an upstream that ignored stream:true
+    } else {
+      const reader = res.body.getReader();
+      const dec = new TextDecoder();
+      let buf = "", done = false;
+      while (!done) {
+        const { value, done: eof } = await reader.read();
+        if (eof) break;
+        buf += dec.decode(value, { stream: true });
+        let nl;
+        while ((nl = buf.indexOf("\n")) >= 0) {
+          const line = buf.slice(0, nl).replace(/\r$/, "");
+          buf = buf.slice(nl + 1);
+          if (!line.startsWith("data:")) continue;
+          const data = line.slice(5).trim();
+          if (!data) continue;
+          if (data === "[DONE]") { done = true; break; }
+          let j;
+          try { j = JSON.parse(data); } catch (e) { continue; }
+          onChunk(j);
+        }
+        paint();
+      }
+    }
+    if (finish === "error") throw new Error("the engine ended the stream with finish_reason=error");
+  } catch (e) {
+    if (e?.name !== "AbortError") msg.error = String(e?.message || e);
+  }
+  const tEnd = performance.now();
+  const tokens = (usage && typeof usage.completion_tokens === "number") ? usage.completion_tokens : null;
+  const genS = tFirst != null ? (tEnd - tFirst) / 1000 : null;
+  msg.metrics = {
+    model: served || model,
+    ttft_s: tFirst != null ? (tFirst - t0) / 1000 : null,
+    tokens,
+    chunks,
+    tps: (tokens != null && genS && genS > 0) ? tokens / genS : null,
+    duration_s: (tEnd - t0) / 1000,
+    finish,
+    stopped: ctrl.signal.aborted || undefined,
+  };
+  chat.inflight = null;
+  if (!chat.deleted.has(c.id)) {
+    c.updated = Date.now();
+    chatStoreSave();
+  }
+  if (msg._el) chatPaintAnswer(msg._el, msg, false);
+  chatRenderList();
+  chatSyncControls();
 }
 
 // ─── Connect card (#90, simple mode) ──────────────────────────────────
