@@ -788,8 +788,10 @@ h1, h2, h3 { margin: 0; }
 /* VLM badge — distinct violet, shown only when an engine-managed VLM is loaded
    & serving ("in action"). Renders alongside the telemak kind-pill. */
 .cluster-item .dot.vlm { background: var(--violet); }
-.cluster-item .kind-pill.vlm { color: var(--violet); background: var(--violet-soft); }
-.kind-pill.vlm { font-size: 10px; font-weight: 700; padding: 2px 6px; border-radius: 4px; letter-spacing: 0.04em; text-transform: uppercase; color: var(--violet); background: var(--violet-soft); }
+.cluster-item .kind-pill.vlm { color: #fff; background: var(--violet); }
+.cluster-item .dot.decision { background: #6b4fa0; }
+.cluster-item .kind-pill.decision { color: #fff; background: #6b4fa0; }
+.kind-pill.vlm { font-size: 10px; font-weight: 700; padding: 2px 6px; border-radius: 4px; letter-spacing: 0.04em; text-transform: uppercase; color: #fff; background: var(--violet); }
 .cluster-item .meta { font-family: var(--font-mono); font-size: 11px; color: var(--ink-2); }
 .add-cluster-btn {
   display: flex; flex-direction: row; align-items: center; gap: 10px;
@@ -4098,7 +4100,7 @@ function renderArgoPoolsList(a) {
     // Shown instead of "VLM" (its checkpoint can carry a vision_config).
     const isDecisionPool = !!(p.is_decision || p.mode === "decision");
     const kindPill = (isDecisionPool
-      ? `<span class="kind-pill" style="background:#6b4fa0" title="Decision model — typed questions (choice/score/noul) → calibrated probabilities. Call POST /v1/systemone with model=${escapeHtml(p.alias)}; chat endpoints refuse it.">decision</span>`
+      ? `<span class="kind-pill" style="background:#6b4fa0;color:#fff" title="Decision model — typed questions (choice/score/noul) → calibrated probabilities. Call POST /v1/systemone with model=${escapeHtml(p.alias)}; chat endpoints refuse it.">decision</span>`
       : isVlmPool
       ? `<span class="kind-pill vlm" title="VL model — mlx_vlm.server, single node">VLM</span>`
       : "") + replicaPill + mtpPill;
