@@ -4,7 +4,7 @@
 
 **OdyssAI-X serves large language and vision models across a cluster of Apple Silicon Macs, behind one OpenAI- and Anthropic-compatible API.**
 
-**98.2%** for GLM-5.3 (max effort) served by OdyssAI-X on our benchmark — ahead of Fable 5 at 97.8% ([bench log](https://odyssai.eu/TODO-dated-bench-log)).
+**97.6%** for GLM-5.3 (Q8, max effort) served locally by OdyssAI-X: the best local model on the [TMB scoreboard](https://themonoclebear.com/en/scoreboard/), 3rd of 81 ranked, 0.2 pt behind Fable 5 (97.8%) and ahead of Claude Opus 4.8 (97.0%) (2026-09-28).
 
 ## Install
 
