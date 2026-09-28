@@ -7243,7 +7243,10 @@ async function handleAct(e) {
         // force=false keeps the preflight gate + proper LM/VLM routing intact.
         force: false,
       });
-      toast(`Pool '${r.alias}' loaded on nodes ${r.node_indices.join(",")} (${r.load_s?.toFixed?.(1)}s)`, "ok");
+      // VL / dflash / decision loads answer with node_index (single node), not node_indices.
+      const _nodes = Array.isArray(r.node_indices) ? r.node_indices
+        : (r.node_index != null ? [r.node_index] : []);
+      toast(`Pool '${r.alias}' loaded on node${_nodes.length > 1 ? "s" : ""} ${_nodes.join(",") || "?"} (${r.load_s?.toFixed?.(1)}s)`, "ok");
       // Reset the form and hide
       f.default_add_open = false;
       f.default_add_alias = "";
