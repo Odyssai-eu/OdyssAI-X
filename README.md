@@ -4,7 +4,7 @@
 
 **OdyssAI-X serves large language and vision models across a cluster of Apple Silicon Macs, behind one OpenAI- and Anthropic-compatible API.**
 
-**94.4%** on the TMB general benchmark: Qwen3.5-397B served by OdyssAI-X, judged by Claude Sonnet 4.6 ([bench log](https://odyssai.eu/TODO-dated-bench-log)).
+**98.2%** for GLM-5.3 (max effort) served by OdyssAI-X on our benchmark — ahead of Fable 5 at 97.8% ([bench log](https://odyssai.eu/TODO-dated-bench-log)).
 
 ## Install
 
