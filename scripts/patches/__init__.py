@@ -1,3 +1,22 @@
+# Portions derived from exo (https://github.com/exo-explore/exo),
+# src/exo/worker/engines/mlx/patches/__init__.py, Copyright 2025 Exo Technologies Ltd.
+# Upstream commit: f0d1371d89a7f899e96977014cce7307a53682f2 (2026-04-28);
+# provenance in vendor/exo/UPSTREAM.md.
+#
+# Licensed under the Apache License, Version 2.0 (the "License"); you may not
+# use this file except in compliance with the License. You may obtain a copy of
+# the License at http://www.apache.org/licenses/LICENSE-2.0 (a copy ships in
+# vendor/exo/LICENSE). Unless required by applicable law or agreed to in
+# writing, software distributed under the License is distributed on an "AS IS"
+# BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
+# implied. See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# Modified by OdyssAI (odyssai.eu), 2026: relative imports; the exo patch set
+# (yarn RoPE, batch generation) extended with OdyssAI's own model patches and
+# the pipeline split-coverage fix. These modifications are part of OdyssAI-X,
+# licensed under the GNU AGPL v3.0 (see LICENSE and NOTICE).
+
 from .bailing_hybrid_alias import apply_bailing_hybrid
 from .g9v3_alias import apply_g9v3
 from .glm_moe_dsa_model import apply_glm_dsa

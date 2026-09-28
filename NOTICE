@@ -5,15 +5,40 @@ Licensed under the GNU Affero General Public License v3.0 (see LICENSE).
 
 This product includes software developed by third parties. AGPL-3.0 is
 one-way compatible with the Apache License 2.0, so the Apache-2.0-licensed
-component below may be, and is, redistributed as part of this AGPL-3.0 work;
-its original license and attribution are preserved:
+files below may be, and are, redistributed as part of this AGPL-3.0 work;
+their original license and attribution are preserved.
 
-* scripts/odyssai-network-setup.sh (the Thunderbolt/RDMA network recipe, installed
-  on cluster nodes as the eu.odyssai.networksetup LaunchDaemon payload) is derived
-  from exo (https://github.com/exo-explore/exo),
-  Copyright 2025 Exo Technologies Ltd,
-  licensed under the Apache License, Version 2.0.
-  Source commit: 09f9ea313f72e261f40a94cea4c0e3681b31af23 (2026-06-03).
-  The file header carries a "MODIFIED" notice describing the changes.
-  scripts/rdma-onboard.sh (the guard driver around that recipe) credits the same
-  mechanism.
+exo (https://github.com/exo-explore/exo)
+  Copyright 2025 Exo Technologies Ltd
+  Licensed under the Apache License, Version 2.0; a copy of the license is in
+  vendor/exo/LICENSE. exo ships no NOTICE file. Provenance, upstream paths and
+  the list of modifications for each file: vendor/exo/UPSTREAM.md. Each file
+  below carries an Apache-2.0 header and a "Modified by OdyssAI" line.
+
+  From upstream commit f0d1371d89a7f899e96977014cce7307a53682f2 (2026-04-28):
+  * scripts/patches/opt_batch_gen.py: byte-identical to exo's
+    src/exo/worker/engines/mlx/patches/opt_batch_gen.py (136 lines) below
+    the attribution header
+  * scripts/patches/standard_yarn_rope.py: byte-identical to exo's
+    src/exo/worker/engines/mlx/patches/standard_yarn_rope.py (118 lines)
+    below the attribution header
+  * scripts/auto_parallel.py: contains exo's
+    src/exo/worker/engines/mlx/auto_parallel.py (1,593 lines) nearly
+    verbatim; about 84% of the file's non-blank lines are exo's, the rest
+    are OdyssAI additions (further model families, prefill transport)
+  * scripts/patches/__init__.py: exo's 13-line skeleton (the _applied guard
+    and apply_mlx_patches()), extended with OdyssAI's own patches
+
+  From upstream commit 09f9ea313f72e261f40a94cea4c0e3681b31af23 (2026-06-03),
+  the LaunchDaemon script embedded in app/EXO/EXO/Services/NetworkSetupHelper.swift:
+  * scripts/odyssai-network-setup.sh (the Thunderbolt/RDMA network recipe,
+    installed on cluster nodes as the eu.odyssai.networksetup LaunchDaemon
+    payload): 10 of its 96 code lines are exo's (bridge0 teardown, the
+    preferences.plist path, the Thunderbolt service patterns); the recipe's
+    structure follows exo's script
+  * scripts/odyssai-network-guard-exoloc.sh: 3 of its 32 code lines are
+    exo's (bridge0 teardown)
+
+  scripts/rdma-onboard.sh (the guard driver around that recipe) and
+  scripts/exo_stubs.py (an import shim for auto_parallel.py) credit exo but
+  contain no exo code; see vendor/exo/UPSTREAM.md.

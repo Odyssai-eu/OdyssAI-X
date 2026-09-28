@@ -1,4 +1,17 @@
 #!/usr/bin/env bash
+#
+# Portions derived from exo (https://github.com/exo-explore/exo): the bridge0
+# teardown, the 20 s boot wait and the Thunderbolt Bridge disable of the
+# LaunchDaemon script embedded in app/EXO/EXO/Services/NetworkSetupHelper.swift,
+# Copyright 2025 Exo Technologies Ltd, licensed under the Apache License,
+# Version 2.0 (http://www.apache.org/licenses/LICENSE-2.0; a copy ships in
+# vendor/exo/LICENSE), distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR
+# CONDITIONS OF ANY KIND. Source commit: 09f9ea313f72e261f40a94cea4c0e3681b31af23
+# (2026-06-03). Provenance in vendor/exo/UPSTREAM.md.
+# Modified by OdyssAI (odyssai.eu), 2026 (AGPL-3.0 for our changes, see NOTICE):
+# no location switch and no service creation; exo's unconditional setdhcp
+# replaced by a static-IP assertion read from static-ips.conf.
+#
 # odyssai-network-guard-exoloc.sh — remplaçant drop-in de l'exo disable_bridge.sh
 # pour les nodes ENCORE sur la location réseau "exo" (.30/.31/.32).
 #
