@@ -1651,6 +1651,40 @@ def log(msg: str) -> None:
     sys.stderr.flush()
 
 
+def _render_chat_template(tokenizer, messages, chat_kwargs: dict):
+    """apply_chat_template with a retry ladder on OPTIONAL kwargs a template may
+    reject — a bad optional must degrade, never kill the rank. Shared by the
+    legacy and the batched loops (#94: the batched loop only had the tools step,
+    so a template refusing reasoning_effort killed the whole batch — Hy3
+    2026-07-08, Qwen3.8-Flash-Next 2026-09-26). Drops rejected kwargs from
+    `chat_kwargs` IN PLACE (the caller reuses it for the tokenize pass) and
+    returns (templated, dropped_kwarg_names). Raises when even the bare render
+    fails."""
+    dropped: list = []
+    try:
+        return tokenizer.apply_chat_template(messages, **chat_kwargs), dropped
+    except Exception as e:
+        err = e
+    # 1. Templates without tool support reject `tools=`.
+    if chat_kwargs.get("tools"):
+        log(f"chat template rejected tools ({err}); retrying without")
+        chat_kwargs.pop("tools", None)
+        dropped.append("tools")
+        try:
+            return tokenizer.apply_chat_template(messages, **chat_kwargs), dropped
+        except Exception as e2:
+            err = e2
+    # 2. Templates that validate reasoning_effort: drop the dial — the template
+    #    default beats a dead pool; the caller reports it (effort_dropped).
+    if chat_kwargs.get("reasoning_effort"):
+        log(f"chat template rejected reasoning_effort="
+            f"{chat_kwargs['reasoning_effort']!r} ({err}); retrying without")
+        chat_kwargs.pop("reasoning_effort", None)
+        dropped.append("reasoning_effort")
+        return tokenizer.apply_chat_template(messages, **chat_kwargs), dropped
+    raise err
+
+
 def _active_gb() -> float:
     """Best-effort MLX active (wired) memory in GB. 0.0 if the API is absent."""
     try:
@@ -2825,36 +2859,10 @@ def _run_legacy_main(model, tokenizer, repo: str, kv_q8_default: bool,
         chat_kwargs["clear_thinking"] = bool(req.get("clear_thinking", True))
         if tools:
             chat_kwargs["tools"] = tools
-        def _apply_template_with_fallbacks():
-            """apply_chat_template with a retry ladder on OPTIONAL kwargs a
-            template may reject — a bad optional must degrade, never kill the
-            rank (2026-07-08: the Hy3 release template VALIDATES
-            reasoning_effort and raises on "medium" → whole pool died)."""
-            nonlocal tools
-            try:
-                return tokenizer.apply_chat_template(messages, **chat_kwargs)
-            except Exception as e:
-                # 1. Tokenizers that reject `tools=` (template without tool
-                #    support). Drop and retry.
-                if tools:
-                    log(f"chat template rejected tools ({e}); retrying without")
-                    chat_kwargs.pop("tools", None)
-                    tools = None
-                    try:
-                        return tokenizer.apply_chat_template(messages, **chat_kwargs)
-                    except Exception as e2:
-                        e = e2
-                # 2. Templates that validate reasoning_effort (Hy3 release:
-                #    no_think/low/high only). Drop the dial and retry —
-                #    template default beats a dead pool.
-                if chat_kwargs.get("reasoning_effort"):
-                    log(f"chat template rejected reasoning_effort="
-                        f"{chat_kwargs['reasoning_effort']!r} ({e}); retrying without")
-                    chat_kwargs.pop("reasoning_effort", None)
-                    return tokenizer.apply_chat_template(messages, **chat_kwargs)
-                raise
-
-        templated = _apply_template_with_fallbacks()
+        templated, _dropped = _render_chat_template(tokenizer, messages, chat_kwargs)
+        if "tools" in _dropped:
+            tools = None
+        effort_dropped = "reasoning_effort" in _dropped
 
         # Tokenize the templated prompt. We need the full token list for prefix
         # cache lookup; on a hit we'll feed only the suffix.
@@ -3296,6 +3304,8 @@ def _run_legacy_main(model, tokenizer, repo: str, kv_q8_default: bool,
                 "length" if ntoks >= max_tokens else "stop")
         if loop_detected:
             done_event["loop_detected"] = True
+        if effort_dropped:
+            done_event["effort_dropped"] = True
         if context_limit_hit:
             done_event["context_limit"] = True
         if tool_calls:
@@ -3480,6 +3490,8 @@ def _run_batched_main(model, tokenizer, repo: str, kv_q8_default: bool,
             done_event["finish_reason"] = finish_reason
         if s.get("loop_detected"):
             done_event["loop_detected"] = True
+        if s.get("effort_dropped"):
+            done_event["effort_dropped"] = True
         if tool_calls:
             done_event["tool_calls"] = tool_calls
         if s["session_id"]:
@@ -3612,16 +3624,22 @@ def _run_batched_main(model, tokenizer, repo: str, kv_q8_default: bool,
             chat_kwargs["clear_thinking"] = bool(req.get("clear_thinking", True))
             if tools:
                 chat_kwargs["tools"] = tools
+            # #94: render through the shared ladder; a request whose template
+            # still fails is rejected ALONE (done + error) — before any slot,
+            # session or BatchGenerator state is touched — instead of the
+            # exception leaving the loop and killing every in-flight request.
             try:
-                templated = tokenizer.apply_chat_template(messages_in, **chat_kwargs)
+                templated, _dropped = _render_chat_template(tokenizer, messages_in, chat_kwargs)
             except Exception as e:
-                if tools:
-                    log(f"chat template rejected tools ({e}); retrying without")
-                    chat_kwargs.pop("tools", None)
-                    templated = tokenizer.apply_chat_template(messages_in, **chat_kwargs)
-                    tools = None
-                else:
-                    raise
+                log(f"req {req_id}: chat template render failed ({type(e).__name__}: {e}) "
+                    f"— request rejected, batch continues")
+                emit(rank, {"event": "done", "id": req_id, "ntoks": 0, "elapsed_s": 0.0,
+                            "tps": 0.0, "finish_reason": "error",
+                            "error": f"chat_template: {e}"[:200]})
+                continue
+            if "tools" in _dropped:
+                tools = None
+            effort_dropped = "reasoning_effort" in _dropped
 
             try:
                 ids_kwargs = dict(chat_kwargs); ids_kwargs["tokenize"] = True
@@ -3690,6 +3708,7 @@ def _run_batched_main(model, tokenizer, repo: str, kv_q8_default: bool,
             slot_cache_hit = locals().get("cache_offset", 0) if cache_for_slot is not None else 0
             slot[uid] = {
                 "req_id": req_id,
+                "effort_dropped": effort_dropped,
                 "prompt_tokens_full": prompt_tokens_full,
                 "cached_tokens": slot_cache_hit,
                 "gen_token_ids": [],

@@ -2764,6 +2764,13 @@ def _sweep_orphan_runners(cluster_id: str,
     return {"cluster": cluster_id, "swept": results, "warnings": warnings}
 
 
+class RunnerRequestError(RuntimeError):
+    """The runner rejected ONE request (a `done` event carrying `error`: its chat
+    template failed even without the optional kwargs, or bg.insert failed) while
+    the pool keeps serving. Surfaced to the client as an error — it used to end
+    as an empty 200 with finish_reason "stop" (#94)."""
+
+
 class RunnerPool:
     def __init__(self, model: str, mode: str, use_ap: bool, nodes_count: int = 2,
                  emit_batch: int = 10, cluster: str = "nautilus",
@@ -3475,6 +3482,8 @@ class RunnerPool:
                     seen_token = True
                 if ev.get("event") == "done":
                     _gen_finished = True
+                    if ev.get("error"):
+                        raise RunnerRequestError(str(ev.get("error")))
                 yield ev
                 if ev.get("event") == "done":
                     return
@@ -10946,6 +10955,7 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
         nstream_cached_tokens: int = 0
         nstream_finish: Optional[str] = None
         nstream_loop = False
+        nstream_effort_dropped = False
         elapsed_s = 0.0
         ttft_s: Optional[float] = None
         tool_calls: list[dict] = []
@@ -10997,6 +11007,15 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
                     nstream_cached_tokens = int(ev.get("cached_tokens") or 0)
                     nstream_finish = ev.get("finish_reason")
                     nstream_loop = bool(ev.get("loop_detected"))
+                    nstream_effort_dropped = bool(ev.get("effort_dropped"))
+        except RunnerRequestError as e:
+            # #94: this request alone was rejected by the runner (the pool keeps
+            # serving). A template that refuses the request is the client's
+            # input → 422; anything else → 500. Never an empty 200.
+            run_status = "error"
+            msg = str(e)
+            raise HTTPException(422 if msg.startswith("chat_template") else 500,
+                                {"error": {"message": msg, "type": "runner_error"}})
         finally:
             _runs_finalize(completion_id)
         _touch_session(pool.cluster, session_meta, model_id)
@@ -11071,6 +11090,10 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
             body["x_mlx_cluster"]["session"] = session_meta
         if nstream_loop:
             body["x_mlx_cluster"]["loop_detected"] = True
+        if nstream_effort_dropped:
+            # #94: the template refused the requested reasoning_effort; the
+            # answer was generated at the template's default effort.
+            body["x_mlx_cluster"]["effort_dropped"] = True
         return JSONResponse(body)
 
     async def stream() -> AsyncIterator[bytes]:
@@ -11182,6 +11205,7 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
                     elapsed_total = ev.get("elapsed_s", 0.0)
                     stream_finish = ev.get("finish_reason")
                     stream_loop = bool(ev.get("loop_detected"))
+                    stream_effort_dropped = bool(ev.get("effort_dropped"))
                     tool_calls = ev.get("tool_calls", []) or []
                     tool_calls_count = len(tool_calls)
                     sess = ev.get("session", {}) or {}
@@ -11215,7 +11239,9 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
                                                "tps": ev.get("tps"),
                                                "ntoks": ntoks_total,
                                                **({"loop_detected": True}
-                                                  if stream_loop else {})}}
+                                                  if stream_loop else {}),
+                                               **({"effort_dropped": True}
+                                                  if stream_effort_dropped else {})}}
                     yield f"data: {json.dumps(final)}\n\n".encode()
             yield b"data: [DONE]\n\n"
         except asyncio.CancelledError:
@@ -11234,7 +11260,8 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
                          "choices": [{"index": 0, "delta": {},
                                       "finish_reason": "error"}],
                          "error": {"message": str(e), "type": "server_error",
-                                   "code": "runner_died"}}
+                                   "code": ("runner_error" if isinstance(e, RunnerRequestError)
+                                            else "runner_died")}}
             try:
                 yield f"data: {json.dumps(err_chunk)}\n\n".encode()
                 yield b"data: [DONE]\n\n"
