@@ -1,6 +1,6 @@
 # AGENTS.md: install and operate OdyssAI-X, step by step
 
-> Node discovery over Bonjour (`odyssai nodes`, #79/#80) is not shipped yet: declare each node in the topology by its ssh target (A3). Every command below exists today.
+> Every command below exists today.
 
 For an agent (or a human at a terminal) with a set of Macs and one goal: **a working
 `/v1/chat/completions` served by those Macs.** Every step is one command, the output
@@ -40,6 +40,7 @@ git clone https://github.com/Odyssai-eu/OdyssAI-X.git && cd OdyssAI-X
 mkdir -p ~/.odysseus && cp config/topology.example.yaml ~/.odysseus/topology.yaml
 docker compose up -d
 curl -s http://localhost:8000/health
+scripts/odyssai-x nodes --engine http://localhost:8000
 scripts/discover-rdma-wiring.py 0=admin@node-a.local 1=admin@node-b.local   # RDMA only
 $EDITOR ~/.odysseus/topology.yaml
 docker compose restart
@@ -69,11 +70,11 @@ ssh -t admin@node-a.local '/bin/bash -c "$(curl -fsSL https://raw.githubusercont
 It installs, on that node: uv and Python 3.11, the pinned venv (`~/mlx-cluster/.venv`,
 versions from `requirements-node.txt`), the runner and its helpers, the vendored model
 modules and runtime patches, the patched JACCL (downloaded and checked against its
-sha256), the GPU wired-memory daemon, then runs `~/mlx-cluster/odyssai-x doctor` (node
+sha256), the GPU wired-memory daemon, the discovery daemon (A3), then runs `~/mlx-cluster/odyssai-x doctor` (node
 mode) and prints the node's topology entry. Each stage prints `ok` or `changed` and
 its duration (about 6 minutes on a fresh node, mostly package downloads).
 
-- **Expected:** eight stage lines, the doctor lines (one per check), the topology entry.
+- **Expected:** nine stage lines, the doctor lines (one per check), the topology entry.
   Exit code 0. A second run prints `already up to date` and changes nothing.
 - **Password prompt:** sudo asks for the node's admin password once, for the GPU
   memory daemon (skipped when the node already has one). An agent does not type
@@ -104,17 +105,31 @@ curl -s http://localhost:8000/health
   `ODYSSAI_X_ADMIN_TOKEN` before `docker compose up -d` and send
   `Authorization: Bearer <token>` on every `/admin/*` call.
 
-### A3. Collect the nodes
+### A3. List the nodes
 
-Each A1 run ends with that node's topology entry (host, ssh target, `models_dir`). Keep
-them for A4. (Discovery over Bonjour, `odyssai nodes`, is not shipped yet.)
+Each installed node announces itself: Bonjour `_odyssai._tcp` on the LAN, and a
+heartbeat every 5 s to its orchestrator (the one given as `ODYSSAI_X_ENGINE` at A1, or
+the OdyssAI-X engine it finds on its /24). From the server:
 
+```bash
+scripts/odyssai-x nodes --engine http://localhost:8000
+```
+
+- **Expected:** one row per node installed in A1 (host, ssh target, chip, RAM, RDMA
+  devices, version, seconds since its last beat, clusters it is already in). A node
+  that stops beating leaves the list within 15 s.
+- **A node is missing:** re-run A1 on it and read its doctor output. The same entry is
+  also printed at the end of A1, so a node can always be written into the topology by
+  hand (A4).
+- **Add a listed node to a cluster** (the engine must already ssh to it with a known
+  host key: run `ssh admin@<ip>` once on the server's Mac):
+  `curl -s -X POST http://localhost:8000/admin/nodes/discovered/<host>/add -H 'content-type: application/json' -d '{"cluster":"default"}'`
 - **A node's doctor showed a `FAIL`:** fix it first (the line names the fix) and re-run
   A1 on that node.
 
 ### A4. Describe the cluster
 
-Write `~/.odysseus/topology.yaml` with one entry per node collected in A3. The ssh target
+Write `~/.odysseus/topology.yaml` with one entry per node listed in A3. The ssh target
 is `admin@<host>`; `models_dir` is the directory on that node where models live.
 
 TCP (`ring`), two nodes:

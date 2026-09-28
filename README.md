@@ -44,7 +44,7 @@ OdyssAI-X is open source. **Deploying it in your company?** Contact us: [odyssai
   - A rank that dies mid-run is reported to every survivor in 0.25 s (measured on process death), instead of a silent hang.
   - No auto-join: a Mac serves only once it is declared in `topology.yaml`.
   - Model families adapted to MLX in this repo: DeepSeek V4, GLM-5.3-Flash, Qwen3.8-Flash-Next, Hunyuan Hy3, Inkling (`scripts/mlx_models/`).
-- **Not covered:** CUDA or Linux nodes, an iOS app, bandwidth-based placement, a radix (prefix-tree) KV cache, Bonjour node discovery.
+- **Not covered:** CUDA or Linux nodes, an iOS app, bandwidth-based placement, a radix (prefix-tree) KV cache, auto-join (a discovered node joins a cluster when you add it).
 
 ## What it is
 

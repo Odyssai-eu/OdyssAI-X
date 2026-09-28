@@ -7516,7 +7516,7 @@ def _initial_default_config() -> Optional[dict]:
 #   major (1.7.2 → 2.0.0) — breaking API or topology change
 #
 # Use `./scripts/bump-version.sh patch|minor|major` to bump + auto-commit.
-APP_VERSION = "1.53.13"
+APP_VERSION = "1.53.14"
 
 app = FastAPI(
     title="OdyssAI-X (odyssai.eu)",
@@ -8338,6 +8338,138 @@ async def admin_doctor(cluster: Optional[str] = None, format: str = "json"):
     if format == "text":
         return PlainTextResponse(_doctor_render(rep["checks"]) + "\n", headers=hdr)
     return JSONResponse(rep, headers=hdr)
+
+
+# ── Node discovery (#79/#80) ─────────────────────────────────────────────
+# Each node announces itself two ways, from one light launchd loop
+# (`odyssai-x advertise`, installed by install.sh): Bonjour `_odyssai._tcp` for
+# any Mac on the LAN (`dns-sd -B`), and an HTTP heartbeat every 5 s to its ONE
+# orchestrator, which is how the engine learns about it: mDNS multicast does
+# not cross Docker Desktop's bridge, and the engine installs nothing on its
+# host (docs/DEPLOY.md). A node is live while it beats; 3 missed beats (15 s)
+# or a goodbye removes it. The list is only a list: a discovered node joins a
+# cluster when the operator adds it, after the engine reached it over ssh with
+# a host key it already trusts (never accept-new).
+DISCOVERY_BEAT_S = 5
+DISCOVERY_EXPIRE_S = 3 * DISCOVERY_BEAT_S
+DISCOVERY_MAX_NODES = 256
+_discovered: dict[str, dict] = {}
+_DISC_HOST_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9-]{0,62}$")
+_DISC_USER_RE = re.compile(r"^[a-z_][a-z0-9_.-]{0,31}$")
+
+
+class NodeBeat(BaseModel):
+    host: str
+    user: str
+    ip: str
+    chip: str = ""
+    ram_gb: int = 0
+    rdma: int = 0
+    version: str = ""
+    bye: bool = False
+
+
+def _discovery_live() -> list[dict]:
+    now = time.time()
+    for h in [h for h, e in _discovered.items() if now - e["seen_at"] > DISCOVERY_EXPIRE_S]:
+        _discovered.pop(h, None)
+    return sorted(_discovered.values(), key=lambda e: e["host"])
+
+
+@app.post("/v1/nodes/heartbeat")
+async def nodes_heartbeat(b: NodeBeat):
+    """A node's beat (every 5 s) or goodbye (`bye: true`). Public like /v1/*:
+    the node holds no admin token. Only feeds the discovered list."""
+    import ipaddress
+    if not _DISC_HOST_RE.match(b.host) or not _DISC_USER_RE.match(b.user):
+        raise HTTPException(422, "host or user has characters a node name never has")
+    try:
+        ip = ipaddress.IPv4Address(b.ip)
+    except ValueError:
+        raise HTTPException(422, "ip must be an IPv4 address")
+    if ip.is_loopback or ip.is_link_local or ip.is_multicast or ip.is_unspecified:
+        raise HTTPException(422, "ip must be the node's LAN address")
+    if b.bye:
+        _discovered.pop(b.host, None)
+        return {"ok": True}
+    now = time.time()
+    prev = _discovered.get(b.host)
+    if prev is None and len(_discovery_live()) >= DISCOVERY_MAX_NODES:
+        raise HTTPException(429, "discovered list full")
+    _discovered[b.host] = {
+        "host": b.host, "user": b.user, "ip": str(ip), "ssh": f"{b.user}@{ip}",
+        "chip": re.sub(r"[^ -~]", "", b.chip)[:64], "ram_gb": max(0, int(b.ram_gb)),
+        "rdma": max(0, int(b.rdma)), "version": re.sub(r"[^ -~]", "", b.version)[:32],
+        "first_seen": prev["first_seen"] if prev else now, "seen_at": now,
+    }
+    return {"ok": True, "beat_s": DISCOVERY_BEAT_S}
+
+
+def _discovered_rows() -> list[dict]:
+    now = time.time()
+    rows = []
+    for e in _discovery_live():
+        clusters = sorted({cid for cid in active_cluster_ids()
+                           for n in (get_cluster_def(cid).get("nodes") or [])
+                           if n.get("host") == e["host"] or n.get("ssh") == e["ssh"]})
+        rows.append({**e, "seen_s_ago": round(now - e["seen_at"], 1), "in_clusters": clusters})
+    return rows
+
+
+@app.get("/admin/nodes/discovered")
+async def admin_nodes_discovered(format: str = "json"):
+    """Nodes beating right now (seen within 15 s). `?format=text` is what
+    `odyssai-x nodes --engine URL` prints."""
+    rows = _discovered_rows()
+    if format == "text":
+        if not rows:
+            return PlainTextResponse("no node is announcing itself to this engine\n")
+        head = f"{'HOST':<20} {'SSH':<24} {'CHIP':<18} {'RAM':>5} {'RDMA':>4} {'VERSION':<9} {'SEEN':>5}  CLUSTERS"
+        lines = [head] + [
+            f"{r['host']:<20} {r['ssh']:<24} {r['chip'][:18]:<18} {str(r['ram_gb']) + 'G':>5} "
+            f"{r['rdma']:>4} {r['version'][:9]:<9} {str(int(r['seen_s_ago'])) + 's':>5}  "
+            f"{', '.join(r['in_clusters']) or '-'}" for r in rows]
+        return PlainTextResponse("\n".join(lines) + "\n")
+    return {"data": rows, "count": len(rows), "beat_s": DISCOVERY_BEAT_S, "expire_s": DISCOVERY_EXPIRE_S}
+
+
+class DiscoveredAdd(BaseModel):
+    cluster: str
+    master: bool = False
+
+
+@app.post("/admin/nodes/discovered/{host}/add")
+async def admin_nodes_discovered_add(host: str, req: DiscoveredAdd):
+    """Add a discovered node to a cluster. The engine first runs `true` on it
+    over ssh with its usual options (BatchMode, no accept-new): a node whose
+    host key or authorised key is not set up yet is refused with the fix."""
+    e = next((r for r in _discovery_live() if r["host"] == host), None)
+    if e is None:
+        raise HTTPException(404, f"{host} is not announcing itself (seen within {DISCOVERY_EXPIRE_S} s)")
+    if not cluster_exists(req.cluster):
+        raise HTTPException(404, f"unknown cluster {req.cluster}")
+    target = _safe_ssh_target(e["ssh"])
+    try:
+        rc, _ = await _ssh_capture(target, "true", timeout=10)
+    except Exception as ex:
+        rc = f"error ({ex})"
+    if rc != 0:
+        raise HTTPException(409, {
+            "error": "ssh_not_ready",
+            "message": f"the engine cannot ssh to {target} yet (rc {rc}). On the orchestrator's Mac, "
+                       f"run `ssh {target}` once to accept its host key, and make sure the engine's "
+                       f"public key is in {target}:~/.ssh/authorized_keys (ssh-copy-id).",
+        })
+    nodes = [dict(n) for n in (get_cluster_def(req.cluster).get("nodes") or [])]
+    if any(n.get("host") == host or n.get("ssh") == target for n in nodes):
+        raise HTTPException(409, f"{host} is already in {req.cluster}")
+    if req.master:
+        for n in nodes:
+            n["master"] = False
+    nodes.append({"host": host, "ssh": target, "master": req.master or not nodes})
+    return await admin_cluster_update(req.cluster, ClusterConfigUpdate(
+        nodes=[ClusterNodeIn(**{k: n.get(k) for k in ("host", "ssh", "master", "port") if k in n})
+               for n in nodes]))
 
 
 def _attribute_jaccl_cause(deaths: list[tuple[int, int, str]]) -> Optional[str]:
@@ -10175,10 +10307,13 @@ async def admin_providers_upstream(provider_id: str):
 # ──────────────────────────────────────────────────────────────────────────────
 # Crew & pairing — companion clients discover and pair with OdyssAI-X
 # ──────────────────────────────────────────────────────────────────────────────
-# Discovery model: the operator opens the gate ("Enable discovery"), the host-side
-# mDNS watcher advertises OdyssAI-X on `_odyssai-engine._tcp.local.`, the
-# first Companion that calls POST /admin/pair gets a crew token, gate
-# auto-closes. No PIN — the open gate IS the auth, scoped to LAN.
+# Discovery model: the operator opens the gate ("Enable discovery"), clients
+# find the engine by scanning the LAN for /.well-known/inference-engine.json
+# (docs/DEPLOY.md; the host-side mDNS watcher once planned for
+# `_odyssai-engine._tcp` was removed on 2026-05-14 and nothing advertises that
+# type), the first Companion that calls POST /admin/pair gets a crew token,
+# gate auto-closes. No PIN — the open gate IS the auth, scoped to LAN.
+# Nodes are a different flow: see "Node discovery (#79/#80)".
 #
 # Crew tokens are NOT access-control on /v1/* (that route is public). They
 # serve as client identifiers so the Crew tab can show "Companion @ host
