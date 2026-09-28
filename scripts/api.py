@@ -7484,7 +7484,7 @@ def _initial_default_config() -> Optional[dict]:
 #   major (1.7.2 → 2.0.0) — breaking API or topology change
 #
 # Use `./scripts/bump-version.sh patch|minor|major` to bump + auto-commit.
-APP_VERSION = "1.53.6"
+APP_VERSION = "1.53.7"
 
 app = FastAPI(
     title="OdyssAI-X (odyssai.eu)",
@@ -14944,13 +14944,16 @@ async def _decision_cluster_load(cluster_id: str, cd: dict, req: "ArgoLoadReques
         if not (0 <= idx < len(nodes)):
             raise HTTPException(400, f"node index {idx} out of range [0..{len(nodes) - 1}]")
     else:
-        busy = {_host_to_index(cluster_id, n.get("host"))
-                for _, p in list_pools(cluster_id) for n in (p.nodes or []) if n.get("host")}
-        free = [i for i in range(len(nodes)) if i not in busy]
-        if not free:
-            raise HTTPException(409, f"{cluster_id}: every node already serves a decision model — "
-                                     f"unload one, or pass node_indices and vlm_port")
-        idx = free[0]
+        # Spread first (a node with no decision model), else co-reside on the node
+        # serving the fewest: several decision servers share a node, each on its own
+        # port (a 144M Julia next to an 8B CLM on a 64 GB Mac).
+        per_node = {i: 0 for i in range(len(nodes))}
+        for _, p in list_pools(cluster_id):
+            for n in (p.nodes or []):
+                i = _host_to_index(cluster_id, n.get("host")) if n.get("host") else None
+                if i is not None:
+                    per_node[i] = per_node.get(i, 0) + 1
+        idx = min(per_node, key=lambda i: (per_node[i], i))
     topo = build_topology_from_indices(cluster_id, [idx])
     ssh_target = topo[0]["ssh"]
     host = topo[0].get("host") or _host_id_from_ssh(ssh_target)
@@ -14976,12 +14979,26 @@ async def _decision_cluster_load(cluster_id: str, cd: dict, req: "ArgoLoadReques
     if (out or "").strip() != "ok":
         raise HTTPException(422, f"decision server not installed on {host} (venv {venv}, "
                                  f"{DECISION_SERVER_REMOTE}) — run scripts/decision/install-decision.sh")
-    port = int(getattr(req, "vlm_port", None) or DECISION_DEFAULT_PORT)
     ip = _vlm_ip_from_ssh(ssh_target)
+    if getattr(req, "vlm_port", None):
+        port = int(req.vlm_port)
+        if await _vlm_probe_ready(ip, port) is not None:
+            raise HTTPException(409, f"http://{ip}:{port} already answers — port in use on {host}; "
+                                     f"unload the pool there first or pick another vlm_port")
+    else:
+        # First port from DECISION_DEFAULT_PORT that no pool of ours holds on this
+        # node and that nothing answers on.
+        held = {getattr(p, "port", None) for _, _, p in list_all_pools()
+                if getattr(p, "ssh_target", None) == ssh_target}
+        port = None
+        for cand in range(DECISION_DEFAULT_PORT, DECISION_DEFAULT_PORT + DECISION_PORT_SPAN):
+            if cand not in held and await _vlm_probe_ready(ip, cand) is None:
+                port = cand
+                break
+        if port is None:
+            raise HTTPException(409, f"{host}: no free decision port in "
+                                     f"{DECISION_DEFAULT_PORT}-{DECISION_DEFAULT_PORT + DECISION_PORT_SPAN - 1}")
     upstream = f"http://{ip}:{port}"
-    if await _vlm_probe_ready(ip, port) is not None:
-        raise HTTPException(409, f"{upstream} already answers — port in use on {host}; unload "
-                                 f"the pool there first or pick another vlm_port")
     size_bytes = await get_model_size_bytes(ssh_target, model_abspath)
     loading_state = _loading_state_for(cluster_id)
     _begin_loading(loading_state, req.model, 1, size_bytes,
@@ -17984,6 +18001,8 @@ def _dflash_pool_log_id(cluster_id: str, alias: str) -> str:
 # launches it over ssh (the ssh session can read the external models volume; a
 # launchd agent needed a manual TCC grant per node) and owns its lifecycle.
 DECISION_DEFAULT_PORT = int(env_get("DECISION_PORT", "8095") or "8095")
+# Decision servers co-reside on a node, one port each, picked from this range.
+DECISION_PORT_SPAN = int(env_get("DECISION_PORT_SPAN", "10") or "10")
 DECISION_DEFAULT_VENV = env_get("DECISION_VENV", "$HOME/odyssai/decision/.venv")
 DECISION_SERVER_REMOTE = env_get("DECISION_SERVER_REMOTE",
                                  "$HOME/odyssai/decision/decision_serve.py")

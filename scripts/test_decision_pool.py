@@ -322,6 +322,22 @@ async def main():
         ss.shutdown()
         await c.post(f"/admin/clusters/dec/unload?alias={palias}", json={"force": True})
 
+        # 23. two decision models co-reside on the single node, each on its own port
+        await c.put("/admin/settings", json={"decision_models": ["Fake-Decision-27B", "Fake-Decision-B"]})
+        r1 = await c.post("/admin/clusters/dec/load", json={"model": "Fake-Decision-27B"})
+        r2 = await c.post("/admin/clusters/dec/load", json={"model": "Fake-Decision-B"})
+        check("23 second model on a busy node loads", (r1.status_code, r2.status_code), (200, 200))
+        a1, a2 = r1.json().get("alias"), r2.json().get("alias")
+        p1, p2 = api.get_pool("dec", a1), api.get_pool("dec", a2)
+        check("23 distinct ports, same node", (p1.port, p2.port, p1.host == p2.host), (PORT, PORT + 1, True))
+        ra = await c.post("/v1/systemone", json={**q, "model": a1})
+        rb = await c.post("/v1/systemone", json={**q, "model": a2})
+        check("23 both answer", (ra.status_code, rb.status_code, rb.json().get("model")), (200, 200, a2))
+        await c.post(f"/admin/clusters/dec/unload?alias={a2}", json={"force": True})
+        check("23 unloading one keeps the other", (api.get_pool("dec", a1) is not None, PORT in SERVERS, PORT + 1 in SERVERS),
+              (True, True, False))
+        await c.post(f"/admin/clusters/dec/unload?alias={a1}", json={"force": True})
+
         # 18. kind validation accepts 'decision'
         check("18 validate kind decision", api.validate_cluster_def("dec2", 
             {"kind": "decision", "nodes": [{"host": "n0", "ssh": "a@b", "master": True}]}), None)
