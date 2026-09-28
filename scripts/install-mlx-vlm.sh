@@ -10,8 +10,9 @@
 #   4. smoke-import mlx_vlm + the minimax_m3_vl model module
 #
 # Idempotent: re-running skips venv creation if it already imports cleanly,
-# pip install is a no-op when the pin is already satisfied, and the patch step
-# skips if already applied.
+# skips pip entirely when mlx-vlm is already at MLX_VLM_REF (direct_url.json),
+# and the patch step skips if already applied. Refuses to reinstall under a
+# running mlx_vlm.server unless MLX_VLM_FORCE=1.
 #
 # scripts/patches/mlx_vlm_thinking_mode_disabled.patch (2026-07-08):
 # upstream mlx_vlm/prompt_utils.py only maps enable_thinking=True to the
@@ -72,6 +73,8 @@ export PATH=/usr/bin:/bin:/usr/sbin:/sbin:/usr/local/bin:/opt/homebrew/bin
 
 VENV="${VLM_VENV}"
 SPEC="${MLX_VLM_SPEC}"
+REF="${MLX_VLM_REF}"
+FORCE="${MLX_VLM_FORCE:-0}"
 
 # Locate python3.12 (Homebrew installs it as python3.12; fall back to a probe).
 PY="\$(command -v ${PY312} || true)"
@@ -95,18 +98,35 @@ else
   echo "[install-mlx-vlm] venv already exists at \$VENV"
 fi
 
-"\$VENV/bin/python" -m pip install --upgrade pip >/dev/null
+# Already at the pinned commit (pip records it in direct_url.json)? Then leave
+# the venv alone: the forced reinstall below used to run on EVERY call, i.e.
+# under a live mlx_vlm.server on the replica nodes whenever a node was
+# re-bootstrapped. A reinstall while a server runs needs MLX_VLM_FORCE=1.
+HAVE="\$("\$VENV/bin/python" -c 'import importlib.metadata as m, json
+try:
+    print(json.loads(m.distribution("mlx-vlm").read_text("direct_url.json") or "{}").get("vcs_info", {}).get("commit_id", ""))
+except Exception:
+    print("")' 2>/dev/null || true)"
+if [[ -n "\$HAVE" && "\$HAVE" == "\$REF"* && "\$FORCE" != 1 ]]; then
+  echo "[install-mlx-vlm] mlx-vlm already at \${REF:0:7}, nothing to install"
+else
+  if pgrep -f "[m]lx_vlm.server" >/dev/null 2>&1 && [[ "\$FORCE" != 1 ]]; then
+    echo "[install-mlx-vlm] REFUSED: mlx_vlm.server is running on this node and mlx-vlm is at \${HAVE:0:7}, not \${REF:0:7}." >&2
+    echo "[install-mlx-vlm] Unload its pool first, or rerun with MLX_VLM_FORCE=1." >&2
+    exit 3
+  fi
+  "\$VENV/bin/python" -m pip install --upgrade pip >/dev/null
 
-# 2. install mlx-vlm (pinned) + torch/torchvision. pip is a no-op when the
-#    pin is already satisfied, so re-runs are cheap.
-echo "[install-mlx-vlm] pip install \$SPEC torch torchvision"
-"\$VENV/bin/python" -m pip install "\$SPEC" torch torchvision
-# Several refs share the version string "0.7.2" (the v0.7.2 tag and the
-# b5952d7 main commit): pip then sees the requirement as satisfied and keeps
-# the OLD code (mimo_v2 was missing on .30-.33 on 2026-09-24). Reinstall
-# mlx-vlm itself from the exact ref, deps untouched. The patch step below
-# runs after, so it is re-applied on the fresh files.
-"\$VENV/bin/python" -m pip install --force-reinstall --no-deps "\$SPEC"
+  # 2. install mlx-vlm (pinned) + torch/torchvision.
+  echo "[install-mlx-vlm] pip install \$SPEC torch torchvision"
+  "\$VENV/bin/python" -m pip install "\$SPEC" torch torchvision
+  # Several refs share the version string "0.7.2" (the v0.7.2 tag and the
+  # b5952d7 main commit): pip then sees the requirement as satisfied and keeps
+  # the OLD code (mimo_v2 was missing on .30-.33 on 2026-09-24). Reinstall
+  # mlx-vlm itself from the exact ref, deps untouched. The patch step below
+  # runs after, so it is re-applied on the fresh files.
+  "\$VENV/bin/python" -m pip install --force-reinstall --no-deps "\$SPEC"
+fi
 
 # 3. smoke import — fails loudly if the VL model module isn't present.
 echo "[install-mlx-vlm] smoke import"
