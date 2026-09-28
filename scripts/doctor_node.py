@@ -310,9 +310,11 @@ def build_manifest(repo: str) -> dict:
     pin = lambda n: (re.search(rf"^{re.escape(n)}==(\S+)", req, re.M) or [None, None])[1]
     top = lambda d: sorted(f for f in os.listdir(os.path.join(repo, d)) if f.endswith(".py"))
     dylib = os.path.join(repo, "vendor", "jaccl", "build", "libjaccl.dylib")
+    sha = _digest(dylib, "sha256")
     return {
         "mlx": pin("mlx"), "mlx_lm": pin("mlx-lm"),
-        "jaccl_sha256_16": (_digest(dylib, "sha256") or "")[:16] or None,
+        "jaccl_sha256": sha,               # full: install.sh verifies the download
+        "jaccl_sha256_16": sha[:16] if sha else None,
         "modules": {f: _digest(os.path.join(repo, "scripts", "mlx_models", f)) for f in top("scripts/mlx_models")},
         "patches": {f: _digest(os.path.join(repo, "scripts", "patches", f)) for f in top("scripts/patches")},
     }

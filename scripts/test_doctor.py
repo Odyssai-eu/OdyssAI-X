@@ -154,6 +154,7 @@ cur = d.build_manifest(REPO)
 committed = json.load(open(os.path.join(HERE, "doctor-manifest.json")))
 if cur["jaccl_sha256_16"] is None:          # no local JACCL build: compare the rest
     cur["jaccl_sha256_16"] = committed.get("jaccl_sha256_16")
+    cur["jaccl_sha256"] = committed.get("jaccl_sha256")
 check("doctor-manifest.json is up to date (else: doctor_node.py --write-manifest . > scripts/doctor-manifest.json)",
       cur == committed, True)
 
