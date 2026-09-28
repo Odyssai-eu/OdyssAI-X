@@ -34,7 +34,7 @@ Nothing to install first: it brings its own Python (uv), the pinned MLX, the pat
 
 `stable`: served in production with a passing run since 2026-09-01 and no open blocking bug. `runs with caveats`: served, with older evidence or a known limit. `unsupported`: tried, did not hold. Other architectures the loader accepts (Llama, GLM-4, DeepSeek V3, gpt-oss, Nemotron, Kimi K2) are unverified on the current fleet.
 
-**Need it installed, tuned or supported on your own hardware?** [See the OdyssAI offer](https://odyssai.eu/TODO-offer-page). <!-- PLACEHOLDER: replace with Sophie's offer page URL (known 2026-09-29) -->
+OdyssAI-X is open source. **Deploying it in your company?** Contact us: [odyssai.eu](https://odyssai.eu).
 
 ## Coming from exo
 
