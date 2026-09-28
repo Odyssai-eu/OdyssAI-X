@@ -1,6 +1,6 @@
 # AGENTS.md: install and operate OdyssAI-X, step by step
 
-> **Pre-release (1.54.0):** `install.sh` lands with #82, `odyssai nodes` with #80 (node advertiser: #79), `odyssai doctor` with #81; until they ship, use the manual path in §B. Every other command below exists today.
+> Node discovery over Bonjour (`odyssai nodes`, #79/#80) is not shipped yet: declare each node in the topology by its ssh target (A3). Every command below exists today.
 
 For an agent (or a human at a terminal) with a set of Macs and one goal: **a working
 `/v1/chat/completions` served by those Macs.** Every step is one command, the output
@@ -18,9 +18,9 @@ Check each item before step 1. If one is not true, stop and tell the human which
 |---|---|
 | Hardware | Apple Silicon Macs (`uname -m` prints `arm64`). One **server** runs the orchestrator; one or more **nodes** hold the models. The server may also be a node. |
 | macOS | Same macOS version on every node. For RDMA over Thunderbolt: macOS 26.2 or later. |
-| Accounts | An **admin** account on every node. The human knows its password: the installer asks for it once (root LaunchDaemons). |
-| Management LAN | Every node and the server on the same Ethernet LAN (one subnet, multicast allowed: nodes announce themselves over Bonjour). |
-| Node software | Xcode Command Line Tools and Homebrew on every node, licence accepted (`git --version` runs without a licence prompt). |
+| Accounts | An **admin** account on every node. The human knows its password: the installer asks for it once (the GPU memory LaunchDaemon). |
+| Management LAN | Every node and the server on the same Ethernet LAN; the nodes reach github.com and astral.sh (the installer downloads from them). |
+| Node software | Nothing: the installer brings uv and Python 3.11 (no Homebrew, no Xcode tools). The manual path (§B) needs Homebrew's `python@3.11`. |
 | SSH | Remote Login ON on every node; from the server, `ssh admin@<node>` works without a password prompt. |
 | Server | Docker Desktop installed and running; `git`, `curl` and `jq` available. |
 | TB5 wiring (RDMA only) | Thunderbolt 5 cables in a full mesh (N nodes, N(N-1)/2 cables) and RDMA enabled once per node in recoveryOS (`rdma_ctl enable`, then reboot). Without this, use `backend: ring` (TCP), which needs nothing. |
@@ -34,17 +34,16 @@ ssh target works), user `admin`, cluster id `default`. Replace them with yours.
 
 ```bash
 # on each node (from the server, over ssh)
-ssh -t admin@node-a.local 'curl -fsSL https://raw.githubusercontent.com/Odyssai-eu/OdyssAI-X/main/install.sh | sh'
+ssh -t admin@node-a.local '/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Odyssai-eu/OdyssAI-X/main/install.sh)"'
 # on the server
 git clone https://github.com/Odyssai-eu/OdyssAI-X.git && cd OdyssAI-X
 mkdir -p ~/.odysseus && cp config/topology.example.yaml ~/.odysseus/topology.yaml
 docker compose up -d
 curl -s http://localhost:8000/health
-odyssai nodes
 scripts/discover-rdma-wiring.py 0=admin@node-a.local 1=admin@node-b.local   # RDMA only
 $EDITOR ~/.odysseus/topology.yaml
 docker compose restart
-odyssai doctor --json                                                        # stop on any FAIL
+scripts/odyssai-x doctor --engine http://localhost:8000                     # stop on any FAIL
 curl -s -X POST http://localhost:8000/admin/downloads -H 'content-type: application/json' \
   -d '{"repo":"mlx-community/Qwen3-30B-A3B-4bit","targets":["node-a"]}'
 curl -s -X POST http://localhost:8000/admin/clusters/default/load -H 'content-type: application/json' \
@@ -64,19 +63,26 @@ The steps below give, for each line, the expected output and the failure branch.
 Run once per node, from the server:
 
 ```bash
-ssh -t admin@node-a.local 'curl -fsSL https://raw.githubusercontent.com/Odyssai-eu/OdyssAI-X/main/install.sh | sh'
+ssh -t admin@node-a.local '/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Odyssai-eu/OdyssAI-X/main/install.sh)"'
 ```
 
-It installs, on that node: the pinned Python venv (`~/mlx-cluster`, versions from
-`requirements-node.txt`), the patched JACCL, the vendored model modules and runtime
-patches, the GPU wired-memory daemon, the Bonjour advertiser (`_odyssai._tcp`), then
-runs `odyssai doctor` in node mode and prints the next step.
+It installs, on that node: uv and Python 3.11, the pinned venv (`~/mlx-cluster/.venv`,
+versions from `requirements-node.txt`), the runner and its helpers, the vendored model
+modules and runtime patches, the patched JACCL (downloaded and checked against its
+sha256), the GPU wired-memory daemon, then runs `~/mlx-cluster/odyssai-x doctor` (node
+mode) and prints the node's topology entry. Each stage prints `ok` or `changed` and
+its duration (about 6 minutes on a fresh node, mostly package downloads).
 
-- **Expected:** one line per check, all `OK`, then the next-step line. Exit code 0.
-  A second run prints `already up to date` and changes nothing.
-- **Password prompt:** the installer asks for the node's admin password once. An
-  agent does not type passwords: hand the prompt to the human, or have the human run
-  the same command in their own terminal.
+- **Expected:** eight stage lines, the doctor lines (one per check), the topology entry.
+  Exit code 0. A second run prints `already up to date` and changes nothing.
+- **Password prompt:** sudo asks for the node's admin password once, for the GPU
+  memory daemon (skipped when the node already has one). An agent does not type
+  passwords: hand the prompt to the human, or have the human run the same command in
+  their own terminal. Without a terminal (`ssh` without `-t`) that stage is skipped
+  with a warning.
+- **`FAIL …: this node is serving a model`:** the installer refuses to change a node
+  that serves. Unload its pools first, or, for a deliberate change, rerun with
+  `ODYSSAI_X_FORCE=1` in front of `/bin/bash`.
 - **`WARN` (exit 1):** read the fix sentence on the line, report it, continue.
 - **`FAIL` (exit 2):** stop. Report the `FAIL` line (it names the check and the fix)
   to the human. After the fix, re-run the same command; it is idempotent.
@@ -98,24 +104,17 @@ curl -s http://localhost:8000/health
   `ODYSSAI_X_ADMIN_TOKEN` before `docker compose up -d` and send
   `Authorization: Bearer <token>` on every `/admin/*` call.
 
-### A3. List the nodes
+### A3. Collect the nodes
 
-```bash
-odyssai nodes
-```
+Each A1 run ends with that node's topology entry (host, ssh target, `models_dir`). Keep
+them for A4. (Discovery over Bonjour, `odyssai nodes`, is not shipped yet.)
 
-Same data as `curl -s http://localhost:8000/v1/nodes/discovered`: one row per node that
-advertises `_odyssai._tcp` (host, ip, chip, RAM, RDMA interfaces, API port, last seen).
-
-- **Expected:** one row per node bootstrapped in A1.
-- **A node is missing:** re-run A1 for that node and read its doctor output; the
-  failing check is named there. If A1 is all `OK` and the row is still missing after
-  30 s, multicast does not cross your LAN: write that node into the topology by its
-  ssh target by hand (A4), which is always supported.
+- **A node's doctor showed a `FAIL`:** fix it first (the line names the fix) and re-run
+  A1 on that node.
 
 ### A4. Describe the cluster
 
-Write `~/.odysseus/topology.yaml` with one entry per node listed in A3. The ssh target
+Write `~/.odysseus/topology.yaml` with one entry per node collected in A3. The ssh target
 is `admin@<host>`; `models_dir` is the directory on that node where models live.
 
 TCP (`ring`), two nodes:
@@ -167,20 +166,23 @@ docker compose restart
 ### A5. Doctor, cluster mode: stop on any FAIL
 
 ```bash
-odyssai doctor --json
+scripts/odyssai-x doctor --engine http://localhost:8000          # add --json for agents
 ```
 
-Runs the cluster checks in the engine (`GET /admin/doctor`): every node reachable, venv
-and pinned `mlx`, patched JACCL, model modules and patches in sync with the server,
-wired-memory limit, disk, Hugging Face cache and, for `jaccl`, every RDMA edge of the
-topology from both ends (port active, link-local alias, peer reachable through that
-cable). One entry per check with `OK`, `WARN` or `FAIL` and a one-sentence fix.
+Runs the checks in the engine (`GET /admin/doctor`, same data with `?format=text`): every
+node reachable, venv and pinned `mlx`, patched JACCL, model modules and patches in sync
+with the release, wired-memory limit, models directory and free space, macOS build
+alike on every node and, for every Thunderbolt cable of the topology, both ends checked
+(port active, link-local alias, peer reachable through that cable) with one line per
+cable. One entry per check with `OK`, `WARN` or `FAIL` and a one-sentence fix; the
+JSON follows `docs/doctor.schema.json`. The exit code is the worst status (header
+`X-Doctor-Exit` on the HTTP call).
 
 - **Exit 0:** continue.
 - **Exit 1 (`WARN` only):** report the warnings, continue.
 - **Exit 2 (any `FAIL`):** stop. Do not load a model. Report each `FAIL` entry
-  verbatim; an edge failure reads like
-  `FAIL rdma edge node-a en3 -> node-b en5: peer unreachable - check the cable on en3`.
+  verbatim; a cable failure reads like
+  `FAIL rdma-edge node-a rdma_en3 ↔ node-b rdma_en5: … PORT_DOWN — Check the Thunderbolt cable on node-a en3 (port down) at both ends.`
   After the fix, run A5 again.
 
 ### A6. First model
@@ -229,9 +231,8 @@ curl -s http://localhost:8000/v1/chat/completions -H 'content-type: application/
 
 ## B. Manual path (no installer)
 
-Use this while `install.sh`, `odyssai nodes` and `odyssai doctor` are not shipped, or
-to drive the nodes from a checkout. It replaces A1, A3 and A5; A2, A4, A6 and A7 are
-unchanged.
+Use this to drive the nodes from a checkout on the server (it pushes over ssh). It
+replaces A1; the other steps are unchanged.
 
 1. **Bootstrap each node from the server** (pushes over ssh, idempotent):
 
@@ -240,29 +241,20 @@ unchanged.
    scripts/bootstrap-node.sh admin@node-a.local /Volumes/models  # or your own
    ```
 
-   Expected: `[1/5]` to `[6/6]`, then `✓ admin@node-a.local bootstrapped.` A line with
+   Expected: `[1/5]` to `[6/6]`, a doctor report, then `✓ admin@node-a.local bootstrapped.` A line with
    `⚠` about JACCL means the stock JACCL was kept (RDMA pools lose the patches listed
    in `vendor/jaccl/PATCHES.md`); a line with `⚠` about `mlx-vlm` disables vision
    models on that node only. `ERROR: python3.11 not found`: `brew install python@3.11`
    on the node, re-run.
 
-2. **Pin the GPU memory budget** (asks for the node password; not automated):
+2. **Pin the GPU memory budget** (asks for the node password; `install.sh` does this):
 
    ```bash
    scripts/wired-limit/install.sh admin@node-a.local 250880    # about 245 GB on a 256 GB Mac
    ```
 
-3. **Check instead of doctor:**
-
-   ```bash
-   scripts/install-model-modules.sh --check admin@node-a.local admin@node-b.local
-   scripts/install-jaccl.sh --check admin@node-a.local
-   curl -s http://localhost:8000/admin/nodes/telemetry | jq '.hosts[] | {host, ssh_ok, ram_total_bytes}'
-   ```
-
-   Expected: no `new` or `stale` file, JACCL `patched`, every node `ssh_ok: true` with
-   a non-zero RAM figure. Anything else: stop and report it. For `jaccl`, every edge is
-   also checked before each load and a bad edge refuses the load by name.
+3. **Check:** the doctor of A5 works the same on nodes bootstrapped this way; on one
+   node: `ssh admin@node-a.local '~/mlx-cluster/odyssai-x doctor'`.
 
 ---
 
@@ -357,7 +349,9 @@ needs none of this.
 - `scripts/runner.py`: per-node MLX runner (spawned over SSH); `scripts/patches/`:
   runtime model patches; `scripts/mlx_models/`: vendored model modules.
 - `scripts/dashboard.html`: the admin page (served per request).
-- Node provisioning: `scripts/bootstrap-node.sh`, `install-model-modules.sh`,
+- Node install: `install.sh` (on the node), `scripts/odyssai-x` + `doctor_node.py` +
+  `doctor-manifest.json` (the doctor; `docs/doctor.schema.json`).
+- Node provisioning from a checkout: `scripts/bootstrap-node.sh`, `install-model-modules.sh`,
   `install-jaccl.sh`, `build-jaccl.sh`, `install-mlx-vlm.sh`, `wired-limit/`,
   `rdma-onboard.sh`, `odyssai-network-setup.sh`, `discover-rdma-wiring.py`.
 - `vendor/jaccl/`: JACCL (MLX v0.32.2) and our patches (`PATCHES.md`, `UPSTREAM.md`);
