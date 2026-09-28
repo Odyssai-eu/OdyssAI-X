@@ -162,6 +162,57 @@ code, r = post(b + "/v1/systemone", {"state": "s", "questions": {"q": {"type": "
 check("decision 503 after load failure", code == 503)
 srv.shutdown()
 
+# --- abandoned jobs are dropped, the queue is bounded -------------------------------------
+import socket as _socket
+import time as _time
+
+
+class SlowDecider(FakeDecider):
+    def dist(self, state, q, opts):
+        _time.sleep(1.0)
+        return super().dist(state, q, opts)
+
+
+slow = SlowDecider()
+ws = ds.Worker("/nonexistent", False, factory=lambda: (slow, decision_core))
+ws.start(); ws.ready.wait(5)
+srvs = ThreadingHTTPServer(("127.0.0.1", 0), ds.make_handler(ws, "slow", {}))
+threading.Thread(target=srvs.serve_forever, daemon=True).start()
+bs = f"http://127.0.0.1:{srvs.server_address[1]}"
+Q1 = {"state": "s", "questions": {"q": {"type": "noul", "instructions": "?"}}}
+
+
+def post_and_drop(url_port, body):
+    """Send a request, then close the socket without reading the answer."""
+    raw = json.dumps(body).encode()
+    s = _socket.create_connection(("127.0.0.1", url_port))
+    s.sendall(b"POST /v1/systemone HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\n"
+              + f"Content-Length: {len(raw)}\r\n\r\n".encode() + raw)
+    _time.sleep(0.2)
+    s.close()
+
+
+port_s = srvs.server_address[1]
+threading.Thread(target=post, args=(bs + "/v1/systemone", Q1), daemon=True).start()   # occupies the worker
+_time.sleep(0.2)
+for _ in range(3):
+    post_and_drop(port_s, Q1)                                                             # 3 abandoned
+_time.sleep(4.5)
+check("abandoned requests are never computed", (slow.calls.count("dist") if hasattr(slow, "calls") else None, ws.skipped) == (None, 3) or ws.skipped == 3, ws.skipped)
+check("served only the live one", ws.served == 1, (ws.served, ws.skipped))
+
+ds.MAX_QUEUE = 2
+threading.Thread(target=post, args=(bs + "/v1/systemone", Q1), daemon=True).start()
+_time.sleep(0.2)
+for _ in range(2):
+    threading.Thread(target=post, args=(bs + "/v1/systemone", Q1), daemon=True).start()
+_time.sleep(0.3)
+code, r = post(bs + "/v1/systemone", Q1)
+check("queue full → 503 at once", code == 503 and "busy" in r.get("error", ""), (code, r))
+ds.MAX_QUEUE = 16
+_time.sleep(3.5)
+srvs.shutdown()
+
 # --- Julia backend (fake engine, real julia.data.sequence encoding) -----------------------
 try:
     import torch  # noqa: F401  (julia.data imports torch)

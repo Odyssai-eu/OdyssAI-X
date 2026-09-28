@@ -43,6 +43,14 @@ KNOWN_PROMPT_VERSIONS = {"letter-v1-semif", "letter-v1-ours"}
 KNOWN_READOUTS = {"letter-logit"}
 MAX_BODY = 8 * 1024 * 1024
 JOB_TIMEOUT_S = float(os.environ.get("DECISION_JOB_TIMEOUT_S", "600"))
+# Backpressure: beyond this many waiting requests the server answers 503 at once
+# (Retry-After) instead of queueing work that would be served long after its client
+# gave up — 254 abandoned requests piled up behind a bench judge on 2026-09-28.
+MAX_QUEUE = int(os.environ.get("DECISION_MAX_QUEUE", "16"))
+
+
+class QueueFull(Exception):
+    pass
 
 
 def log(msg: str) -> None:
@@ -186,6 +194,7 @@ class Worker(threading.Thread):
         self.error: str | None = None
         self.busy = False
         self.served = 0
+        self.skipped = 0
         self.wired: dict = {}
 
     def run(self) -> None:
@@ -215,6 +224,13 @@ class Worker(threading.Thread):
         self.ready.set()
         while True:
             state, questions, box, done = self.jobs.get()
+            alive = box.get("alive")
+            if box.get("cancelled") or (alive is not None and not alive()):
+                # Its client is gone (disconnected or timed out): never compute it.
+                box["cancelled"] = True
+                self.skipped += 1
+                done.set()
+                continue
             self.busy = True
             try:
                 box["result"] = self._decide_all(state, questions)
@@ -272,12 +288,23 @@ class Worker(threading.Thread):
             out[name] = ({**format_answer(questions[name], probs), **extra}, n)
         return out
 
-    def submit(self, state, questions: dict) -> dict:
-        box: dict = {}
+    def submit(self, state, questions: dict, alive=None) -> dict:
+        """Queue a job and wait for it. `alive()` (the HTTP handler's view of its client)
+        is polled while waiting: a job whose client left is marked cancelled and dropped
+        by the worker instead of being computed for nobody."""
+        if self.jobs.qsize() >= MAX_QUEUE:
+            raise QueueFull(f"{self.jobs.qsize()} decisions already waiting (max {MAX_QUEUE})")
+        box: dict = {"alive": alive}
         done = threading.Event()
         self.jobs.put((state, questions, box, done))
-        if not done.wait(JOB_TIMEOUT_S):
-            raise TimeoutError(f"decision not finished after {JOB_TIMEOUT_S:.0f} s")
+        deadline = time.monotonic() + JOB_TIMEOUT_S
+        while not done.wait(0.5):
+            if alive is not None and not alive():
+                box["cancelled"] = True
+                raise ConnectionAbortedError("client disconnected")
+            if time.monotonic() > deadline:
+                box["cancelled"] = True
+                raise TimeoutError(f"decision not finished after {JOB_TIMEOUT_S:.0f} s")
         if "error" in box:
             code, msg = box["error"]
             raise (ValueError(msg) if code == 422 else RuntimeError(msg))
@@ -291,9 +318,23 @@ def make_handler(worker: Worker, name: str, cfg: dict):
         def log_message(self, *a):
             pass
 
-        def _send(self, code: int, obj) -> None:
+        def _client_alive(self) -> bool:
+            """False once the client closed its connection (readable + zero-byte peek)."""
+            import select
+            import socket
+            try:
+                r, _, _ = select.select([self.connection], [], [], 0)
+                if not r:
+                    return True
+                return self.connection.recv(1, socket.MSG_PEEK) != b""
+            except OSError:
+                return False
+
+        def _send(self, code: int, obj, retry_after: int | None = None) -> None:
             b = json.dumps(obj).encode()
             self.send_response(code)
+            if retry_after:
+                self.send_header("Retry-After", str(retry_after))
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(b)))
             self.end_headers()
@@ -315,7 +356,8 @@ def make_handler(worker: Worker, name: str, cfg: dict):
                 "version": VERSION, "kind": "decision", "prompt_version": cfg.get("prompt_version"),
                 "readout": cfg.get("readout"), "loading": not worker.ready.is_set(),
                 "error": worker.error, "busy": worker.busy, "queued": worker.jobs.qsize(),
-                "served": worker.served, "wired": worker.wired})
+                "served": worker.served, "skipped": worker.skipped, "max_queue": MAX_QUEUE,
+                "wired": worker.wired})
 
         def do_POST(self):
             if self.path not in ("/v1/systemone", "/v1/evaluate"):
@@ -332,7 +374,12 @@ def make_handler(worker: Worker, name: str, cfg: dict):
                 body = json.loads(self.rfile.read(n) or b"{}")
                 if not isinstance(body, dict):
                     raise ValueError("body must be a JSON object")
-                res = worker.submit(body.get("state", ""), body.get("questions") or {})
+                res = worker.submit(body.get("state", ""), body.get("questions") or {},
+                                    alive=self._client_alive)
+            except QueueFull as e:
+                return self._send(503, {"error": f"busy: {e}"}, retry_after=5)
+            except ConnectionAbortedError:
+                return  # nobody to answer
             except ValueError as e:
                 return self._send(422, {"error": str(e)})
             except TimeoutError as e:

@@ -270,6 +270,48 @@ async def main():
         check("20 /v1/models shows julia readout", ent.get("x_odyssai", {}).get("decision_readout"), "julia-markers")
         await c.post(f"/admin/clusters/dec/unload?alias={jb.get('alias')}", json={"force": True})
 
+        # 21. backpressure and client-disconnect cancellation
+        await c.put("/admin/settings", json={"decision_models": ["Fake-Decision-27B", "Julia-Test"]})
+        r = await c.post("/admin/clusters/dec/load", json={"model": "Fake-Decision-27B"})
+        palias = r.json().get("alias")
+        ppool = api.get_pool("dec", palias)
+        ds.MAX_QUEUE = 0
+        r = await c.post("/v1/systemone", json={**q, "model": palias})
+        check("21 node queue full → 503 passed through", (r.status_code, r.headers.get("retry-after")), (503, "5"))
+        ds.MAX_QUEUE = 16
+
+        class SlowFake(FakeDecider):
+            def dist(self, state, q, opts):
+                import time as _t
+                _t.sleep(3.0)
+                return super().dist(state, q, opts)
+        slow_port = free_port()
+        w = ds.Worker("/x", False, factory=lambda: (SlowFake(), decision_core))
+        w.start(); w.ready.wait(5)
+        ss = ThreadingHTTPServer(("127.0.0.1", slow_port), ds.make_handler(w, "slow", DCFG))
+        threading.Thread(target=ss.serve_forever, daemon=True).start()
+        ppool.upstream = f"http://127.0.0.1:{slow_port}"
+
+        class GoneRequest:
+            async def is_disconnected(self):
+                return True
+        import time as _time
+        import urllib.request as _ur
+        live = threading.Thread(target=lambda: _ur.urlopen(_ur.Request(
+            f"http://127.0.0.1:{slow_port}/v1/systemone", data=json.dumps(q).encode(),
+            headers={"content-type": "application/json"}), timeout=20).read(), daemon=True)
+        live.start()                      # occupies the worker for 3 s
+        _time.sleep(0.3)
+        t0 = _time.time()
+        resp = await api._systemone_local("dec", palias, ppool,
+                                          {**q, "model": palias}, GoneRequest())
+        check("21 disconnected client → engine gives up at once", (resp.status_code, _time.time() - t0 < 2.5), (499, True))
+        live.join(10)
+        _time.sleep(1.0)
+        check("21 queued job of the gone client dropped, live one served", (w.served, w.skipped), (1, 1))
+        ss.shutdown()
+        await c.post(f"/admin/clusters/dec/unload?alias={palias}", json={"force": True})
+
         # 18. kind validation accepts 'decision'
         check("18 validate kind decision", api.validate_cluster_def("dec2", 
             {"kind": "decision", "nodes": [{"host": "n0", "ssh": "a@b", "master": True}]}), None)

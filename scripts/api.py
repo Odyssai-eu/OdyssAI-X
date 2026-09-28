@@ -10670,7 +10670,8 @@ async def _systemone_health(prov: dict) -> dict:
 DECISION_REQUEST_TIMEOUT_S = float(env_get("DECISION_REQUEST_TIMEOUT_S", "600") or "600")
 
 
-async def _systemone_local(cluster_id: str, alias: str, pool, body: dict):
+async def _systemone_local(cluster_id: str, alias: str, pool, body: dict,
+                           request: Optional[Request] = None):
     """Forward a /v1/systemone request to a local decision pool (#95). The node
     server runs one MLX worker: requests queue there, hence the long timeout
     (a bench judge sends whole answers as state)."""
@@ -10689,7 +10690,22 @@ async def _systemone_local(cluster_id: str, alias: str, pool, body: dict):
     try:
         try:
             async with httpx.AsyncClient(timeout=DECISION_REQUEST_TIMEOUT_S) as client:
-                r = await client.post(f"{pool.upstream}/v1/systemone", json=fwd)
+                # Cancellation follows the client: when it disconnects (a bench judge
+                # gives up after its own timeout), drop the upstream request too —
+                # closing that connection makes the node server discard the queued job
+                # instead of computing it for nobody (254 piled up on 2026-09-28).
+                task = asyncio.create_task(client.post(f"{pool.upstream}/v1/systemone", json=fwd))
+                while True:
+                    done, _ = await asyncio.wait({task}, timeout=1.0)
+                    if done:
+                        break
+                    if request is not None and await request.is_disconnected():
+                        task.cancel()
+                        status = "cancelled"
+                        return JSONResponse({"error": "client disconnected"}, status_code=499)
+                r = task.result()
+        except HTTPException:
+            raise
         except Exception as e:
             raise HTTPException(502, f"decision pool '{alias}' ({pool.upstream}) unreachable: {e}")
         if r.status_code == 200:
@@ -10705,7 +10721,10 @@ async def _systemone_local(cluster_id: str, alias: str, pool, body: dict):
     except Exception:
         raise HTTPException(502, f"decision pool '{alias}' returned non-JSON (HTTP {r.status_code})")
     if r.status_code != 200:
-        return JSONResponse(data, status_code=r.status_code)
+        # Pass the node's backpressure through (503 + Retry-After when its queue is full).
+        ra = r.headers.get("retry-after")
+        return JSONResponse(data, status_code=r.status_code,
+                            headers={"Retry-After": ra} if ra else None)
     if isinstance(data, dict):
         data["model"] = alias
         data.setdefault("x_odyssai", {}).update({
@@ -10751,7 +10770,7 @@ async def systemone(request: Request):
                 "error": "unknown_decision_model", "model": want,
                 "available": [x[1] for x in local] + [a[2]["alias"] for a in aliases]})
     if lmatch is not None:
-        return await _systemone_local(lmatch[0], lmatch[1], lmatch[2], body)
+        return await _systemone_local(lmatch[0], lmatch[1], lmatch[2], body, request)
     prov_id, prov, entry = match
     fwd = dict(body)
     fwd["model"] = entry.get("upstream") or entry["alias"]
