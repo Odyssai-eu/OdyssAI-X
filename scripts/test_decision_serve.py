@@ -275,5 +275,35 @@ if HAVE_TORCH:
 else:
     print("SKIP julia backend tests (no torch)")
 
+# letter readout on a long state: prefill in blocks, KV-bounded question batches
+try:
+    import mlx.core as mx
+except ImportError:
+    mx = None
+if mx is not None:
+    class Cell:
+        def __init__(self):
+            self.state = mx.zeros((1,))
+
+    calls = []
+
+    def inner(ids, cache=None):
+        calls.append(ids.shape[1])
+        return ids.astype(mx.float32)[..., None]
+
+    cp = ds.ChunkedPrefill(inner, step=4)
+    h = cp(mx.arange(10)[None], [Cell()])
+    check("long input goes through the cache in blocks", calls == [4, 4, 2], calls)
+    check("blocks concatenate back to the one-shot output", h[0, :, 0].tolist() == list(range(10)), h.shape)
+    calls.clear()
+    cp(mx.arange(10)[None], None)
+    check("no cache → one call, unchanged", calls == [10], calls)
+    lb = ds.LetterBackend.__new__(ds.LetterBackend)
+    lb._kvpt = 65536                      # Eikos-27B: 16 attention layers x 4 KV heads x 256 x 2 x bf16
+    check("short state keeps upstream's batch of 32", lb.batch_size(3000) == 32, lb.batch_size(3000))
+    check("33k-token state: batch sized to the KV budget", 1 <= lb.batch_size(33000) <= 4, lb.batch_size(33000))
+else:
+    print("SKIP chunked prefill tests (no mlx)")
+
 print("all OK" if not FAILS else f"{len(FAILS)} FAILED: {FAILS}")
 sys.exit(1 if FAILS else 0)

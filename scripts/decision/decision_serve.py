@@ -112,6 +112,39 @@ def format_answer(q: dict, probs: dict) -> dict:
     return {"type": "choice", "choice": top, "probabilities": probs, "confidence": probs[top]}
 
 
+PREFILL_STEP = int(os.environ.get("DECISION_PREFILL_STEP", "2048"))
+BATCH_KV_GB = float(os.environ.get("DECISION_BATCH_KV_GB", "8"))
+
+
+class ChunkedPrefill:
+    """Wraps the decider's inner model so a long input goes through the cache in blocks of
+    `step` tokens, as mlx_lm prefills before generating. The vendored readout feeds the whole
+    state in one call; its activations grow ~1.8 GB per 1k tokens on Eikos-27B (measured on
+    .42: 13k tokens → 78 GB peak with the 54 GB model), so a 30k-token state outgrew the
+    node's RAM and the request thrashed for minutes. Same computation (causal attention,
+    recurrent state carried by the cache), bounded memory. Calls without a cache or no
+    longer than `step` pass through unchanged."""
+
+    def __init__(self, inner, step: int = PREFILL_STEP):
+        self._inner, self._step = inner, max(1, int(step))
+
+    def __call__(self, ids, cache=None, *args, **kwargs):
+        n = ids.shape[1]
+        if cache is None or n <= self._step:
+            return self._inner(ids, cache, *args, **kwargs)
+        import mlx.core as mx
+        outs = []
+        for s in range(0, n, self._step):
+            h = self._inner(ids[:, s:s + self._step], cache, *args, **kwargs)
+            mx.eval(h, [c.state for c in cache])
+            outs.append(h)
+            mx.clear_cache()
+        return mx.concatenate(outs, axis=1)
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
+
+
 class LetterBackend:
     """Letter-logit readout (MLX): every question of a request in one pass over the shared
     prefix, exactly as upstream serve.py decide_all."""
@@ -119,13 +152,38 @@ class LetterBackend:
 
     def __init__(self, decider, dc):
         self.decider, self.dc = decider, dc
+        self._kvpt = None
+        if hasattr(decider, "inner"):
+            decider.inner = ChunkedPrefill(decider.inner)
+
+    def _kv_bytes_per_token(self) -> int:
+        """KV bytes one cached token costs across the attention layers (bf16 keys + values).
+        Linear-attention layers keep a fixed-size state and are not counted."""
+        if self._kvpt is None:
+            from mlx_lm.models.cache import KVCache
+            lm = self.decider.lm
+            args = getattr(lm, "args", None)
+            n_kv = sum(isinstance(c, KVCache) for c in lm.make_cache())
+            heads, hd = getattr(args, "num_key_value_heads", None), getattr(args, "head_dim", None)
+            self._kvpt = n_kv * heads * hd * 2 * 2 if heads and hd else 128 * 1024
+        return self._kvpt
+
+    def batch_size(self, n_tok: int) -> int:
+        """Questions read together: the readout copies the state's KV cache once per question
+        of a batch (Eikos-27B, 33k tokens: ~2 GB a copy), so the batch is sized to
+        BATCH_KV_GB instead of upstream's fixed 32."""
+        return max(1, min(32, int(BATCH_KV_GB * 1e9 // max(1, n_tok * self._kv_bytes_per_token()))))
 
     def dist_items(self, state, items):
         if len(items) == 1:
             q, opts = items[0]
             p, n = self.decider.dist(state, q, opts)
             return [(p, n, {})]
-        return [(p, n, {}) for p, n in self.decider.dist_many_cached(state, items)]
+        if not hasattr(self.decider, "lm"):  # test doubles
+            return [(p, n, {}) for p, n in self.decider.dist_many_cached(state, items)]
+        n_tok = len(self.decider._ids(state, *items[0]))
+        chunk = self.batch_size(n_tok)
+        return [(p, n, {}) for p, n in self.decider.dist_many_cached(state, items, chunk=chunk)]
 
 
 class JuliaBackend:
