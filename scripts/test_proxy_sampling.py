@@ -93,6 +93,10 @@ check("9 messages keeps thinking/top_p/top_k/effort",
       {"thinking": {"type": "enabled", "budget_tokens": 2000}, "top_p": 0.9, "top_k": 40, "reasoning_effort": "low"})
 check("9 anthropic thinking -> bool", api._thinking_from_aliases({"thinking": {"type": "disabled", "budget_tokens": 0}}), False)
 check("9 no thinking -> None", api._thinking_from_aliases({"thinking": None}), None)
+check("10 minimax gets a thinking object", api._upstream_thinking("https://api.minimax.io/v1", False), {"type": "disabled"})
+check("10 zhipu GLM gets a thinking object", api._upstream_thinking("https://api.z.ai/api/paas/v4", True), {"type": "enabled"})
+check("10 bigmodel.cn too", api._upstream_thinking("https://open.bigmodel.cn/api/paas/v4", False), {"type": "disabled"})
+check("10 others keep the boolean", api._upstream_thinking("https://openrouter.ai/api/v1", False), False)
 
 if FAILS:
     print("\n".join("FAIL " + f for f in FAILS))

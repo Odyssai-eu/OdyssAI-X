@@ -7516,7 +7516,7 @@ def _initial_default_config() -> Optional[dict]:
 #   major (1.7.2 → 2.0.0) — breaking API or topology change
 #
 # Use `./scripts/bump-version.sh patch|minor|major` to bump + auto-commit.
-APP_VERSION = "1.53.11"
+APP_VERSION = "1.53.12"
 
 app = FastAPI(
     title="OdyssAI-X (odyssai.eu)",
@@ -8899,6 +8899,21 @@ async def _aiter_with_heartbeat(src, heartbeat_s: float = _PROXY_SSE_HEARTBEAT_S
                 pass
 
 
+# Upstreams whose OpenAI-compatible API validates `thinking` as an OBJECT
+# ({"type": "enabled"|"disabled"}) and rejects the bare boolean other upstreams
+# accept or ignore: MiniMax (c9c2202) and Zhipu's GLM API (api.z.ai,
+# open.bigmodel.cn), which answered every request 400 "Cannot construct
+# instance of ChatCompletionRequest$Thinking … from boolean value (false)".
+_THINKING_OBJECT_UPSTREAMS = ("minimax", "api.z.ai", "bigmodel.cn")
+
+
+def _upstream_thinking(upstream, think_on: bool):
+    """The `thinking` value this upstream accepts for an on/off intent."""
+    if any(h in str(upstream).lower() for h in _THINKING_OBJECT_UPSTREAMS):
+        return {"type": "enabled" if think_on else "disabled"}
+    return think_on
+
+
 async def _proxy_chat_completion(prov_id: str, prov: dict, entry: dict,
                                   body: dict) -> Any:
     """Proxy OpenAI-compat chat completion to an upstream provider.
@@ -8957,13 +8972,7 @@ async def _proxy_chat_completion(prov_id: str, prov: dict, entry: dict,
     else:
         think_on = get_enable_thinking_default()
     if think_on is not None:
-        # MiniMax's OpenAI-compatible API validates `thinking` as a
-        # ThinkingConfig OBJECT ({"type":"enabled"|"disabled"}), not the bare
-        # boolean that other upstreams accept or ignore. Translate per-upstream.
-        if "minimax" in str(upstream).lower():
-            fwd["thinking"] = {"type": "enabled" if think_on else "disabled"}
-        else:
-            fwd["thinking"] = think_on
+        fwd["thinking"] = _upstream_thinking(upstream, think_on)
     # OpenAI spec: streaming responses do NOT include `usage` in their final
     # chunk unless the client opts in via `stream_options.include_usage`.
     # Without it, clients (Companion) can't render prompt/completion tokens
