@@ -6,6 +6,9 @@
 #   odyssai-x doctor --engine URL [--cluster ID] [--json]
 #                                                  every node + RDMA link, via the
 #                                                  engine's GET /admin/doctor
+#   odyssai-x nodes --engine URL [--json]          nodes announcing themselves
+#   odyssai-x advertise [--dry-run]                the node's announcement loop
+#                                                  (run by launchd, see install.sh)
 #
 # Named odyssai-x, not odyssai: `odyssai` is odyssai-launch's command (the
 # agent launcher on the workstation).
@@ -19,6 +22,80 @@ PY="${ODYSSAI_X_PYTHON:-$HOME/mlx-cluster/.venv/bin/python}"
 usage() {
   echo "usage: odyssai-x doctor [--json] [--models-dir DIR]" >&2
   echo "       odyssai-x doctor --engine URL [--cluster ID] [--json]" >&2
+  echo "       odyssai-x nodes --engine URL [--json]" >&2
+  echo "       odyssai-x advertise [--dry-run]" >&2
+}
+
+# Discovery (#79/#80). One loop, meant to cost nothing: it sleeps, and every
+# 5 s runs one curl (the heartbeat to the node's ONE orchestrator). Bonjour is a
+# single `dns-sd -R` child that mDNSResponder keeps registered. The LAN address
+# is re-read once a minute, the engine is looked up on the /24 only when none
+# is configured or it stopped answering (then at most every 5 minutes). No log
+# per beat. SIGTERM (launchctl bootout) sends a goodbye and deregisters.
+advertise() {
+  dry=0; [ "${1:-}" = "--dry-run" ] && dry=1
+  host="$(scutil --get LocalHostName 2>/dev/null || hostname -s)"
+  user="$(id -un)"
+  chip="$(sysctl -n machdep.cpu.brand_string 2>/dev/null || echo unknown)"
+  ram=$(( $(sysctl -n hw.memsize) / 1073741824 ))
+  rdma=$(ibv_devinfo -l 2>/dev/null | grep -c 'rdma_' || true)
+  ver="$(cat "$DIR/version" 2>/dev/null || echo unknown)"
+  engine="${ODYSSAI_X_ENGINE:-$(cat "$DIR/engine-url" 2>/dev/null || true)}"
+  engine="${engine%/}"
+  lan_ip() { ipconfig getifaddr "$(route -n get default 2>/dev/null | awk '/interface:/{print $2}')" 2>/dev/null || true; }
+  ip="$(lan_ip)"
+  beat() {  # $1 = true for the goodbye
+    [ -n "$engine" ] && [ -n "$ip" ] || return 1
+    curl -fsS -m 2 -o /dev/null -H 'content-type: application/json' \
+      -d "{\"host\":\"$host\",\"user\":\"$user\",\"ip\":\"$ip\",\"chip\":\"$chip\",\"ram_gb\":$ram,\"rdma\":$rdma,\"version\":\"$ver\",\"bye\":${1:-false}}" \
+      "$engine/v1/nodes/heartbeat" 2>/dev/null
+  }
+  find_engine() {  # an OdyssAI-X engine on this /24, port 8000
+    [ -n "$ip" ] || return 1
+    net="${ip%.*}"
+    seq 1 254 | xargs -P 64 -I{} sh -c "curl -fsS -m 1 http://$net.{}:8000/.well-known/inference-engine.json 2>/dev/null | grep -q '\"vendor\": *\"odyssai.eu\"' && echo http://$net.{}:8000" | head -1
+  }
+  if [ "$dry" = 1 ]; then
+    echo "bonjour: dns-sd -R $host _odyssai._tcp local 22 v=$ver chip=$chip ram=$ram rdma=$rdma role=node user=$user"
+    echo "heartbeat: POST ${engine:-<no engine configured>}/v1/nodes/heartbeat every 5 s"
+    echo "payload: {\"host\":\"$host\",\"user\":\"$user\",\"ip\":\"$ip\",\"chip\":\"$chip\",\"ram_gb\":$ram,\"rdma\":$rdma,\"version\":\"$ver\",\"bye\":false}"
+    return 0
+  fi
+  dns-sd -R "$host" _odyssai._tcp local 22 "v=$ver" "chip=$chip" "ram=$ram" "rdma=$rdma" role=node "user=$user" >/dev/null 2>&1 &
+  dnssd=$!
+  trap 'beat true; kill $dnssd 2>/dev/null; exit 0' TERM INT
+  n=0 misses=0 next_scan=0
+  while :; do
+    n=$((n + 1))
+    [ $((n % 12)) -eq 0 ] && ip="$(lan_ip)"
+    if beat; then misses=0; else misses=$((misses + 1)); fi
+    now=$(date +%s)
+    if { [ -z "$engine" ] || [ "$misses" -ge 12 ]; } && [ "$now" -ge "$next_scan" ]; then
+      found="$(find_engine)"
+      if [ -n "$found" ]; then engine="$found"; misses=0; printf '%s\n' "$engine" > "$DIR/engine-url"; fi
+      next_scan=$((now + 300))
+    fi
+    kill -0 "$dnssd" 2>/dev/null || {
+      dns-sd -R "$host" _odyssai._tcp local 22 "v=$ver" "chip=$chip" "ram=$ram" "rdma=$rdma" role=node "user=$user" >/dev/null 2>&1 &
+      dnssd=$!; }
+    sleep 5 & wait $!
+  done
+}
+
+engine_nodes() {
+  url="" fmt="text"
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --engine) url="${2:-}"; shift 2 ;;
+      --json) fmt="json"; shift ;;
+      *) usage; exit 64 ;;
+    esac
+  done
+  [ -n "$url" ] || { usage; exit 64; }
+  auth=""; [ -n "${ODYSSAI_X_ADMIN_TOKEN:-}" ] && auth="Authorization: Bearer $ODYSSAI_X_ADMIN_TOKEN"
+  curl -fsS --max-time 10 ${auth:+-H "$auth"} "${url%/}/admin/nodes/discovered?format=$fmt" || exit 2
+  [ "$fmt" = json ] && echo
+  exit 0
 }
 
 # Cluster mode: the engine runs the checks on every node; this only asks for
@@ -64,6 +141,8 @@ case "${1:-}" in
       exit 2
     fi
     exec "$PY" "$DIR/doctor_node.py" --manifest "$DIR/doctor-manifest.json" "$@" ;;
+  nodes) shift; engine_nodes "$@" ;;
+  advertise) shift; advertise "$@" ;;
   -h|--help|help) usage; exit 0 ;;
   *) usage; exit 64 ;;
 esac

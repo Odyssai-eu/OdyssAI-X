@@ -11,11 +11,13 @@
 #   5. files       runner, helpers, runtime patches, vendored model modules
 #   6. jaccl       OdyssAI's patched libjaccl.dylib, checked against its sha256
 #   7. wired-limit the GPU wired-memory limit, kept across reboots (asks sudo)
-#   8. doctor      `odyssai-x doctor`: what this node still lacks, if anything
+#   8. discovery   the node announces itself: Bonjour `_odyssai._tcp` and a
+#                  heartbeat every 5 s to its orchestrator (launchd, background)
+#   9. doctor      `odyssai-x doctor`: what this node still lacks, if anything
 #
 # Out of scope: RDMA activation (recoveryOS: `rdma_ctl enable`), the
 # Thunderbolt network setup (scripts/rdma-onboard.sh, run as root), the vision
-# venv (scripts/install-mlx-vlm.sh), Bonjour discovery.
+# venv (scripts/install-mlx-vlm.sh).
 #
 # Environment:
 #   ODYSSAI_X_REF         git ref to install (default: main)
@@ -24,6 +26,8 @@
 #                         if it exists, else ~/mlx-models)
 #   ODYSSAI_X_WIRED_MB    wired limit in MB (default: the current value if set,
 #                         else RAM minus the larger of 8 GiB and 6.25 %)
+#   ODYSSAI_X_ENGINE      this node's orchestrator, e.g. http://mini.local:8000
+#                         (default: the node finds an OdyssAI-X engine on its /24)
 #   ODYSSAI_X_FORCE=1     change a node even while it serves a model
 #
 # Everything sits in main(), called on the last line: a truncated download
@@ -37,7 +41,7 @@ PY_VERSION="3.11"
 T0=$(date +%s)
 CHANGED=0
 STAGE_N=0
-STAGES=8
+STAGES=9
 SUMMARY=""
 
 say()  { printf '%s\n' "$*"; }
@@ -174,9 +178,17 @@ main() {
     done
     copy_if_changed "$REQ" "$DIR/requirements-node.txt" && n=$((n + 1)) || true
     chmod +x "$DIR/odyssai-x"
+    touch "$DIR/.advertise-restart"
     for f in "$SRC"/scripts/patches/*.py; do copy_if_changed "$f" "$DIR/patches/$(basename "$f")" && n=$((n + 1)) || true; done
     for f in "$SRC"/scripts/mlx_models/*.py; do copy_if_changed "$f" "$SITE/mlx_lm/models/$(basename "$f")" && n=$((n + 1)) || true; done
     stage_changed
+  fi
+  local VER; VER=$(sed -n 's/^APP_VERSION = "\(.*\)"/\1/p' "$SRC/scripts/api.py" | head -1)
+  if [ -n "$VER" ] && [ "$(cat "$DIR/version" 2>/dev/null)" != "$VER" ]; then
+    printf '%s\n' "$VER" > "$DIR/version"; n=$((n + 1)); stage_changed; touch "$DIR/.advertise-restart"
+  fi
+  if [ -n "${ODYSSAI_X_ENGINE:-}" ] && [ "$(cat "$DIR/engine-url" 2>/dev/null)" != "${ODYSSAI_X_ENGINE%/}" ]; then
+    printf '%s\n' "${ODYSSAI_X_ENGINE%/}" > "$DIR/engine-url"; n=$((n + 1)); stage_changed; touch "$DIR/.advertise-restart"
   fi
   stage_end "$n file(s) updated"
 
@@ -259,7 +271,60 @@ XML
     fi
   fi
 
-  # 8. doctor ────────────────────────────────────────────────────────────
+  # 8. discovery ─────────────────────────────────────────────────────────
+  # A LaunchDaemon (starts at boot, no login needed on a headless node) running
+  # `odyssai-x advertise` as this user, at launchd's lowest priority
+  # (ProcessType Background). It touches no runner, so it needs no FORCE.
+  stage_begin discovery
+  local DPL=/Library/LaunchDaemons/eu.odyssai.x.node.plist DXML
+  DXML=$(cat <<XML
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>eu.odyssai.x.node</string>
+    <key>UserName</key>
+    <string>$(id -un)</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/sh</string>
+        <string>$DIR/odyssai-x</string>
+        <string>advertise</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>ThrottleInterval</key>
+    <integer>30</integer>
+    <key>ProcessType</key>
+    <string>Background</string>
+    <key>StandardErrorPath</key>
+    <string>/tmp/eu.odyssai.x.node.log</string>
+</dict>
+</plist>
+XML
+)
+  if [ -f "$DPL" ] && [ "$(cat "$DPL")" = "$DXML" ]; then
+    if [ -f "$DIR/.advertise-restart" ]; then
+      sudo -n launchctl kickstart -k system/eu.odyssai.x.node 2>/dev/null && rm -f "$DIR/.advertise-restart"
+    fi
+    stage_end "announcing ($(cat "$DIR/engine-url" 2>/dev/null || echo 'engine: looking on the LAN'))"
+  elif sudo -n true 2>/dev/null || [ -t 0 ] || { : </dev/tty; } 2>/dev/null; then
+    printf '%s\n' "$DXML" | sudo tee "$DPL" >/dev/null && sudo chown root:wheel "$DPL" && sudo chmod 644 "$DPL" \
+      || die "discovery daemon install failed"
+    sudo launchctl bootout system "$DPL" 2>/dev/null || true
+    sudo launchctl bootstrap system "$DPL" || die "discovery daemon did not start"
+    rm -f "$DIR/.advertise-restart"
+    stage_changed
+    stage_end "daemon installed ($(cat "$DIR/engine-url" 2>/dev/null || echo 'engine: looking on the LAN'))"
+  else
+    warn "no terminal for sudo: rerun from a terminal (or ssh -t) to install the discovery daemon"
+    stage_end "skipped (no terminal for sudo)"
+  fi
+
+  # 9. doctor ────────────────────────────────────────────────────────────
   stage_begin doctor
   say ""
   local rc=0
