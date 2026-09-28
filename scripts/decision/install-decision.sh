@@ -1,14 +1,15 @@
 #!/bin/zsh
 # Install / update the decision server on a Mac node of a `kind: decision` cluster.
 #   scripts/decision/install-decision.sh <admin@host> [backends]
-#     backends: mlx (default, letter readout — Eikos), julia (PyTorch — Julia-1), or mlx,julia
+#     backends: mlx (default, letter readout — Eikos), julia (PyTorch — Julia-1),
+#               clm (MLX Qwen3-8B encoder + torch heads — CLM-v0.1-8B), comma-separated
 # Creates ~/odyssai/decision/.venv (python 3.12, pinned deps, its own venv so a cluster-venv
 # upgrade never changes the readout) and copies the server + the vendored readouts. The
 # OdyssAI-X engine launches the server over ssh when a decision model is loaded on the
 # cluster (DECISION_VENV / DECISION_SERVER_REMOTE in api.py): no launchd agent — a launchd
 # agent cannot read the external models volume without a manual TCC grant per node, an ssh
 # session can.
-HOST=${1:?usage: install-decision.sh <admin@host> [mlx|julia|mlx,julia]}
+HOST=${1:?usage: install-decision.sh <admin@host> [mlx|julia|clm, comma-separated]}
 BACKENDS=${2:-mlx}
 MLX_PINS=${MLX_PINS:-"mlx==0.32.0 mlx-lm==0.31.3"}
 JULIA_PINS=${JULIA_PINS:-"torch>=2.6 transformers>=5.0,<5.1 safetensors>=0.5 numpy>=1.26"}
@@ -16,6 +17,7 @@ DIR=$(cd "$(dirname "$0")" && pwd)
 PKGS=""
 [[ ",$BACKENDS," == *",mlx,"* ]] && PKGS="$PKGS $MLX_PINS"
 [[ ",$BACKENDS," == *",julia,"* ]] && PKGS="$PKGS $JULIA_PINS"
+[[ ",$BACKENDS," == *",clm,"* ]] && PKGS="$PKGS $MLX_PINS torch>=2.6 numpy>=1.26"
 [ -n "$PKGS" ] || { echo "unknown backends: $BACKENDS"; exit 2; }
 QUOTED=$(for p in ${=PKGS}; do printf "'%s' " "$p"; done)
 ssh $HOST "mkdir -p ~/odyssai/decision && cd ~/odyssai/decision && { [ -x .venv/bin/python ] || ~/.local/bin/uv venv -q --python 3.12 .venv; } && UV_CACHE_DIR=~/odyssai/decision/.uvcache ~/.local/bin/uv pip install -q --python .venv/bin/python $QUOTED" || exit 1
@@ -23,6 +25,10 @@ scp -q "$DIR/decision_serve.py" "$DIR/decision_core.py" "$DIR/mlx_decide.py" "$D
 if [[ ",$BACKENDS," == *",julia,"* ]]; then
   ssh $HOST "rm -rf ~/odyssai/decision/julia && mkdir -p ~/odyssai/decision/julia" || exit 1
   scp -q "$DIR"/julia/*.py "$DIR"/julia/LICENSE-APACHE-2.0.txt $HOST:odyssai/decision/julia/ || exit 1
+fi
+if [[ ",$BACKENDS," == *",clm,"* ]]; then
+  ssh $HOST "rm -rf ~/odyssai/decision/clm && mkdir -p ~/odyssai/decision/clm" || exit 1
+  scp -q "$DIR"/clm/*.py "$DIR"/clm/LICENSE $HOST:odyssai/decision/clm/ || exit 1
 fi
 # Smoke: each installed backend imports (no model loaded).
 ssh $HOST "cd ~/odyssai/decision && .venv/bin/python - '$BACKENDS'" <<'PY' || exit 1
@@ -32,6 +38,9 @@ out = ["prompt " + decision_core.PROMPT_VERSION]
 if "mlx" in b:
     import mlx.core as mx, mlx_lm
     out.append(f"mlx {mx.__version__} mlx_lm {mlx_lm.__version__}")
+if "clm" in b:
+    import mlx.core as mx, torch, clm.heads, clm.schema  # noqa: F401
+    out.append(f"clm: mlx {mx.__version__} torch {torch.__version__}")
 if "julia" in b:
     import torch, transformers, julia.inference  # noqa: F401
     out.append(f"torch {torch.__version__} (mps={torch.backends.mps.is_available()}) transformers {transformers.__version__}")

@@ -87,6 +87,11 @@ def stop_fake(port):
 
 def fake_ssh(target, cmd, timeout=30):
     CALLS.append(cmd)
+    if cmd.startswith("cat ") and "CLM-Test" in cmd:
+        if cmd.endswith("/config.json' 2>/dev/null") or "CLM-Test/config.json" in cmd:
+            return 0, json.dumps({"model_type": "clm", "base_model": "Qwen/Qwen3-8B",
+                                  "encoder_pooling": "last-token", "checkpoints": ["h.pt"]}), ""
+        return 1, "", ""
     if cmd.startswith("cat ") and "Julia-Test" in cmd:
         if "julia_config.json" in cmd:
             return 0, json.dumps({"format_version": 1, "architecture": "JuliaDecisionModel"}), ""
@@ -269,6 +274,11 @@ async def main():
         ent = next((m for m in r.json()["data"] if m["id"] == jb.get("alias")), {})
         check("20 /v1/models shows julia readout", ent.get("x_odyssai", {}).get("decision_readout"), "julia-markers")
         await c.post(f"/admin/clusters/dec/unload?alias={jb.get('alias')}", json={"force": True})
+
+        # 22. a CLM checkpoint (config.json model_type clm) is a known decision format
+        cfg = await api._read_decision_config("admin@127.0.0.1", f"{MODELS_DIR}/CLM-Test")
+        check("22 CLM format recognised", (cfg or {}).get("prompt_version"), "clm-v0.1")
+        check("22 CLM format accepted", api._decision_format_ok(cfg or {}), True)
 
         # 21. backpressure and client-disconnect cancellation
         await c.put("/admin/settings", json={"decision_models": ["Fake-Decision-27B", "Julia-Test"]})

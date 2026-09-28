@@ -58,6 +58,7 @@ def log(msg: str) -> None:
 
 
 JULIA_PROMPT_VERSION, JULIA_READOUT = "julia-v1", "julia-markers"
+CLM_PROMPT_VERSION, CLM_READOUT = "clm-v0.1", "clm-contrastive"
 
 
 def read_decision_config(model_dir: str) -> dict:
@@ -83,7 +84,19 @@ def read_decision_config(model_dir: str) -> dict:
                 "max_one_pass": 20, "max_length": pol.get("max_length"),
                 "head_length": pol.get("head_length") or 512,
                 "weights_sha256": pol.get("weights_sha256")}
-    raise SystemExit(f"not a decision model: no decision_config.json nor julia_config.json in {model_dir}")
+    cpath = os.path.join(model_dir, "config.json")
+    if os.path.exists(cpath):
+        cc = json.load(open(cpath))
+        if cc.get("model_type") == "clm":
+            ck = (cc.get("checkpoints") or [None])[0]
+            if not ck or cc.get("encoder_pooling") != "last-token":
+                raise SystemExit(f"unsupported CLM checkpoint: checkpoints={cc.get('checkpoints')!r} "
+                                 f"pooling={cc.get('encoder_pooling')!r}")
+            return {"backend": "clm", "prompt_version": CLM_PROMPT_VERSION, "readout": CLM_READOUT,
+                    "base_model": cc.get("base_model"), "checkpoint": ck,
+                    "embedding_dim": cc.get("embedding_dim"), "max_tokens": 2048}
+    raise SystemExit(f"not a decision model: no decision_config.json, julia_config.json nor "
+                     f"CLM config.json in {model_dir}")
 
 
 def format_answer(q: dict, probs: dict) -> dict:
@@ -159,6 +172,79 @@ class JuliaBackend:
         return out
 
 
+class CLMBackend:
+    """Contrastive LM (CLM): a frozen Qwen3-8B encoder (last-token pooling, L2-normalised,
+    last 2,048 tokens kept — the vLLM `--runner pooling` setup the heads were trained on),
+    here on MLX, plus the vendored state/action projection heads (torch, CPU). Each
+    candidate is scored by the scaled cosine between projected state and projected
+    candidate; the question text and candidate texts come from the vendored schema."""
+    device = "mlx+cpu"
+
+    def __init__(self, model, tokenizer, head, dc, max_tokens: int = 2048):
+        from collections import OrderedDict
+        self.model, self.tokenizer, self.head, self.dc = model, tokenizer, head, dc
+        self.max_tokens = max_tokens
+        self.cache: "OrderedDict[str, object]" = OrderedDict()
+
+    def _embed(self, texts: list[str]):
+        import numpy as np
+        import mlx.core as mx
+        out, spent = [], 0
+        for t in texts:
+            v = self.cache.get(t)
+            if v is None:
+                ids = self.tokenizer.encode(t)[-self.max_tokens:]
+                spent += len(ids)
+                h = self.model.model(mx.array([ids]))[0, -1].astype(mx.float32)
+                v = np.array(h)
+                v = v / (np.linalg.norm(v) + 1e-12)
+                self.cache[t] = v
+                while len(self.cache) > 4096:
+                    self.cache.popitem(last=False)
+            else:
+                self.cache.move_to_end(t)
+            out.append(v)
+        return np.stack(out).astype(np.float32), spent
+
+    def dist_items(self, state, items):
+        import math
+        from clm.schema import build_pairs
+        out = []
+        for q, _opts in items:
+            (st, keys, texts), = build_pairs(state, {"q": q}).values()
+            zs_in, n1 = self._embed([st])
+            zc_in, n2 = self._embed(texts)
+            zs, zc = self.head.project(zs_in, zc_in)
+            logits = [self.head.scale * float(x) for x in (zc @ zs[0])]
+            m = max(logits)
+            e = [math.exp(v - m) for v in logits]
+            t = sum(e)
+            p = {k: v / t for k, v in zip(keys, e)}
+            if q.get("type") in ("noul", "boolean"):
+                p = {"yes": p["true"], "no": p["false"]}
+            out.append((p, n1 + n2, {}))
+        return out
+
+
+def _load_clm(model_dir: str, cfg: dict):
+    import torch
+    major, minor = (int(x) for x in torch.__version__.split(".")[:2])
+    if (major, minor) < (2, 6):
+        # heads.py calls torch.load() without weights_only; only >= 2.6 defaults it to True.
+        raise RuntimeError(f"torch {torch.__version__} < 2.6: refusing to unpickle the CLM checkpoint")
+    enc = os.environ.get("DECISION_CLM_ENCODER") or os.path.join(
+        os.path.dirname(os.path.dirname(model_dir.rstrip("/"))), cfg.get("base_model") or "")
+    if not os.path.exists(os.path.join(enc, "config.json")):
+        raise RuntimeError(f"CLM encoder {cfg.get('base_model')} not found at {enc} "
+                           f"(set DECISION_CLM_ENCODER)")
+    from mlx_lm import load as mlx_load
+    from clm.heads import HeadPair
+    import decision_core
+    model, tok = mlx_load(enc)
+    head = HeadPair("clm", os.path.join(model_dir, cfg["checkpoint"]), device="cpu").ensure()
+    return CLMBackend(model, tok, head, decision_core, int(cfg.get("max_tokens") or 2048))
+
+
 def _load_julia(model_dir: str, cfg: dict):
     import hashlib
     import torch
@@ -205,12 +291,15 @@ class Worker(threading.Thread):
                 self.backend = made if hasattr(made, "dist_items") else LetterBackend(*made)
             elif self.cfg.get("backend") == "julia":
                 self.backend = _load_julia(self.model_dir, self.cfg)
+            elif self.cfg.get("backend") == "clm":
+                self.backend = _load_clm(self.model_dir, self.cfg)
+                self._pin_weights(self.backend.model)
             else:
                 from mlx_decide import MLXDecider  # sets PROMPT_STYLE, then imports decision_core
                 import decision_core
                 self.backend = LetterBackend(MLXDecider(self.model_dir), decision_core)
                 self.decider = self.backend.decider
-                self._pin_weights()
+                self._pin_weights(self.decider.model)
             self.dc = self.backend.dc
             log(f"model loaded in {time.perf_counter() - t0:.1f} s ({self.model_dir}), "
                 f"backend={self.cfg.get('backend')} device={getattr(self.backend, 'device', '?')}")
@@ -243,7 +332,7 @@ class Worker(threading.Thread):
                 self.served += 1
                 done.set()
 
-    def _pin_weights(self) -> None:
+    def _pin_weights(self, model) -> None:
         """Wire the weights for the life of the process, as mlx_lm does around every
         generation (`wired_limit`). The readout calls the model directly, so without
         this macOS evicts the Metal buffers of a model close to the node's working
@@ -255,7 +344,7 @@ class Worker(threading.Thread):
             return
         rec = mx.device_info()["max_recommended_working_set_size"]
         model_bytes = tree_reduce(
-            lambda acc, x: acc + x.nbytes if isinstance(x, mx.array) else acc, self.decider.model, 0)
+            lambda acc, x: acc + x.nbytes if isinstance(x, mx.array) else acc, model, 0)
         mx.set_wired_limit(rec)
         self.wired = {"model_gb": round(model_bytes / 1e9, 1), "wired_limit_gb": round(rec / 1e9, 1)}
         log(f"weights wired: model {self.wired['model_gb']} GB, wired limit {self.wired['wired_limit_gb']} GB"

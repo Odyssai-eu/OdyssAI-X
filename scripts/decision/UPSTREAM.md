@@ -40,3 +40,23 @@ only used by `load_model`'s FastEngine). `decision_serve.py` uses
 `julia.inference.TransformerEngine` directly: local tokenizer and encoder config,
 `trust_remote_code=False`, no network. Weights are checked by the server against the
 `weights_sha256` of the model's `inference-policy.json` before loading.
+
+## CLM (`clm/`)
+
+`schema.py` (question → state / candidate texts, answer assembly) and `heads.py`
+(projection-head architecture and checkpoint loading) from
+`github.com/Contrastive-LM/CLM` `src/clm/` at commit
+`bb42c6c5bf914fd449bed2f6ca65be80602cb1f7`, fetched 2026-09-28, Apache-2.0 (`clm/LICENSE`).
+Byte-identical:
+
+| File | SHA-256 |
+|---|---|
+| `clm/schema.py` | `52cec58afbf49ad7b7aa6bdb7e7476ee42bf3fd7a2703d44319dc4b565987335` |
+| `clm/heads.py` | `3f3b880e940a47b45879614b140fd873f7de9b13ccb8254b07989af7ea92e093` |
+
+`clm/__init__.py` is ours and imports nothing (upstream's pulls in their HTTP client
+and server). Never called: `heads.download()` / `_count_download()` (network).
+`heads.py` loads the checkpoint with `torch.load()` without `weights_only`;
+`decision_serve.py` refuses torch < 2.6, where that default is not yet `True`.
+The encoder is not vendored: Qwen3-8B (the official `Qwen/Qwen3-8B` bf16 weights)
+runs on MLX, last-token pooled and L2-normalised like their vLLM pooling server.

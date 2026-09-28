@@ -17994,6 +17994,7 @@ DECISION_KNOWN_FORMATS = frozenset({
     ("letter-v1-semif", "letter-logit"),     # Eikos family (MLX letter readout)
     ("letter-v1-ours", "letter-logit"),
     ("julia-v1", "julia-markers"),           # Supersonic Labs Julia (PyTorch marker head)
+    ("clm-v0.1", "clm-contrastive"),         # Contrastive-LM CLM (Qwen3-8B encoder + heads)
 })
 
 
@@ -18083,6 +18084,12 @@ async def _read_decision_config(ssh_target: str, model_abspath: str) -> Optional
         return {**cfg, "backend": "letter"}
     jc = await _cat("julia_config.json")
     if jc is None:
+        cc = await _cat("config.json")
+        if cc is not None and cc.get("model_type") == "clm":
+            ok = bool(cc.get("checkpoints")) and cc.get("encoder_pooling") == "last-token"
+            return {"prompt_version": "clm-v0.1" if ok else "clm-unknown",
+                    "readout": "clm-contrastive", "backend": "clm",
+                    "base_model": cc.get("base_model"), "max_tokens": 2048}
         return None
     if jc.get("architecture") != "JuliaDecisionModel" or jc.get("format_version") != 1:
         return {"prompt_version": f"julia-unknown:{jc.get('architecture')}/{jc.get('format_version')}",
