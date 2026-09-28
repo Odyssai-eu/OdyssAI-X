@@ -7516,7 +7516,7 @@ def _initial_default_config() -> Optional[dict]:
 #   major (1.7.2 → 2.0.0) — breaking API or topology change
 #
 # Use `./scripts/bump-version.sh patch|minor|major` to bump + auto-commit.
-APP_VERSION = "1.53.12"
+APP_VERSION = "1.53.13"
 
 app = FastAPI(
     title="OdyssAI-X (odyssai.eu)",
@@ -8972,7 +8972,9 @@ async def _proxy_chat_completion(prov_id: str, prov: dict, entry: dict,
     else:
         think_on = get_enable_thinking_default()
     if think_on is not None:
-        fwd["thinking"] = _upstream_thinking(upstream, think_on)
+        # `upstream` is the upstream MODEL id (MiniMax matched on it by luck);
+        # the provider is identified by its base URL.
+        fwd["thinking"] = _upstream_thinking(f"{prov.get('api_base') or ''} {upstream or ''}", think_on)
     # OpenAI spec: streaming responses do NOT include `usage` in their final
     # chunk unless the client opts in via `stream_options.include_usage`.
     # Without it, clients (Companion) can't render prompt/completion tokens

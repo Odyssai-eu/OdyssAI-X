@@ -97,6 +97,9 @@ check("10 minimax gets a thinking object", api._upstream_thinking("https://api.m
 check("10 zhipu GLM gets a thinking object", api._upstream_thinking("https://api.z.ai/api/paas/v4", True), {"type": "enabled"})
 check("10 bigmodel.cn too", api._upstream_thinking("https://open.bigmodel.cn/api/paas/v4", False), {"type": "disabled"})
 check("10 others keep the boolean", api._upstream_thinking("https://openrouter.ai/api/v1", False), False)
+src = open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "api.py")).read()
+check("10 proxy passes the provider base URL, not only the model id",
+      "_upstream_thinking(f\"{prov.get('api_base') or ''} {upstream or ''}\", think_on)" in src, True)
 
 if FAILS:
     print("\n".join("FAIL " + f for f in FAILS))
