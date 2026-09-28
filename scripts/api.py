@@ -7516,7 +7516,7 @@ def _initial_default_config() -> Optional[dict]:
 #   major (1.7.2 → 2.0.0) — breaking API or topology change
 #
 # Use `./scripts/bump-version.sh patch|minor|major` to bump + auto-commit.
-APP_VERSION = "1.53.10"
+APP_VERSION = "1.53.11"
 
 app = FastAPI(
     title="OdyssAI-X (odyssai.eu)",
@@ -8306,7 +8306,12 @@ async def run_doctor(cluster: Optional[str] = None) -> dict:
     node_rows, edge_rows = await asyncio.gather(
         asyncio.gather(*[_doctor_node(n, script, manifest_json, md) for n, md in nodes.values()]),
         asyncio.gather(*[_doctor_edges(t) for t in topos]))
-    rows = [r for rs in node_rows for r in rs]
+    # A port wired in a topology is judged by the edge check (one row per
+    # cable); the node's own rdma-port row about it would report the same
+    # dead cable a second time from its far end.
+    wired_ports = {(n.get("host"), d) for t in topos for n in t for d in (n.get("rdma") or []) if d}
+    rows = [r for rs in node_rows for r in rs
+            if not (r["check"] == "rdma-port" and (r["host"], r["subject"]) in wired_ports)]
     seen_edges: set = set()
     for rs in edge_rows:
         for r in rs:

@@ -93,8 +93,9 @@ def ports_with(target, dev, state="PORT_ACTIVE", ip="keep"):
     return p
 
 
-# ── 1. the string view is unchanged (load preflight, link watch) ───────
-old_src = subprocess.run(["git", "-C", REPO, "show", "HEAD:scripts/api.py"], capture_output=True, text=True).stdout
+# ── 1. the string view is unchanged (load preflight, link watch): compared
+#    with the function as it was before the split (67a1dfb) ─────────────
+old_src = subprocess.run(["git", "-C", REPO, "show", "67a1dfb:scripts/api.py"], capture_output=True, text=True).stdout
 start = old_src.index("async def _validate_rdma_edges(")
 end = old_src.index("\n\n\n", start)
 ns = {"asyncio": asyncio, "shlex": api.shlex, "sys": sys}
@@ -240,6 +241,23 @@ api.build_topology = lambda cid, count=None: TOPO
 async def call(q):
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=api.app), base_url="http://t") as c:
         return await c.get("/admin/doctor" + q)
+
+# the far end of the dead cable is active without its alias: the node row about
+# it must not add a second FAIL for the same cable (seen on Argo, 2026-09-28)
+far_end = {"check": "rdma-port", "status": "FAIL", "subject": "rdma_en3", "message": "rdma_en3 is active but en3 has no link-local", "fix": "x"}
+api._ssh_capture_stdin = node_stub({t_: (0, NODE_REPORT(h, "25G76", (far_end,) if h == "na" else ()), "") for t_, h in
+                                    (("admin@198.51.100.1", "na"), ("admin@198.51.100.2", "nb"), ("admin@198.51.100.3", "nc"))})
+unwired = dict(far_end, subject="rdma_en9", message="rdma_en9 is active but en9 has no link-local")
+rep = asyncio.run(api.run_doctor("dt"))
+check("node row for a wired port dropped (the edge check owns it)",
+      [r["subject"] for r in rep["checks"] if r["check"] == "rdma-port"], [])
+api._ssh_capture_stdin = node_stub({t_: (0, NODE_REPORT(h, "25G76", (unwired,) if h == "na" else ()), "") for t_, h in
+                                    (("admin@198.51.100.1", "na"), ("admin@198.51.100.2", "nb"), ("admin@198.51.100.3", "nc"))})
+rep = asyncio.run(api.run_doctor("dt"))
+check("node row for a port outside the topology kept",
+      [r["subject"] for r in rep["checks"] if r["check"] == "rdma-port"], ["rdma_en9"])
+api._ssh_capture_stdin = node_stub({t_: (0, NODE_REPORT(h, "25G76", (far_end,) if h == "na" else ()), "") for t_, h in
+                                    (("admin@198.51.100.1", "na"), ("admin@198.51.100.2", "nb"), ("admin@198.51.100.3", "nc"))})
 
 r = asyncio.run(call("?cluster=dt&format=text"))
 lines = r.text.strip().splitlines()
