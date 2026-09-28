@@ -20,6 +20,7 @@ docs/*
 !docs/GETTING-STARTED.md
 !docs/DEPLOY.md
 !docs/API.md
+!docs/doctor.schema.json
 !docs/RUNBOOK-argo-v4.md
 !docs/bug-reports/
 # Public user-guide chapters (mirrored into the guide and the site content).

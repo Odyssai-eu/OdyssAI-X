@@ -1,0 +1,35 @@
+#!/bin/sh
+# odyssai-x — node-side commands of OdyssAI-X. Installed next to runner.py in
+# ~/mlx-cluster/ (bootstrap-node.sh, the installer).
+#
+#   odyssai-x doctor [--json] [--models-dir DIR]   is this node ready? (read-only)
+#
+# Named odyssai-x, not odyssai: `odyssai` is odyssai-launch's command (the
+# agent launcher on the workstation).
+#
+# Plain sh, so it answers even when Python does not: a missing venv is itself
+# the first thing the doctor reports. /usr/bin/python3 is never used (an
+# Xcode update re-arms its licence prompt and it refuses to run).
+DIR="$(cd "$(dirname "$0")" && pwd)"
+PY="${ODYSSAI_X_PYTHON:-$HOME/mlx-cluster/.venv/bin/python}"
+
+usage() { echo "usage: odyssai-x doctor [--json] [--models-dir DIR]" >&2; }
+
+case "${1:-}" in
+  doctor)
+    shift
+    if [ ! -x "$PY" ]; then
+      msg="no venv python at $PY"
+      fix="run the installer (it creates ~/mlx-cluster/.venv)"
+      case " $* " in
+        *" --json "*)
+          printf '{"schema": 1, "mode": "node", "host": "%s", "checks": [{"check": "python", "status": "FAIL", "subject": "", "message": "%s", "fix": "%s"}], "summary": {"ok": 0, "warn": 0, "fail": 1}, "exit": 2}\n' \
+            "$(hostname -s)" "$msg" "$fix" ;;
+        *) echo "FAIL python: $msg — $fix" ;;
+      esac
+      exit 2
+    fi
+    exec "$PY" "$DIR/doctor_node.py" --manifest "$DIR/doctor-manifest.json" "$@" ;;
+  -h|--help|help) usage; exit 0 ;;
+  *) usage; exit 64 ;;
+esac

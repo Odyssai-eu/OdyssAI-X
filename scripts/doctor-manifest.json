@@ -1,0 +1,34 @@
+{
+ "jaccl_sha256_16": "03ecbe4b8ad93f26",
+ "mlx": "0.32.2",
+ "mlx_lm": "0.31.3",
+ "modules": {
+  "deepseek_v4.py": "e5ec120854b4e799cf42179759f2ae10",
+  "dsv4_cache.py": "fe867f467ceb5ef34d24512bf0aa0103",
+  "dsv4_hyper_connection.py": "3a2064a6d517b7134af741d537c0f11a",
+  "glm5_gated_delta.py": "f701c5bfeff0c06ee9b13819c6ace58d",
+  "glm5_next.py": "3b27ec22efa89194afb95e53a41c4ea8",
+  "glm_moe_dsa.py": "e85a59475f97408d3ef6fdc83ddf941b",
+  "hy_v3.py": "491d29239d981e281a3d3029590c71c8",
+  "hy_v4.py": "9058ba9a321ba7778330e1b9a5e3e0e1",
+  "inkling_mm_model.py": "4db92deaaf5fd48a1801488f7cc06b0c",
+  "kimi_k3.py": "7a9309ad145dd15f7f5dc76f57dc0975",
+  "laguna.py": "6616f947b928ba0014d32c5645e8b19d",
+  "qwen4_exp.py": "3591df7c261685bc02159279503df704"
+ },
+ "patches": {
+  "__init__.py": "2af1542c0e4590528e0f1897ebfa6d23",
+  "bailing_hybrid_alias.py": "109154fa41427bcccf6c9cb8cab9d244",
+  "bailing_hybrid_model.py": "3f4d65717cfad083c2c874c97dfa9da9",
+  "g9v3_alias.py": "eab0efadecf3ce9f31eb1637e6b73db6",
+  "g9v3_model.py": "a7624bb491a6c91cdc37001ba3b1579a",
+  "glm_moe_dsa_model.py": "ab413a6fa47cebbe20343dbbdada0bd7",
+  "longcat2_pipeline.py": "8b5885a2e265ec31564a7990eed8b022",
+  "mimo_v2_alias.py": "2ff38dc53fde4171f7e7f207ab1c2e7c",
+  "minimax_m3_alias.py": "323029f936a5c333019e93d69a794dff",
+  "minimax_m3_model.py": "d6c6d5def7827485479578344ba298cb",
+  "opt_batch_gen.py": "b33414fd4f1bc2d88e28d3164baeaa93",
+  "pipeline_split_coverage.py": "bda0b9872fa3f1faba1b0beb0bd32e7a",
+  "standard_yarn_rope.py": "ffcc5fee24c9300d40dedb565a0e3758"
+ }
+}

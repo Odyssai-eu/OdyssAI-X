@@ -9,6 +9,7 @@
 #   ~/mlx-cluster/auto_parallel.py     # helper for tensor parallel
 #   ~/mlx-cluster/exo_stubs.py         # backport compatibility
 #   ~/mlx-cluster/patches/             # per-model patches loaded at boot
+#   ~/mlx-cluster/odyssai-x            # node commands: `odyssai-x doctor` (#81)
 #
 # plus, inside the venv's site-packages/mlx_lm/models/, the custom and vendored
 # architecture modules from scripts/mlx_models/ (step 4, via
@@ -113,6 +114,9 @@ scp $SSH_OPTS -q \
   "$REPO_ROOT/scripts/inference_pipe.py" \
   "$REPO_ROOT/scripts/persistence.py" \
   "$REPO_ROOT/requirements-node.txt" \
+  "$REPO_ROOT/scripts/doctor_node.py" \
+  "$REPO_ROOT/scripts/doctor-manifest.json" \
+  "$REPO_ROOT/scripts/odyssai-x" \
   "$NODE:$REMOTE_DIR/"
 
 # Patches directory (per-model fixes loaded at runner boot). The files are
@@ -185,6 +189,12 @@ ssh $SSH_OPTS "$NODE" "command -v python3.12 >/dev/null 2>&1 || [ -x /opt/homebr
 if ! "$REPO_ROOT/scripts/install-mlx-vlm.sh" "$NODE"; then
   echo "  ⚠ mlx-vlm install failed on $NODE — LM serving works, but VLM (vision_config) models will not load until it's fixed." >&2
 fi
+
+# Doctor (#81): read-only report of what this node still lacks (RDMA, wired
+# limit, pins…). Informational here: a WARN or FAIL does not undo the install.
+echo
+echo "Doctor on $NODE:"
+ssh $SSH_OPTS "$NODE" "$REMOTE_DIR/odyssai-x doctor --models-dir $MODELS_DIR" || true
 
 echo
 echo "✓ $NODE bootstrapped."

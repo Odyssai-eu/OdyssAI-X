@@ -1,0 +1,43 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://odyssai.eu/schemas/doctor.schema.json",
+  "title": "odyssai-x doctor report",
+  "description": "Output of `odyssai-x doctor --json` (mode node) and of GET /admin/doctor (mode cluster). One row per check; exit is the worst status: 0 OK, 1 WARN, 2 FAIL.",
+  "type": "object",
+  "required": ["schema", "mode", "checks", "summary", "exit"],
+  "additionalProperties": false,
+  "properties": {
+    "schema": {"const": 1},
+    "mode": {"enum": ["node", "cluster"]},
+    "host": {"type": "string", "description": "node mode: the node's short hostname"},
+    "cluster": {"type": "string", "description": "cluster mode: the cluster id"},
+    "elapsed_s": {"type": "number", "minimum": 0},
+    "checks": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["check", "status", "message"],
+        "additionalProperties": false,
+        "properties": {
+          "check": {"type": "string", "pattern": "^[a-z][a-z0-9-]*$"},
+          "status": {"enum": ["OK", "WARN", "FAIL"]},
+          "host": {"type": "string", "description": "cluster mode: the node the row is about"},
+          "subject": {"type": "string", "description": "device, edge or file the row names, empty if none"},
+          "message": {"type": "string"},
+          "fix": {"type": "string", "description": "one sentence; empty on OK"}
+        }
+      }
+    },
+    "summary": {
+      "type": "object",
+      "required": ["ok", "warn", "fail"],
+      "additionalProperties": false,
+      "properties": {
+        "ok": {"type": "integer", "minimum": 0},
+        "warn": {"type": "integer", "minimum": 0},
+        "fail": {"type": "integer", "minimum": 0}
+      }
+    },
+    "exit": {"enum": [0, 1, 2]}
+  }
+}
