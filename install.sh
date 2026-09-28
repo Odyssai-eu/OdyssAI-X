@@ -271,10 +271,8 @@ XML
   if [ "$CHANGED" = 0 ]; then say "already up to date"; fi
   say "total $(( $(date +%s) - T0 ))s"
   say ""
-  say "Next: add this node to your cluster topology (on the orchestrator):"
-  say "    - host: $(hostname -s)"
-  say "      ssh: $(id -un)@$(hostname -s).local"
-  say "      models_dir: $MODELS_DIR"
+  say "Next: add this node to a pool of your topology (~/.odysseus/topology.yaml on the server):"
+  say "    - {rank: <n>, id: $(hostname -s), ssh: $(id -un)@$(hostname -s).local, models_dir: $MODELS_DIR}"
   say "Check it again any time: $DIR/odyssai-x doctor"
   if [ "$RDMA_OS" = 1 ] && ! rdma_ctl status 2>/dev/null | grep -q enabled; then
     say "RDMA over Thunderbolt: enable it once from recoveryOS (\`rdma_ctl enable\`), then run scripts/rdma-onboard.sh as root."
