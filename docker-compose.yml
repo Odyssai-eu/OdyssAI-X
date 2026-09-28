@@ -4,6 +4,13 @@ services:
     image: odyssai-odysseus:latest
     container_name: odyssai-odysseus
     restart: unless-stopped
+    # #93: the engine's shutdown stops runners gracefully (soft stop, SIGTERM,
+    # then a remote pkill — up to ~90 s in the lifespan). The container ran with
+    # StopTimeout=1 s (checked on .39 2026-09-28): Docker SIGKILLed it before the
+    # remote kill, leaving runner.py orphans holding hundreds of GB wired.
+    # Must exceed the lifespan's 90 s. Applies at the next `up -d --force-recreate`;
+    # until then, restart with `docker restart -t 100`.
+    stop_grace_period: 100s
     # Cap the json-file log: the access-log line per canary/status poll grows
     # it to tens of millions of lines in days, which makes `docker logs
     # --since` unusable for post-mortem (2026-09-02: 22M lines / the GLM crash

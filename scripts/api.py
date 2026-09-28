@@ -226,7 +226,12 @@ COORDINATOR_RANK = 0
 REMOTE_CLUSTER_DIR = env_get("REMOTE_CLUSTER_DIR", "$HOME/mlx-cluster").rstrip("/")
 RUNNER_REMOTE = env_get("RUNNER_REMOTE", f"{REMOTE_CLUSTER_DIR}/runner.py")
 PYTHON_REMOTE = env_get("PYTHON_REMOTE", f"{REMOTE_CLUSTER_DIR}/.venv/bin/python")
-RUNNER_MATCH_PATTERN = env_get("RUNNER_MATCH_PATTERN", "mlx-cluster/runner.py")
+# Bracketed first letter (#93): the regex still matches "mlx-cluster/runner.py",
+# but the literal text "[m]lx-cluster/…" in a sweep shell's own command line does
+# not — so two sweeps running in parallel on a shared node no longer pkill each
+# other's shell (reproduced on max-64 2026-09-28: the second sweep printed
+# nothing, the "(no output)" of the 2026-09-26 boot).
+RUNNER_MATCH_PATTERN = env_get("RUNNER_MATCH_PATTERN", "[m]lx-cluster/runner.py")
 # Distributed VLM runner (vlm_runner.py, ring/TCP tensor-parallel mlx-vlm).
 # Own venv (mlx-vlm + torch, py3.12 — NOT the text cluster venv) and own
 # pkill pattern, disjoint from both runner.py and the untouchable prod
@@ -234,7 +239,7 @@ RUNNER_MATCH_PATTERN = env_get("RUNNER_MATCH_PATTERN", "mlx-cluster/runner.py")
 # only activates with VLM_DISTRIBUTED_ENABLED=1 (default off = prod-safe).
 VLM_RUNNER_REMOTE = env_get("VLM_RUNNER_REMOTE", f"{REMOTE_CLUSTER_DIR}/vlm_runner.py")
 VLM_PYTHON_REMOTE = env_get("VLM_PYTHON_REMOTE", "$HOME/.venvs/mlx-vlm/bin/python")
-VLM_RUNNER_MATCH_PATTERN = env_get("VLM_RUNNER_MATCH_PATTERN", "mlx-cluster/vlm_runner.py")
+VLM_RUNNER_MATCH_PATTERN = env_get("VLM_RUNNER_MATCH_PATTERN", "[m]lx-cluster/vlm_runner.py")
 VLM_DISTRIBUTED_ENABLED = env_get("VLM_DISTRIBUTED_ENABLED", "0") == "1"
 # #78 — the ONLY model types vlm_runner.py knows how to split across nodes:
 # tensor-parallel = its in-repo MiniMax-M3 sharder (replicated MSA indexer),
@@ -2717,9 +2722,17 @@ def _sweep_orphan_runners(cluster_id: str,
                 except Exception:
                     pass
             wired_warn = bool(wired_bytes and wired_bytes > WIRED_WARN_THRESHOLD)
+            # No WIRED_BYTES line = the remote shell died or ssh failed before
+            # phase 2: the node's state is UNKNOWN, not clean (#93). Say so, with
+            # the rc and stderr that used to be thrown away.
+            complete = wired_bytes is not None
+            if not complete:
+                err = (r.stderr or "").strip().replace("\n", " | ")[:200]
+                kill_result = f"incomplete (rc={r.returncode}{', ' + err if err else ''})"
             return {
                 "host": host,
-                "ok": r.returncode == 0,
+                "ok": r.returncode == 0 and complete,
+                "complete": complete,
                 "result": kill_result,
                 "rc": r.returncode,
                 "wired_bytes": wired_bytes,
@@ -2727,9 +2740,9 @@ def _sweep_orphan_runners(cluster_id: str,
                 "wired_warn": wired_warn,
             }
         except subprocess.TimeoutExpired:
-            return {"host": host, "ok": False, "result": "ssh timeout"}
+            return {"host": host, "ok": False, "complete": False, "result": "ssh timeout"}
         except Exception as e:
-            return {"host": host, "ok": False, "result": f"error: {e}"}
+            return {"host": host, "ok": False, "complete": False, "result": f"error: {e}"}
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=len(nodes)) as pool:
         results = list(pool.map(_run_one, nodes))
@@ -6474,6 +6487,16 @@ async def lifespan(app: FastAPI):
             sys.stderr.write(f"[api] orphan sweep ({_cid}) failed: {_res}\n")
             continue
         for _entry in (_res or {}).get("swept") or []:
+            if _entry.get("complete") is False:
+                # #93: sweep never reached its wired probe on this node — its
+                # state is unknown (an orphan may still hold the RAM). Do not
+                # restore onto it; the desired state is kept for a later reload.
+                _leaked_hosts.add(_entry.get("host"))
+                sys.stderr.write(
+                    f"[api] restore guard: sweep on {_entry.get('host')} ({_cid}) "
+                    f"incomplete — {_entry.get('result')}; pools on this node will "
+                    f"NOT be restored until it is checked\n")
+                continue
             _wgb = _entry.get("wired_gb")
             if _wgb is not None and _wgb > _restore_wired_guard_gb:
                 _leaked_hosts.add(_entry.get("host"))
@@ -7493,7 +7516,7 @@ def _initial_default_config() -> Optional[dict]:
 #   major (1.7.2 → 2.0.0) — breaking API or topology change
 #
 # Use `./scripts/bump-version.sh patch|minor|major` to bump + auto-commit.
-APP_VERSION = "1.53.7"
+APP_VERSION = "1.53.8"
 
 app = FastAPI(
     title="OdyssAI-X (odyssai.eu)",
@@ -14322,6 +14345,48 @@ async def _wait_nodes_up(cluster_id: str, timeout_s: int = 420,
     return False
 
 
+async def _wait_models_readable(cluster_id: str, timeout_s: float = 180.0,
+                                every_s: float = 5.0) -> bool:
+    """Poll until every model of the cluster's desired state has a non-empty
+    config.json on each of its target nodes (the external models volume mounts
+    after ssh is up). Returns False on timeout — the caller restores anyway and
+    the normal per-pool failure is logged."""
+    try:
+        entries = [e for e in load_cluster_state_v2(cluster_id) if isinstance(e, dict) and e.get("model")]
+    except Exception:
+        return True
+    checks: list[tuple[str, str]] = []
+    for e in entries:
+        idx = e.get("node_indices") or list(range(int(e.get("nodes") or 1)))
+        try:
+            topo = build_topology_from_indices(cluster_id, idx)
+        except Exception:
+            continue
+        for n in topo:
+            checks.append((n["ssh"], e["model"].rstrip("/") + "/config.json"))
+    checks = sorted(set(checks))
+    if not checks:
+        return True
+    deadline = time.time() + timeout_s
+    while True:
+        missing = []
+        for ssh, path in checks:
+            try:
+                rc, out, _ = await asyncio.to_thread(
+                    _ssh_exec, ssh, f"test -s {shlex.quote(path)} && echo ok || echo missing", 10)
+            except Exception:
+                out = "missing"
+            if (out or "").strip() != "ok":
+                missing.append(f"{ssh}:{path}")
+        if not missing:
+            return True
+        if time.time() > deadline:
+            sys.stderr.write(f"[api] reboot-reload ({cluster_id}): models still unreadable after "
+                             f"{timeout_s:.0f}s ({', '.join(missing[:3])}) — restoring anyway\n")
+            return False
+        await asyncio.sleep(every_s)
+
+
 async def _reboot_reload_after(cluster_id: str) -> None:
     """Background task scheduled by reboot-all when reload_on_reboot is on: wait
     for the cluster's nodes to come back SSH-up, sweep any orphan runners, then
@@ -14348,6 +14413,10 @@ async def _reboot_reload_after(cluster_id: str) -> None:
             await asyncio.to_thread(_sweep_orphan_runners, cluster_id)
         except Exception:
             pass
+        # #93: ssh answers before the external models volume is mounted; the
+        # restore then failed on every pool with "config.json missing"
+        # (2026-09-26, the volume came up seconds later). Wait for it.
+        await _wait_models_readable(cluster_id)
         restored = await _restore_cluster_pools(cluster_id)
         sys.stderr.write(
             f"[api] reboot-reload ({cluster_id}): restored "
