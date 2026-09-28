@@ -7516,7 +7516,7 @@ def _initial_default_config() -> Optional[dict]:
 #   major (1.7.2 → 2.0.0) — breaking API or topology change
 #
 # Use `./scripts/bump-version.sh patch|minor|major` to bump + auto-commit.
-APP_VERSION = "1.53.9"
+APP_VERSION = "1.53.10"
 
 app = FastAPI(
     title="OdyssAI-X (odyssai.eu)",
@@ -7988,8 +7988,8 @@ async def _ssh_capture(ssh_target: str, remote_cmd: str,
     return proc.returncode or 0, (stdout or b"").decode("utf-8", "ignore")
 
 
-async def _validate_rdma_edges(nodes: list[dict],
-                               timeout: float = 10.0) -> list[str]:
+async def _probe_rdma_edges(nodes: list[dict],
+                            timeout: float = 10.0) -> list[dict]:
     """Pre-flight every RDMA edge of a jaccl topology before spawning ranks.
 
     Measured on the Ultras (2026-09-18, scripts/jaccl/rdma_probe.c and
@@ -8048,7 +8048,7 @@ async def _validate_rdma_edges(nodes: list[dict],
             return
         info[n["rank"]] = parsed
     await asyncio.gather(*[_round1(n) for n in ranked])
-    problems: list[str] = []
+    problems: list[dict] = []
     pingable: dict[int, list[tuple[str, str, int, str]]] = {}   # rank → [(dev, peer_ip, peer_rank, peer_dev)]
     for n in ranked:
         r = n["rank"]
@@ -8063,11 +8063,13 @@ async def _validate_rdma_edges(nodes: list[dict],
             peer_dev = peer_row[r] if r < len(peer_row) else None
             edge = f"{_host(n)} {dev} → {_host(peer)} {peer_dev or '?'}"
             st, ip = info[r].get(dev, ("NO_DEVICE", "none"))
+            ends = {"a": (_host(n), dev), "b": (_host(peer), peer_dev or "?")}
             if st != "PORT_ACTIVE":
-                problems.append(f"{edge}: {st}")
+                problems.append({"text": f"{edge}: {st}", "kind": "port", **ends})
                 continue
             if ip == "none":
-                problems.append(f"{edge}: no link-local (169.254.x.x) alias on {dev[len('rdma_'):]}")
+                problems.append({"text": f"{edge}: no link-local (169.254.x.x) alias on {dev[len('rdma_'):]}",
+                                 "kind": "alias", **ends})
                 continue
             pst, pip = info.get(peer.get("rank"), {}).get(peer_dev or "", ("?", "none"))
             if pst == "PORT_ACTIVE" and pip != "none":
@@ -8091,11 +8093,246 @@ async def _validate_rdma_edges(nodes: list[dict],
         status = dict(line.split()[:2] for line in out.splitlines() if len(line.split()) >= 2)
         for dev, ip, j, peer_dev in edges:
             if status.get(dev) != "ok":
-                problems.append(
-                    f"{_host(n)} {dev} → {_host(ranked[j])} {peer_dev}: peer {ip} unreachable "
-                    f"on {dev[len('rdma_'):]} (wrong cable, or the peer's link-local alias is gone)")
+                problems.append({
+                    "text": f"{_host(n)} {dev} → {_host(ranked[j])} {peer_dev}: peer {ip} unreachable "
+                            f"on {dev[len('rdma_'):]} (wrong cable, or the peer's link-local alias is gone)",
+                    "kind": "unreachable", "a": (_host(n), dev), "b": (_host(ranked[j]), peer_dev)})
     await asyncio.gather(*[_round2(n) for n in ranked])
     return problems
+
+
+async def _validate_rdma_edges(nodes: list[dict],
+                               timeout: float = 10.0) -> list[str]:
+    """Bad RDMA edges as human-readable strings (load preflight, link watch);
+    see `_probe_rdma_edges`."""
+    return [p["text"] for p in await _probe_rdma_edges(nodes, timeout)]
+
+
+# ── Doctor, cluster mode (#81) ────────────────────────────────────────────
+# `GET /admin/doctor`: the node checks of scripts/doctor_node.py, piped over SSH
+# to every node (so a node never answers with a stale copy of the checks), plus
+# the RDMA edge checks, merged into one report. Read-only: it never touches
+# the link watch's state, never sweeps, never loads. Bounded: 10 s per node,
+# 5 s per edge round, one re-check of a bad edge before calling it FAIL (a
+# node under RDMA load can briefly report no device, see _probe_rdma_edges).
+DOCTOR_NODE_FILE = Path(os.environ.get("DOCTOR_NODE_FILE", _HERE / "doctor_node.py"))
+DOCTOR_MANIFEST_FILE = Path(os.environ.get("DOCTOR_MANIFEST_FILE", _HERE / "doctor-manifest.json"))
+DOCTOR_NODE_TIMEOUT_S = 10.0
+DOCTOR_EDGE_TIMEOUT_S = 5.0
+DOCTOR_RANK = {"OK": 0, "WARN": 1, "FAIL": 2}
+_DOCTOR_KINDS_SKIPPED = ("telemak", "decision")   # no MLX runner venv on their nodes
+
+
+def _doctor_row(check: str, status: str, message: str, fix: str = "",
+                subject: str = "", host: str = "") -> dict:
+    return {"check": check, "status": status, "host": host, "subject": subject,
+            "message": message, "fix": fix}
+
+
+async def _ssh_capture_stdin(ssh_target: str, remote_cmd: str, data: bytes,
+                             timeout: float) -> tuple[int, str, str]:
+    """`_ssh_capture` with `data` on the remote command's stdin."""
+    proc = await asyncio.create_subprocess_exec(
+        "ssh", "-o", "ConnectTimeout=4", "-o", "BatchMode=yes", ssh_target, remote_cmd,
+        stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE)
+    try:
+        out, err = await asyncio.wait_for(proc.communicate(data), timeout=timeout)
+    except asyncio.TimeoutError:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+        raise
+    return proc.returncode or 0, (out or b"").decode("utf-8", "ignore"), \
+        (err or b"").decode("utf-8", "ignore")
+
+
+def _doctor_remote_cmd(manifest_json: str, models_dir: Optional[str]) -> str:
+    """Remote shell for one node: the venv python reads doctor_node.py on stdin.
+    models_dir may be `$HOME/...` (expands on the node), so it is double-quoted
+    after refusing characters that could leave the quotes."""
+    md = ""
+    if models_dir and not re.search(r'["`\\]', models_dir):
+        md = f' --models-dir "{models_dir}"'
+    return ('PY="$HOME/mlx-cluster/.venv/bin/python"; '
+            '[ -x "$PY" ] || { echo ODYSSAI_NO_VENV; exit 0; }; '
+            f'exec "$PY" - --json --manifest-json {shlex.quote(manifest_json)}{md}')
+
+
+async def _doctor_node(node: dict, script: bytes, manifest_json: str,
+                       models_dir: Optional[str]) -> list[dict]:
+    host = node.get("host") or node.get("ssh") or "?"
+    target = node.get("ssh") or (f"{node.get('user', 'admin')}@{node['ip']}" if node.get("ip") else None)
+    if not target:
+        return [_doctor_row("ssh", "FAIL", "no ssh target in the cluster definition",
+                            "Add `ssh: user@host` to this node in the topology.", host=host)]
+    try:
+        rc, out, err = await _ssh_capture_stdin(
+            target, _doctor_remote_cmd(manifest_json, models_dir), script, DOCTOR_NODE_TIMEOUT_S)
+    except asyncio.TimeoutError:
+        return [_doctor_row("ssh", "FAIL", f"no answer within {DOCTOR_NODE_TIMEOUT_S:g} s",
+                            "Check that the node is powered on and on the network.", host=host)]
+    except Exception as e:
+        return [_doctor_row("ssh", "FAIL", f"ssh could not start ({e})", host=host)]
+    if rc == 255:
+        tail = (err.strip().splitlines() or ["unreachable"])[-1][:160]
+        return [_doctor_row("ssh", "FAIL", f"unreachable over SSH: {tail}",
+                            "Check power, network and the SSH key for this node.", host=host)]
+    if "ODYSSAI_NO_VENV" in out:
+        return [_doctor_row("python", "FAIL", "no venv python at ~/mlx-cluster/.venv",
+                            "Run the installer on this node.", host=host)]
+    try:
+        rep = json.loads(out)
+    except ValueError:
+        tail = (err.strip().splitlines() or out.strip().splitlines() or ["no output"])[-1][:160]
+        return [_doctor_row("doctor", "FAIL", f"the node checks did not run: {tail}",
+                            "Run `~/mlx-cluster/odyssai-x doctor` on the node to see why.", host=host)]
+    rows = []
+    for r in rep.get("checks") or []:
+        r = {k: r.get(k, "") for k in ("check", "status", "subject", "message", "fix")}
+        r["host"] = host
+        rows.append(r)
+    return rows
+
+
+def _doctor_edge_key(p: dict) -> frozenset:
+    return frozenset({tuple(p["a"]), tuple(p["b"])})
+
+
+_DOCTOR_EDGE_FIX = {
+    "port": "Check the Thunderbolt cable on {dev} (port down) at both ends.",
+    "alias": "Re-run the network setup on {host} (scripts/rdma-onboard.sh --check tells what is off).",
+    "unreachable": "Wrong cable or the peer's link-local alias is gone: check the cable on {dev}.",
+}
+
+
+async def _doctor_edges(topo: list[dict]) -> list[dict]:
+    """One row per physical cable: the two ends of a bad cable are merged, and a
+    bad cable is re-checked once before it is reported FAIL."""
+    wired = [n for n in topo if any(n.get("rdma") or [])]
+    if len(wired) < 2:
+        return []
+    n_cables = sum(1 for n in topo for d in (n.get("rdma") or []) if d) // 2
+    try:
+        first = await _probe_rdma_edges(topo, timeout=DOCTOR_EDGE_TIMEOUT_S)
+    except Exception as e:
+        return [_doctor_row("rdma-edge", "WARN", f"edge check skipped ({e})")]
+    if not first:
+        return [_doctor_row("rdma-edge", "OK", f"{n_cables} Thunderbolt links usable")]
+    rechecked = True
+    try:
+        second = await _probe_rdma_edges(topo, timeout=DOCTOR_EDGE_TIMEOUT_S)
+        still = {_doctor_edge_key(p) for p in second}
+    except Exception:
+        rechecked, still = False, None
+    cables: dict = {}
+    for p in first:
+        k = _doctor_edge_key(p)
+        if still is not None and k not in still:
+            continue                    # transient: gone on the re-check
+        cables.setdefault(k, p)
+    rows = []
+    for p in cables.values():
+        (ha, da), (hb, db) = p["a"], p["b"]
+        en = da[len("rdma_"):] if da.startswith("rdma_") else da
+        rows.append(_doctor_row(
+            "rdma-edge", "FAIL", p["text"] + ("" if rechecked else " (not re-checked)"),
+            _DOCTOR_EDGE_FIX.get(p["kind"], "").format(dev=f"{ha} {en}", host=ha),
+            subject=f"{ha} {da} ↔ {hb} {db}"))
+    if not rows:
+        rows.append(_doctor_row("rdma-edge", "OK",
+                                f"{n_cables} Thunderbolt links usable (a transient fault cleared on re-check)"))
+    return rows
+
+
+def _doctor_cross_node(rows: list[dict]) -> list[dict]:
+    """What only shows when nodes are compared: different macOS builds."""
+    builds: dict[str, list[str]] = {}
+    for r in rows:
+        m = re.search(r"\(([0-9A-Z]+)\)$", r.get("message") or "") if r["check"] == "macos" else None
+        if m:
+            builds.setdefault(m.group(1), []).append(r["host"])
+    if len(builds) > 1:
+        detail = "; ".join(f"{b}: {', '.join(sorted(h))}" for b, h in sorted(builds.items()))
+        return [_doctor_row("macos-build", "WARN", f"nodes run different macOS builds ({detail})",
+                            "Align the nodes on one macOS build (RDMA behaviour changes between builds).")]
+    return []
+
+
+def _doctor_render(rows: list[dict]) -> str:
+    out = []
+    for r in rows:
+        who = f" {r['host']}" if r.get("host") else ""
+        subj = f" {r['subject']}" if r.get("subject") else ""
+        line = f"{r['status']:<4}{who} {r['check']}{subj}: {r['message']}"
+        if r["status"] != "OK" and r.get("fix"):
+            line += f" — {r['fix']}"
+        out.append(line)
+    return "\n".join(out)
+
+
+async def run_doctor(cluster: Optional[str] = None) -> dict:
+    t0 = time.time()
+    if cluster:
+        if not cluster_exists(cluster):
+            raise HTTPException(404, f"unknown cluster {cluster}")
+        kind = get_cluster_def(cluster).get("kind")
+        if kind in _DOCTOR_KINDS_SKIPPED:
+            raise HTTPException(400, f"doctor checks MLX runner nodes; '{cluster}' is a {kind} cluster")
+        clusters = [cluster]
+    else:
+        clusters = [c for c in active_cluster_ids()
+                    if get_cluster_def(c).get("kind") not in _DOCTOR_KINDS_SKIPPED
+                    and get_cluster_def(c).get("enabled", True) is not False]
+    try:
+        script = DOCTOR_NODE_FILE.read_bytes()
+        manifest_json = json.dumps(json.loads(DOCTOR_MANIFEST_FILE.read_text()), separators=(",", ":"))
+    except (OSError, ValueError) as e:
+        raise HTTPException(500, f"doctor files missing in the engine ({e}): "
+                                 f"doctor_node.py and doctor-manifest.json go next to api.py")
+    nodes: dict[str, tuple[dict, Optional[str]]] = {}
+    topos = []
+    for cid in clusters:
+        cd = get_cluster_def(cid)
+        for n in cd.get("nodes") or []:
+            key = n.get("ssh") or n.get("host")
+            if key and key not in nodes:
+                nodes[key] = (n, n.get("models_dir") or cd.get("models_dir"))
+        try:
+            topos.append(build_topology(cid))
+        except Exception:
+            pass
+    node_rows, edge_rows = await asyncio.gather(
+        asyncio.gather(*[_doctor_node(n, script, manifest_json, md) for n, md in nodes.values()]),
+        asyncio.gather(*[_doctor_edges(t) for t in topos]))
+    rows = [r for rs in node_rows for r in rs]
+    seen_edges: set = set()
+    for rs in edge_rows:
+        for r in rs:
+            k = (r["status"], r["subject"], r["message"])
+            if k not in seen_edges:
+                seen_edges.add(k)
+                rows.append(r)
+    rows += _doctor_cross_node(rows)
+    counts = {s.lower(): sum(r["status"] == s for r in rows) for s in DOCTOR_RANK}
+    return {"schema": 1, "mode": "cluster", "cluster": cluster or "all",
+            "elapsed_s": round(time.time() - t0, 2), "checks": rows, "summary": counts,
+            "exit": max((DOCTOR_RANK[r["status"]] for r in rows), default=0)}
+
+
+@app.get("/admin/doctor")
+async def admin_doctor(cluster: Optional[str] = None, format: str = "json"):
+    """Cluster doctor (#81): every node's readiness checks plus the RDMA links,
+    one row each, OK / WARN / FAIL with the fix. `?cluster=<id>` limits it to
+    one cluster (default: every enabled MLX cluster). `?format=text` returns
+    the lines `odyssai-x doctor --engine` prints. The exit code (0/1/2) is
+    in the X-Doctor-Exit header in both formats. Schema: docs/doctor.schema.json."""
+    rep = await run_doctor(cluster)
+    hdr = {"X-Doctor-Exit": str(rep["exit"])}
+    if format == "text":
+        return PlainTextResponse(_doctor_render(rep["checks"]) + "\n", headers=hdr)
+    return JSONResponse(rep, headers=hdr)
 
 
 def _attribute_jaccl_cause(deaths: list[tuple[int, int, str]]) -> Optional[str]:

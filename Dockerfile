@@ -20,6 +20,11 @@ COPY scripts/api.py /app/api.py
 COPY scripts/topology.py /app/topology.py
 COPY scripts/persistence.py /app/persistence.py
 COPY scripts/dashboard.html /app/dashboard.html
+# Load gate (imported by api.py) and the doctor's node checks (#81), which the
+# engine pipes to every node over SSH.
+COPY scripts/preflight.py /app/preflight.py
+COPY scripts/doctor_node.py /app/doctor_node.py
+COPY scripts/doctor-manifest.json /app/doctor-manifest.json
 # Brand logo — cyclops eye from the Odyssey
 COPY logo/odysseus.png /app/odysseus.png
 

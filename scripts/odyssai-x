@@ -3,6 +3,9 @@
 # ~/mlx-cluster/ (bootstrap-node.sh, the installer).
 #
 #   odyssai-x doctor [--json] [--models-dir DIR]   is this node ready? (read-only)
+#   odyssai-x doctor --engine URL [--cluster ID] [--json]
+#                                                  every node + RDMA link, via the
+#                                                  engine's GET /admin/doctor
 #
 # Named odyssai-x, not odyssai: `odyssai` is odyssai-launch's command (the
 # agent launcher on the workstation).
@@ -13,11 +16,42 @@
 DIR="$(cd "$(dirname "$0")" && pwd)"
 PY="${ODYSSAI_X_PYTHON:-$HOME/mlx-cluster/.venv/bin/python}"
 
-usage() { echo "usage: odyssai-x doctor [--json] [--models-dir DIR]" >&2; }
+usage() {
+  echo "usage: odyssai-x doctor [--json] [--models-dir DIR]" >&2
+  echo "       odyssai-x doctor --engine URL [--cluster ID] [--json]" >&2
+}
+
+# Cluster mode: the engine runs the checks on every node; this only asks for
+# the report (curl, no Python). Exit code from the X-Doctor-Exit header.
+engine_doctor() {
+  url="" cluster="" fmt="text"
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --engine) url="${2:-}"; shift 2 ;;
+      --cluster) cluster="${2:-}"; shift 2 ;;
+      --json) fmt="json"; shift ;;
+      *) usage; exit 64 ;;
+    esac
+  done
+  [ -n "$url" ] || { usage; exit 64; }
+  q="format=$fmt"; [ -n "$cluster" ] && q="$q&cluster=$cluster"
+  auth=""; [ -n "${ODYSSAI_X_ADMIN_TOKEN:-}" ] && auth="Authorization: Bearer $ODYSSAI_X_ADMIN_TOKEN"
+  hdr="$(mktemp)"
+  if ! curl -sS --max-time 30 -D "$hdr" ${auth:+-H "$auth"} "${url%/}/admin/doctor?$q"; then
+    rm -f "$hdr"; echo "FAIL engine: no answer from $url" >&2; exit 2
+  fi
+  [ "$fmt" = json ] && echo
+  code="$(awk -F': *' 'tolower($1)=="x-doctor-exit"{print $2+0}' "$hdr" | tail -1)"
+  status="$(awk 'NR==1{print $2}' "$hdr")"
+  rm -f "$hdr"
+  [ "$status" = 200 ] || exit 2
+  exit "${code:-2}"
+}
 
 case "${1:-}" in
   doctor)
     shift
+    case " $* " in *" --engine "*) engine_doctor "$@" ;; esac
     if [ ! -x "$PY" ]; then
       msg="no venv python at $PY"
       fix="run the installer (it creates ~/mlx-cluster/.venv)"
