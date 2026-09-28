@@ -7516,7 +7516,7 @@ def _initial_default_config() -> Optional[dict]:
 #   major (1.7.2 → 2.0.0) — breaking API or topology change
 #
 # Use `./scripts/bump-version.sh patch|minor|major` to bump + auto-commit.
-APP_VERSION = "1.53.8"
+APP_VERSION = "1.53.9"
 
 app = FastAPI(
     title="OdyssAI-X (odyssai.eu)",
@@ -7611,77 +7611,102 @@ else:
     sys.stderr.write(_ADMIN_OPEN_WARNING)
 
 
-@app.middleware("http")
-async def _admin_token_middleware(request: Request, call_next):
-    path = request.url.path
+class _AdminTokenMiddleware:
+    """Admin bearer auth + crew last_seen, as a plain ASGI middleware.
 
-    # Extract bearer once (used by multiple branches below).
-    bearer = None
-    auth = request.headers.get("authorization", "")
-    if auth.lower().startswith("bearer "):
-        bearer = auth[7:].strip()
-    if not bearer:
-        bearer = request.query_params.get("token")
+    It was `@app.middleware("http")` (Starlette's BaseHTTPMiddleware) until 1.53.9.
+    That wrapper hides the client's disconnect from the route: behind it
+    `request.is_disconnected()` never turned true (measured in the prod container,
+    Starlette 1.0.1: a bare route saw the disconnect after 0.5 s, the wrapped one
+    never). Every cancel-on-disconnect path was blind: decision requests a bench
+    judge had abandoned kept the node busy, non-stream chat kept generating.
+    A plain ASGI middleware passes `receive` through untouched."""
 
-    # ── Per-route auth rules ──────────────────────────────────────────────
-    # Public always (no auth check):
-    public_always = (
-        path == "/admin/discovery/state"        # watcher poll
-    )
-    # Public while the discovery gate is open, OR with a valid pre-shared enroll
-    # secret (CodeOS clients: no operator window). Companion window flow unaffected.
-    if path == "/admin/pair" and (get_discovery_state().get("active") or _valid_enroll_secret(request)):
-        public_always = True
-    # /admin/crew/self accepts a crew bearer (not admin):
-    if path == "/admin/crew/self" and request.method == "DELETE" and bearer:
-        if find_crew_by_token(bearer):
-            return await call_next(request)
-        # fall through to admin-token branch (admin can also self-revoke
-        # any crew via /admin/crew/{id} — not /self — so this is rejected
-        # unless admin token is provided which is silly but not harmful).
+    def __init__(self, app):
+        self.app = app
 
-    if not ADMIN_TOKEN:
-        # Dev mode — admin routes open. We still update crew last_seen below.
-        response = await call_next(request)
-        _maybe_update_crew_last_seen(path, bearer, response)
-        return response
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            return await self.app(scope, receive, send)
+        request = Request(scope)           # headers and query only: the body stays with the route
+        path = request.url.path
 
-    if public_always:
-        return await call_next(request)
+        # Extract bearer once (used by multiple branches below).
+        bearer = None
+        auth = request.headers.get("authorization", "")
+        if auth.lower().startswith("bearer "):
+            bearer = auth[7:].strip()
+        if not bearer:
+            bearer = request.query_params.get("token")
 
-    if path.startswith("/admin/"):
-        if bearer != ADMIN_TOKEN:
-            return JSONResponse(
-                {"detail": "missing or invalid admin token"},
-                status_code=401,
-                headers={"WWW-Authenticate": "Bearer"},
-            )
-        return await call_next(request)
+        # ── Per-route auth rules ──────────────────────────────────────────
+        # Public always (no auth check):
+        public_always = (
+            path == "/admin/discovery/state"        # watcher poll
+        )
+        # Public while the discovery gate is open, OR with a valid pre-shared enroll
+        # secret (CodeOS clients: no operator window). Companion window flow unaffected.
+        if path == "/admin/pair" and (get_discovery_state().get("active") or _valid_enroll_secret(request)):
+            public_always = True
+        # /admin/crew/self accepts a crew bearer (not admin):
+        if path == "/admin/crew/self" and request.method == "DELETE" and bearer:
+            if find_crew_by_token(bearer):
+                return await self.app(scope, receive, send)
+            # fall through to admin-token branch (admin can also self-revoke
+            # any crew via /admin/crew/{id} — not /self — so this is rejected
+            # unless admin token is provided which is silly but not harmful).
 
-    # Not /admin/* — public route. Update crew last_seen if a crew bearer was sent.
-    response = await call_next(request)
-    _maybe_update_crew_last_seen(path, bearer, response)
-    return response
+        if not ADMIN_TOKEN:
+            # Dev mode — admin routes open. We still update crew last_seen below.
+            return await self.app(scope, receive, self._crew_send(path, bearer, send))
+
+        if public_always:
+            return await self.app(scope, receive, send)
+
+        if path.startswith("/admin/"):
+            if bearer != ADMIN_TOKEN:
+                return await JSONResponse(
+                    {"detail": "missing or invalid admin token"},
+                    status_code=401,
+                    headers={"WWW-Authenticate": "Bearer"},
+                )(scope, receive, send)
+            return await self.app(scope, receive, send)
+
+        # Not /admin/* — public route. Update crew last_seen if a crew bearer was sent.
+        return await self.app(scope, receive, self._crew_send(path, bearer, send))
+
+    @staticmethod
+    def _crew_send(path: str, bearer: Optional[str], send):
+        """`send` that runs the crew last_seen hook when the response starts (the
+        moment `call_next` used to return) and adds its header to the response."""
+        async def wrapped(message):
+            if message["type"] == "http.response.start":
+                if _maybe_update_crew_last_seen(path, bearer):
+                    message = dict(message)
+                    message["headers"] = list(message.get("headers") or []) + \
+                        [(b"x-odyssai-crew-revoked", b"true")]
+            await send(message)
+        return wrapped
 
 
-def _maybe_update_crew_last_seen(path: str, bearer: Optional[str], response) -> None:
+app.add_middleware(_AdminTokenMiddleware)
+
+
+def _maybe_update_crew_last_seen(path: str, bearer: Optional[str]) -> bool:
     """If the request carried a crew bearer on /v1/* or similar, bump the crew
-    member's last_seen and tag the response if the token has been revoked."""
+    member's last_seen. True when the token is unknown (revoked): the caller
+    tags the response so Companion can prompt a re-pair."""
     if not bearer or not path.startswith("/v1/"):
-        return
+        return False
     # Ignore admin token on /v1/* (works but isn't a crew member)
     if bearer == ADMIN_TOKEN:
-        return
+        return False
     entry = find_crew_by_token(bearer)
     if entry:
         update_crew_last_seen(entry["id"])
-    else:
-        # Companion sent something looking like a crew token but it's unknown.
-        # Tell it via response header so it can prompt re-pair.
-        try:
-            response.headers["x-odyssai-crew-revoked"] = "true"
-        except Exception:
-            pass
+        return False
+    # Companion sent something looking like a crew token but it's unknown.
+    return True
 
 
 # ──────────────────────────────────────────────────────────────────────────────
