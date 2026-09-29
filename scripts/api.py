@@ -7596,7 +7596,7 @@ def _initial_default_config() -> Optional[dict]:
 #   major (1.7.2 → 2.0.0) — breaking API or topology change
 #
 # Use `./scripts/bump-version.sh patch|minor|major` to bump + auto-commit.
-APP_VERSION = "1.55.0"
+APP_VERSION = "1.55.1"
 
 app = FastAPI(
     title="OdyssAI-X (odyssai.eu)",
@@ -16218,26 +16218,39 @@ async def admin_cluster_load(cluster_id: str, req: ArgoLoadRequest):
                     + ". Load it on ONE node (mlx_vlm.server) if it fits, or on a "
                       "`kind: replica` cluster (one full copy per node).")
             vlm_model_path = _vlm_resolve_model_path(req.model, base_dir)
-            async with get_admin_lock(cluster_id):
-                old = get_pool(cluster_id, alias)
-                if old is not None:
+            # Same loading-progress state as the single-node VL path below
+            # (2026-07-08 fix): without it /status reports `loading: null` for
+            # the whole distributed load and the pool appears at the end (seen
+            # on MiMo-V2.6-Pro, 4 nodes, 2026-09-29). Posted BEFORE the admin
+            # lock so a concurrent /status poll sees it immediately.
+            _vd_ssh = build_topology_from_indices(cluster_id, [node_indices[0]])[0]["ssh"]
+            _vd_size = await get_model_size_bytes(_vd_ssh, vlm_model_path)
+            _vd_est = estimate_load_s(req.model, _vd_size, cluster_id, len(node_indices))
+            _vd_state = _loading_state_for(cluster_id)
+            _begin_loading(_vd_state, req.model, len(node_indices), _vd_size, _vd_est)
+            try:
+                async with get_admin_lock(cluster_id):
+                    old = get_pool(cluster_id, alias)
+                    if old is not None:
+                        try:
+                            await old.stop()
+                        except Exception as e:
+                            sys.stderr.write(
+                                f"[api] stop of old pool '{alias}' failed: {e}\n")
+                        set_pool(cluster_id, alias, None)
+                    vdpool = VLMDistPool(
+                        model=vlm_model_path, cluster=cluster_id, alias=alias,
+                        node_indices=node_indices, shard_mode=_vd_mode,
+                        backend=req.backend,
+                    )
                     try:
-                        await old.stop()
-                    except Exception as e:
-                        sys.stderr.write(
-                            f"[api] stop of old pool '{alias}' failed: {e}\n")
-                    set_pool(cluster_id, alias, None)
-                vdpool = VLMDistPool(
-                    model=vlm_model_path, cluster=cluster_id, alias=alias,
-                    node_indices=node_indices, shard_mode=_vd_mode,
-                    backend=req.backend,
-                )
-                try:
-                    await vdpool.start()
-                except RuntimeError as e:
-                    raise HTTPException(500, f"{cluster_id} vlm-dist load failed: {e}")
-                set_pool(cluster_id, alias, vdpool)
-                save_cluster_state_v2(cluster_id)
+                        await vdpool.start()
+                    except RuntimeError as e:
+                        raise HTTPException(500, f"{cluster_id} vlm-dist load failed: {e}")
+                    set_pool(cluster_id, alias, vdpool)
+                    save_cluster_state_v2(cluster_id)
+            finally:
+                _end_loading(_vd_state)
             return {
                 "loaded": True,
                 "cluster": cluster_id,
