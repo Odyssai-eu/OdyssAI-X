@@ -7596,7 +7596,7 @@ def _initial_default_config() -> Optional[dict]:
 #   major (1.7.2 → 2.0.0) — breaking API or topology change
 #
 # Use `./scripts/bump-version.sh patch|minor|major` to bump + auto-commit.
-APP_VERSION = "1.54.1"
+APP_VERSION = "1.55.0"
 
 app = FastAPI(
     title="OdyssAI-X (odyssai.eu)",
