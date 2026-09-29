@@ -312,6 +312,14 @@ MODEL_SAMPLING_DEFAULTS: dict[str, dict] = {
         "repetition_penalty": 1.05,
         "repetition_context_size": 512,
     },
+    # Tencent Hy4-preview (hy_v4). generation_config.json: do_sample, temperature
+    # 0.9, top_p 1, top_k -1. Without an entry it ran greedy, the likely cause of
+    # the repetition after ~150 tokens seen in September. No repetition penalty:
+    # it would mask a collapse instead of fixing it.
+    "hy4": {
+        "temp": 0.9,
+        "top_p": 1.0,
+    },
 }
 
 
@@ -1759,6 +1767,8 @@ def shard_pipeline(model, group, num_layers):
       3. Even split (default — same shard size on every rank).
     """
     from auto_parallel import (pipeline_auto_parallel,
+                               align_bounds_to_full_indexer,
+                               misaligned_pipeline_starts,
                                compute_proportional_bounds as _compute_proportional_bounds)
     from exo_stubs import PipelineShardMetadata
 
@@ -1800,6 +1810,20 @@ def shard_pipeline(model, group, num_layers):
     if bounds is None:
         per = num_layers // size
         bounds = [0] + [per * i for i in range(1, size)] + [num_layers]
+    # DSA models with a shared top-k indexer: every rank must start on a "full"
+    # indexer layer (indices never cross ranks). Manual bounds are refused when
+    # misaligned; computed bounds are moved onto the nearest full layer.
+    indexer_types = getattr(getattr(model, "args", None), "indexer_types", None)
+    if indexer_types:
+        bad = misaligned_pipeline_starts(bounds, indexer_types)
+        if bad and split_source == "manual":
+            raise ValueError(
+                f"RUNNER_LAYER_BOUNDS={bounds_env!r}: ranks start on shared DSA layers "
+                f"{bad}; use {','.join(map(str, align_bounds_to_full_indexer(bounds, indexer_types)))}")
+        if bad:
+            aligned = align_bounds_to_full_indexer(bounds, indexer_types)
+            log(f"rank {rank} DSA-aligned bounds {bounds} -> {aligned}")
+            bounds = aligned
     start, end = bounds[rank], bounds[rank + 1]
     log(f"rank {rank} pipeline shard layers [{start}, {end}) split={split_source}")
     meta = PipelineShardMetadata(

@@ -287,8 +287,10 @@ class PipelineLastLayer(CustomMlxLayer):
                 # Contrat tuple SANS attn-residual (glm_moe_dsa : (h, topk_indices),
                 # topk possiblement None). Seul h est transporté ; la queue du tuple
                 # est rendue telle quelle à la boucle native du modèle. Les indices
-                # ne traversent JAMAIS les rangs : les couches 'shared' en tête du
-                # rang suivant retombent en dense (surensemble sûr du sparse).
+                # ne traversent JAMAIS les rangs : un rang ne doit donc jamais
+                # commencer sur une couche 'shared' (retomber en dense n'est PAS
+                # un surensemble sûr : le softmax change, la référence lève) ;
+                # les bornes sont alignées par align_bounds_to_full_indexer.
                 # Avant ce fix : extra.reshape sur None -> AttributeError, mort du
                 # rank-0 à chaque prefill multi-node GLM-5.3 (2026-08-29).
                 output = result[0]
@@ -480,6 +482,43 @@ def compute_proportional_bounds(num_layers, weights):
     if bounds[-1] != num_layers:
         bounds[-1] = num_layers
     return bounds
+
+
+def align_bounds_to_full_indexer(bounds, indexer_types):
+    """Move each internal pipeline boundary onto the nearest layer whose DSA
+    indexer is "full" (hy_v4, glm_moe_dsa, glm5_next: "shared" layers reuse the
+    previous full layer's top-k indices, which never cross ranks).
+
+    A rank starting on a shared layer has no indices past index_topk keys: the
+    reference raises there; the old wrappers fell back to dense attention, which
+    changes the output (hy_v4 bounds 0,22,41,60,78: layers 22-24 and 60 dense
+    past 2048 tokens, 2026-09-29). Full layers sit every 4 (0, 1, 5, 9, ...), so
+    a boundary moves by at most 2 layers.
+
+    Returns the aligned bounds; raises when no aligned split keeps every rank
+    non-empty. Bounds without indexer_types come back unchanged."""
+    if not indexer_types or len(bounds) <= 2:
+        return list(bounds)
+    n = bounds[-1]
+    full = [i for i, t in enumerate(indexer_types[:n]) if t == "full"]
+    out = [bounds[0]]
+    for k, b in enumerate(bounds[1:-1], start=1):
+        ranks_left = len(bounds) - 1 - k
+        cands = [f for f in full if out[-1] < f and f <= n - ranks_left]
+        if not cands:
+            raise ValueError(
+                f"no DSA-aligned pipeline split for bounds {bounds}: every rank must "
+                f"start on a 'full' indexer layer {full[:12]}...")
+        out.append(min(cands, key=lambda f: (abs(f - b), f)))
+    out.append(n)
+    return out
+
+
+def misaligned_pipeline_starts(bounds, indexer_types):
+    """Rank starts (after rank 0) that fall on a 'shared' DSA indexer layer."""
+    if not indexer_types:
+        return []
+    return [b for b in bounds[1:-1] if b < len(indexer_types) and indexer_types[b] != "full"]
 
 
 def pipeline_auto_parallel(
