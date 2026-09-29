@@ -153,6 +153,16 @@ ring = api.remote_vlm_cmd(nodes[0], nodes, "/Volumes/m/MiMo", 50000, backend="ri
 check("5 ring only on override", ("MLX_HOSTFILE" in ring, "RUNNER_SHARD_MODE" in ring), (True, False))
 check("5 default backend is jaccl", inspect.signature(api.remote_vlm_cmd).parameters["backend"].default, "jaccl")
 
+# 6. MiMo emits its own <think> when thinking is on; <think></think> is prefilled when off.
+mm = "/Volumes/models/odysseus/odyssai/MiMo-V2.6-Pro-RL-Q9h16"
+check("6 mimo filtered when thinking on", api._should_filter_think(mm, True), True)
+check("6 mimo not filtered when thinking off", api._should_filter_think(mm, False), False)
+check("6 mimo starts outside the think block", api._seed_in_think(mm, True), False)
+st = {"in_think": False, "carry": "", "open": "<think>", "close": "</think>", "strip": api._model_think_strips(mm)}
+parts = [api._split_think_stream(c, st) for c in ["<thi", "nk>reason", "ing</th", "ink>\n\nanswer"]] + [api._flush_think_stream(st)]
+check("6 mimo split: content", "".join(p[0] for p in parts).strip(), "answer")
+check("6 mimo split: reasoning", "".join(p[1] for p in parts), "reasoning")
+
 if FAILS:
     print("\n".join("FAIL " + f for f in FAILS))
     sys.exit(1)

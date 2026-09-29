@@ -5464,6 +5464,11 @@ def _seed_in_think(model_id: Optional[str], enable_thinking) -> bool:
     # filter catch the literal open tag instead.
     if "inkling" in (model_id or "").lower():
         return False
+    # MiMo emits its own `<think>` (the template prefills nothing when thinking
+    # is on); seeding True would route the answer after `</think>`... into
+    # reasoning and eat the literal open tag.
+    if "mimo" in (model_id or "").lower():
+        return False
     return True
 
 # Models whose chat_template auto-prefills `<think>\n` at the end of the
@@ -5517,7 +5522,17 @@ _MODELS_AUTO_OPEN_THINK = ("minimax", "qwen3.5", "qwen3.6", "step-3.7", "step3p7
                            # hades : reasoning_content vide, tout dans `content`).
                            # Pas de kwarg enable_thinking dans le template
                            # (reasoning_effort seulement) → aussi dans _MODELS_IGNORE_*.
-                           "step-5", "step5", "step4")
+                           "step-5", "step5", "step4",
+                           # MiMo-V2.6 (Xiaomi) — le template NE pré-ouvre PAS le
+                           # bloc : thinking-on, le modèle émet lui-même `<think>`
+                           # … `</think>` en clair ; thinking-off, le prompt se
+                           # termine par `<think></think>` (honoré → PAS dans
+                           # _MODELS_IGNORE_*). Vérifié 2026-09-29 sur le pool
+                           # distribué mimo-v2.6-pro (vlm_runner) : tout partait
+                           # dans `content`. Départ hors bloc : _seed_in_think.
+                           # mlx_vlm.server (Flash) sépare déjà le raisonnement ;
+                           # sans `<think>` dans le flux, le filtre laisse passer.
+                           "mimo")
 # Subset of _MODELS_AUTO_OPEN_THINK that IGNORES the `enable_thinking`
 # kwarg and always wraps reasoning in <think>...</think>. Per MiniMax M2
 # docs (2026-05-20 update): "The model's reasoning is wrapped in <think>
@@ -7581,7 +7596,7 @@ def _initial_default_config() -> Optional[dict]:
 #   major (1.7.2 → 2.0.0) — breaking API or topology change
 #
 # Use `./scripts/bump-version.sh patch|minor|major` to bump + auto-commit.
-APP_VERSION = "1.54.0"
+APP_VERSION = "1.54.1"
 
 app = FastAPI(
     title="OdyssAI-X (odyssai.eu)",
