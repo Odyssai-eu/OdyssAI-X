@@ -6841,7 +6841,12 @@ async def _auto_reload_purged(cid: str, purged: list) -> None:
         if entry is None or alias in live_aliases:
             _AUTO_RELOAD_PENDING.pop(key, None)   # gone from desired state, or back
             continue
-        if entry.get("is_vlm") or entry.get("vlm_distributed"):
+        # VLM pools are not RunnerPool text pools. A distributed VL pool is
+        # persisted with `is_vlm_dist` only (VLMDistPool, 1.54.0): missing it here
+        # sent MiMo-V2.6-Pro back through the text runner, whose ranks died
+        # (no mimo_v2 in mlx_lm), and each death's leak recovery rebooted the
+        # Argo nodes again (2026-09-29/30).
+        if entry.get("is_vlm") or entry.get("is_vlm_dist") or entry.get("vlm_distributed"):
             _AUTO_RELOAD_PENDING.pop(key, None)
             continue
         if _AUTO_RELOAD_RETRIES.get(key, 0) >= _AUTO_RELOAD_MAX:
@@ -7596,7 +7601,7 @@ def _initial_default_config() -> Optional[dict]:
 #   major (1.7.2 → 2.0.0) — breaking API or topology change
 #
 # Use `./scripts/bump-version.sh patch|minor|major` to bump + auto-commit.
-APP_VERSION = "1.55.1"
+APP_VERSION = "1.55.2"
 
 app = FastAPI(
     title="OdyssAI-X (odyssai.eu)",
