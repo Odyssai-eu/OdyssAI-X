@@ -7185,7 +7185,8 @@ def _pool_reload_request(pool: RunnerPool) -> ArgoLoadRequest:
         nodes=pool.nodes_count, kv_q8=pool.kv_q8,
         draft_model=pool.draft_model, num_draft_tokens=pool.num_draft_tokens,
         mtp=getattr(pool, "mtp_cfg", None),
-        force=True, alias=pool.alias, node_indices=pool.node_indices,
+        force=True, internal_reload=True,
+        alias=pool.alias, node_indices=pool.node_indices,
         # The reload targets the SAME alias on purpose (stop-old-start-new).
         # Without this the #64 explicit-alias collision guard 409s every
         # attempt — observed in prod 2026-07-03: 695 consecutive
@@ -7601,7 +7602,7 @@ def _initial_default_config() -> Optional[dict]:
 #   major (1.7.2 → 2.0.0) — breaking API or topology change
 #
 # Use `./scripts/bump-version.sh patch|minor|major` to bump + auto-commit.
-APP_VERSION = "1.55.2"
+APP_VERSION = "1.55.3"
 
 app = FastAPI(
     title="OdyssAI-X (odyssai.eu)",
@@ -15375,6 +15376,14 @@ class ArgoLoadRequest(BaseModel):
     # Power-user override for the preflight size check. Use only when you
     # know the apparent du size is overestimating (e.g. dedup / sparse files).
     force: bool = False
+    # Set by _pool_reload_request only (watchdog recovery, preventive reload,
+    # /reset). Such a reload carries force=True to skip the size preflight and
+    # the degraded gate, but it must still reach the model's own loader:
+    # force=True alone bypasses the vision auto-detect, which sent every
+    # distributed VL pool (MiMo-V2.6-Pro) through the TEXT runner on recovery,
+    # where its four ranks died on "The model does not support tensor
+    # parallelism" and re-marked the cluster degraded (2026-09-30).
+    internal_reload: bool = False
     # Stop-old-before-start-new by default (audit 2026-05-18). Set True to
     # overlap loads — only safe when both models fit simultaneously in RAM.
     force_hot_swap: bool = False
@@ -16080,7 +16089,8 @@ async def admin_cluster_load(cluster_id: str, req: ArgoLoadRequest):
     # it internally via http-proxy. Set force=true to bypass detection and
     # attempt a (doomed) text load anyway. Multi-node VL requests collapse to
     # a single node (the first requested index, else index 0 = master).
-    if arch.get("is_vision") and not getattr(req, "force", False):
+    if arch.get("is_vision") and (not getattr(req, "force", False)
+                                  or getattr(req, "internal_reload", False)):
         # Inkling (inkling_mm_model): OUR native multimodal server, not
         # mlx_vlm.server (no loader) nor the slow mlx_lm text adapter. Native
         # inkling_mlx: 25 tok/s text + working vision tower (validated 2026-08-10).
