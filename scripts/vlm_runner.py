@@ -32,10 +32,14 @@ no batching, no kv-q8. Fresh cache per request, single-stream.
 
 Config via env (no argparse, same contract as runner.py):
   RUNNER_MODEL       model dir (local path)
-  RUNNER_BACKEND     ring | jaccl        (default ring — frozen: ring first)
+  RUNNER_BACKEND     ring | jaccl        (default ring; the engine sends jaccl)
+  RUNNER_SHARD_MODE  "" (auto: the model type's own split) | tensor | pipeline
+                     | upstream (model.language_model.shard(group))
+  RUNNER_LAYER_BOUNDS / RUNNER_RAM_WEIGHTS  pipeline split, same contract as
+                     runner.py (manual bounds CSV > per-rank weights > even)
   MLX_WORLD_SIZE     "1" => no distributed init (single-node bypass)
   RUNNER_EMIT_BATCH  tokens coalesced per stdout token event (default 10)
-  RUNNER_MAX_IMAGE_MB  per-image decoded cap, safety valve (default 64)
+  RUNNER_MAX_IMAGE_MB  per-image / per-audio decoded cap, safety valve (default 64)
 """
 
 import base64
@@ -52,6 +56,8 @@ import time
 from pathlib import Path
 
 import mlx.core as mx
+import mlx.nn as nn
+from mlx.nn.layers.distributed import shard_inplace, shard_linear
 
 # ── stdout/stderr contract ────────────────────────────────────────────────────
 
@@ -198,14 +204,117 @@ def _shard_fused_gate_up_inplace(sl, group):
             setattr(sl, name, slice_fused(getattr(sl, name)))
 
 
-# Model types served PIPELINE-parallel (layer-split) instead of the MiniMax-M3
-# tensor-parallel path. The TP sharder (_shard_lm_replicated_indexer) is
-# MiniMax-only (MSA indexer, block_sparse_moe/switch_mlp) and its forward has
-# no all_sum collectives; qwen3.5-MoE is a HYBRID (self_attn + linear_attn
-# GatedDeltaNet) with num_kv_heads=2 (won't divide 3/4 nodes). Pipeline needs
-# neither head-divisibility nor forward collectives — each rank runs full local
-# layers + send/recv. Reuses the exo pipeline machinery (auto_parallel).
-_PIPELINE_MODEL_TYPES = frozenset({"qwen3_5_moe"})
+class _AllSumAfter(nn.Module):
+    """Sum a tensor-sharded block's partial output across ranks.
+
+    mlx-vlm's MiMo MoE.__call__ has no sharding_group hook (mlx-lm's MoE
+    classes all_sum inside the block). The routed experts are sharded on the
+    intermediate dim, so each rank returns a partial sum over its slice; the
+    weighted sum over the top-k experts is linear, so one all_sum of the block
+    output restores the full result."""
+
+    def __init__(self, inner, group):
+        super().__init__()
+        self.inner = inner
+        self.sharding_group = group
+
+    def __call__(self, x):
+        return mx.distributed.all_sum(self.inner(x), group=self.sharding_group)
+
+
+def _shard_lm_mimo_tensor(lm, group):
+    """Tensor-shard the MiMo-V2 language model (mlx-vlm mimo_v2, MiMo-V2.6).
+
+    mlx-vlm's MiMo LanguageModel has no shard(). This follows the shard() of
+    the mlx-lm mimo_v2_flash port (ml-explore/mlx-lm PR #1219): q/k/v
+    all-to-sharded, o_proj sharded-to-all, head counts divided, the per-head
+    attention sinks sliced to this rank's heads, dense MLP gate/up
+    all-to-sharded + down sharded-to-all, routed experts sharded in place on
+    the intermediate dim with one all_sum per MoE block (_AllSumAfter). The
+    router stays replicated, so every rank picks the same experts.
+
+    Rank r keeps q heads [r*H/n, (r+1)*H/n) and kv heads [r*K/n, (r+1)*K/n):
+    with contiguous GQA grouping (q head h reads kv head h // (H/K)) the two
+    slices pair up exactly. MXFP4 experts: the down_proj input dim (2048)
+    splits into whole 32-value scale groups for n <= 4 (2048/32/4 = 16)."""
+    n, r = group.size(), group.rank()
+    for layer in lm.layers:
+        sa = layer.self_attn
+        if sa.n_heads % n or sa.n_kv_heads % n:
+            raise ValueError(
+                f"mimo tensor split: {sa.n_heads} q / {sa.n_kv_heads} kv heads "
+                f"do not divide by {n} ranks")
+        sa.q_proj = shard_linear(sa.q_proj, "all-to-sharded", group=group)
+        sa.k_proj = shard_linear(sa.k_proj, "all-to-sharded", group=group)
+        sa.v_proj = shard_linear(sa.v_proj, "all-to-sharded", group=group)
+        sa.o_proj = shard_linear(sa.o_proj, "sharded-to-all", group=group)
+        sa.n_heads //= n
+        sa.n_kv_heads //= n
+        if sa.attention_sink_bias is not None:
+            h = sa.n_heads
+            sa.attention_sink_bias = sa.attention_sink_bias[r * h:(r + 1) * h]
+        mlp = layer.mlp
+        if hasattr(mlp, "switch_mlp"):
+            shard_inplace(mlp.switch_mlp.gate_proj, "all-to-sharded", group=group)
+            shard_inplace(mlp.switch_mlp.up_proj, "all-to-sharded", group=group)
+            shard_inplace(mlp.switch_mlp.down_proj, "sharded-to-all", group=group)
+            shared = getattr(mlp, "shared_experts", None)
+            if shared is not None:
+                # Partial like the routed experts: covered by the same all_sum.
+                shard_inplace(shared.gate_proj, "all-to-sharded", group=group)
+                shard_inplace(shared.up_proj, "all-to-sharded", group=group)
+                shard_inplace(shared.down_proj, "sharded-to-all", group=group)
+            layer.mlp = _AllSumAfter(mlp, group)
+        else:
+            mlp.gate_proj = shard_linear(mlp.gate_proj, "all-to-sharded", group=group)
+            mlp.up_proj = shard_linear(mlp.up_proj, "all-to-sharded", group=group)
+            mlp.down_proj = shard_linear(mlp.down_proj, "sharded-to-all", group=group)
+
+
+# Distributed split per model type. The first mode listed is the type's
+# default (RUNNER_SHARD_MODE unset); api.py's VLM_DIST_SUPPORTED mirrors this
+# table — keep them in sync.
+#   tensor   : the type's in-repo sharder below (forward all_sums over JACCL).
+#   pipeline : layer split through the exo machinery (auto_parallel) — needs
+#              neither head divisibility nor forward collectives. qwen3.5-MoE
+#              only knows pipeline: a HYBRID (self_attn + GatedDeltaNet) with
+#              num_kv_heads=2, which won't divide 3/4 nodes.
+_TENSOR_SHARDERS = {
+    "minimax_m3_vl": _shard_lm_replicated_indexer,
+    "mimo_v2": _shard_lm_mimo_tensor,
+}
+_DIST_MODES = {
+    "minimax_m3_vl": ("tensor",),
+    "qwen3_5_moe": ("pipeline",),
+    "mimo_v2": ("tensor", "pipeline"),
+}
+
+
+def _pipeline_bounds(num_layers: int, size: int) -> tuple[list[int], str]:
+    """Cumulative layer bounds, same precedence as runner.shard_pipeline:
+    RUNNER_LAYER_BOUNDS (manual) > RUNNER_RAM_WEIGHTS (per-rank bytes, sent by
+    the engine from wired limits) > even split. An even split on .29 (460 GiB
+    wired) + a 256 GB node (200 GiB) OOMs the small node."""
+    from auto_parallel import compute_proportional_bounds
+    bounds_env = os.environ.get("RUNNER_LAYER_BOUNDS", "")
+    if bounds_env:
+        b = [int(x) for x in bounds_env.split(",")]
+        if len(b) != size + 1 or b[0] != 0 or b[-1] != num_layers:
+            raise ValueError(
+                f"RUNNER_LAYER_BOUNDS={bounds_env!r} invalid for size={size}, "
+                f"num_layers={num_layers}")
+        return b, "manual"
+    weights_env = os.environ.get("RUNNER_RAM_WEIGHTS", "")
+    if weights_env:
+        try:
+            w = [int(x) for x in weights_env.split(",")]
+        except ValueError:
+            w = []
+        if len(w) == size and all(x >= 0 for x in w) and sum(w) > 0:
+            return compute_proportional_bounds(num_layers, w), f"proportional({w})"
+        log(f"RUNNER_RAM_WEIGHTS={weights_env!r} invalid for size={size}; even split")
+    per = num_layers // size
+    return [0] + [per * i for i in range(1, size)] + [num_layers], "even"
 
 
 def _shard_lm_pipeline(model, group, num_layers: int):
@@ -215,18 +324,16 @@ def _shard_lm_pipeline(model, group, num_layers: int):
     Pipeline{First,Last}Layer (recv/send), materialises only local layers.
     auto_parallel recomputes fa_idx/ssm_idx for the stock mlx-lm hybrid class
     but NOT for the mlx-vlm Qwen3_5MoeModel — do it here (shard-LOCAL indices,
-    else cache[fa_idx] points at the wrong local layer's cache)."""
+    else cache[fa_idx] points at the wrong local layer's cache). MiMo's
+    swa_idx/ga_idx are recomputed inside auto_parallel for both the mlx-lm
+    and the mlx-vlm class."""
     from auto_parallel import pipeline_auto_parallel
     from exo_stubs import PipelineShardMetadata
     rank, size = group.rank(), group.size()
-    bounds_env = os.environ.get("RUNNER_LAYER_BOUNDS", "")
-    if bounds_env:
-        b = [int(x) for x in bounds_env.split(",")]
-    else:
-        per = num_layers // size
-        b = [0] + [per * i for i in range(1, size)] + [num_layers]
+    b, split_source = _pipeline_bounds(num_layers, size)
     start, end = b[rank], b[rank + 1]
-    log(f"rank {rank} pipeline shard layers [{start}, {end}) of {num_layers}")
+    log(f"rank {rank} pipeline shard layers [{start}, {end}) of {num_layers} "
+        f"split={split_source}")
     # Pass the LanguageModel WRAPPER: get_inner_model() resolves .model ->
     # Qwen3_5MoeModel (the one carrying .layers) and mutates it in place.
     meta = PipelineShardMetadata(device_rank=rank, world_size=size,
@@ -239,6 +346,8 @@ def _shard_lm_pipeline(model, group, num_layers: int):
             break
     # LOCAL hybrid indices (auto_parallel's isinstance misses the mlx-vlm class).
     inner = model.language_model.model            # sliced+wrapped in place
+    if not hasattr(inner, "fa_idx"):              # not a qwen3.5 hybrid
+        return
     fa = [i for i, l in enumerate(inner.layers)
           if not getattr(l, "is_linear", True)]
     ssm = [i for i, l in enumerate(inner.layers)
@@ -252,7 +361,9 @@ def _shard_lm_pipeline(model, group, num_layers: int):
 def sharded_vlm_load(path: str, group):
     from mlx_vlm.utils import (get_model_path, load_image_processor,
                                load_model, load_processor)
-    shard_mode = os.environ.get("RUNNER_SHARD_MODE", "replicated-indexer")
+    shard_mode = os.environ.get("RUNNER_SHARD_MODE", "").strip().lower()
+    if shard_mode == "replicated-indexer":     # pre-2026-09-29 name
+        shard_mode = "tensor"
     model_path = get_model_path(path)
     log(f"loading model (lazy=True) from {model_path}")
     model = load_model(model_path, lazy=True, strict=False)
@@ -263,30 +374,27 @@ def sharded_vlm_load(path: str, group):
     if image_processor is not None:
         processor.image_processor = image_processor
     model_type = config.get("model_type") or ""
-    use_pipeline = (shard_mode == "pipeline"
-                    or model_type in _PIPELINE_MODEL_TYPES)
     if group is not None and group.size() > 1:
-        if use_pipeline:
-            log(f"rank {group.rank()} sharding language_model "
-                f"(pipeline, {model_type})")
+        modes = _DIST_MODES.get(model_type, ())
+        mode = shard_mode or (modes[0] if modes else "")
+        # #78 — each sharder is written for one layout; applied to another
+        # type it crashes or corrupts silently. The engine refuses such loads
+        # (VLM_DIST_SUPPORTED in api.py); this is the backstop for a forced
+        # load. "upstream" is the explicit escape hatch to the model's own
+        # shard().
+        if mode != "upstream" and mode not in modes:
+            raise RuntimeError(
+                f"vlm_runner: model_type {model_type!r} has no {mode or 'distributed'} "
+                f"split (known: {_DIST_MODES}); serve it on one node or on a "
+                f"replica cluster")
+        log(f"rank {group.rank()} sharding language_model ({mode}, {model_type})")
+        if mode == "pipeline":
             n_layers = len(model.language_model.model.layers)
             _shard_lm_pipeline(model, group, n_layers)
+        elif mode == "upstream":
+            model.language_model.shard(group)
         else:
-            # #78 — the replicated-indexer sharder is written for MiniMax-M3's
-            # layout; applied to another type it crashes or corrupts silently.
-            # The engine refuses such loads (VLM_DIST_SUPPORTED in api.py);
-            # this is the backstop for a forced load.
-            if shard_mode != "upstream" and model_type != "minimax_m3_vl":
-                raise RuntimeError(
-                    f"vlm_runner: model_type {model_type!r} has no distributed split "
-                    f"(tensor = minimax_m3_vl, pipeline = {sorted(_PIPELINE_MODEL_TYPES)}); "
-                    f"serve it on one node or on a replica cluster")
-            log(f"rank {group.rank()} sharding language_model "
-                f"(tensor, {shard_mode})")
-            if shard_mode == "upstream":
-                model.language_model.shard(group)
-            else:
-                _shard_lm_replicated_indexer(model.language_model, group)
+            _TENSOR_SHARDERS[model_type](model.language_model, group)
     mx.eval(model.language_model.parameters())
     log("materializing vision tower + projector (replicated)")
     mx.eval(model.parameters())
@@ -294,25 +402,61 @@ def sharded_vlm_load(path: str, group):
     return model, processor, config
 
 
-# ── image transport: pull image sources out of OpenAI-shape messages ─────────
+# ── media transport: pull image/audio sources out of OpenAI-shape messages ───
 # The engine forwards `messages` verbatim. Multimodal content is a list of
-# parts; we keep text parts in the message (joined) and collect image sources
-# in encounter order. Supported sources: data URIs (decoded to a temp file so
-# every rank feeds prepare_inputs identical bytes) and local paths. http(s) is
-# REFUSED — resolving URLs is the engine's job, ranks must never fetch.
+# parts; we keep text parts in the message (joined) and collect image and
+# audio sources in encounter order. Supported sources: data URIs / bare base64
+# (decoded to a temp file so every rank feeds prepare_inputs identical bytes)
+# and local paths. http(s) is REFUSED — resolving URLs is the engine's job,
+# ranks must never fetch. Audio follows mlx_vlm.server's OpenAI shape:
+# {"type": "input_audio", "input_audio": {"data": <base64|data:audio/..>,
+# "format": "wav"}}. Any other non-text part (video, ...) is refused: a
+# silently dropped part makes the model answer blind.
 
 _DATA_URI_RE = re.compile(r"^data:image/[\w.+-]+;base64,", re.IGNORECASE)
+_AUDIO_DATA_URI_RE = re.compile(r"^data:audio/([\w.+-]+);base64,", re.IGNORECASE)
+_TEXTLIKE_PARTS = ("text", "input_text")
 
 
 class ImageExtractionError(Exception):
-    pass
+    """A media part the runner cannot hand to the model (image or audio)."""
 
 
-def _extract_images(messages: list[dict], req_id: str,
-                    max_image_mb: int) -> tuple[list[dict], list[str], list[str]]:
-    """Returns (template_messages, image_paths, temp_paths_to_cleanup)."""
+def _decode_audio_part(part: dict, req_id: str, idx: int, max_mb: int) -> str:
+    ia = part.get("input_audio")
+    if not isinstance(ia, dict) or not isinstance(ia.get("data"), str) or not ia["data"]:
+        raise ImageExtractionError("input_audio part with no data")
+    data = ia["data"].strip()
+    fmt = (ia.get("format") or "wav").lower()
+    m = _AUDIO_DATA_URI_RE.match(data)
+    if m:
+        fmt = ia.get("format") or m.group(1)
+        data = data.split(",", 1)[1]
+    elif data.startswith(("http://", "https://")):
+        raise ImageExtractionError(
+            "http(s) audio URL reached the runner — the engine must resolve "
+            "URLs; ranks never fetch")
+    elif Path(data).suffix and Path(data).exists():
+        return data
+    try:
+        raw = base64.b64decode(data, validate=True)
+    except (binascii.Error, ValueError) as e:
+        raise ImageExtractionError(f"bad base64 audio: {e}")
+    if len(raw) > max_mb * 1024 * 1024:
+        raise ImageExtractionError(f"audio {len(raw)//(1024*1024)}MB > cap {max_mb}MB")
+    fmt = re.sub(r"[^a-z0-9]", "", fmt.lower()) or "wav"
+    tmp = f"/tmp/vlmr_{req_id}_a{idx}.{fmt}"
+    with open(tmp, "wb") as f:
+        f.write(raw)
+    return tmp
+
+
+def _extract_media(messages: list[dict], req_id: str, max_image_mb: int
+                   ) -> tuple[list[dict], list[str], list[str], list[str]]:
+    """Returns (template_messages, image_paths, audio_paths, temp_paths)."""
     out_msgs: list[dict] = []
     images: list[str] = []
+    audios: list[str] = []
     temps: list[str] = []
     for m in messages:
         content = m.get("content")
@@ -324,11 +468,19 @@ def _extract_images(messages: list[dict], req_id: str,
             if not isinstance(p, dict):
                 continue
             ptype = p.get("type")
-            if ptype == "text":
+            if ptype in _TEXTLIKE_PARTS:
                 texts.append(p.get("text") or "")
                 continue
-            if ptype not in ("image_url", "input_image", "image"):
+            if ptype == "input_audio":
+                path = _decode_audio_part(p, req_id, len(audios), max_image_mb)
+                if path.startswith("/tmp/vlmr_"):
+                    temps.append(path)
+                audios.append(path)
                 continue
+            if ptype not in ("image_url", "input_image", "image"):
+                raise ImageExtractionError(
+                    f"unsupported content part {ptype!r} (this runner reads "
+                    f"text, image and input_audio)")
             url = p.get("image_url")
             if isinstance(url, dict):
                 url = url.get("url")
@@ -360,7 +512,7 @@ def _extract_images(messages: list[dict], req_id: str,
         nm = dict(m)
         nm["content"] = "\n".join(t for t in texts if t)
         out_msgs.append(nm)
-    return out_msgs, images, temps
+    return out_msgs, images, audios, temps
 
 
 # ── main ─────────────────────────────────────────────────────────────────────
@@ -489,10 +641,12 @@ def main() -> None:
 
         temps: list[str] = []
         try:
-            tmpl_messages, images, temps = _extract_images(
+            tmpl_messages, images, audios, temps = _extract_media(
                 messages, req_id or "noid", max_image_mb)
 
             chat_kwargs: dict = {"num_images": len(images)}
+            if audios:
+                chat_kwargs["num_audios"] = len(audios)
             enable_thinking = req.get("enable_thinking", None)
             if enable_thinking is not None:
                 chat_kwargs["enable_thinking"] = enable_thinking
@@ -507,13 +661,29 @@ def main() -> None:
 
             gen_kwargs: dict = {"max_tokens": max_tokens}
             for k in ("temperature", "top_p", "top_k", "min_p",
-                      "repetition_penalty", "seed"):
+                      "repetition_penalty"):
                 if req.get(k) is not None:
                     gen_kwargs[k] = req[k]
+            # One RNG stream on every rank. mlx-vlm's stream_generate ignores a
+            # `seed` kwarg (only its CLI seeds), so each rank sampled from its
+            # own process RNG: at temperature > 0 the ranks could draw
+            # different tokens, and one reaching EOS first leaves the others
+            # blocked in the next collective. Without a client seed, rank 0
+            # draws one and the all_sum hands it to everyone (a 24-bit value
+            # stays exact in float32).
+            seed = req.get("seed")
+            if seed is None and size > 1:
+                local = (int.from_bytes(os.urandom(3), "little")
+                         if rank == 0 else 0)
+                shared = mx.distributed.all_sum(
+                    mx.array([float(local)], dtype=mx.float32), group=group)
+                seed = int(shared.item())
+            if seed is not None:
+                mx.random.seed(int(seed))
 
             if rank == 0:
-                log(f"req {req_id}: images={len(images)} "
-                    f"max_tokens={max_tokens} "
+                log(f"req {req_id}: images={len(images)} audios={len(audios)} "
+                    f"max_tokens={max_tokens} seed={seed} "
                     f"sampling={ {k: v for k, v in gen_kwargs.items() if k != 'max_tokens'} }")
 
             ntoks = 0
@@ -523,7 +693,8 @@ def main() -> None:
             cancelled_mid_gen = False
             last = None
             for res in stream_generate(model, processor, formatted,
-                                       image=images or None, **gen_kwargs):
+                                       image=images or None,
+                                       audio=audios or None, **gen_kwargs):
                 buf.append(res.text)
                 ntoks += 1
                 last = res
@@ -558,7 +729,7 @@ def main() -> None:
             log(f"req {req_id}: {ntoks} toks in {elapsed:.1f}s = {tps:.2f} tok/s"
                 + (" · CANCELLED" if cancelled_mid_gen else ""))
         except ImageExtractionError as e:
-            log(f"req {req_id}: image extraction failed: {e}")
+            log(f"req {req_id}: media extraction failed: {e}")
             emit(rank, {"event": "done", "id": req_id, "ntoks": 0,
                         "prompt_tokens": 0, "cached_tokens": 0,
                         "elapsed_s": 0.0, "tps": 0.0,

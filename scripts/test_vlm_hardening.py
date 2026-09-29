@@ -126,9 +126,32 @@ import inspect
 check("3 RunnerPool.submit accepts sampling", "sampling" in inspect.signature(api.RunnerPool.submit).parameters, True)
 
 # 4. #78
-check("4 supported distributed VL types", api.VLM_DIST_SUPPORTED, {"minimax_m3_vl": "tensor", "qwen3_5_moe": "pipeline"})
+check("4 supported distributed VL types", api.VLM_DIST_SUPPORTED,
+      {"minimax_m3_vl": ("tensor",), "qwen3_5_moe": ("pipeline",), "mimo_v2": ("tensor", "pipeline")})
 src = open(os.path.join(REPO, "scripts", "vlm_runner.py")).read()
-check("4 vlm_runner backstop present", "has no distributed split" in src, True)
+check("4 vlm_runner backstop present", "split (known: {_DIST_MODES})" in src, True)
+# vlm_runner._DIST_MODES must match api.VLM_DIST_SUPPORTED (no mlx import needed).
+import ast
+_tree = ast.parse(src)
+_dm = next(ast.literal_eval(n.value) for n in _tree.body
+           if isinstance(n, ast.Assign) and getattr(n.targets[0], "id", "") == "_DIST_MODES")
+check("4 runner and engine split tables agree", _dm, api.VLM_DIST_SUPPORTED)
+
+# 5. 2026-09-29 — distributed VL over JACCL, split mode and pipeline weights forwarded
+nodes = [{"rank": 0, "ssh": "admin@192.168.86.29", "rdma": [None, "rdma_en2"]},
+         {"rank": 1, "ssh": "admin@192.168.86.31", "rdma": ["rdma_en2", None]}]
+cmd = api.remote_vlm_cmd(nodes[1], nodes, "/Volumes/m/MiMo", 50000, backend="jaccl",
+                         devices_json='[[null,"rdma_en2"],["rdma_en2",null]]',
+                         shard_mode="pipeline", ram_weights_csv="493921239040,214748364800")
+check("5 jaccl backend", "RUNNER_BACKEND=jaccl" in cmd, True)
+check("5 jaccl coordinator = rank 0", "MLX_JACCL_COORDINATOR=192.168.86.29:50000" in cmd, True)
+check("5 devices json written per port", "/tmp/mlx_jaccl_devices_vlm_50000.json" in cmd, True)
+check("5 no ring hostfile", "MLX_HOSTFILE" in cmd, False)
+check("5 shard mode forwarded", "RUNNER_SHARD_MODE=pipeline" in cmd, True)
+check("5 ram weights forwarded", "RUNNER_RAM_WEIGHTS=493921239040,214748364800" in cmd, True)
+ring = api.remote_vlm_cmd(nodes[0], nodes, "/Volumes/m/MiMo", 50000, backend="ring")
+check("5 ring only on override", ("MLX_HOSTFILE" in ring, "RUNNER_SHARD_MODE" in ring), (True, False))
+check("5 default backend is jaccl", inspect.signature(api.remote_vlm_cmd).parameters["backend"].default, "jaccl")
 
 if FAILS:
     print("\n".join("FAIL " + f for f in FAILS))

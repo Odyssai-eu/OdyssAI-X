@@ -1747,56 +1747,6 @@ def shard_tensor(model, group):
     return last  # unreachable
 
 
-def _compute_proportional_bounds(num_layers, weights):
-    """Split `num_layers` across ranks proportionally to `weights`.
-
-    Returns cumulative bounds (len = size+1, starts at 0, ends at num_layers).
-    Each rank gets `floor(num_layers * w_i / total_w)` layers; the rounding
-    leftover goes to the rank with the largest weight (the one that
-    can afford it). Every rank receives at least 1 layer.
-
-    Why proportional-to-weight : when nodes have heterogeneous RAM
-    (.29 512 GB + .30 256 GB), the even split assigns equal shards and
-    the small node OOMs on the first forward pass. Weighting by
-    available RAM (or wired_limit) approximates per-shard memory
-    pressure well enough that the small node breathes.
-
-    Layer-size variance (MoE sparsity) is NOT modelled — proportional-
-    by-RAM is rough but vastly better than even split on heterogeneous
-    hardware. Tune via RUNNER_LAYER_BOUNDS when the rough split misses.
-    """
-    size = len(weights)
-    if size <= 0 or num_layers <= 0:
-        return list(range(num_layers + 1))
-    total_w = sum(weights)
-    if total_w <= 0:
-        per = num_layers // size
-        return [0] + [per * i for i in range(1, size)] + [num_layers]
-    raw = [num_layers * w / total_w for w in weights]
-    counts = [max(1, int(r)) for r in raw]
-    diff = num_layers - sum(counts)
-    if diff != 0:
-        order = sorted(range(size), key=lambda i: weights[i], reverse=True)
-        i = 0
-        step = 1 if diff > 0 else -1
-        guard = 0
-        while diff != 0 and guard < size * (abs(diff) + size):
-            idx = order[i % size]
-            if counts[idx] + step >= 1:
-                counts[idx] += step
-                diff -= step
-            i += 1
-            guard += 1
-    bounds = [0]
-    acc = 0
-    for c in counts:
-        acc += c
-        bounds.append(acc)
-    if bounds[-1] != num_layers:
-        bounds[-1] = num_layers
-    return bounds
-
-
 def shard_pipeline(model, group, num_layers):
     """Apply exo-style auto_parallel pipeline sharding.
 
@@ -1808,7 +1758,8 @@ def shard_pipeline(model, group, num_layers):
          for heterogeneous clusters where even-split OOMs small nodes.
       3. Even split (default — same shard size on every rank).
     """
-    from auto_parallel import pipeline_auto_parallel
+    from auto_parallel import (pipeline_auto_parallel,
+                               compute_proportional_bounds as _compute_proportional_bounds)
     from exo_stubs import PipelineShardMetadata
 
     rank = group.rank()

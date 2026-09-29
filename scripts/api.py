@@ -232,7 +232,8 @@ PYTHON_REMOTE = env_get("PYTHON_REMOTE", f"{REMOTE_CLUSTER_DIR}/.venv/bin/python
 # other's shell (reproduced on max-64 2026-09-28: the second sweep printed
 # nothing, the "(no output)" of the 2026-09-26 boot).
 RUNNER_MATCH_PATTERN = env_get("RUNNER_MATCH_PATTERN", "[m]lx-cluster/runner.py")
-# Distributed VLM runner (vlm_runner.py, ring/TCP tensor-parallel mlx-vlm).
+# Distributed VLM runner (vlm_runner.py, tensor- or pipeline-parallel mlx-vlm
+# over JACCL; ring/TCP only on an explicit per-pool `backend` override).
 # Own venv (mlx-vlm + torch, py3.12 — NOT the text cluster venv) and own
 # pkill pattern, disjoint from both runner.py and the untouchable prod
 # mlx_vlm.server processes. Feature-flagged: the multi-node VL load path
@@ -241,12 +242,16 @@ VLM_RUNNER_REMOTE = env_get("VLM_RUNNER_REMOTE", f"{REMOTE_CLUSTER_DIR}/vlm_runn
 VLM_PYTHON_REMOTE = env_get("VLM_PYTHON_REMOTE", "$HOME/.venvs/mlx-vlm/bin/python")
 VLM_RUNNER_MATCH_PATTERN = env_get("VLM_RUNNER_MATCH_PATTERN", "[m]lx-cluster/vlm_runner.py")
 VLM_DISTRIBUTED_ENABLED = env_get("VLM_DISTRIBUTED_ENABLED", "0") == "1"
-# #78 — the ONLY model types vlm_runner.py knows how to split across nodes:
-# tensor-parallel = its in-repo MiniMax-M3 sharder (replicated MSA indexer),
-# pipeline = _PIPELINE_MODEL_TYPES. Any other VL type would get the MiniMax
-# sharder applied blindly (crash at load, or a model that answers garbage).
-# Keep in sync with scripts/vlm_runner.py.
-VLM_DIST_SUPPORTED: dict[str, str] = {"minimax_m3_vl": "tensor", "qwen3_5_moe": "pipeline"}
+# #78 — the ONLY model types vlm_runner.py knows how to split across nodes,
+# and the splits each one supports; the first is the default when the load
+# request does not name a mode. Any other VL type would get a sharder written
+# for another layout (crash at load, or a model that answers garbage).
+# Mirrors vlm_runner._DIST_MODES — keep them in sync.
+VLM_DIST_SUPPORTED: dict[str, tuple[str, ...]] = {
+    "minimax_m3_vl": ("tensor",),
+    "qwen3_5_moe": ("pipeline",),
+    "mimo_v2": ("tensor", "pipeline"),
+}
 # SIGTERM->SIGKILL grace for remote pkills/sweeps, in seconds (0.5s polls).
 # 12s default: big-model clean exits need the room for free_metal; ranks stuck
 # in a collective ignore SIGTERM regardless (the wired-guard covers that case).
@@ -1156,7 +1161,8 @@ def _model_load_overhead_factor() -> float:
     return 1.15
 
 
-def _cluster_total_ram_bytes(cluster: str, nodes_count: int) -> tuple[int, list[dict]]:
+def _cluster_total_ram_bytes(cluster: str, nodes_count: int,
+                             topo: Optional[list[dict]] = None) -> tuple[int, list[dict]]:
     """Sum RAM across the nodes that would be used for a load of `cluster`
     at `nodes_count`. Uses the cached telemetry probe data; falls back to
     a static map per known hardware when telemetry hasn't yet probed a node.
@@ -1168,11 +1174,15 @@ def _cluster_total_ram_bytes(cluster: str, nodes_count: int) -> tuple[int, list[
     rank can hold (model weights + KV + activations must all fit under it).
     When the user has tuned wired_limit_mb above the default ~75% of RAM,
     we want the validator to honour it instead of being conservative.
+
+    `topo` overrides the contiguous-from-0 selection with the pool's actual
+    nodes (a pool built from node_indices).
     """
-    try:
-        topo = build_topology(cluster, nodes_count)
-    except Exception:
-        topo = []
+    if topo is None:
+        try:
+            topo = build_topology(cluster, nodes_count)
+        except Exception:
+            topo = []
     if not topo:
         return 0, []
     # Use the live telemetry snapshot when available.
@@ -2268,34 +2278,49 @@ def remote_cmd(node: dict, nodes: list[dict], model: str, mode: str, port: int,
 
 
 def remote_vlm_cmd(node: dict, nodes: list[dict], model: str, port: int,
-                   emit_batch: int = 10) -> str:
-    """Per-node command for the distributed VLM runner (ring/TCP).
+                   emit_batch: int = 10, backend: str = "jaccl",
+                   devices_json: str = "", shard_mode: str = "",
+                   ram_weights_csv: Optional[str] = None) -> str:
+    """Per-node command for the distributed VLM runner.
 
-    Mirrors remote_cmd's echo-prefix pattern but writes an MLX ring hostfile
-    ([["ip:port"], ...] in rank order — the format Gate-0 validated cross-node
-    on 2026-07-02) instead of the jaccl devices json, and launches
-    vlm_runner.py with the mlx-vlm venv python. Hosts/ports derive from the
-    topology + the caller's ephemeral port — nothing hardcoded."""
-    ordered = sorted(nodes, key=lambda x: x["rank"])
-    hosts = [[f"{n['ssh'].split('@')[1]}:{port}"] for n in ordered]
-    hostfile_json = json.dumps(hosts)
-    hostfile_path = f"/tmp/mlx_ring_hostfile_{port}.json"
+    Same transport env as remote_cmd: JACCL (coordinator + RDMA devices json)
+    by default, or an MLX ring hostfile ([["ip:port"], ...] in rank order) on
+    an explicit ring override. Launches vlm_runner.py with the mlx-vlm venv
+    python. `shard_mode` ("" = the model type's default, "tensor",
+    "pipeline") and `ram_weights_csv` (per-rank wired-limit bytes for the
+    capacity-aware pipeline split) are forwarded as RUNNER_* env."""
     env = {
         "MLX_RANK": str(node["rank"]),
         "MLX_WORLD_SIZE": str(len(nodes)),
-        "MLX_HOSTFILE": hostfile_path,
         "MLX_METAL_FAST_SYNCH": "1",
         "RUNNER_MODEL": model,
-        "RUNNER_BACKEND": "ring",
+        "RUNNER_BACKEND": backend,
         "RUNNER_EMIT_BATCH": str(emit_batch),
     }
+    if shard_mode:
+        env["RUNNER_SHARD_MODE"] = shard_mode
+    if ram_weights_csv:
+        env["RUNNER_RAM_WEIGHTS"] = ram_weights_csv
+    if backend == "ring":
+        ordered = sorted(nodes, key=lambda x: x["rank"])
+        hosts = [[f"{n['ssh'].split('@')[1]}:{port}"] for n in ordered]
+        hostfile_path = f"/tmp/mlx_ring_hostfile_{port}.json"
+        env["MLX_HOSTFILE"] = hostfile_path
+        write_prefix = f"echo {shlex.quote(json.dumps(hosts))} > {hostfile_path}"
+    else:
+        coord_ip = next(n for n in nodes if n["rank"] == COORDINATOR_RANK)["ssh"].split("@")[1]
+        env["MLX_JACCL_COORDINATOR"] = f"{coord_ip}:{port}"
+        env["MLX_IBV_DEVICES"] = f"/tmp/mlx_jaccl_devices_vlm_{port}.json"
+        if os.environ.get("JACCL_PROGRESS_TIMEOUT_S"):
+            env["JACCL_PROGRESS_TIMEOUT_S"] = os.environ["JACCL_PROGRESS_TIMEOUT_S"]
+        write_prefix = (f"echo {shlex.quote(devices_json)} > "
+                        f"{env['MLX_IBV_DEVICES']}")
     env_str = " ".join(f"{k}={shlex.quote(v)}" for k, v in env.items())
-    write_hosts = f"echo {shlex.quote(hostfile_json)} > {hostfile_path}"
     cd_prefix = ""
     if not model.startswith("/"):
         node_models_dir = node.get("models_dir") or DEFAULT_MODELS_DIR
         cd_prefix = f"cd {shlex.quote(node_models_dir)} && "
-    return f"{write_hosts} && {cd_prefix}{env_str} {VLM_PYTHON_REMOTE} {VLM_RUNNER_REMOTE}"
+    return f"{write_prefix} && {cd_prefix}{env_str} {VLM_PYTHON_REMOTE} {VLM_RUNNER_REMOTE}"
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -3620,9 +3645,10 @@ class RunnerPool:
 
 
 class VLMDistPool(RunnerPool):
-    """Distributed (tensor-parallel) VLM pool: N vlm_runner.py ranks over
-    ring/TCP, driven through the inherited RunnerPool machinery (stdin-JSONL
-    fan-out submit, cancel broadcast, graceful_stop, alive_count, keepalive).
+    """Distributed VLM pool: N vlm_runner.py ranks (tensor- or
+    pipeline-parallel, JACCL by default), driven through the inherited
+    RunnerPool machinery (stdin-JSONL fan-out submit, cancel broadcast,
+    graceful_stop, alive_count, keepalive).
 
     is_vlm=True publishes the badge + supports_vision; vlm_proxy=False keeps
     chat routing on the normal pool.submit() path (the http-proxy branch is
@@ -3633,19 +3659,27 @@ class VLMDistPool(RunnerPool):
     vlm_proxy = False
 
     def __init__(self, model: str, cluster: str, alias: str,
-                 node_indices: list[int]):
-        super().__init__(model=model, mode="tensor", use_ap=False,
+                 node_indices: list[int], shard_mode: str = "",
+                 backend: Optional[str] = None):
+        # shard_mode "" = the model type's default split (vlm_runner decides);
+        # an entry persisted before 2026-09-29 has none and restores that way.
+        super().__init__(model=model,
+                         mode="pipeline" if shard_mode == "pipeline" else "tensor",
+                         use_ap=False,
                          nodes_count=len(node_indices), cluster=cluster,
                          kv_q8=False, draft_model=None, alias=alias,
                          node_indices=list(node_indices))
-        self.backend = "ring"
+        self.shard_mode = shard_mode
+        # JACCL unless the load explicitly asked for ring (Sophie, 2026-09:
+        # no ring for distributed models).
+        self.backend = backend or "jaccl"
 
     async def start(self):
         """Mirror of RunnerPool.start() for the VLM runner: same model-layout
-        preflight and the same wait-ready-while-scanning-deaths loop, minus
-        the text-only extras (AP, draft, capacity-aware pipeline split) and
-        with the ring hostfile command instead of the jaccl devices json.
-        Deliberately a contained copy — the text start() stays untouched."""
+        preflight, RDMA edge preflight (jaccl), capacity-aware pipeline split
+        and wait-ready-while-scanning-deaths loop, minus the text-only extras
+        (AP, draft, MTP). Deliberately a contained copy — the text start()
+        stays untouched."""
         self._loop = asyncio.get_running_loop()
         async def _probe_node(n):
             ssh_t = (
@@ -3674,15 +3708,42 @@ class VLMDistPool(RunnerPool):
                 + "; ".join(problems)
                 + ". Rsync the model to every node before loading."
             )
+        if self.backend == "jaccl" and len(self.nodes) > 1:
+            edge_problems = await _validate_rdma_edges(self.nodes)
+            if edge_problems:
+                raise RuntimeError(
+                    "rdma link(s) not usable — " + "; ".join(edge_problems)
+                    + ". Check the port state (ibv_devinfo) and the link-local "
+                    "alias on both ends; rebooting the node renegotiates the link."
+                )
+        devices_json = json.dumps(
+            [n.get("rdma") for n in sorted(self.nodes, key=lambda x: x["rank"])])
+        # Capacity-aware pipeline split: per-rank wired limits, in rank order,
+        # so .29 (460 GiB) takes proportionally more layers than a 256 GB node.
+        ram_weights_csv: Optional[str] = None
+        if self.shard_mode == "pipeline" and len(self.nodes) > 1:
+            _total, per_node = _cluster_total_ram_bytes(
+                self.cluster, len(self.nodes),
+                topo=sorted(self.nodes, key=lambda x: x["rank"]))
+            weights = [int(e.get("wired_limit_bytes") or e.get("ram_bytes") or 0)
+                       for e in per_node]
+            if all(w > 0 for w in weights) and len(set(weights)) > 1:
+                ram_weights_csv = ",".join(str(w) for w in weights)
         port = random_ephemeral_port()
         sys.stderr.write(
             f"[api] starting {self.nodes_count} VLM runners "
-            f"(model={self.model}, backend=ring, port={port})\n"
+            f"(model={self.model}, backend={self.backend}, "
+            f"split={self.shard_mode or 'type default'}, "
+            f"ram_weights={ram_weights_csv}, port={port})\n"
         )
         t0 = time.time()
         for node in self.nodes:
             cmd = remote_vlm_cmd(node, self.nodes, self.model, port,
-                                 emit_batch=self.emit_batch)
+                                 emit_batch=self.emit_batch,
+                                 backend=self.backend,
+                                 devices_json=devices_json,
+                                 shard_mode=self.shard_mode,
+                                 ram_weights_csv=ram_weights_csv)
             self.runners.append(RunnerProc(
                 node, cmd, self._on_event, cluster=self.cluster,
                 match_pattern=VLM_RUNNER_MATCH_PATTERN,
@@ -5039,6 +5100,8 @@ def save_cluster_state_v2(cluster_id: str, *,
                 "is_vlm_dist": True,
                 "node_indices": indices,
                 "nodes": pool.nodes_count,
+                "vlm_shard_mode": getattr(pool, "shard_mode", ""),
+                "backend": getattr(pool, "backend", "jaccl"),
             })
             continue
         # VL pools (Argo-VLM fold): a single-node mlx_vlm.server proxied under
@@ -6381,6 +6444,8 @@ async def _restore_cluster_pools(cid: str, leaked_hosts: Optional[set] = None,
                 vdpool = VLMDistPool(
                     model=entry["model"], cluster=cid, alias=alias,
                     node_indices=indices,
+                    shard_mode=entry.get("vlm_shard_mode") or "",
+                    backend=entry.get("backend"),
                 )
                 await vdpool.start()
                 set_pool(cid, alias, vdpool)
@@ -7516,7 +7581,7 @@ def _initial_default_config() -> Optional[dict]:
 #   major (1.7.2 → 2.0.0) — breaking API or topology change
 #
 # Use `./scripts/bump-version.sh patch|minor|major` to bump + auto-commit.
-APP_VERSION = "1.53.14"
+APP_VERSION = "1.54.0"
 
 app = FastAPI(
     title="OdyssAI-X (odyssai.eu)",
@@ -16118,17 +16183,23 @@ async def admin_cluster_load(cluster_id: str, req: ArgoLoadRequest):
                 ),
             }
         # Distributed VL path (feature-flagged). With VLM_DISTRIBUTED_ENABLED
-        # and an explicit multi-node request, spawn tensor-parallel
-        # vlm_runner.py ranks over ring/TCP instead of clamping to one node.
+        # and an explicit multi-node request, spawn vlm_runner.py ranks
+        # (tensor or pipeline, JACCL) instead of clamping to one node.
         # Whole path additive: flag off => exact pre-existing behavior.
         if len(node_indices) > 1 and VLM_DISTRIBUTED_ENABLED:
             _vd_mt = (arch.get("model_type") or "").lower()
-            if _vd_mt not in VLM_DIST_SUPPORTED and not getattr(req, "force", False):
+            _vd_modes = VLM_DIST_SUPPORTED.get(_vd_mt, ())
+            # The request's `mode` defaults to "pipeline" for the text path; for
+            # a VL model only an EXPLICIT mode overrides the type's default.
+            _vd_mode = (req.mode if "mode" in req.model_fields_set
+                        else (_vd_modes[0] if _vd_modes else ""))
+            if _vd_mode not in _vd_modes and not getattr(req, "force", False):
                 raise HTTPException(
                     409,
                     f"{cluster_id}: {req.model} (model_type {_vd_mt or '?'}) cannot be "
-                    f"split across {len(node_indices)} nodes — the distributed VL runner "
-                    f"only knows " + ", ".join(f"{k} ({v})" for k, v in VLM_DIST_SUPPORTED.items())
+                    f"split {_vd_mode or ''} across {len(node_indices)} nodes — the "
+                    f"distributed VL runner only knows "
+                    + ", ".join(f"{k} ({'/'.join(v)})" for k, v in VLM_DIST_SUPPORTED.items())
                     + ". Load it on ONE node (mlx_vlm.server) if it fits, or on a "
                       "`kind: replica` cluster (one full copy per node).")
             vlm_model_path = _vlm_resolve_model_path(req.model, base_dir)
@@ -16143,7 +16214,8 @@ async def admin_cluster_load(cluster_id: str, req: ArgoLoadRequest):
                     set_pool(cluster_id, alias, None)
                 vdpool = VLMDistPool(
                     model=vlm_model_path, cluster=cluster_id, alias=alias,
-                    node_indices=node_indices,
+                    node_indices=node_indices, shard_mode=_vd_mode,
+                    backend=req.backend,
                 )
                 try:
                     await vdpool.start()
@@ -16162,8 +16234,8 @@ async def admin_cluster_load(cluster_id: str, req: ArgoLoadRequest):
                 "node_indices": node_indices,
                 "load_s": vdpool.load_s,
                 "note": (
-                    f"{req.model} is a vision model — served TENSOR-PARALLEL "
-                    f"by {len(node_indices)} vlm_runner.py ranks over ring/TCP, "
+                    f"{req.model} is a vision model — served {_vd_mode.upper()}-PARALLEL "
+                    f"by {len(node_indices)} vlm_runner.py ranks over {vdpool.backend}, "
                     f"registered as VL pool '{alias}' under {cluster_id}."
                 ),
             }

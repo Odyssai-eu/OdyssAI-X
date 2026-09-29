@@ -73,6 +73,19 @@ try:
 except ImportError:
     MimoV2FlashInnerModel = None  # type: ignore[assignment,misc]
     _HAS_MIMO_V2_FLASH = False
+# The mlx-vlm MiMo backbone (MimoModel, used by mimo_v2 / MiMo-V2.6 in
+# vlm_runner.py) carries the same GLOBAL swa_idx/ga_idx as the mlx-lm class
+# above but is a different class, so the local-index fix below must name both.
+# Only importable in the mlx-vlm venv; absent from the text cluster venv.
+try:
+    from mlx_vlm.models.mimo_v2_flash.language import (
+        MimoModel as MimoV2FlashVlmInnerModel,
+    )
+except ImportError:
+    MimoV2FlashVlmInnerModel = None  # type: ignore[assignment,misc]
+_MIMO_V2_INNER_CLASSES = tuple(
+    c for c in (MimoV2FlashInnerModel, MimoV2FlashVlmInnerModel) if c is not None
+)
 from mlx_lm.models.deepseek_v32 import DeepseekV32MLP
 from mlx_lm.models.deepseek_v32 import Model as DeepseekV32Model
 from mlx_lm.models.gemma4 import Model as Gemma4Model
@@ -419,6 +432,56 @@ def _patch_hybrid_cache(
     model.make_cache = patched
 
 
+def compute_proportional_bounds(num_layers, weights):
+    """Split `num_layers` across ranks proportionally to `weights`.
+
+    Returns cumulative bounds (len = size+1, starts at 0, ends at num_layers).
+    Each rank gets `floor(num_layers * w_i / total_w)` layers; the rounding
+    leftover goes to the rank with the largest weight (the one that
+    can afford it). Every rank receives at least 1 layer.
+
+    Why proportional-to-weight : when nodes have heterogeneous RAM
+    (.29 512 GB + .30 256 GB), the even split assigns equal shards and
+    the small node OOMs on the first forward pass. Weighting by
+    available RAM (or wired_limit) approximates per-shard memory
+    pressure well enough that the small node breathes.
+
+    Layer-size variance (MoE sparsity) is NOT modelled — proportional-
+    by-RAM is rough but vastly better than even split on heterogeneous
+    hardware. Tune via RUNNER_LAYER_BOUNDS when the rough split misses.
+    """
+    size = len(weights)
+    if size <= 0 or num_layers <= 0:
+        return list(range(num_layers + 1))
+    total_w = sum(weights)
+    if total_w <= 0:
+        per = num_layers // size
+        return [0] + [per * i for i in range(1, size)] + [num_layers]
+    raw = [num_layers * w / total_w for w in weights]
+    counts = [max(1, int(r)) for r in raw]
+    diff = num_layers - sum(counts)
+    if diff != 0:
+        order = sorted(range(size), key=lambda i: weights[i], reverse=True)
+        i = 0
+        step = 1 if diff > 0 else -1
+        guard = 0
+        while diff != 0 and guard < size * (abs(diff) + size):
+            idx = order[i % size]
+            if counts[idx] + step >= 1:
+                counts[idx] += step
+                diff -= step
+            i += 1
+            guard += 1
+    bounds = [0]
+    acc = 0
+    for c in counts:
+        acc += c
+        bounds.append(acc)
+    if bounds[-1] != num_layers:
+        bounds[-1] = num_layers
+    return bounds
+
+
 def pipeline_auto_parallel(
     model: nn.Module,
     group: mx.distributed.Group,
@@ -489,8 +552,8 @@ def pipeline_auto_parallel(
             else inner_model_instance.layer_types.index("full_attention")
         )
 
-    if _HAS_MIMO_V2_FLASH and isinstance(
-        inner_model_instance, MimoV2FlashInnerModel
+    if _MIMO_V2_INNER_CLASSES and isinstance(
+        inner_model_instance, _MIMO_V2_INNER_CLASSES
     ):
         # mimo_v2_flash.LanguageModel computes swa_idx/ga_idx ONCE at init from
         # the FULL config.hybrid_layer_pattern (.index(1)/.index(0)); its
