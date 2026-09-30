@@ -38,7 +38,7 @@
 #                 native MXFP4 load #2337, image/video/audio #2338, batching #2339,
 #                 MiMo audio across server threads #2352;
 #                 0.6.3 + mlx 0.32 crashes Qwen3.5 in server mode, mlx-vlm #1614)
-#   MLX_VLM_SPEC  full pip spec, overrides the git URL built from MLX_VLM_REF
+#   MLX_VLM_SPEC  full pip spec, overrides the archive URL built from MLX_VLM_REF
 #                 (e.g. a wheel path on the node when its GitHub link is slow)
 #   PY312         python3.12 executable (default python3.12)
 set -euo pipefail
@@ -58,7 +58,10 @@ REMOTE_USER="$(ssh -o ConnectTimeout=10 -o BatchMode=yes "$SSH_TARGET" 'id -un')
 VLM_VENV="${VLM_VENV:-$REMOTE_HOME/.venvs/mlx-vlm}"
 MLX_VLM_REF="${MLX_VLM_REF:-87020830d4dde238f111ade6d592f204a89cd527}"
 PY312="${PY312:-python3.12}"
-MLX_VLM_SPEC="${MLX_VLM_SPEC:-git+https://github.com/Blaizzy/mlx-vlm.git@${MLX_VLM_REF}}"
+# A GitHub archive of the pinned commit, not `git+https`: pip then needs no git,
+# and a Mac without Xcode's command-line tools has none (fresh ultra-96c,
+# 2026-09-30: `git version` popped the Xcode install dialog and failed).
+MLX_VLM_SPEC="${MLX_VLM_SPEC:-mlx-vlm @ https://github.com/Blaizzy/mlx-vlm/archive/${MLX_VLM_REF}.tar.gz}"
 
 echo "[install-mlx-vlm] target=$SSH_TARGET venv=$VLM_VENV ref=$MLX_VLM_REF"
 
@@ -83,8 +86,19 @@ if [[ -z "\$PY" ]]; then
     [[ -x "\$cand" ]] && PY="\$cand" && break
   done
 fi
+# A node set up by install.sh has uv but no Homebrew or python.org Python
+# (fresh ultra-96c, 2026-09-30): let uv provide 3.12, as install.sh does for 3.11.
 if [[ -z "\$PY" ]]; then
-  echo "[install-mlx-vlm] ERROR: python3.12 not found on this node" >&2
+  UV="\$(command -v uv || true)"
+  [[ -z "\$UV" && -x "\$HOME/.local/bin/uv" ]] && UV="\$HOME/.local/bin/uv"
+  if [[ -n "\$UV" ]]; then
+    echo "[install-mlx-vlm] no python3.12 on this node, installing it with uv"
+    "\$UV" python install 3.12
+    PY="\$("\$UV" python find 3.12 || true)"
+  fi
+fi
+if [[ -z "\$PY" ]]; then
+  echo "[install-mlx-vlm] ERROR: python3.12 not found on this node (and no uv to install it: run install.sh first)" >&2
   exit 1
 fi
 echo "[install-mlx-vlm] python3.12 = \$PY (\$(\$PY --version 2>&1))"
@@ -102,12 +116,15 @@ fi
 # the venv alone: the forced reinstall below used to run on EVERY call, i.e.
 # under a live mlx_vlm.server on the replica nodes whenever a node was
 # re-bootstrapped. A reinstall while a server runs needs MLX_VLM_FORCE=1.
+# A git install records the commit in vcs_info; an archive install (the
+# default now) records the archive URL, which carries the commit.
 HAVE="\$("\$VENV/bin/python" -c 'import importlib.metadata as m, json
 try:
-    print(json.loads(m.distribution("mlx-vlm").read_text("direct_url.json") or "{}").get("vcs_info", {}).get("commit_id", ""))
+    d = json.loads(m.distribution("mlx-vlm").read_text("direct_url.json") or "{}")
+    print(d.get("vcs_info", {}).get("commit_id") or d.get("url", ""))
 except Exception:
     print("")' 2>/dev/null || true)"
-if [[ -n "\$HAVE" && "\$HAVE" == "\$REF"* && "\$FORCE" != 1 ]]; then
+if [[ -n "\$HAVE" && ( "\$HAVE" == "\$REF"* || "\$HAVE" == *"/\$REF.tar.gz" ) && "\$FORCE" != 1 ]]; then
   echo "[install-mlx-vlm] mlx-vlm already at \${REF:0:7}, nothing to install"
 else
   if pgrep -f "[m]lx_vlm.server" >/dev/null 2>&1 && [[ "\$FORCE" != 1 ]]; then
