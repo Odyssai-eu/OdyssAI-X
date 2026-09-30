@@ -5152,6 +5152,28 @@ function computeFitCheck(cluster, selectedModel, nodes, modeOverride) {
   return { fits: true, modelGB, ramGB, requiredGB };
 }
 
+// Node count the Load form uses on `cluster`. When the user hasn't explicitly
+// picked one, default to the smallest topology that fits the selected model
+// (`optNodes`). Falls back to 3 only if we don't yet have capacity data — then
+// the polling will bring it shortly and the render will refine.
+// A manual pick belongs to the cluster it was made on: one outside THIS
+// cluster's range (4 picked on Argo, then a 1-node cluster selected) is not a
+// pick here, so it is dropped. The form used to keep it and POST nodes=4 to the
+// 1-node cluster (400 "unsupported nodes=4", 2026-09-30). The result is
+// persisted in `f` so the rest of the render (form-default-nodes pills, plan,
+// load action) all see the same value without recomputing.
+function resolveDefaultNodes(f, cluster, optNodes) {
+  const maxNodes = clusterMaxNodes(cluster);
+  const inRange = f.default_nodes >= 1 && f.default_nodes <= maxNodes;
+  if (!inRange) f.default_nodes_user_picked = false;
+  if (!f.default_nodes_user_picked && optNodes != null) {
+    f.default_nodes = optNodes;
+  } else if (!inRange) {
+    f.default_nodes = optNodes ?? Math.min(3, maxNodes);
+  }
+  return f.default_nodes;
+}
+
 function renderLoadConfig(a) {
   const f = state.pending_form;
   const busy = state.busy_default_load || !!a?.loading;
@@ -5162,21 +5184,8 @@ function renderLoadConfig(a) {
   // capability). Fire-and-forget: cached after first call, re-renders on
   // arrival so the pills upgrade from heuristic to truth.
   fetchLoadOptions(state.selected_cluster, selectedModel);
-  // Resolve the node count to display. When the user hasn't explicitly
-  // picked one, default to the smallest topology that fits the selected
-  // model. Falls back to 3 only if we don't yet have capacity data — then
-  // the polling will bring it shortly and the render will refine.
   const optNodes = optimalNodesForModel(state.selected_cluster, selectedModel);
-  let selectedNodes = f.default_nodes;
-  if (!f.default_nodes_user_picked && optNodes != null) {
-    selectedNodes = optNodes;
-    // Persist so the rest of the render (form-default-nodes pills, plan,
-    // load action) all see the same value without recomputing.
-    f.default_nodes = optNodes;
-  } else if (!selectedNodes) {
-    selectedNodes = optNodes ?? 3;
-    f.default_nodes = selectedNodes;
-  }
+  const selectedNodes = resolveDefaultNodes(f, state.selected_cluster, optNodes);
   const presence = computeArgoPresence(selectedModel);
   const hadesLoaded = false;
   const showLock = (selectedNodes === 4 && hadesLoaded);
