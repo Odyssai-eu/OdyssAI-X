@@ -776,11 +776,11 @@ def validate_cluster_def(cluster_id: str, new_def: dict) -> Optional[str]:
                 if src == dst: continue
                 if not RDMA_WIRING.get(src, {}).get(dst):
                     return f"no RDMA wiring from {src} to {dst}"
-    # Ensure ssh field is filled (look up KNOWN_HOSTS if missing)
+    # Ensure ssh field is filled (look up the host inventory if missing)
     for n in nodes:
         if not n.get("ssh"):
             host_id = n.get("host")
-            inv = next((h for h in KNOWN_HOSTS if h["id"] == host_id), None)
+            inv = next((h for h in _inventory_hosts() if h["id"] == host_id), None)
             if not inv:
                 return f"unknown host: {host_id}"
             n["ssh"] = inv["ssh"]
@@ -7602,7 +7602,7 @@ def _initial_default_config() -> Optional[dict]:
 #   major (1.7.2 → 2.0.0) — breaking API or topology change
 #
 # Use `./scripts/bump-version.sh patch|minor|major` to bump + auto-commit.
-APP_VERSION = "1.55.3"
+APP_VERSION = "1.55.4"
 
 app = FastAPI(
     title="OdyssAI-X (odyssai.eu)",
@@ -13179,6 +13179,22 @@ def _build_hosts_registry() -> list[dict]:
 # import HOSTS_REGISTRY directly.
 HOSTS_REGISTRY = _build_hosts_registry()
 
+
+def _inventory_hosts() -> list[dict]:
+    """Hosts a cluster can be composed from: the topology.yaml hosts, plus every
+    node of a cluster added through the dashboard (cluster-config.json). The
+    96 GB Macs only exist in dashboard-added clusters, so with KNOWN_HOSTS
+    alone they were missing from "+ Add node" and a node picked by id alone
+    failed validation as "unknown host" (2026-09-30)."""
+    out = [dict(h) for h in KNOWN_HOSTS]
+    seen = {h["id"] for h in out}
+    for h in _build_hosts_registry():
+        if h["id"] not in seen:
+            out.append({"id": h["id"], "ssh": h["ssh"], "rdma_wired": False,
+                        "label": h.get("label") or h["id"]})
+            seen.add(h["id"])
+    return out
+
 # In-memory cache: { "matrix": {...}, "ts": epoch }.
 _sync_matrix_cache: dict = {"ts": 0.0, "data": None}
 _SYNC_MATRIX_TTL_S = 60.0
@@ -13935,7 +13951,9 @@ async def _tb5_fast_copy(job_id: str, model: str, src: dict, dst: dict,
 
 
 def _resolve_host(host_id: str) -> Optional[dict]:
-    for h in HOSTS_REGISTRY:
+    # Fresh, not the import snapshot: a node added from the dashboard after
+    # the engine started must still be rebooted by the recovery ladder.
+    for h in _build_hosts_registry():
         if h["id"] == host_id:
             return h
     return None
@@ -14355,8 +14373,8 @@ async def _auto_unload_cluster(cluster_id: str, reason: str) -> None:
 
 @app.get("/admin/inventory")
 async def admin_inventory():
-    """Return the static inventory of known hosts the user can compose into a cluster."""
-    return {"hosts": KNOWN_HOSTS}
+    """Return the inventory of hosts the user can compose into a cluster."""
+    return {"hosts": _inventory_hosts()}
 
 
 @app.get("/admin/clusters")
