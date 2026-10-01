@@ -92,7 +92,7 @@ patch_jaccl() {   # patch_jaccl <venv python> <manifest>
   else
     guard_change "libjaccl.dylib"
     tmp=$(mktemp -d)
-    curl -fsSL -o "$tmp/libjaccl.dylib" "https://github.com/$REPO/releases/download/$JACCL_TAG/libjaccl.dylib" \
+    curl -fsSL --retry 4 --retry-all-errors --retry-delay 2 -o "$tmp/libjaccl.dylib" "https://github.com/$REPO/releases/download/$JACCL_TAG/libjaccl.dylib" \
       || die "cannot download $JACCL_TAG/libjaccl.dylib"
     [ "$(shasum -a 256 "$tmp/libjaccl.dylib" | cut -d' ' -f1)" = "$want" ] \
       || die "downloaded libjaccl.dylib does not match the manifest sha256: refusing it (is mlx on the node pin?)"
@@ -116,6 +116,8 @@ copy_if_changed() {   # src dst → returns 0 when it copied
   return 0
 }
 
+# Every curl retries (--retry-all-errors): a connection reset by GitHub ended a
+# run on ultra-96c at the download (2026-10-01).
 main() {
   local DIR="${ODYSSAI_X_DIR:-$HOME/mlx-cluster}"
   local REF="${ODYSSAI_X_REF:-main}"
@@ -151,13 +153,17 @@ main() {
   # 2. fetch ─────────────────────────────────────────────────────────────
   stage_begin fetch
   local SHA
-  SHA=$(curl -fsSL -H "Accept: application/vnd.github.sha" "https://api.github.com/repos/$REPO/commits/$REF") \
+  SHA=$(curl -fsSL --retry 4 --retry-all-errors --retry-delay 2 -H "Accept: application/vnd.github.sha" "https://api.github.com/repos/$REPO/commits/$REF") \
     || die "cannot resolve $REF on github.com/$REPO"
   SRC="$DIR/.src/$SHA"
   if [ ! -f "$SRC/.complete" ]; then
     rm -rf "$DIR/.src"; mkdir -p "$SRC"
-    curl -fsSL "https://codeload.github.com/$REPO/tar.gz/$SHA" | tar -xz -C "$SRC" --strip-components 1 \
-      || die "download of $REPO@$SHA failed"
+    # To a file, then tar: a retried download streamed into tar would hand it
+    # the start of the archive twice.
+    curl -fsSL --retry 4 --retry-all-errors --retry-delay 2 -o "$DIR/.src.tgz" "https://codeload.github.com/$REPO/tar.gz/$SHA" \
+      && tar -xzf "$DIR/.src.tgz" -C "$SRC" --strip-components 1 \
+      || { rm -f "$DIR/.src.tgz"; die "download of $REPO@$SHA failed"; }
+    rm -f "$DIR/.src.tgz"
     touch "$SRC/.complete"
     stage_changed
   fi
@@ -171,8 +177,10 @@ main() {
   if ! "$PY" -c 'import sys; assert sys.version_info[:2] == (3, 11)' >/dev/null 2>&1; then
     guard_change "the venv"
     if [ -z "$UV" ]; then
-      curl -fsSL https://astral.sh/uv/install.sh | env UV_NO_MODIFY_PATH=1 sh >/dev/null \
-        || die "uv install failed (https://astral.sh/uv)"
+      curl -fsSL --retry 4 --retry-all-errors --retry-delay 2 -o "$DIR/.uv-install.sh" https://astral.sh/uv/install.sh \
+        && env UV_NO_MODIFY_PATH=1 sh "$DIR/.uv-install.sh" >/dev/null \
+        || { rm -f "$DIR/.uv-install.sh"; die "uv install failed (https://astral.sh/uv)"; }
+      rm -f "$DIR/.uv-install.sh"
       UV="$HOME/.local/bin/uv"
     fi
     "$UV" python install "$PY_VERSION" >/dev/null 2>&1 || die "uv could not install Python $PY_VERSION"
