@@ -6525,6 +6525,9 @@ async def lifespan(app: FastAPI):
     except Exception:
         pass
     _persist.init_db(str(PERSIST_DB_PATH))
+    # Host keys pinned through onboarding stay trusted across container
+    # recreations: the ssh drop-in lives in the image, the keys in the volume.
+    _ensure_onboard_ssh_config()
     # Any sync_jobs left in 'running' state are orphaned from a previous
     # container life — mark them as interrupted so the UI shows truth.
     _persist.mark_orphans_interrupted()
@@ -8522,19 +8525,93 @@ async def admin_nodes_discovered(format: str = "json"):
 class DiscoveredAdd(BaseModel):
     cluster: str
     master: bool = False
+    # The node's own ssh host key ("ssh-ed25519 AAAA…"), as the onboarding app
+    # received it from the node during pairing (#101/#105). Pinned for this
+    # node's address before the ssh check, so nobody has to `ssh` it once by
+    # hand on the orchestrator's Mac to accept it.
+    host_key: Optional[str] = None
+
+
+# ── Onboarding (#101/#105) ─────────────────────────────────────────────────
+# Host keys pinned through onboarding live in the engine's data volume (the
+# operator's ~/.ssh is mounted read-only). ssh reads them as a second global
+# known_hosts file, declared once in /etc/ssh/ssh_config.d — so every ssh the
+# engine runs trusts them without a per-call option.
+ONBOARD_KNOWN_HOSTS = Path(env_get("ONBOARD_KNOWN_HOSTS", CLUSTER_CONFIG_FILE.parent / "known_hosts.onboarded"))
+SSH_CONFIG_D = Path(env_get("SSH_CONFIG_D", "/etc/ssh/ssh_config.d"))
+_HOST_KEY_RE = re.compile(r"^(ssh-ed25519|ecdsa-sha2-nistp(256|384|521)|ssh-rsa) [A-Za-z0-9+/]{40,}={0,3}$")
+
+
+def _ensure_onboard_ssh_config() -> bool:
+    """Make ssh read ONBOARD_KNOWN_HOSTS as a global known_hosts file. True when
+    in place. A non-root engine (outside Docker) cannot write the drop-in: the
+    operator then accepts host keys the usual way."""
+    conf = SSH_CONFIG_D / "odyssai-onboard.conf"
+    want = ("# Written by OdyssAI-X: host keys pinned through onboarding.\n"
+            f"GlobalKnownHostsFile /etc/ssh/ssh_known_hosts /etc/ssh/ssh_known_hosts2 {ONBOARD_KNOWN_HOSTS}\n")
+    try:
+        if conf.is_file() and conf.read_text() == want:
+            return True
+        if not SSH_CONFIG_D.is_dir():
+            return False
+        conf.write_text(want)
+        return True
+    except OSError:
+        return False
+
+
+def _pin_host_key(host: str, key: str) -> None:
+    """Replace the pinned key(s) of `host` with `key` in ONBOARD_KNOWN_HOSTS."""
+    key = " ".join(key.split()[:2])
+    if not _HOST_KEY_RE.match(key):
+        raise HTTPException(422, "host_key is not an ssh public host key (\"ssh-ed25519 AAAA…\")")
+    lines = []
+    if ONBOARD_KNOWN_HOSTS.is_file():
+        lines = [ln for ln in ONBOARD_KNOWN_HOSTS.read_text().splitlines()
+                 if ln.strip() and ln.split(" ", 1)[0] != host]
+    lines.append(f"{host} {key}")
+    ONBOARD_KNOWN_HOSTS.parent.mkdir(parents=True, exist_ok=True)
+    tmp = ONBOARD_KNOWN_HOSTS.with_name(ONBOARD_KNOWN_HOSTS.name + ".tmp")
+    tmp.write_text("\n".join(lines) + "\n")
+    os.replace(tmp, ONBOARD_KNOWN_HOSTS)
+
+
+@app.get("/admin/onboarding/pubkey")
+async def admin_onboarding_pubkey():
+    """The public key(s) this engine logs into nodes with, for the onboarding app
+    to hand to a node during pairing (#101). A public key is not a secret."""
+    keys = []
+    for name in ("id_ed25519.pub", "id_ecdsa.pub", "id_rsa.pub"):
+        f = Path.home() / ".ssh" / name
+        if f.is_file():
+            line = f.read_text().strip().splitlines()[0] if f.read_text().strip() else ""
+            if line:
+                keys.append({"file": name, "public_key": line})
+    if not keys:
+        raise HTTPException(404, "this engine has no ssh public key in ~/.ssh (id_ed25519.pub, id_ecdsa.pub, id_rsa.pub)")
+    return {"public_key": keys[0]["public_key"], "keys": keys,
+            "host_key_pinning": _ensure_onboard_ssh_config()}
 
 
 @app.post("/admin/nodes/discovered/{host}/add")
 async def admin_nodes_discovered_add(host: str, req: DiscoveredAdd):
     """Add a discovered node to a cluster. The engine first runs `true` on it
     over ssh with its usual options (BatchMode, no accept-new): a node whose
-    host key or authorised key is not set up yet is refused with the fix."""
+    host key or authorised key is not set up yet is refused with the fix. With
+    `host_key` (onboarding), that key is pinned for the node's address first."""
     e = next((r for r in _discovery_live() if r["host"] == host), None)
     if e is None:
         raise HTTPException(404, f"{host} is not announcing itself (seen within {DISCOVERY_EXPIRE_S} s)")
     if not cluster_exists(req.cluster):
         raise HTTPException(404, f"unknown cluster {req.cluster}")
     target = _safe_ssh_target(e["ssh"])
+    if req.host_key:
+        if not _ensure_onboard_ssh_config():
+            raise HTTPException(409, {"error": "host_key_pinning_unavailable",
+                                      "message": "this engine cannot pin host keys (no writable "
+                                                 f"{SSH_CONFIG_D}); run `ssh {target}` once on the "
+                                                 "orchestrator's Mac to accept the node's host key"})
+        _pin_host_key(target.split("@", 1)[-1], req.host_key)
     try:
         rc, _ = await _ssh_capture(target, "true", timeout=10)
     except Exception as ex:
