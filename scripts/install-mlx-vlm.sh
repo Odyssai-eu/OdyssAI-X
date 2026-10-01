@@ -31,6 +31,7 @@
 # Usage:
 #   scripts/install-mlx-vlm.sh <ssh-target>
 #   scripts/install-mlx-vlm.sh admin@192.168.86.30
+#   scripts/install-mlx-vlm.sh --local        # on this Mac (install.sh's vision stage)
 #
 # Env overrides:
 #   VLM_VENV      target venv path      (default <remote $HOME>/.venvs/mlx-vlm)
@@ -39,22 +40,37 @@
 #                 MiMo audio across server threads #2352;
 #                 0.6.3 + mlx 0.32 crashes Qwen3.5 in server mode, mlx-vlm #1614)
 #   MLX_VLM_SPEC  full pip spec, overrides the archive URL built from MLX_VLM_REF
+#   MLX_VLM_PINS  the rest of the venv, pinned to the set Argo serves MiMo with
+#                 (default mlx==0.32.2 transformers==5.17.0 torch==2.12.1
+#                 torchvision==0.27.1). mlx stays on the node pin so the patched
+#                 libjaccl fits; unpinned, pip pulled mlx 0.32.3 and three
+#                 different transformers/torch sets across the fleet (2026-09-30).
 #                 (e.g. a wheel path on the node when its GitHub link is slow)
 #   PY312         python3.12 executable (default python3.12)
 set -euo pipefail
 
 SSH_TARGET="${1:-}"
 if [[ -z "$SSH_TARGET" ]]; then
-  echo "usage: $0 <ssh-target>   e.g. $0 admin@192.168.86.30" >&2
+  echo "usage: $0 <ssh-target> | --local   e.g. $0 admin@192.168.86.30" >&2
   exit 2
 fi
+
+# --local runs the same steps on this Mac (install.sh calls it that way, and so
+# will the node app): no ssh, the node is the machine we are on.
+on_node() {   # on_node <command>, script on stdin
+  if [[ "$SSH_TARGET" == "--local" ]]; then
+    bash -c "$1"
+  else
+    ssh -o ConnectTimeout=10 -o BatchMode=yes "$SSH_TARGET" "$1"
+  fi
+}
 
 # Resolve the node's HOME once (the operator user is whatever SSH_TARGET says —
 # not necessarily `admin`). The remote script below is an UNQUOTED heredoc, so
 # these expand locally into a plain string; a literal $HOME would not survive
 # the Python patch step that gets this path substituted in.
-REMOTE_HOME="$(ssh -o ConnectTimeout=10 -o BatchMode=yes "$SSH_TARGET" 'printf %s "$HOME"')"
-REMOTE_USER="$(ssh -o ConnectTimeout=10 -o BatchMode=yes "$SSH_TARGET" 'id -un')"
+REMOTE_HOME="$(on_node 'printf %s "$HOME"' </dev/null)"
+REMOTE_USER="$(on_node 'id -un' </dev/null)"
 VLM_VENV="${VLM_VENV:-$REMOTE_HOME/.venvs/mlx-vlm}"
 MLX_VLM_REF="${MLX_VLM_REF:-87020830d4dde238f111ade6d592f204a89cd527}"
 PY312="${PY312:-python3.12}"
@@ -62,6 +78,7 @@ PY312="${PY312:-python3.12}"
 # and a Mac without Xcode's command-line tools has none (fresh ultra-96c,
 # 2026-09-30: `git version` popped the Xcode install dialog and failed).
 MLX_VLM_SPEC="${MLX_VLM_SPEC:-mlx-vlm @ https://github.com/Blaizzy/mlx-vlm/archive/${MLX_VLM_REF}.tar.gz}"
+MLX_VLM_PINS="${MLX_VLM_PINS:-mlx==0.32.2 transformers==5.17.0 torch==2.12.1 torchvision==0.27.1}"
 
 echo "[install-mlx-vlm] target=$SSH_TARGET venv=$VLM_VENV ref=$MLX_VLM_REF"
 
@@ -77,7 +94,9 @@ export PATH=/usr/bin:/bin:/usr/sbin:/sbin:/usr/local/bin:/opt/homebrew/bin
 VENV="${VLM_VENV}"
 SPEC="${MLX_VLM_SPEC}"
 REF="${MLX_VLM_REF}"
+PINS="${MLX_VLM_PINS}"
 FORCE="${MLX_VLM_FORCE:-0}"
+server_running() { pgrep -f "[m]lx_vlm.server|[v]lm_runner.py" >/dev/null 2>&1; }
 
 # Locate python3.12 (Homebrew installs it as python3.12; fall back to a probe).
 PY="\$(command -v ${PY312} || true)"
@@ -127,16 +146,16 @@ except Exception:
 if [[ -n "\$HAVE" && ( "\$HAVE" == "\$REF"* || "\$HAVE" == *"/\$REF.tar.gz" ) && "\$FORCE" != 1 ]]; then
   echo "[install-mlx-vlm] mlx-vlm already at \${REF:0:7}, nothing to install"
 else
-  if pgrep -f "[m]lx_vlm.server" >/dev/null 2>&1 && [[ "\$FORCE" != 1 ]]; then
+  if server_running && [[ "\$FORCE" != 1 ]]; then
     echo "[install-mlx-vlm] REFUSED: mlx_vlm.server is running on this node and mlx-vlm is at \${HAVE:0:7}, not \${REF:0:7}." >&2
     echo "[install-mlx-vlm] Unload its pool first, or rerun with MLX_VLM_FORCE=1." >&2
     exit 3
   fi
   "\$VENV/bin/python" -m pip install --upgrade pip >/dev/null
 
-  # 2. install mlx-vlm (pinned) + torch/torchvision.
-  echo "[install-mlx-vlm] pip install \$SPEC torch torchvision"
-  "\$VENV/bin/python" -m pip install "\$SPEC" torch torchvision
+  # 2. install mlx-vlm (pinned) + the pinned rest of the venv.
+  echo "[install-mlx-vlm] pip install \$SPEC \$PINS"
+  "\$VENV/bin/python" -m pip install "\$SPEC" \$PINS
   # Several refs share the version string "0.7.2" (the v0.7.2 tag and the
   # b5952d7 main commit): pip then sees the requirement as satisfied and keeps
   # the OLD code (mimo_v2 was missing on .30-.33 on 2026-09-24). Reinstall
@@ -145,13 +164,41 @@ else
   "\$VENV/bin/python" -m pip install --force-reinstall --no-deps "\$SPEC"
 fi
 
+# 2b. the pinned set, also on a venv already at REF (a venv built before the
+#     pins drifted: mlx 0.32.3 and two transformers/torch sets on 2026-09-30).
+OFF="\$("\$VENV/bin/python" - \$PINS <<'PY' 2>/dev/null || true
+import importlib.metadata as m, sys
+off = []
+for spec in sys.argv[1:]:
+    name, want = spec.split("==")
+    try:
+        have = m.version(name)
+    except Exception:
+        have = "-"
+    if have != want:
+        off.append(f"{name} {have}->{want}")
+print(" ".join(off))
+PY
+)"
+if [[ -n "\$OFF" ]]; then
+  if server_running && [[ "\$FORCE" != 1 ]]; then
+    echo "[install-mlx-vlm] REFUSED: a VL server runs on this node and the venv is off its pins (\$OFF)." >&2
+    echo "[install-mlx-vlm] Unload its pool first, or rerun with MLX_VLM_FORCE=1." >&2
+    exit 3
+  fi
+  echo "[install-mlx-vlm] aligning pins: \$OFF"
+  "\$VENV/bin/python" -m pip install -q \$PINS
+else
+  echo "[install-mlx-vlm] pins OK (\$PINS)"
+fi
+
 # 3. smoke import — fails loudly if the VL model module isn't present.
 echo "[install-mlx-vlm] smoke import"
 "\$VENV/bin/python" -c "import mlx_vlm; from mlx_vlm.models import minimax_m3_vl; from mlx_vlm.models.mimo_v2 import audio; print('[install-mlx-vlm] OK', mlx_vlm.__version__ if hasattr(mlx_vlm,'__version__') else '(no __version__)')"
 REMOTE
 )
 
-ssh -o ConnectTimeout=10 -o BatchMode=yes "$SSH_TARGET" "bash -s" <<<"$REMOTE_SCRIPT"
+on_node "bash -s" <<<"$REMOTE_SCRIPT"
 
 # 4. thinking_mode=disabled patch (idempotent, applied locally over SSH since
 #    the fix is a small in-place string replace, not a line-numbered diff that
@@ -193,6 +240,6 @@ else:
 PYEOF
 )
 PATCH_SCRIPT="${PATCH_SCRIPT//VENV_PLACEHOLDER/$VLM_VENV}"
-ssh -o ConnectTimeout=10 -o BatchMode=yes "$SSH_TARGET" "$VLM_VENV/bin/python -" <<<"$PATCH_SCRIPT"
+on_node "$VLM_VENV/bin/python -" <<<"$PATCH_SCRIPT"
 
-echo "[install-mlx-vlm] done on $SSH_TARGET"
+echo "[install-mlx-vlm] done on ${SSH_TARGET/--local/this Mac}"

@@ -241,7 +241,8 @@ def evaluate(facts: dict, manifest: dict) -> list[dict]:
                          "Update to macOS 26.2+ for RDMA; ring (TCP) still works."))
     elif "enabled" not in (rc.get("out") or "").lower() or "disabled" in (rc.get("out") or "").lower():
         rows.append(_row("rdma", "WARN", f"RDMA is not enabled ({rc.get('out') or 'no output'})",
-                         "Enable it once from recoveryOS: `rdma_ctl enable`, then reboot."))
+                         "Enable it once from recoveryOS: `rdma_ctl enable`, then reboot "
+                         "(steps: README, \"Enable RDMA\")."))
     else:
         devs = facts.get("rdma_devices") or []
         rows.append(_row("rdma", "OK", f"enabled, {len(active)} of {len(devs)} Thunderbolt ports active"

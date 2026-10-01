@@ -10,14 +10,18 @@
 #   4. packages    the pinned node requirements (requirements-node.txt)
 #   5. files       runner, helpers, runtime patches, vendored model modules
 #   6. jaccl       OdyssAI's patched libjaccl.dylib, checked against its sha256
-#   7. wired-limit the GPU wired-memory limit, kept across reboots (asks sudo)
-#   8. discovery   the node announces itself: Bonjour `_odyssai._tcp` and a
+#   7. wired-limit the GPU wired-memory limit, kept across reboots (asks sudo);
+#                  ODYSSAI_X_WIRED_MB changes it even when its daemon exists
+#   8. network     the Thunderbolt network for RDMA (scripts/rdma-onboard.sh,
+#                  asks sudo; only on the Mac's own console, it can cut SSH)
+#   9. vision      the vision venv ~/.venvs/mlx-vlm (scripts/install-mlx-vlm.sh,
+#                  Python 3.12 from uv) with the same patched libjaccl
+#  10. discovery   the node announces itself: Bonjour `_odyssai._tcp` and a
 #                  heartbeat every 5 s to its orchestrator (launchd, background)
-#   9. doctor      `odyssai-x doctor`: what this node still lacks, if anything
+#  11. doctor      `odyssai-x doctor`: what this node still lacks, if anything
 #
-# Out of scope: RDMA activation (recoveryOS: `rdma_ctl enable`), the
-# Thunderbolt network setup (scripts/rdma-onboard.sh, run as root), the vision
-# venv (scripts/install-mlx-vlm.sh).
+# Out of scope: RDMA activation, which only recoveryOS can do
+# (`rdma_ctl enable`, see README "Enable RDMA"). The network stage waits for it.
 #
 # Environment:
 #   ODYSSAI_X_REF         git ref to install (default: main)
@@ -29,6 +33,8 @@
 #   ODYSSAI_X_ENGINE      this node's orchestrator, e.g. http://mini.local:8000
 #                         (default: the node finds an OdyssAI-X engine on its /24)
 #   ODYSSAI_X_FORCE=1     change a node even while it serves a model
+#   ODYSSAI_X_VISION=0    skip the vision venv (default: installed)
+#   ODYSSAI_X_NETWORK=0   skip the Thunderbolt network stage
 #
 # Everything sits in main(), called on the last line: a truncated download
 # runs nothing.
@@ -41,7 +47,7 @@ PY_VERSION="3.11"
 T0=$(date +%s)
 CHANGED=0
 STAGE_N=0
-STAGES=9
+STAGES=11
 SUMMARY=""
 
 say()  { printf '%s\n' "$*"; }
@@ -71,6 +77,39 @@ guard_change() {
   fi
 }
 
+# OdyssAI's patched libjaccl into the mlx of a venv (the node venv, then the
+# vision venv: distributed VL runs there). Sets JACCL_NOTE; dies on failure.
+patch_jaccl() {   # patch_jaccl <venv python> <manifest>
+  local py="$1" want site lib tmp
+  want=$("$py" -c 'import json,sys; print(json.load(open(sys.argv[1]))["jaccl_sha256"])' "$2")
+  site=$("$py" -c 'import sysconfig; print(sysconfig.get_paths()["purelib"])')
+  lib="$site/mlx/lib/libjaccl.dylib"
+  [ -f "$lib" ] || die "mlx in $py has no lib/libjaccl.dylib: the mlx wheel is incomplete"
+  if [ "$RDMA_OS" != 1 ]; then
+    JACCL_NOTE="skipped: macOS $MACOS, stock JACCL kept"
+  elif [ "$(shasum -a 256 "$lib" | cut -d' ' -f1)" = "$want" ]; then
+    JACCL_NOTE="patched"
+  else
+    guard_change "libjaccl.dylib"
+    tmp=$(mktemp -d)
+    curl -fsSL -o "$tmp/libjaccl.dylib" "https://github.com/$REPO/releases/download/$JACCL_TAG/libjaccl.dylib" \
+      || die "cannot download $JACCL_TAG/libjaccl.dylib"
+    [ "$(shasum -a 256 "$tmp/libjaccl.dylib" | cut -d' ' -f1)" = "$want" ] \
+      || die "downloaded libjaccl.dylib does not match the manifest sha256: refusing it (is mlx on the node pin?)"
+    [ -f "$lib.orig" ] || cp -p "$lib" "$lib.orig"
+    cp "$tmp/libjaccl.dylib" "$lib.odx-new" && mv "$lib.odx-new" "$lib"
+    rm -rf "$tmp"
+    if ! "$py" -c 'import mlx.core as mx; mx.distributed.is_available()' >/dev/null 2>&1; then
+      cp -p "$lib.orig" "$lib.odx-new" && mv "$lib.odx-new" "$lib"
+      die "mlx does not import with the patched JACCL: stock one restored"
+    fi
+    stage_changed
+    JACCL_NOTE="patched ($JACCL_TAG)"
+  fi
+}
+
+can_sudo() { sudo -n true 2>/dev/null || [ -t 0 ] || { : </dev/tty; } 2>/dev/null; }
+
 copy_if_changed() {   # src dst → returns 0 when it copied
   if [ -f "$2" ] && cmp -s "$1" "$2"; then return 1; fi
   cp "$1" "$2.odx-new" && mv "$2.odx-new" "$2"
@@ -82,7 +121,13 @@ main() {
   local REF="${ODYSSAI_X_REF:-main}"
   local MODELS_DIR="${ODYSSAI_X_MODELS_DIR:-}"
   if [ -z "$MODELS_DIR" ]; then
-    if [ -d /Volumes/models/odysseus ]; then MODELS_DIR=/Volumes/models/odysseus; else MODELS_DIR="$HOME/mlx-models"; fi
+    # The shared volume only if this user can write to it: another account's
+    # /Volumes/models/odysseus (admin:staff 755) is readable, not writable.
+    if [ -d /Volumes/models/odysseus ] && [ -w /Volumes/models/odysseus ]; then
+      MODELS_DIR=/Volumes/models/odysseus
+    else
+      MODELS_DIR="$HOME/mlx-models"
+    fi
   fi
   say "OdyssAI-X node install — $(hostname -s), ref $REF, into $DIR"
 
@@ -194,30 +239,8 @@ main() {
 
   # 6. jaccl ─────────────────────────────────────────────────────────────
   stage_begin jaccl
-  local WANT; WANT=$("$PY" -c 'import json,sys; print(json.load(open(sys.argv[1]))["jaccl_sha256"])' "$DIR/doctor-manifest.json")
-  local LIB="$SITE/mlx/lib/libjaccl.dylib"
-  [ -f "$LIB" ] || die "mlx has no lib/libjaccl.dylib: the mlx wheel is incomplete"
-  if [ "$RDMA_OS" != 1 ]; then
-    stage_end "skipped: macOS $MACOS, stock JACCL kept"
-  elif [ "$(shasum -a 256 "$LIB" | cut -d' ' -f1)" = "$WANT" ]; then
-    stage_end "patched"
-  else
-    guard_change "libjaccl.dylib"
-    local TMP; TMP=$(mktemp -d)
-    curl -fsSL -o "$TMP/libjaccl.dylib" "https://github.com/$REPO/releases/download/$JACCL_TAG/libjaccl.dylib" \
-      || die "cannot download $JACCL_TAG/libjaccl.dylib"
-    [ "$(shasum -a 256 "$TMP/libjaccl.dylib" | cut -d' ' -f1)" = "$WANT" ] \
-      || die "downloaded libjaccl.dylib does not match the manifest sha256: refusing it"
-    [ -f "$LIB.orig" ] || cp -p "$LIB" "$LIB.orig"
-    cp "$TMP/libjaccl.dylib" "$LIB.odx-new" && mv "$LIB.odx-new" "$LIB"
-    rm -rf "$TMP"
-    if ! "$PY" -c 'import mlx.core as mx; mx.distributed.is_available()' >/dev/null 2>&1; then
-      cp -p "$LIB.orig" "$LIB.odx-new" && mv "$LIB.odx-new" "$LIB"
-      die "mlx does not import with the patched JACCL: stock one restored"
-    fi
-    stage_changed
-    stage_end "patched ($JACCL_TAG)"
-  fi
+  patch_jaccl "$PY" "$DIR/doctor-manifest.json"
+  stage_end "$JACCL_NOTE"
 
   # 7. wired-limit ───────────────────────────────────────────────────────
   stage_begin wired-limit
@@ -226,19 +249,26 @@ main() {
     [ -f "/Library/LaunchDaemons/$label.plist" ] && break
     label=""
   done
-  if [ -n "$label" ]; then
+  local WANT_MB="${ODYSSAI_X_WIRED_MB:-}" HAVE_MB=""
+  [ -n "$label" ] && HAVE_MB=$(sed -n 's/.*iogpu.wired_limit_mb=\([0-9]*\).*/\1/p' "/Library/LaunchDaemons/$label.plist" | head -1)
+  if [ -n "$label" ] && { [ -z "$WANT_MB" ] || [ "$WANT_MB" = "$HAVE_MB" ]; }; then
     stage_end "$(sysctl -n iogpu.wired_limit_mb) MB, daemon $label"
+  elif [ -n "$label" ] && [ "$label" != eu.odyssai.wiredlimit ]; then
+    warn "wired limit: $label is not this installer's daemon; change its value by hand to $WANT_MB"
+    stage_end "$(sysctl -n iogpu.wired_limit_mb) MB, daemon $label (not changed)"
   else
     local RAM_MB CUR VAL RES
     RAM_MB=$(( $(sysctl -n hw.memsize) / 1048576 ))
     CUR=$(sysctl -n iogpu.wired_limit_mb 2>/dev/null || echo 0)
     RES=$(( RAM_MB / 16 )); [ "$RES" -lt 8192 ] && RES=8192
-    VAL="${ODYSSAI_X_WIRED_MB:-}"
+    # An existing daemon is rewritten only when ODYSSAI_X_WIRED_MB asks for a new
+    # value (.42/.49 kept 80 GB while a replica needed 87, 2026-10-01).
+    VAL="$WANT_MB"
     [ -n "$VAL" ] || { [ "$CUR" -gt 0 ] && VAL=$CUR; } || VAL=$(( RAM_MB - RES ))
     [ "$VAL" -lt "$RAM_MB" ] || die "wired limit $VAL MB >= $RAM_MB MB of RAM"
     local PLIST=/Library/LaunchDaemons/eu.odyssai.wiredlimit.plist
     local CMD="sudo tee $PLIST >/dev/null && sudo chown root:wheel $PLIST && sudo chmod 644 $PLIST && sudo launchctl bootstrap system $PLIST"
-    if sudo -n true 2>/dev/null || [ -t 0 ] || { : </dev/tty; } 2>/dev/null; then
+    if can_sudo; then
       say "      wired limit ${VAL} MB on ${RAM_MB} MB of RAM — sudo asks for this Mac's password:"
       cat <<XML | sudo tee "$PLIST" >/dev/null
 <?xml version="1.0" encoding="UTF-8"?>
@@ -261,17 +291,89 @@ main() {
 </dict>
 </plist>
 XML
+      sudo launchctl bootout system/eu.odyssai.wiredlimit 2>/dev/null || true
       sudo chown root:wheel "$PLIST" && sudo chmod 644 "$PLIST" && sudo launchctl bootstrap system "$PLIST" \
         || die "wired-limit daemon install failed"
+      sudo sysctl "iogpu.wired_limit_mb=$VAL" >/dev/null || true
       stage_changed
-      stage_end "$(sysctl -n iogpu.wired_limit_mb) MB, daemon installed"
+      if [ -n "$label" ]; then stage_end "$(sysctl -n iogpu.wired_limit_mb) MB, daemon updated (was ${HAVE_MB:-?})"
+      else stage_end "$(sysctl -n iogpu.wired_limit_mb) MB, daemon installed"; fi
     else
       warn "no terminal for sudo: rerun this installer from a terminal (or ssh -t) to set the wired limit"
       stage_end "skipped (no terminal for sudo)"
     fi
   fi
 
-  # 8. discovery ─────────────────────────────────────────────────────────
+  # 8. network ───────────────────────────────────────────────────────────
+  # The Thunderbolt network RDMA needs (scripts/rdma-onboard.sh wraps the exo
+  # recipe). It rebuilds network services, so it runs only on the Mac's own
+  # console (rdma-onboard refuses under SSH), never under a serving runner, and
+  # never over an exo-managed network without the operator's choice.
+  stage_begin network
+  local NET_OUT NET_RC=0 ONB="$SRC/scripts/rdma-onboard.sh"
+  if [ "${ODYSSAI_X_NETWORK:-1}" = 0 ]; then
+    stage_end "skipped (ODYSSAI_X_NETWORK=0)"
+  elif [ "$RDMA_OS" != 1 ]; then
+    stage_end "skipped: macOS $MACOS has no RDMA"
+  elif ! rdma_ctl status 2>/dev/null | grep -q enabled; then
+    stage_end "waiting: RDMA not enabled (recoveryOS, see README \"Enable RDMA\")"
+  else
+    NET_OUT=$(bash "$ONB" --check 2>&1) || NET_RC=$?
+    case "$NET_RC" in
+      0)  stage_end "ready" ;;
+      10) warn "network: applied but the Thunderbolt ports have no link-local address yet: reboot this Mac once"
+          stage_end "needs one reboot" ;;
+      11) if printf '%s' "$NET_OUT" | grep -q "exo present"; then
+            warn "network: this Mac's Thunderbolt network is managed by exo. Keep it, or replace it: sudo bash $ONB --apply --console --migrate-exo (on this Mac's console)"
+            stage_end "exo-managed: not changed"
+          elif [ "$SERVING" = 1 ]; then
+            warn "network: this node is serving a model; unload it, then rerun the installer here"
+            stage_end "skipped (serving)"
+          elif [ -n "${SSH_CONNECTION:-}" ]; then
+            warn "network: must run on this Mac's own console (it rebuilds network services and could cut SSH): open Terminal on $(hostname -s) and rerun the installer"
+            stage_end "skipped (over SSH)"
+          elif can_sudo; then
+            say "      Thunderbolt network for RDMA — sudo asks for this Mac's password:"
+            NET_RC=0; sudo bash "$ONB" --apply --console || NET_RC=$?
+            case "$NET_RC" in
+              0)  stage_changed; stage_end "applied" ;;
+              10) stage_changed; warn "network: applied; reboot this Mac once so the Thunderbolt ports get their link-local addresses"
+                  stage_end "applied, needs one reboot" ;;
+              *)  warn "network: rdma-onboard refused or failed (exit $NET_RC); its log says why"
+                  stage_end "blocked (exit $NET_RC)" ;;
+            esac
+          else
+            warn "no terminal for sudo: rerun this installer from a terminal on this Mac to set up the Thunderbolt network"
+            stage_end "skipped (no terminal for sudo)"
+          fi ;;
+      *)  warn "network: $(printf '%s' "$NET_OUT" | grep -v '^$' | tail -2 | tr '\n' ' ')"
+          stage_end "blocked (exit $NET_RC)" ;;
+    esac
+  fi
+
+  # 9. vision ────────────────────────────────────────────────────────────
+  # mlx-vlm at the repo pin in ~/.venvs/mlx-vlm (Python 3.12 from uv), with the
+  # same patched libjaccl: single-node and distributed VL pools run there.
+  stage_begin vision
+  local VLOG="$DIR/install-vision.log" VPY="${VLM_VENV:-$HOME/.venvs/mlx-vlm}/bin/python" VRC=0
+  if [ "${ODYSSAI_X_VISION:-1}" = 0 ]; then
+    stage_end "skipped (ODYSSAI_X_VISION=0)"
+  else
+    PATH="$HOME/.local/bin:$PATH" bash "$SRC/scripts/install-mlx-vlm.sh" --local >"$VLOG" 2>&1 || VRC=$?
+    if [ "$VRC" = 3 ]; then
+      warn "vision: a VL server runs on this node and its venv would change; unload it, then rerun"
+      stage_end "skipped (serving)"
+    elif [ "$VRC" != 0 ]; then
+      warn "vision: install failed (exit $VRC): $(grep -v '^$' "$VLOG" | tail -1)"
+      stage_end "failed, see $VLOG"
+    else
+      grep -q "nothing to install" "$VLOG" && grep -q "pins OK" "$VLOG" && grep -q "already applied" "$VLOG" || stage_changed
+      if [ "$SERVING" = 1 ]; then JACCL_NOTE="libjaccl not checked (serving)"; else patch_jaccl "$VPY" "$DIR/doctor-manifest.json"; fi
+      stage_end "mlx-vlm $("$VPY" -c 'import importlib.metadata as m; print(m.version("mlx-vlm"))' 2>/dev/null || echo '?'), libjaccl ${JACCL_NOTE}"
+    fi
+  fi
+
+  # 10. discovery ────────────────────────────────────────────────────────
   # A LaunchDaemon (starts at boot, no login needed on a headless node) running
   # `odyssai-x advertise` as this user, at launchd's lowest priority
   # (ProcessType Background). It touches no runner, so it needs no FORCE.
@@ -311,7 +413,7 @@ XML
       sudo -n launchctl kickstart -k system/eu.odyssai.x.node 2>/dev/null && rm -f "$DIR/.advertise-restart"
     fi
     stage_end "announcing ($(cat "$DIR/engine-url" 2>/dev/null || echo 'engine: looking on the LAN'))"
-  elif sudo -n true 2>/dev/null || [ -t 0 ] || { : </dev/tty; } 2>/dev/null; then
+  elif can_sudo; then
     printf '%s\n' "$DXML" | sudo tee "$DPL" >/dev/null && sudo chown root:wheel "$DPL" && sudo chmod 644 "$DPL" \
       || die "discovery daemon install failed"
     sudo launchctl bootout system "$DPL" 2>/dev/null || true
@@ -324,7 +426,7 @@ XML
     stage_end "skipped (no terminal for sudo)"
   fi
 
-  # 9. doctor ────────────────────────────────────────────────────────────
+  # 11. doctor ───────────────────────────────────────────────────────────
   stage_begin doctor
   say ""
   local rc=0
@@ -340,7 +442,7 @@ XML
   say "    - {rank: <n>, id: $(hostname -s), ssh: $(id -un)@$(hostname -s).local, models_dir: $MODELS_DIR}"
   say "Check it again any time: $DIR/odyssai-x doctor"
   if [ "$RDMA_OS" = 1 ] && ! rdma_ctl status 2>/dev/null | grep -q enabled; then
-    say "RDMA over Thunderbolt: enable it once from recoveryOS (\`rdma_ctl enable\`), then run scripts/rdma-onboard.sh as root."
+    say "RDMA over Thunderbolt: enable it once from recoveryOS (see README \"Enable RDMA\"), then rerun this installer on this Mac."
   fi
   return 0
 }

@@ -14,7 +14,19 @@ On each Mac that will hold models (a node), in Terminal:
 /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Odyssai-eu/OdyssAI-X/main/install.sh)"
 ```
 
-Nothing to install first: it brings its own Python (uv), the pinned MLX, the patched JACCL and the GPU memory setting, times each stage and ends with `odyssai-x doctor`, one line per check with the fix when something is off. Run it again any time: `already up to date`. Or hand this repo to your coding agent: it reads [`AGENTS.md`](AGENTS.md). Then [start the server](#other-install-methods) (step 3 onwards).
+Nothing to install first: it brings its own Python (uv), the pinned MLX, the patched JACCL, the GPU memory setting, the Thunderbolt network for RDMA and the vision runtime (`mlx-vlm`), times each stage and ends with `odyssai-x doctor`, one line per check with the fix when something is off. Run it again any time: `already up to date`. Run it in the Mac's own Terminal: the network step can cut an SSH session, so over SSH it is skipped with a note. Or hand this repo to your coding agent: it reads [`AGENTS.md`](AGENTS.md). Then [start the server](#other-install-methods) (step 3 onwards).
+
+### Enable RDMA
+
+Distributed pools over Thunderbolt 5 need RDMA, which only recoveryOS can switch on, once per Mac (macOS 26.2 or later):
+
+1. Shut the Mac down.
+2. Press and hold the power button until "Loading startup options" appears, then choose **Options** › **Continue**.
+3. Pick a user and give its password, then open **Utilities** › **Terminal**.
+4. Type `rdma_ctl enable`, press Return, then restart from the Apple menu.
+5. Back in macOS, `rdma_ctl status` says `enabled`. Run the installer again: its network step now sets up the Thunderbolt ports.
+
+Replica and single-node pools, and TCP `ring`, do not need RDMA.
 
 ## Model support
 
@@ -141,7 +153,7 @@ curl -s -X POST http://localhost:8000/admin/clusters/<id>/load -H 'content-type:
   -d '{"model":"<org>/<name>","nodes":4,"batch":true}'
 ```
 
-**Optional — RDMA over Thunderbolt 5** for distributed pools: enable RDMA once per node in recoveryOS (`rdma_ctl enable`), cable the nodes in a full mesh, run `sudo scripts/rdma-onboard.sh --apply --console` at each node's console (it provisions the Thunderbolt network; attribution in `NOTICE`), map the ports with `scripts/discover-rdma-wiring.py`, and declare `backend: jaccl` and the port wiring in `topology.yaml`. Every edge is checked before a load (port state, link-local alias, reachability through that cable) and a rank that dies mid-run is reported to the survivors in under a second instead of hanging them — see `AGENTS.md` section E and `vendor/jaccl/PATCHES.md`. TCP `ring` needs none of this and always works.
+**Optional — RDMA over Thunderbolt 5** for distributed pools: [enable RDMA](#enable-rdma) once per node, cable the nodes in a full mesh, run the installer at each node's console (its network step runs `scripts/rdma-onboard.sh`, which provisions the Thunderbolt network; attribution in `NOTICE`), map the ports with `scripts/discover-rdma-wiring.py`, and declare `backend: jaccl` and the port wiring in `topology.yaml`. Every edge is checked before a load (port state, link-local alias, reachability through that cable) and a rank that dies mid-run is reported to the survivors in under a second instead of hanging them — see `AGENTS.md` section E and `vendor/jaccl/PATCHES.md`. TCP `ring` needs none of this and always works.
 
 Narrative guide, node roles, budgets and gotchas: [`docs/GETTING-STARTED.md`](docs/GETTING-STARTED.md).
 
