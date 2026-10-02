@@ -598,10 +598,20 @@ footer a:hover { color: var(--accent3); }
 // ── Config ──────────────────────────────────────────────────────────────────
 const HOST = window.location.hostname;
 
+// `model` is only a descriptive fallback: the card shows the live llm_model
+// from each instance's /health, so no model name is hardcoded here.
 const SHARDS = [
-  { id: 'alpha',   label: 'Alpha',    port: 8766, model: 'tele-fast · consolidated corpus', primary: true },
-  { id: 'company', label: 'Company',  port: 8767, model: 'tele-fast · company memory' },
+  { id: 'alpha',   label: 'Alpha',    port: 8766, model: 'consolidated corpus', primary: true },
+  { id: 'company', label: 'Company',  port: 8767, model: 'company memory' },
 ];
+
+// Per-call timeouts. Status/health polls stay short; a LightRAG hybrid query
+// takes 20-60 s (keyword extraction + retrieval + generation), uploads and
+// graph reads are slower still.
+const TIMEOUT_POLL_MS   = 5000;
+const TIMEOUT_QUERY_MS  = 300000;
+const TIMEOUT_UPLOAD_MS = 120000;
+const TIMEOUT_GRAPH_MS  = 60000;
 
 const ODYSSAI_URL = `http://${HOST}:8000`;
 
@@ -631,12 +641,31 @@ function toast(msg, type = 'inf') {
 // ── API helpers ──────────────────────────────────────────────────────────────
 function shardUrl(port) { return `http://${HOST}:${port}`; }
 
-async function safeFetch(url, opts = {}) {
+async function safeFetch(url, opts = {}, timeoutMs = TIMEOUT_POLL_MS) {
   try {
-    const r = await fetch(url, { ...opts, signal: AbortSignal.timeout(5000) });
+    const r = await fetch(url, { ...opts, signal: AbortSignal.timeout(timeoutMs) });
     if (!r.ok) throw new Error(`HTTP ${r.status}`);
     return await r.json();
   } catch { return null; }
+}
+
+// Like safeFetch, but keeps the reason of a failure so the UI can say
+// "timed out after 300 s" or "HTTP 500" instead of a generic message.
+async function fetchDetailed(url, opts = {}, timeoutMs = TIMEOUT_POLL_MS) {
+  try {
+    const r = await fetch(url, { ...opts, signal: AbortSignal.timeout(timeoutMs) });
+    if (!r.ok) {
+      let detail = '';
+      try { detail = (await r.text()).slice(0, 200); } catch {}
+      return { data: null, error: `HTTP ${r.status}${detail ? ' — ' + detail : ''}` };
+    }
+    return { data: await r.json(), error: null };
+  } catch (e) {
+    if (e && e.name === 'TimeoutError') {
+      return { data: null, error: `no answer after ${Math.round(timeoutMs / 1000)} s` };
+    }
+    return { data: null, error: (e && e.message) || 'network error' };
+  }
 }
 
 // ── Shard Overview ────────────────────────────────────────────────────────────
@@ -803,7 +832,7 @@ async function uploadFile(file) {
   const fd = new FormData();
   fd.append('file', file);
   toast(`Uploading ${file.name} to ${shard.label}…`, 'inf');
-  const r = await safeFetch(`${base}/documents/upload`, { method: 'POST', body: fd });
+  const r = await safeFetch(`${base}/documents/upload`, { method: 'POST', body: fd }, TIMEOUT_UPLOAD_MS);
   if (r) {
     toast(`${file.name} → ${r.status} (${shard.label})`, r.status === 'success' ? 'ok' : 'inf');
     refreshShard(shard);
@@ -958,14 +987,20 @@ async function doQuery() {
   document.getElementById('query-elapsed').textContent = '';
 
   const t0 = Date.now();
-  const r = await safeFetch(`${shardUrl(shard.port)}/query`, {
+  const elapsedEl = document.getElementById('query-elapsed');
+  // Live counter: a hybrid query runs 20-60 s, silence looks like a hang.
+  const ticker = setInterval(() => {
+    elapsedEl.textContent = `${((Date.now() - t0) / 1000).toFixed(0)}s…`;
+  }, 1000);
+  const { data: r, error } = await fetchDetailed(`${shardUrl(shard.port)}/query`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ query: q, mode, only_need_context: false }),
-  });
+  }, TIMEOUT_QUERY_MS);
+  clearInterval(ticker);
 
   const elapsed = ((Date.now() - t0) / 1000).toFixed(1);
-  document.getElementById('query-elapsed').textContent = `${elapsed}s`;
+  elapsedEl.textContent = `${elapsed}s`;
 
   btn.innerHTML = '<span>&#x2728;</span> Query';
   btn.disabled = false;
@@ -974,7 +1009,7 @@ async function doQuery() {
     resp.textContent = r.response || r.answer || JSON.stringify(r, null, 2);
   } else {
     resp.style.color = 'var(--red)';
-    resp.textContent = 'Query failed — is the shard running and the graph built?';
+    resp.textContent = `Query failed on ${shard.label}: ${error}`;
     setTimeout(() => { resp.style.color = ''; }, 3000);
   }
 }
@@ -1047,7 +1082,7 @@ async function loadGraph() {
   status.textContent = '';
 
   const base   = shardUrl(shard.port);
-  const labels = await safeFetch(`${base}/graph/label/popular`);
+  const labels = await safeFetch(`${base}/graph/label/popular`, {}, TIMEOUT_GRAPH_MS);
   if (!labels || !labels.length) {
     overlay.innerHTML = '<div style="font-size:24px">&#x1F300;</div><div>No entities yet — keep ingesting!</div>';
     return;
@@ -1057,7 +1092,7 @@ async function loadGraph() {
   overlay.innerHTML = `<div style="font-size:24px">&#x231B;</div><div>Loading ${top.length} subgraphs…</div>`;
 
   const graphs = await Promise.all(
-    top.map(label => safeFetch(`${base}/graphs?label=${encodeURIComponent(label)}`))
+    top.map(label => safeFetch(`${base}/graphs?label=${encodeURIComponent(label)}`, {}, TIMEOUT_GRAPH_MS))
   );
 
   const nodeMap = new Map();
