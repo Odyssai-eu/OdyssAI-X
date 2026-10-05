@@ -877,6 +877,20 @@ TENSOR_CAPABLE_MODEL_TYPES = frozenset({
     "minimax", "glm4_moe", "glm4_moe_lite",
     "qwen3", "qwen3_moe", "qwen3_next", "qwen3_5", "qwen3_5_moe", "qwen3_vl",
     "gpt_oss", "step3p5", "nemotron_h", "gemma4",
+    # hy_v4: no auto_parallel strategy — the module's own Model.shard() is the
+    # tensor split, reached through sharded_load (see TENSOR_NO_AP_MODEL_TYPES).
+    "hy_v4",
+})
+
+# Tensor mode only: model types whose tensor split is the module's own
+# Model.shard(), reached through mlx_lm's sharded_load (use_ap=False), not an
+# auto_parallel ShardingStrategy. Their pipeline mode keeps auto_parallel
+# (hy_v4: align_bounds_to_full_indexer), so FORCE_NO_AP_MODEL_TYPES — which
+# covers every mode — does not fit.
+TENSOR_NO_AP_MODEL_TYPES = frozenset({
+    # 2026-10-05: Hy4-preview-Q6h16 on 4 nodes, JACCL. hy4_oracle_tiny --tp
+    # passes at 2 and 4 ranks (rel_err 1.5e-6).
+    "hy_v4",
 })
 
 # Model types whose pipeline path is a runner-side patch (patches/) rather than
@@ -7602,7 +7616,7 @@ def _initial_default_config() -> Optional[dict]:
 #   major (1.7.2 → 2.0.0) — breaking API or topology change
 #
 # Use `./scripts/bump-version.sh patch|minor|major` to bump + auto-commit.
-APP_VERSION = "1.55.4"
+APP_VERSION = "1.55.5"
 
 app = FastAPI(
     title="OdyssAI-X (odyssai.eu)",
@@ -16400,6 +16414,16 @@ async def admin_cluster_load(cluster_id: str, req: ArgoLoadRequest):
             f"[load] {cluster_id}: model_type={arch.get('model_type')} requires "
             f"the runner-side pipeline patch — forcing use_ap=False "
             f"(auto_parallel would die on num_hidden_layers / skip the patch)\n"
+        )
+        req.use_ap = False
+
+    # Tensor mode through the module's own shard() — see TENSOR_NO_AP_MODEL_TYPES.
+    # auto_parallel has no strategy for these and raises "Unsupported model type".
+    if (req.use_ap and req.mode == "tensor"
+            and arch.get("model_type") in TENSOR_NO_AP_MODEL_TYPES):
+        sys.stderr.write(
+            f"[load] {cluster_id}: model_type={arch.get('model_type')} tensor "
+            f"split is the module's shard() — forcing use_ap=False\n"
         )
         req.use_ap = False
 

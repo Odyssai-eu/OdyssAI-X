@@ -2473,10 +2473,14 @@ def main() -> None:
         tokenizer = tokenizer_utils.load(repo_path, tokenizer_config_extra={"trust_remote_code": True},
                                          eos_token_ids=model_config.get("eos_token_id"))
     else:
+        # return_config: model_config is read after the load (model_type
+        # dispatch below), like on the two branches above.
         if mode == "tensor":
-            model, tokenizer = sharded_load(repo, tensor_group=group)
+            model, tokenizer, model_config = sharded_load(
+                repo, tensor_group=group, return_config=True)
         else:
-            model, tokenizer = sharded_load(repo, pipeline_group=group)
+            model, tokenizer, model_config = sharded_load(
+                repo, pipeline_group=group, return_config=True)
 
     # Sync barrier: don't signal "ready" until ALL ranks have loaded tokenizer
     # otherwise rank 0 starts its gen timer before rank 1 is actually ready.
