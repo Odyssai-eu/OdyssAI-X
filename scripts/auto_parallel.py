@@ -58,6 +58,14 @@ except ImportError:
     DeepseekV4Model = None  # type: ignore[assignment,misc]
     _HAS_DEEPSEEK_V4 = False
 try:
+    # Vendored module (scripts/mlx_models/hy_v4.py): same start_idx / end_idx /
+    # num_layers layer loop as DeepseekV32, see _set_layers. Exercised by
+    # diag/hy4_oracle_tiny.py --pp; prod loads hy_v4 with use_ap=False
+    # (api.py FORCE_NO_AP_MODEL_TYPES: this path hung on the 2nd request).
+    from mlx_lm.models.hy_v4 import Model as HyV4Model
+except ImportError:
+    HyV4Model = None  # type: ignore[assignment,misc]
+try:
     from mlx_lm.models.bailing_moe_linear import (
         LanguageModel as BailingMoeLinearInnerModel,
     )
@@ -1085,6 +1093,7 @@ def _set_layers(model: nn.Module, layers: list[_LayerCallable]) -> None:
                 DeepseekV4Model,
                 Glm4MoeModel,
                 KimiK25Model,
+                HyV4Model,
             ) if m is not None),
         ) and hasattr(inner_model_instance, "num_layers"):
             logger.info(

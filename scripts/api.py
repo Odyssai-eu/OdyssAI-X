@@ -878,18 +878,7 @@ TENSOR_CAPABLE_MODEL_TYPES = frozenset({
     "qwen3", "qwen3_moe", "qwen3_next", "qwen3_5", "qwen3_5_moe", "qwen3_vl",
     "gpt_oss", "step3p5", "nemotron_h", "gemma4",
     # hy_v4: no auto_parallel strategy — the module's own Model.shard() is the
-    # tensor split, reached through sharded_load (see TENSOR_NO_AP_MODEL_TYPES).
-    "hy_v4",
-})
-
-# Tensor mode only: model types whose tensor split is the module's own
-# Model.shard(), reached through mlx_lm's sharded_load (use_ap=False), not an
-# auto_parallel ShardingStrategy. Their pipeline mode keeps auto_parallel
-# (hy_v4: align_bounds_to_full_indexer), so FORCE_NO_AP_MODEL_TYPES — which
-# covers every mode — does not fit.
-TENSOR_NO_AP_MODEL_TYPES = frozenset({
-    # 2026-10-05: Hy4-preview-Q6h16 on 4 nodes, JACCL. hy4_oracle_tiny --tp
-    # passes at 2 and 4 ranks (rel_err 1.5e-6).
+    # tensor split, reached through sharded_load (see FORCE_NO_AP_MODEL_TYPES).
     "hy_v4",
 })
 
@@ -915,6 +904,13 @@ FORCE_NO_AP_MODEL_TYPES = frozenset({
     # ni de shard()) — l'etat partage CSA2 (KV compresse des couches 2/8/14/20,
     # top-k, pool de candidats) ne traverse pas un split AP. Meme regle que V4.
     "deepseek_v41",
+    # hy_v4 (2026-10-05) : module repris tel quel de kernelpool (mlx-lm add-hy4-preview),
+    # shard() pour le tensoriel et pipeline() maison (bornes sur les couches
+    # indexer "full", all_gather final) via sharded_load. Le chemin AP pipeline
+    # répondait à la 1re requête puis bloquait à la 2e (rangs 1-3 jamais
+    # entrés, watchdog 300 s, pool à décharger) ; le pipeline natif tient
+    # 4 requêtes d'affilée (10 tok/s, Argo 4 nœuds).
+    "hy_v4",
 })
 
 # Model types that carry a vision_config but must NOT route to mlx_vlm.server.
@@ -5430,6 +5426,9 @@ _THINK_MARKERS = {
     # OWN open tag (not template-prefilled), so _seed_in_think returns False for
     # it — otherwise a no-think reply (no thinking block) would ghost.
     "inkling": ("<|content_thinking|>", "<|end_message|>"),
+    # Tencent Hy4-preview: <think:opensource>…</think:opensource>, the open tag
+    # prefilled by the template (reasoning_effort high, its default).
+    "hy4": ("<think:opensource>", "</think:opensource>"),
 }
 
 
@@ -5546,7 +5545,12 @@ _MODELS_AUTO_OPEN_THINK = ("minimax", "qwen3.5", "qwen3.6", "step-3.7", "step3p7
                            # dans `content`. Départ hors bloc : _seed_in_think.
                            # mlx_vlm.server (Flash) sépare déjà le raisonnement ;
                            # sans `<think>` dans le flux, le filtre laisse passer.
-                           "mimo")
+                           "mimo",
+                           # Hy4-preview (hy_v4) — le template termine le prompt par
+                           # `<think:opensource>` ; le modèle émet le raisonnement +
+                           # `</think:opensource>` en clair (vérifié 2026-10-05 sur
+                           # Argo : tout dans `content`). Marqueurs : _THINK_MARKERS.
+                           "hy4")
 # Subset of _MODELS_AUTO_OPEN_THINK that IGNORES the `enable_thinking`
 # kwarg and always wraps reasoning in <think>...</think>. Per MiniMax M2
 # docs (2026-05-20 update): "The model's reasoning is wrapped in <think>
@@ -5584,7 +5588,11 @@ _MODELS_IGNORE_ENABLE_THINKING_FLAG = ("minimax-m2", "step-3.7", "step3p7",
                                        # low/high/max, défaut max — pas de switch off).
                                        # Vérifié 2026-08-29: enable_thinking défaut off,
                                        # raisonnement émis quand même.
-                                       "glm-5.3", "glm-5-3")
+                                       "glm-5.3", "glm-5-3",
+                                       # Hy4-preview : pas d'enable_thinking dans le template
+                                       # (reasoning_effort no_think/high seulement), il pense
+                                       # donc quand même avec enable_thinking=false.
+                                       "hy4")
 
 # Models whose chat template reads a `reasoning_effort` system directive
 # (OpenAI o-series convention: minimal/low/medium/high). Step-3.7-Flash is a
@@ -7616,7 +7624,7 @@ def _initial_default_config() -> Optional[dict]:
 #   major (1.7.2 → 2.0.0) — breaking API or topology change
 #
 # Use `./scripts/bump-version.sh patch|minor|major` to bump + auto-commit.
-APP_VERSION = "1.55.5"
+APP_VERSION = "1.55.6"
 
 app = FastAPI(
     title="OdyssAI-X (odyssai.eu)",
@@ -16414,16 +16422,6 @@ async def admin_cluster_load(cluster_id: str, req: ArgoLoadRequest):
             f"[load] {cluster_id}: model_type={arch.get('model_type')} requires "
             f"the runner-side pipeline patch — forcing use_ap=False "
             f"(auto_parallel would die on num_hidden_layers / skip the patch)\n"
-        )
-        req.use_ap = False
-
-    # Tensor mode through the module's own shard() — see TENSOR_NO_AP_MODEL_TYPES.
-    # auto_parallel has no strategy for these and raises "Unsupported model type".
-    if (req.use_ap and req.mode == "tensor"
-            and arch.get("model_type") in TENSOR_NO_AP_MODEL_TYPES):
-        sys.stderr.write(
-            f"[load] {cluster_id}: model_type={arch.get('model_type')} tensor "
-            f"split is the module's shard() — forcing use_ap=False\n"
         )
         req.use_ap = False
 

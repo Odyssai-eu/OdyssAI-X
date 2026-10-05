@@ -8,6 +8,12 @@ break those ties differently — both valid, measured 2026-09-29) is built in to
 (transformers >= 5.17, eager), its weights are renamed to the checkpoint names
 and loaded through our module's sanitize(). Both run in float32.
 
+RoPE: the transformers reference (add-h4) rotates halves (rotate_half), but the
+released checkpoint needs interleaved pairs, as kernelpool/mlx-lm add-hy4-preview
+does (traditional=True). Our module followed the reference and generated
+scrambled text on the real weights (2026-10-05). The reference is therefore
+patched to interleaved RoPE by default; `--rope reference` keeps its own.
+
 Checks, logits at every position against the reference's full causal forward:
   1. MLX full forward, no cache (prefill path, L > 1)
   2. MLX with the latent cache: prefill in two chunks (the second on a filled
@@ -30,10 +36,30 @@ import numpy as np
 HERE = Path(__file__).resolve().parent
 
 
-def build_reference(n_tokens: int, seed: int):
+def _interleaved_rope(q, k, cos, sin, unsqueeze_dim=1):
+    """apply_rotary_pos_emb on (even, odd) pairs instead of halves. cos/sin come
+    from the reference's rotary embedding, cat(freqs, freqs): the first half
+    holds one frequency per pair."""
     import torch
+
+    d = cos.shape[-1]
+    c = cos[..., : d // 2].repeat_interleave(2, dim=-1).unsqueeze(unsqueeze_dim)
+    s = sin[..., : d // 2].repeat_interleave(2, dim=-1).unsqueeze(unsqueeze_dim)
+
+    def rot(x):
+        return torch.stack((-x[..., 1::2], x[..., 0::2]), dim=-1).flatten(-2)
+
+    return (q * c) + (rot(q) * s), (k * c) + (rot(k) * s)
+
+
+def build_reference(n_tokens: int, seed: int, rope: str = "interleaved"):
+    import torch
+    import transformers.models.hy_v4.modeling_hy_v4 as hm
     from transformers.models.hy_v4.configuration_hy_v4 import HYV4Config
     from transformers.models.hy_v4.modeling_hy_v4 import HYV4ForCausalLM
+
+    if rope == "interleaved":
+        hm.apply_rotary_pos_emb = _interleaved_rope
 
     cfg = HYV4Config(
         vocab_size=512, hidden_size=96, intermediate_size=192, moe_intermediate_size=48,
@@ -79,7 +105,9 @@ def to_checkpoint_names(sd: dict) -> dict:
 
 def load_module(path: Path):
     import mlx_lm.models  # noqa: F401  (package for the module's relative imports)
-    spec = importlib.util.spec_from_file_location("mlx_lm.models.hy_v4_oracle", path)
+    # Registered under its production name: auto_parallel imports
+    # mlx_lm.models.hy_v4.Model for its isinstance checks (_set_layers).
+    spec = importlib.util.spec_from_file_location("mlx_lm.models.hy_v4", path)
     mod = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = mod
     spec.loader.exec_module(mod)
@@ -93,9 +121,12 @@ def main() -> int:
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--tp", action="store_true", help="shard() over the launched group")
     ap.add_argument("--pp", default="", help="pipeline bounds over the launched group, e.g. 0,1,6")
+    ap.add_argument("--rope", choices=("interleaved", "reference"), default="interleaved",
+                    help="reference RoPE: interleaved pairs (the checkpoint's) or the "
+                         "transformers reference's rotate_half")
     args = ap.parse_args()
 
-    cfg, sd, toks, ref = build_reference(args.tokens, args.seed)
+    cfg, sd, toks, ref = build_reference(args.tokens, args.seed, args.rope)
 
     import mlx.core as mx
     # CPU: exact fp32. On M5-class GPUs MLX's fp32 matmul runs at reduced
