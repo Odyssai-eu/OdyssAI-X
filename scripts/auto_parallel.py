@@ -773,6 +773,41 @@ def pipeline_auto_parallel(
         inner_model_instance.ssm_idx = linear_locals[0]
         inner_model_instance.attn_idx = full_locals[0]
 
+    # Duck-typed: glm5_next (GLM-5.3-Flash, 3 linear + 1 sparse-attention
+    # layers per group) computes fa_idx and ssm_idx ONCE at init from the FULL
+    # layer list (glm5_next.py:801-802) and reads cache[fa_idx][0] for the
+    # attention mask. After the slice cache[] is LOCAL: on a shard starting at
+    # 22, local 3 is global 25, a linear layer, so cache[fa_idx][0] is the
+    # ArraysCache conv state and create_attention_mask dies on its first token
+    # with "[convert] Only length-1 arrays can be converted to Python scalars"
+    # (2026-10-06, .30+.31). Rank 0 alone lines up by chance. Same fix class as
+    # Qwen3-Next above (matched by isinstance there, excluded here).
+    if (
+        hasattr(inner_model_instance, "fa_idx")
+        and hasattr(inner_model_instance, "ssm_idx")
+        and not hasattr(inner_model_instance, "attn_idx")
+        and not isinstance(
+            inner_model_instance,
+            (Qwen3_5TextModelInner, Qwen3NextInnerModel, NemotronHInnerModel),
+        )
+        and any(getattr(l, "is_linear", None) is not None for l in layers)
+    ):
+        linear_locals = [
+            i for i, layer in enumerate(layers) if getattr(layer, "is_linear", False)
+        ]
+        full_locals = [
+            i for i, layer in enumerate(layers) if not getattr(layer, "is_linear", True)
+        ]
+        if not linear_locals or not full_locals:
+            missing = "full-attention" if not full_locals else "linear-attention"
+            raise ValueError(
+                f"hybrid pipeline shard [{start_layer},{end_layer}) contains no "
+                f"{missing} layer — re-cut the pipeline so every shard spans at "
+                f"least one layer of each kind."
+            )
+        inner_model_instance.fa_idx = full_locals[0]
+        inner_model_instance.ssm_idx = linear_locals[0]
+
     if isinstance(inner_model_instance, NemotronHInnerModel):
         # NemotronH uses block_type: "M" (Mamba/SSM), "*" (Attention), "E" (MoE), "-" (MLP)
         # Only "M" and "*" blocks have cache entries.
