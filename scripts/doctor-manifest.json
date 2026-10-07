@@ -18,7 +18,7 @@
   "qwen4_exp.py": "3591df7c261685bc02159279503df704"
  },
  "patches": {
-  "__init__.py": "2af1542c0e4590528e0f1897ebfa6d23",
+  "__init__.py": "c79c852fdd64cffb0484b7718b25d90a",
   "bailing_hybrid_alias.py": "109154fa41427bcccf6c9cb8cab9d244",
   "bailing_hybrid_model.py": "3f4d65717cfad083c2c874c97dfa9da9",
   "g9v3_alias.py": "eab0efadecf3ce9f31eb1637e6b73db6",
