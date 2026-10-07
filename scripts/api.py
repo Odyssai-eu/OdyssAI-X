@@ -7692,7 +7692,7 @@ def _initial_default_config() -> Optional[dict]:
 #   major (1.7.2 → 2.0.0) — breaking API or topology change
 #
 # Use `./scripts/bump-version.sh patch|minor|major` to bump + auto-commit.
-APP_VERSION = "1.55.12"
+APP_VERSION = "1.55.13"
 
 app = FastAPI(
     title="OdyssAI-X (odyssai.eu)",
@@ -11629,7 +11629,14 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
             raise HTTPException(422 if msg.startswith("chat_template") else 500,
                                 {"error": {"message": msg, "type": "runner_error"}})
         finally:
-            _runs_finalize(completion_id)
+            # #41: the registry must tell the truth — a run whose producer
+            # raised is NOT "done". Statuses follow the registry vocabulary
+            # (done|cancelled|error); "completed" is the metric-side word.
+            if completion_id is not None:
+                _runs_finalize(completion_id,
+                               status=("error" if run_status == "error"
+                                       else "cancelled" if run_status == "cancelled"
+                                       else "done"))
         _touch_session(pool.cluster, session_meta, model_id)
         record_metric(client_ip, ntoks, elapsed_s, ttft_s, prompt_chars, model_id,
                       cluster=pool.cluster, tool_calls=len(tool_calls),
@@ -11880,7 +11887,12 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
             except Exception:
                 pass
         finally:
-            _runs_finalize(completion_id)
+            # #41: same truth as the non-stream path — see the comment there.
+            if completion_id is not None:
+                _runs_finalize(completion_id,
+                               status=("error" if run_status == "error"
+                                       else "cancelled" if run_status == "cancelled"
+                                       else "done"))
             record_metric(client_ip, ntoks_total, elapsed_total, ttft_s, prompt_chars, model_id,
                           cluster=pool.cluster, tool_calls=tool_calls_count,
                           session_kind=sess.get("cache_kind"),
@@ -12514,22 +12526,35 @@ async def anthropic_messages(req: AnthropicMessagesRequest, request: Request):
         tool_calls: list[dict] = []
         session_meta: dict = {}
         t_start = time.time()
-        async for ev in pool.submit(None, req.max_tokens, _antc_thinking,
-                                    messages=oa_messages, tools=oa_tools,
-                                    session_id=session_id,
-                                    request_id=msg_id,
-                                    reasoning_effort=_antc_effort):
-            # P8.1 — re-stamp per chunk (in-flight coverage, cf chat path).
-            _CLUSTER_LAST_SERVED[pool.cluster] = time.time()
-            if ev.get("event") == "token":
-                if ttft_s is None:
-                    ttft_s = time.time() - t_start
-                text_parts.append(ev.get("text", ""))
-            elif ev.get("event") == "done":
-                ntoks = ev.get("ntoks", 0)
-                elapsed_s = ev.get("elapsed_s", 0.0)
-                tool_calls = ev.get("tool_calls", []) or []
-                session_meta.update(ev.get("session", {}) or {})
+        try:
+            async for ev in pool.submit(None, req.max_tokens, _antc_thinking,
+                                        messages=oa_messages, tools=oa_tools,
+                                        session_id=session_id,
+                                        request_id=msg_id,
+                                        reasoning_effort=_antc_effort):
+                # P8.1 — re-stamp per chunk (in-flight coverage, cf chat path).
+                _CLUSTER_LAST_SERVED[pool.cluster] = time.time()
+                if ev.get("event") == "token":
+                    if ttft_s is None:
+                        ttft_s = time.time() - t_start
+                    text_parts.append(ev.get("text", ""))
+                elif ev.get("event") == "done":
+                    ntoks = ev.get("ntoks", 0)
+                    elapsed_s = ev.get("elapsed_s", 0.0)
+                    tool_calls = ev.get("tool_calls", []) or []
+                    session_meta.update(ev.get("session", {}) or {})
+        except HTTPException:
+            raise
+        except Exception as e:
+            # #41: a watchdog/died raise must not become an opaque 500 —
+            # same convention as the OpenAI non-stream path.
+            record_metric(client_ip, ntoks, elapsed_s, ttft_s, prompt_chars, model_id,
+                          cluster=pool.cluster, tool_calls=0, status="error")
+            msg = str(e)[:300]
+            raise HTTPException(
+                422 if msg.startswith("chat_template") else 500,
+                {"type": "error",
+                 "error": {"type": "runner_error", "message": msg}})
         _touch_session(pool.cluster, session_meta, model_id)
         record_metric(client_ip, ntoks, elapsed_s, ttft_s, prompt_chars, model_id,
                       cluster=pool.cluster, tool_calls=len(tool_calls),
@@ -12567,6 +12592,7 @@ async def anthropic_messages(req: AnthropicMessagesRequest, request: Request):
     async def antc_stream() -> AsyncIterator[bytes]:
         ttft_s: Optional[float] = None
         t_start = time.time()
+        gen_status = "completed"
         ntoks_total = 0
         elapsed_total = 0.0
         text_parts_local: list[str] = []
@@ -12640,9 +12666,28 @@ async def anthropic_messages(req: AnthropicMessagesRequest, request: Request):
 
             # message_stop
             yield f"event: message_stop\ndata: {json.dumps({'type':'message_stop'})}\n\n".encode()
+        except asyncio.CancelledError:
+            # Re-raised BEFORE any emit: the generator is being torn down
+            # (client gone) — writing to a dead socket would raise here too
+            # (#41 review, GLM-Flash F1).
+            raise
+        except Exception as e:
+            # #41: terminal error event instead of a silent truncation. Per
+            # the Anthropic spec `event: error` IS terminal — no
+            # message_stop after it.
+            gen_status = "error"
+            sys.stderr.write(f"[antc-stream {msg_id}] ended with error: {e}\n")
+            err_ev = {"type": "error",
+                      "error": {"type": "server_error", "message": str(e)[:300]}}
+            try:
+                yield f"event: error\ndata: {json.dumps(err_ev)}\n\n".encode()
+            except Exception:
+                pass
         finally:
+            # Single record — the status the run actually ended with.
             record_metric(client_ip, ntoks_total, elapsed_total, ttft_s, prompt_chars, model_id,
-                          cluster=pool.cluster, tool_calls=len(tool_calls_final))
+                          cluster=pool.cluster, tool_calls=len(tool_calls_final),
+                          status=gen_status)
 
     return StreamingResponse(antc_stream(), media_type="text/event-stream")
 
