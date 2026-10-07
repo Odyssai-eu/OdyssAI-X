@@ -7624,7 +7624,7 @@ def _initial_default_config() -> Optional[dict]:
 #   major (1.7.2 → 2.0.0) — breaking API or topology change
 #
 # Use `./scripts/bump-version.sh patch|minor|major` to bump + auto-commit.
-APP_VERSION = "1.55.8"
+APP_VERSION = "1.55.9"
 
 app = FastAPI(
     title="OdyssAI-X (odyssai.eu)",
@@ -16292,7 +16292,15 @@ async def admin_cluster_load(cluster_id: str, req: ArgoLoadRequest):
                         except Exception as e:
                             sys.stderr.write(
                                 f"[api] stop of old pool '{alias}' failed: {e}\n")
-                        set_pool(cluster_id, alias, None)
+                        # Remove the entry, never store None (bug 4, 2026-09-30
+                        # incident): list_pools()/list_all_pools() don't filter
+                        # None, so a None entry made _pool_view crash on
+                        # 'NoneType' has no attribute 'started_at' for every
+                        # status poll while the VL load ran, and the
+                        # [jaccl-stability] loop degraded the cluster. If the
+                        # new pool fails to start below, the alias must simply
+                        # be absent (unloaded), not registered as None.
+                        del_pool(cluster_id, alias)
                     vdpool = VLMDistPool(
                         model=vlm_model_path, cluster=cluster_id, alias=alias,
                         node_indices=node_indices, shard_mode=_vd_mode,
