@@ -27,7 +27,7 @@ Rules for the table (the skill parses it):
 | exo-explore/exo | 1847 | issue | jaccl RDMA crashes on M3 Ultra (errno 2/60/22) | nothing more; solved on our side, kept for visibility (Alex Cheema call 2026-09-17) | 2026-09-21 | close it ourselves with a pointer to #4530 once merged | - |
 | exo-explore/exo | 1831 | issue | Mistral Large 3 support | dormant | 2026-09-21 | close if still silent at next pass | 2026-10-15 |
 | exo-explore/exo | 1825 | issue | load private models from a local path while online | dormant | 2026-09-21 | close if still silent at next pass | 2026-10-15 |
-| exo-explore/exo | 1788 | issue | mDNS discovery broken from git source | dormant, exo is paused | 2026-09-21 | close if still silent at next pass | 2026-10-15 |
+| exo-explore/exo | 1788 | issue | mDNS discovery broken from git source | root cause on record: Mearman (2026-10-07) reproduced without exo — an ungranted process launched over ssh loses LAN multicast (EHOSTUNREACH) once the ssh session ends, fine in the foreground; Apple TN3179 `AllowedEthernetLocalNetworkAddresses` untested. Matches our TCC finding (no kTCCServiceLocalNetwork entry) | 2026-10-07 | no longer dormant: keep open; check whether our own headless paths (node daemon `eu.odyssai.x.node`, runners launched over ssh) depend on LAN multicast; reply only on Sophie's go | - |
 
 ## Archive
 
