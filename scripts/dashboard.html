@@ -1175,6 +1175,7 @@ const state = {
     default_draft: "", default_num_draft: 4, default_dflash: false,
     default_use_drafter: true,   // toggle: auto-attach du drafter enregistré (model_drafters)
     default_batch: true,         // replica only: continuous batching inside each replica (#107: ON by default — a forgotten checkbox served 1 req at a time)
+    default_vlm_seqs: "",        // #108: VLM replica concurrency cap (MLX_VLM_MAX_NUM_SEQS) — empty = unbounded
     default_targets: {},
     // Multi-pool "+ Add pool" inline form (2026-05-19). When open=true,
     // shown below the Pools list. default_add_indices is a Set<number>
@@ -5401,7 +5402,8 @@ function renderFormRow2(f, busy, presence, fitCheck) {
             <div class="box ${f.default_batch?"on":""}">${f.default_batch?Icon.check:""}</div>
             <span class="check-text">Batch</span>
             <span class="check-hint">Continuous batching in replica mode</span>
-          </label>` : ""}
+          </label>
+          <input class="text" data-act="form-default-vlm-seqs" type="number" min="1" placeholder="VLM max seqs" value="${f.default_vlm_seqs}" style="width:110px" title="#108: per-replica concurrency cap for VLM replica loads (exported as MLX_VLM_MAX_NUM_SEQS to each mlx_vlm.server). Empty = unbounded. Text-replica loads ignore it.">` : ""}
         </div>
       </div>
       <div class="field">
@@ -7886,6 +7888,7 @@ async function handleAct(e) {
   if (act === "form-default-dflash"){ if (e.type==="click") { f.default_dflash = !f.default_dflash; render(); } return; }
   if (act === "form-default-use-drafter"){ if (e.type==="click") { f.default_use_drafter = !f.default_use_drafter; render(); } return; }
   if (act === "form-default-batch"){ if (e.type==="click") { f.default_batch = !f.default_batch; render(); } return; }
+  if (act === "form-default-vlm-seqs"){ if (e.type==="change") { f.default_vlm_seqs = (parseInt(el.value,10)>0) ? String(parseInt(el.value,10)) : ""; render(); } return; }
   if (act === "form-default-draft") { f.default_draft = el.value || ""; if (e.type === "change") render(); return; }
   if (act === "form-default-nodes"){ if (e.type==="click") {
     f.default_nodes = parseInt(v);
@@ -7970,6 +7973,7 @@ async function handleAct(e) {
       if (f.default_backend) body.backend = f.default_backend;  // "" = cluster default
       body.use_drafter = !!f.default_use_drafter;  // toggle auto-attach model_drafters (explicit bool)
       body.batch = !!f.default_batch;      // #107: ALWAYS explicit — unchecked sends false (opt-out), so the box can't invert against the API default
+      if (f.default_vlm_seqs) body.vlm_max_num_seqs = parseInt(f.default_vlm_seqs, 10);   // #108: omitted when empty = unbounded
       if (f.default_dflash) {
         // dflash-dense (B1): serve a dense target single-node via mlx-dspark
         // --mode dflash with a DFlash drafter, as a managed TEXT proxy pool.

@@ -4032,6 +4032,7 @@ class VLMReplicaPool:
 
     def __init__(self, model_path: str, cluster: str, alias: str,
                  node_indices: list[int], port: int, venv: str,
+                 max_num_seqs: Optional[int] = None,
                  ready_timeout: Optional[float] = None):
         self.model = model_path
         self.model_path = model_path
@@ -4042,7 +4043,12 @@ class VLMReplicaPool:
         self.mode = "vlm-replica"
         self.use_ap = False
         self.kv_q8 = False
-        self.batch = False
+        # #108: mlx_vlm.server interleaves by design (unbounded by default —
+        # measured 347-437 tok/s agg on 2026-10-07). Do NOT "fix" this back to
+        # False: the old label lied about the actual serving behavior.
+        self.batch = True
+        # Per-replica concurrency cap exported to the servers (None = unbounded).
+        self.max_num_seqs = int(max_num_seqs) if max_num_seqs else None
         self.draft_model: Optional[str] = None
         self.num_draft_tokens = 4
         self.runners: list = []
@@ -4098,6 +4104,14 @@ class VLMReplicaPool:
         served = await _vlm_served_model(self._ip(i), c.port, c.model_path)
         if served is not None:
             if _same_model_path(served, c.model_path):
+                if self.max_num_seqs is not None:
+                    # ADOPTION + requested cap: the running server's bound can't
+                    # be reconfigured nor cheaply introspected — refuse rather
+                    # than silently drop the requested value (3-amigos, Kimi-1).
+                    raise RuntimeError(
+                        f"{c.host}:{c.port} already serves this model (adopted) — "
+                        f"cannot apply max_num_seqs={self.max_num_seqs}; "
+                        f"unload the pool first")
                 sys.stderr.write(
                     f"[vlm-replica] {self.cluster}[{self.alias}] replica {i} "
                     f"({c.host}): {c.upstream} already serves this model — adopted\n")
@@ -4107,7 +4121,7 @@ class VLMReplicaPool:
                 f"not touching it")
         ready, pid, tail = await _launch_vlm_server(
             c.ssh_target, self._log_id(i), c.model_path, c.port, c.venv,
-            self.ready_timeout)
+            self.ready_timeout, max_num_seqs=self.max_num_seqs)
         if not ready:
             try:
                 await c.stop()
@@ -5134,6 +5148,7 @@ def save_cluster_state_v2(cluster_id: str, *,
                 "nodes": pool.nodes_count,
                 "port": pool.port,
                 "venv": getattr(pool, "venv", None),
+                "max_num_seqs": getattr(pool, "max_num_seqs", None),
             })
             continue
         if getattr(pool, "is_replica", False):
@@ -6501,7 +6516,10 @@ async def _restore_cluster_pools(cid: str, leaked_hosts: Optional[set] = None,
                     model_path=entry["model"], cluster=cid, alias=alias,
                     node_indices=indices,
                     port=int(entry.get("port") or VLM_DEFAULT_PORT),
-                    venv=entry.get("venv") or VLM_DEFAULT_VENV)
+                    venv=entry.get("venv") or VLM_DEFAULT_VENV,
+                    # .get, never entry[...]: entries saved before #108 have
+                    # no key — restore unbounded (3-amigos, GLM-2/Kimi-3).
+                    max_num_seqs=entry.get("max_num_seqs"))
                 await vrpool.start()
                 set_pool(cid, alias, vrpool)
                 restored.append(alias)
@@ -7674,7 +7692,7 @@ def _initial_default_config() -> Optional[dict]:
 #   major (1.7.2 → 2.0.0) — breaking API or topology change
 #
 # Use `./scripts/bump-version.sh patch|minor|major` to bump + auto-commit.
-APP_VERSION = "1.55.11"
+APP_VERSION = "1.55.12"
 
 app = FastAPI(
     title="OdyssAI-X (odyssai.eu)",
@@ -15311,6 +15329,8 @@ async def admin_cluster_status(cluster_id: str):
                                or getattr(pool, "is_vlm_replica", False)),
             "is_vlm_replica": bool(getattr(pool, "is_vlm_replica", False)),
             "batch": bool(getattr(pool, "batch", False)),
+            # #108: effective per-replica concurrency cap (None = unbounded).
+            "max_num_seqs": getattr(pool, "max_num_seqs", None),
             "replicas": (pool.replica_stats()
                          if (getattr(pool, "is_replica", False)
                              or getattr(pool, "is_vlm_replica", False)) else None),
@@ -15542,6 +15562,11 @@ class ArgoLoadRequest(BaseModel):
     # resolve_replica_batch — null never reaches persistence or /status.
     # Ignored for distributed / VL / dflash loads (VL: dead code, #108).
     batch: Optional[bool] = None
+    # #108: per-replica concurrency cap for VLM replica loads, exported to the
+    # mlx_vlm.servers as MLX_VLM_MAX_NUM_SEQS (None/absent = unbounded, the
+    # current behavior). Strict: "8"/true/8.0 must 422, not coerce (pydantic
+    # lax would accept them — 3-amigos, GLM-1/Kimi-1).
+    vlm_max_num_seqs: Optional[int] = Field(default=None, strict=True, gt=0)
 
 
 @app.get("/admin/clusters/{cluster_id}/load-options")
@@ -15975,6 +16000,14 @@ async def admin_cluster_load(cluster_id: str, req: ArgoLoadRequest):
     base_dir = topo[0].get("models_dir") or models_dir_for(cluster_id)
     model_abspath = _resolve_model_abspath(req.model, base_dir)
 
+    # #108: same refusal one level up — the knob on a non-replica cluster
+    # (distributed / VL-dist / dflash) is a dead flag by construction.
+    if (req.vlm_max_num_seqs is not None
+            and get_cluster_def(cluster_id).get("kind") != "replica"):
+        raise HTTPException(
+            422, "vlm_max_num_seqs applies only to replica clusters "
+                 f"(this one is kind={get_cluster_def(cluster_id).get('kind')!r})")
+
     # Replica (data-parallel serving): fan-out ONE full copy per node, dispatched
     # internally by ReplicaPool (least-busy + session affinity, no collective).
     # Runs BEFORE dflash/vlm/distributed branches — a replica cluster never
@@ -15985,6 +16018,15 @@ async def admin_cluster_load(cluster_id: str, req: ArgoLoadRequest):
         # node (VLMReplicaPool), never text RunnerPools (which would load it
         # text-only or die). force=true keeps the old text behaviour.
         _rep_arch = await get_model_arch_meta(rank0_ssh, model_abspath)
+        # #108: the cap only exists on the VLM-replica path. Refuse it anywhere
+        # else BEFORE any side effect — a silently ignored knob is the exact
+        # dead-flag pattern this issue closes (3-amigos, Kimi-2: the 422 lives
+        # at the dispatcher, after model-type resolution, not in the VLM path).
+        if req.vlm_max_num_seqs is not None and (
+                not _rep_arch.get("is_vision") or getattr(req, "force", False)):
+            raise HTTPException(
+                422, "vlm_max_num_seqs applies only to VLM replica loads "
+                     "(vision checkpoint on a kind=replica cluster)")
         if _rep_arch.get("is_vision") and not getattr(req, "force", False):
             return await _load_vlm_replica(cluster_id, alias, req, model_abspath,
                                            _rep_indices, rank0_ssh)
@@ -18342,22 +18384,32 @@ def _vlm_log_path(vlm_id: str) -> str:
     return f"~/mlx-vlm-{vlm_id}.log"
 
 
-def _vlm_launch_cmd(vlm_id: str, venv: str, model_path: str, port: int) -> str:
+def _vlm_launch_cmd(vlm_id: str, venv: str, model_path: str, port: int,
+                   max_num_seqs: Optional[int] = None) -> str:
     """Build the proven nohup launch command with a full exported env block.
 
     Mirrors the manual launch that ran on .29 tonight: export a clean env
     (HOME/USER/TMPDIR/PATH) so mlx_vlm.server finds its venv + HF cache the
     same way an interactive login shell would, then nohup the server detached
     with stdout+stderr to the per-id log. Echoes the launched PID on stdout.
+
+    #108: MLX_VLM_MAX_NUM_SEQS is exported on EVERY launch — the int when a
+    cap is requested, EMPTY when none (mlx_vlm's get_max_num_seqs() reads
+    empty as None = unbounded). The CLI flag only writes this same env var
+    (mlx_vlm/server/cli.py:322), so a leftover var in a node profile would
+    silently win when the flag is omitted; always exporting makes the
+    engine the single source of truth. No --max-num-seqs flag.
     """
     venv_bin = f"{venv.rstrip('/')}/bin"
     server_bin = f"{venv_bin}/mlx_vlm.server"
     log = _vlm_log_path(vlm_id)
+    max_seqs = "" if max_num_seqs is None else str(int(max_num_seqs))
     # HOME/USER fixed to the admin account the nodes run under (matches the
     # ssh target `admin@...`); PATH puts the venv first. All interpolated
     # values are shlex.quote'd — model_path may contain '/', slug is validated.
     return (
         f"export HOME=\"${{HOME:-/Users/$(id -un)}}\" USER=\"$(id -un)\" TMPDIR=/tmp "
+        f"MLX_VLM_MAX_NUM_SEQS={max_seqs} "
         f"PATH={_remote_path(venv_bin)}:/usr/bin:/bin:/usr/sbin:/sbin && "
         f"nohup {_remote_path(server_bin)} "
         f"--model {shlex.quote(model_path)} "
@@ -18553,7 +18605,7 @@ def _vlm_resolve_model_path(model: str, models_dir: Optional[str]) -> str:
 
 async def _launch_vlm_server(
     ssh_target: str, log_id: str, model_path: str, port: int,
-    venv: str, ready_timeout: float,
+    venv: str, ready_timeout: float, max_num_seqs: Optional[int] = None,
 ) -> tuple[bool, Optional[str], str]:
     """Launch mlx_vlm.server on a node and poll until ready. Shared by the
     Argo-VLM pool load branch (admin_cluster_load) and the startup restore.
@@ -18563,7 +18615,7 @@ async def _launch_vlm_server(
     server log so the caller can surface WHY (OOM, bad checkpoint, import err).
     """
     ip = _vlm_ip_from_ssh(ssh_target)
-    launch = _vlm_launch_cmd(log_id, venv, model_path, port)
+    launch = _vlm_launch_cmd(log_id, venv, model_path, port, max_num_seqs)
     launched_pid: Optional[str] = None
     rc, out, err = await asyncio.to_thread(_ssh_exec, ssh_target, launch, 20)
     if rc != 0:
@@ -18628,6 +18680,7 @@ async def _load_vlm_replica(cluster_id: str, alias: str, req, model_path: str,
             vrpool = VLMReplicaPool(
                 model_path=model_path, cluster=cluster_id, alias=alias,
                 node_indices=indices, port=port, venv=venv,
+                max_num_seqs=getattr(req, "vlm_max_num_seqs", None),
                 ready_timeout=float(getattr(req, "ready_timeout_s", None) or VLM_READY_TIMEOUT_S))
             try:
                 await vrpool.start()
