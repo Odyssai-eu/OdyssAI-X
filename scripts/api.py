@@ -6511,7 +6511,13 @@ async def _restore_cluster_pools(cid: str, leaked_hosts: Optional[set] = None,
                     model=entry["model"], cluster=cid, alias=alias,
                     node_indices=indices,
                     kv_q8=bool(entry.get("kv_q8", False)),
-                    batch=bool(entry.get("batch", False)))
+                    # #107: null ≡ clé absente → défaut du kind (une entrée
+                    # sauvée sans le flag revient batchée, comme un load
+                    # frais) ; une valeur explicite est restaurée telle quelle.
+                    batch=resolve_replica_batch(
+                        entry.get("batch"),
+                        (get_cluster_def(cid) or {}).get("kind") or "",
+                        cid))
                 await rpool.start()
                 set_pool(cid, alias, rpool)
                 restored.append(alias)
@@ -7668,7 +7674,7 @@ def _initial_default_config() -> Optional[dict]:
 #   major (1.7.2 → 2.0.0) — breaking API or topology change
 #
 # Use `./scripts/bump-version.sh patch|minor|major` to bump + auto-commit.
-APP_VERSION = "1.55.10"
+APP_VERSION = "1.55.11"
 
 app = FastAPI(
     title="OdyssAI-X (odyssai.eu)",
@@ -15443,6 +15449,24 @@ async def admin_cluster_models_dir(cluster_id: str, req: ModelsDirRequest):
     return {"cluster": cluster_id, "models_dir": req.dir}
 
 
+def resolve_replica_batch(raw: Optional[bool], kind: str, cluster_id: str,
+                          log=sys.stderr.write) -> bool:
+    """Single source of truth for the replica batch flag (#107, plan revu
+    par les 3 amigos le 2026-10-08). Explicit True/False wins (opt-out
+    honoré, sans trace) ; absent ou null → défaut True pour kind=="replica"
+    (une case oubliée servait une requête à la fois par replica : 164 vs
+    431-625 tok/s mesurés le 2026-10-07), False pour tout autre kind. Ne
+    retourne JAMAIS None : persistance et /status ne voient que le bool
+    résolu."""
+    if raw is True:
+        return True
+    if raw is False:
+        return False
+    v = (kind == "replica")
+    log(f"[load] batch defaulted to {v} for {kind} cluster {cluster_id}\n")
+    return v
+
+
 class ArgoLoadRequest(BaseModel):
     model: str
     mode: str = "pipeline"  # "pipeline" | "tensor"
@@ -15512,11 +15536,12 @@ class ArgoLoadRequest(BaseModel):
     # spec and plain is one click — no more editing cluster-config to disable.
     use_drafter: Optional[bool] = None
     # Replica clusters only (2026-09-06): continuous batching inside each
-    # replica (runner BatchGenerator loop, RUNNER_BATCH=1). Off by default —
-    # the batched loop was reverted from production on 2026-08-27 — so it is
-    # an explicit per-load opt-in (dashboard "Batch" checkbox). Ignored for
-    # distributed / VL / dflash loads.
-    batch: bool = False
+    # replica (runner BatchGenerator loop, RUNNER_BATCH=1). DEFAULTS TO ON
+    # for kind=replica (#107, 2026-10-08): opt-in cost a forgotten checkbox
+    # 2.6-3.8x of capacity. Explicit false opts out. Resolved ONCE by
+    # resolve_replica_batch — null never reaches persistence or /status.
+    # Ignored for distributed / VL / dflash loads (VL: dead code, #108).
+    batch: Optional[bool] = None
 
 
 @app.get("/admin/clusters/{cluster_id}/load-options")
@@ -16023,7 +16048,10 @@ async def admin_cluster_load(cluster_id: str, req: ArgoLoadRequest):
                 rpool = ReplicaPool(
                     model=req.model, cluster=cluster_id, alias=alias,
                     node_indices=_rep_indices, kv_q8=_rep_kv_q8,
-                    batch=bool(req.batch))
+                    batch=resolve_replica_batch(
+                        req.batch,
+                        (get_cluster_def(cluster_id) or {}).get("kind") or "",
+                        cluster_id))
                 try:
                     await rpool.start()
                 except Exception as _e:

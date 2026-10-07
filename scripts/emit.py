@@ -105,7 +105,10 @@ def main():
     ap.add_argument("--envelope", required=True, help="RELAY-*.md file")
     ap.add_argument("--models", required=True,
                     help="comma-separated model aliases")
-    ap.add_argument("--max-tokens", type=int, default=4000)
+    ap.add_argument("--max-tokens", type=int, default=128000,
+                    help="default 128000: the emitters are reasoning models, "
+                         "they think long before writing (4000 cut Kimi's "
+                         "reply to zero on 2026-10-07)")
     ap.add_argument("--timeout", type=int, default=480)
     ap.add_argument("--warmup", action="store_true",
                     help="one tiny request first (cold pools measure 2x slow)")
