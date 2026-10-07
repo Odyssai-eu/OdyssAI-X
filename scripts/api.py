@@ -58,6 +58,7 @@ import sys
 import threading
 import time
 import uuid
+import weakref
 from collections import deque, OrderedDict
 from contextlib import asynccontextmanager, contextmanager
 from pathlib import Path
@@ -1440,10 +1441,11 @@ _loading_state: dict[str, dict] = {}
 # request coroutine dropped without its finally (client disconnect mid-load,
 # a uvicorn-config-dependent asyncio path) leaves `in_progress` stuck → the
 # status endpoint shows a phantom "95%" forever and the operator must restart
-# the container. `_loading_snapshot` treats a flag older than
-# max(estimate*MULT, FLOOR) as stale and clears it. Generous so a genuinely
-# slow load (huge model, cold rsync) is never mis-cleared — a real load either
-# completes near its estimate or errors long before this.
+# the container. `_loading_snapshot` treats a flag as stale only when the
+# load's request task is gone AND the flag is older than
+# max(estimate*MULT, FLOOR), then clears it. The task guard is what makes the
+# time bound safe: a real load that runs long past its estimate (cold cache,
+# huge model) keeps its task alive and is never mis-cleared.
 _LOADING_STALE_MIN_S = 120.0      # never clear a flag younger than 2 min (safety)
 _LOADING_STALE_MULT = 5.0         # clear past 5x the estimate (scales with model)
 # Cap on stopping the OLD pool before a hot-swap load. The stop ladder
@@ -1488,6 +1490,15 @@ def _begin_loading(state: dict, model: str, nodes: int, size_bytes: int,
         "estimated_s": float(estimated_s),
         "started_at": time.time(),
     })
+    # Weak handle on the load request coroutine. _loading_snapshot refuses to
+    # stale-clear a flag while this task is still alive: a live task means the
+    # load is really still running (its finally WILL call _end_loading), no
+    # matter how far past the estimate it is. See _LOADING_STALE_MIN_S.
+    try:
+        _t = asyncio.current_task()   # None outside a loop/task (sync callers)
+    except RuntimeError:
+        _t = None
+    state["_task_ref"] = weakref.ref(_t) if _t is not None else None
 
 
 def _end_loading(state: dict) -> None:
@@ -1501,10 +1512,17 @@ def _loading_snapshot(state: dict) -> Optional[dict]:
         return None
     elapsed = time.time() - state.get("started_at", time.time())
     est = max(state.get("estimated_s") or 1.0, 1.0)
-    # Self-heal a leaked flag: past max(est*MULT, FLOOR) the load's finally never
+    # Self-heal a LEAKED flag: past max(est*MULT, FLOOR) the load's finally never
     # ran (dropped coroutine) — clear it so the UI stops showing a phantom 95%
-    # and the next load isn't confused. Idempotent, cheap (runs on status polls).
-    if elapsed > max(est * _LOADING_STALE_MULT, _LOADING_STALE_MIN_S):
+    # and the next load isn't confused. But only when the load's request task is
+    # gone: a live task means a genuinely slow load still in progress
+    # (GLM-5.3-Flash Q6h16, 2026-10-06: 21 s estimated for 66 GB, real load
+    # past 2 min — the time rule alone cleared the flag mid-load and the UI
+    # went empty while the runners were still working). Idempotent, cheap.
+    _tref = state.get("_task_ref")
+    _load_task = _tref() if _tref is not None else None
+    task_alive = _load_task is not None and not _load_task.done()
+    if not task_alive and elapsed > max(est * _LOADING_STALE_MULT, _LOADING_STALE_MIN_S):
         sys.stderr.write(
             f"[load] stale loading flag for {state.get('model')} "
             f"(elapsed {elapsed:.0f}s >> est {est:.0f}s) — auto-cleared\n")
@@ -2819,6 +2837,27 @@ class RunnerRequestError(RuntimeError):
     as an empty 200 with finish_reason "stop" (#94)."""
 
 
+def _midgen_death_report(runners: list) -> str:
+    """stderr tails of the ranks that already exited, for mid-generation errors.
+
+    The rank that CRASHED is usually a peer, not rank 0: rank 0 exits
+    "controlled" through the JACCL side channel with a clean stderr of its
+    own, while the real traceback sits on the dead peer — GLM-5.3-Flash
+    rank-1 "[convert] Only length-1 arrays…" (2026-10-06) never reached the
+    surfaced message, only the container log. Bounded to 25 lines per rank.
+    """
+    out = []
+    for r in runners:
+        try:
+            rc = r.proc.poll()
+        except Exception:
+            rc = None
+        if rc is not None:
+            out.append(
+                f"--- rank {r.node.get('rank')} (exit={rc}) ---\n{r.stderr_tail(25)}")
+    return "\n".join(out)
+
+
 class RunnerPool:
     def __init__(self, model: str, mode: str, use_ap: bool, nodes_count: int = 2,
                  emit_batch: int = 10, cluster: str = "nautilus",
@@ -3485,9 +3524,12 @@ class RunnerPool:
                         _mark_cluster_degraded(
                             self.cluster, "rank-0 died mid-generation",
                             {"alias": self.alias, "request_id": req_id})
+                        _r0 = next((r for r in self.runners if r.node.get("rank") == 0), None)
+                        _r0_tail = _r0.stderr_tail(25) if _r0 is not None else ""
                         raise RuntimeError(
                             "runner died mid-generation "
                             "(no events and rank-0 process is gone)"
+                            + (f"\n--- rank 0 stderr tail ---\n{_r0_tail}" if _r0_tail else "")
                         )
                     continue  # loop top re-checks the no-progress deadline
                 if ev.get("event") == "runner_exit":
@@ -3519,11 +3561,13 @@ class RunnerPool:
                             self.cluster, "rank-0 died mid-generation",
                             {"alias": self.alias, "request_id": req_id,
                              "rc": ev.get("rc")})
+                    report = _midgen_death_report(self.runners)
                     raise RuntimeError(
                         "runner died mid-generation (rank-0 process exited"
                         f" rc={ev.get('rc')}"
                         + (", a peer rank died — pool self-recovers" if controlled else "")
                         + ")"
+                        + (f"\n{report}" if report else "")
                     )
                 if ev.get("event") == "token":
                     last_progress = time.monotonic()
@@ -7624,7 +7668,7 @@ def _initial_default_config() -> Optional[dict]:
 #   major (1.7.2 → 2.0.0) — breaking API or topology change
 #
 # Use `./scripts/bump-version.sh patch|minor|major` to bump + auto-commit.
-APP_VERSION = "1.55.9"
+APP_VERSION = "1.55.10"
 
 app = FastAPI(
     title="OdyssAI-X (odyssai.eu)",
