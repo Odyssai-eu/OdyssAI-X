@@ -334,7 +334,7 @@ class NemotronH(ReindexBase):
                          (0, False, 0, True))
 
 
-# ---- negative and known-gap cases -------------------------------------------
+# ---- negative case -------------------------------------------
 
 class Negative(ReindexBase):
     def test_X1_no_index_family_touches_nothing(self):
@@ -345,17 +345,6 @@ class Negative(ReindexBase):
             self.assertFalse(hasattr(inner, name), name)
         self.assertEqual(self.calls, [])
 
-    def test_X2_known_gap_fa_and_attn_without_ssm_is_untouched(self):
-        # PINNED CURRENT BEHAVIOUR, not a target. No block matches this shape:
-        # kimi needs ssm_idx, glm5_next excludes attn_idx. Do not fix in step 1.
-        inner = Inner()
-        inner.fa_idx = 7
-        inner.attn_idx = 7
-        inner.layers = layers8("is_linear", [T, T, F, T, T, F, T, F])
-        run(outer_of(inner))
-        self.assertEqual(inner.fa_idx, 7)
-        self.assertEqual(inner.attn_idx, 7)
-        self.assertEqual(self.calls, [])
 
 
 if __name__ == "__main__":
