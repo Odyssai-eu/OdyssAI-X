@@ -7380,6 +7380,19 @@ async def _keepalive_recovery_ladder(cluster_id: str, req: ArgoLoadRequest) -> N
     if not await _wait_nodes_reachable(cluster_id, host_ids=host_ids):
         _jaccl_log(cluster_id, "recovery: pool nodes did not return in time — left degraded")
         return
+    # Poison-gate (codereview finding 2): this ladder is a re-injector too —
+    # a poison shows up as keepalive misses; without the gate it would
+    # reboot+reload+clear-degraded in an unbounded loop. Same rule as the
+    # leak recovery: one full reload per operator intervention.
+    if _leak_reload_done.get(cluster_id, 0) > 0:
+        _aliases = [a for a, _ in list_pools(cluster_id)] or [getattr(req, "alias", "?")]
+        _jaccl_log(cluster_id,
+                   f"[poison] {cluster_id}: keepalive recovery holds — nodes "
+                   f"rebooted but NOT reloading; models at hold: "
+                   f"{', '.join(_aliases) or 'none'} — needs eyes "
+                   f"(the cluster reset endpoint re-arms full recovery)")
+        return
+    _epoch0 = _leak_epoch.get(cluster_id, 0)
     # /Volumes/models lags SSH by a few seconds after reboot — a reload fired too
     # early fails 'config.json missing or empty'. Grace + one retry (seen 2026-06-14).
     await asyncio.sleep(12)
@@ -7390,6 +7403,9 @@ async def _keepalive_recovery_ladder(cluster_id: str, req: ArgoLoadRequest) -> N
                        f"load_s={res.get('load_s')}")
             if res.get("loaded"):
                 _clear_cluster_degraded(cluster_id)
+                if _leak_epoch.get(cluster_id, 0) == _epoch0:
+                    _leak_reload_done[cluster_id] = (
+                        _leak_reload_done.get(cluster_id, 0) + 1)
             return
         except Exception as e:
             if attempt == 1:
@@ -7418,6 +7434,29 @@ async def _keepalive_recovery_ladder(cluster_id: str, req: ArgoLoadRequest) -> N
 # a per-host cooldown guards against reboot loops if a node somehow still
 # shows high wired right after a fresh boot.
 _LEAK_REBOOT_COOLDOWN_S = float(os.environ.get("LEAK_REBOOT_COOLDOWN_S", "1800"))
+# Poison-gate (3-amigos reboot-loop, R2 final 2026-10-08): a model that kills
+# its runner must not be re-injected in a loop by the recovery itself. The
+# cooldown above bounds the REBOOT rhythm per host; the gate bounds the
+# RELOADS: one full recovery (reboot+reload) per operator intervention, then
+# reboots-only (wired must be freed) with the cluster held degraded until an
+# operator acts. Sticky by design — a poison's crash cadence is usage-driven
+# (the documented 05/10 pair is 9.4h apart; no time window can catch it).
+# Resets: the admin reset endpoint and a MANUAL load (HTTP layer only —
+# internal recovery reloads do not reset). Counts reload-injections, not
+# leak events: a held (reboot-only) recovery does not increment.
+_leak_reload_done: dict[str, int] = {}
+_leak_epoch: dict[str, int] = {}    # bumped by operator resets; recoveries
+                                     # capture it at tier decision and skip
+                                     # arming if the operator intervened
+
+
+def _poison_reset(cluster_id: str) -> None:
+    """Operator action re-arms full recovery for this cluster. Also bumps
+    the epoch so an in-flight recovery that reloads after the operator
+    intervened does not re-arm the gate behind their back."""
+    _leak_epoch[cluster_id] = _leak_epoch.get(cluster_id, 0) + 1
+    if _leak_reload_done.pop(cluster_id, None) is not None:
+        sys.stderr.write(f"[poison] {cluster_id}: counter reset by operator\n")
 _WIRED_LEAK_THRESHOLD_B = 15 * 1024**3  # same bar as the sweep's WIRED_WARN_THRESHOLD
 _leak_reboot_last: dict[str, float] = {}
 _leak_reboot_in_flight: set[str] = set()
@@ -7493,6 +7532,17 @@ async def _auto_reboot_leaked_nodes(cluster_id: str, sweep_result: dict,
     if not hosts:
         _jaccl_log(cluster_id, "leak recovery: no leaked hosts resolved — left degraded")
         return
+    # Poison-gate: tier decision BEFORE any await (TOCTOU, 3-amigos t2-t3).
+    _poison_tier = "hold" if _leak_reload_done.get(cluster_id, 0) > 0 else "full"
+    _poison_epoch0 = _leak_epoch.get(cluster_id, 0)
+    _poison_aliases = [a for a, _ in list_pools(cluster_id)] or (
+        [getattr(r, "alias", "?") for r in (reload_reqs or [])])
+    if _poison_tier == "hold":
+        _jaccl_log(cluster_id,
+                   f"[poison] {cluster_id}: recurrent leak — rebooting to free "
+                   f"wired but NOT reloading; models served at hold time: "
+                   f"{', '.join(_poison_aliases) or 'none'} — needs eyes "
+                   f"(the cluster reset endpoint re-arms full recovery)")
     _leak_reboot_in_flight.add(cluster_id)
     try:
         for h in hosts:
@@ -7517,6 +7567,29 @@ async def _auto_reboot_leaked_nodes(cluster_id: str, sweep_result: dict,
             _jaccl_log(cluster_id,
                        f"leak recovery: wired STILL high after reboot ({still_high}) "
                        f"— left degraded, needs eyes")
+            return
+        # Boottime honesty (3-amigos R2 §6): re-read AFTER the nodes are
+        # back; a `failed` label with a CHANGED kern.boottime was a real
+        # reboot (sudo shutdown killed the SSH before the echo). The
+        # timeout-likely-rebooting label is NEVER overwritten (more
+        # informative), nor are sudo/osascript.
+        for i, h in enumerate(hosts):
+            base = results[i].get("boottime_before")
+            if base is None or results[i].get("method") != "failed":
+                continue
+            try:
+                rc, out, _e = await asyncio.to_thread(
+                    _ssh_exec, h["ssh"], "sysctl -n kern.boottime", 8)
+                if rc == 0 and out.strip() and out.strip() != base:
+                    results[i]["method"] = "confirmed-boottime"
+            except Exception:
+                pass
+        _jaccl_log(cluster_id,
+                   f"leak recovery reboot methods: {[r.get('method') for r in results]}")
+        if _poison_tier == "hold":
+            _jaccl_log(cluster_id,
+                       "leak recovery: wired freed, cluster HELD degraded — "
+                       "no reload (poison gate); operator resets to re-arm")
             return
         _clear_cluster_degraded(cluster_id)
         _jaccl_log(cluster_id,
@@ -7543,6 +7616,14 @@ async def _auto_reboot_leaked_nodes(cluster_id: str, sweep_result: dict,
                             continue
                         _jaccl_log(cluster_id,
                                    f"leak recovery reload error ({req.alias}): {e}")
+        # A reload was attempted — a re-injection happened: the gate has
+        # spent its one full recovery. Recoveries spawned WITHOUT a reload
+        # snapshot (operator unloads) must NOT arm the counter (codereview
+        # finding 1: they never re-injected anything).
+        # F4 race guard: an operator reset/load during this in-flight
+        # recovery raises the epoch — their intent wins, don't re-arm.
+        if reload_reqs and _leak_epoch.get(cluster_id, 0) == _poison_epoch0:
+            _leak_reload_done[cluster_id] = _leak_reload_done.get(cluster_id, 0) + 1
     finally:
         _leak_reboot_in_flight.discard(cluster_id)
 
@@ -7692,7 +7773,7 @@ def _initial_default_config() -> Optional[dict]:
 #   major (1.7.2 → 2.0.0) — breaking API or topology change
 #
 # Use `./scripts/bump-version.sh patch|minor|major` to bump + auto-commit.
-APP_VERSION = "1.55.13"
+APP_VERSION = "1.55.14"
 
 app = FastAPI(
     title="OdyssAI-X (odyssai.eu)",
@@ -14342,6 +14423,18 @@ async def _reboot_one(host: dict) -> dict:
         "echo METHOD=osascript) || "
         "echo METHOD=failed"
     )
+    # Poison-gate R2 §6: baseline read BEFORE the shutdown fires — sudo
+    # shutdown can kill the SSH before the echo, labeling a real reboot
+    # "failed"; the recovery compares after the node returns.
+    try:
+        _rc, _out, _ = await asyncio.to_thread(
+            _ssh_exec, host["ssh"], "sysctl -n kern.boottime", 5)
+        if _rc == 0 and _out.strip():
+            out["boottime_before"] = _out.strip()
+    except Exception:
+        out["boottime_before"] = None       # unreadable → skip comparison
+        sys.stderr.write("[reboot] boottime baseline unreadable "
+                         f"({host['id']}) — honesty check skipped\n")
     try:
         rc, stdout, stderr = await asyncio.to_thread(_ssh_exec, host["ssh"], cmd, 6)
         out["rc"] = rc
@@ -15819,6 +15912,15 @@ async def _decision_cluster_load(cluster_id: str, cd: dict, req: "ArgoLoadReques
 
 
 @app.post("/admin/clusters/{cluster_id}/load")
+async def admin_cluster_load_route(cluster_id: str, req: ArgoLoadRequest):
+    """HTTP layer ONLY (poison-gate): a manual load is operator intent and
+    re-arms full recovery. The internal reload paths (leak recovery, reboot
+    recovery, preventive QP reload) call admin_cluster_load directly and
+    must NOT reset the gate — hence a thin wrapper, not a flag."""
+    _poison_reset(cluster_id)
+    return await admin_cluster_load(cluster_id, req)
+
+
 async def admin_cluster_load(cluster_id: str, req: ArgoLoadRequest):
     if not cluster_exists(cluster_id):
         raise HTTPException(404, f"unknown cluster {cluster_id}")
@@ -18241,12 +18343,16 @@ async def _cluster_reset(cluster_id: str) -> dict:
 async def admin_cluster_reset(cluster_id: str):
     if not cluster_exists(cluster_id):
         raise HTTPException(404, f"unknown cluster {cluster_id}")
-    return await _cluster_reset(cluster_id)
+    res = await _cluster_reset(cluster_id)
+    _poison_reset(cluster_id)   # operator action re-arms full recovery
+    return res
 
 
 @app.post("/admin/reset")
 async def admin_nautilus_reset():
-    return await _cluster_reset("nautilus")
+    res = await _cluster_reset("nautilus")
+    _poison_reset("nautilus")   # operator action re-arms (codereview finding 3)
+    return res
 
 
 @app.post("/admin/clusters/{cluster_id}/keepalive")
