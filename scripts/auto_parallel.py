@@ -529,6 +529,234 @@ def misaligned_pipeline_starts(bounds, indexer_types):
     return [b for b in bounds[1:-1] if b < len(indexer_types) and indexer_types[b] != "full"]
 
 
+def _reindex_gpt_oss(inner: nn.Module, start_layer: int, end_layer: int) -> None:
+    inner.layer_types = inner.layer_types[start_layer:end_layer]
+    # We can assume the model has at least one layer thanks to placement.
+    # If a layer type doesn't exist, we can set it to 0.
+    inner.swa_idx = (
+        0
+        if "sliding_attention" not in inner.layer_types
+        else inner.layer_types.index("sliding_attention")
+    )
+    inner.ga_idx = (
+        0
+        if "full_attention" not in inner.layer_types
+        else inner.layer_types.index("full_attention")
+    )
+
+
+def _reindex_mimo_v2(inner: nn.Module, layers: list[_LayerCallable]) -> None:
+    # mimo_v2_flash.LanguageModel computes swa_idx/ga_idx ONCE at init from
+    # the FULL config.hybrid_layer_pattern (.index(1)/.index(0)); its
+    # __call__ uses them to pick which layer's cache builds the SWA vs
+    # full-attention mask (cache[ga_idx] / cache[swa_idx]). After the
+    # pipeline slice, cache[] is LOCAL to this shard, so a global index
+    # points at the wrong layer's cache — the mask's KV length diverges
+    # from the real keys/values as session offsets grow, crashing with
+    # "[broadcast_shapes] ... cannot be broadcast" on the 2nd+ request of a
+    # multi-turn session (first request happens to line up). Recompute both
+    # as shard-LOCAL indices from the sliced layers' is_sliding_window flag
+    # (same fix class as GptOss / Step35 / bailing_moe_linear).
+    sliding_layers = [
+        i
+        for i, layer in enumerate(layers)
+        if getattr(layer, "is_sliding_window", False)
+    ]
+    full_layers = [
+        i
+        for i, layer in enumerate(layers)
+        if not getattr(layer, "is_sliding_window", True)
+    ]
+    inner.swa_idx = sliding_layers[0] if sliding_layers else 0
+    inner.ga_idx = full_layers[0] if full_layers else 0
+
+
+def _reindex_step35(inner: nn.Module, layers: list[_LayerCallable]) -> None:
+    inner.num_layers = len(layers)
+    sliding_layers = [
+        i for i, layer in enumerate(layers) if getattr(layer, "is_sliding", False)
+    ]
+    full_layers = [
+        i
+        for i, layer in enumerate(layers)
+        if not getattr(layer, "is_sliding", True)
+    ]
+    inner._swa_idx = 0 if not sliding_layers else sliding_layers[0]
+    inner._full_idx = 0 if not full_layers else full_layers[0]
+
+
+def _reindex_qwen3_hybrid(
+    model: nn.Module, inner: nn.Module, layers: list[_LayerCallable]
+) -> None:
+    full_attn_layers = [
+        i for i, layer in enumerate(layers) if not getattr(layer, "is_linear", True)
+    ]
+    linear_layers = [
+        i for i, layer in enumerate(layers) if getattr(layer, "is_linear", False)
+    ]
+    inner.fa_idx = full_attn_layers[0] if full_attn_layers else 0
+    inner.ssm_idx = linear_layers[0] if linear_layers else 0
+    if not full_attn_layers or not linear_layers:
+        _patch_hybrid_cache(
+            cast(Qwen3_5TextModel | Qwen3NextModel, model),
+            fa_idx=inner.fa_idx,
+            has_full_attn=bool(full_attn_layers),
+            ssm_idx=inner.ssm_idx,
+            has_linear=bool(linear_layers),
+        )
+
+
+def _reindex_qwen4_exp_ple(inner: nn.Module, layers: list[_LayerCallable]) -> None:
+    # ple_layers is computed at init from GLOBAL layer indices
+    # (qwen4_exp.py:814-816); Model.__call__ uses cache[ple_layers[0]] for
+    # the n-gram tail (L841-856). After the slice the cache list is LOCAL,
+    # so recompute ple_layers from the sliced layers (the PLE layer lives
+    # on rank 0 in a contiguous split; other ranks get [] and skip the
+    # n-gram block entirely, which is correct — their layers have no .ple).
+    inner.ple_layers = [
+        i for i, layer in enumerate(layers) if getattr(layer, "ple", None) is not None
+    ]
+
+
+def _slice_qwen4_exp_make_cache(
+    model: nn.Module, start_layer: int, end_layer: int
+) -> None:
+    # Model.make_cache() (qwen4_exp.py:1075) builds the FULL layer_types cache
+    # list; per-rank it must follow the local slice or cache kinds misalign
+    # with layers (the 2026-08-28 "ArraysCache.offset" crash).
+    _q4_orig_make_cache = model.make_cache
+
+    def _q4_sliced_make_cache(
+        _mc=_q4_orig_make_cache, _s=start_layer, _e=end_layer
+    ):
+        return _mc()[_s:_e]
+
+    model.make_cache = _q4_sliced_make_cache
+
+
+def _reindex_bailing(
+    inner: nn.Module, layers: list[_LayerCallable], start_layer: int, end_layer: int
+) -> None:
+    # bailing_moe_linear (Ling/Ring hybrid family) hardcodes attn_idx =
+    # layer_group_size - 1 and gla_idx = 0 as GLOBAL layer indices
+    # (bailing_moe_linear.py:483-484); after slicing, cache[] is local so
+    # they must point at LOCAL layers of the right kind. A shard whose
+    # start is not a multiple of layer_group_size otherwise resolves
+    # cache[attn_idx] to a linear-attention ArraysCache and dies with
+    # "make_mask() got an unexpected keyword argument 'return_array'"
+    # (#43 — observed deterministically on ranks whose start % 8 == 4).
+    # DecoderLayer.is_global marks full-attention layers; attribute reads
+    # traverse the Pipeline{First,Last}Layer wrappers via CustomMlxLayer.
+    attn_layers = [
+        i for i, layer in enumerate(layers) if getattr(layer, "is_global", False)
+    ]
+    gla_layers = [
+        i for i, layer in enumerate(layers) if not getattr(layer, "is_global", True)
+    ]
+    if not attn_layers or not gla_layers:
+        # The model computes BOTH masks/offsets from one layer of each
+        # kind — a shard missing a kind cannot run. Fail loudly with the
+        # re-cut hint instead of producing garbage (shards >= group size
+        # always contain both kinds; only <8-layer shards can hit this).
+        missing = "full-attention" if not attn_layers else "linear-attention"
+        raise ValueError(
+            f"bailing_moe_linear pipeline shard [{start_layer},{end_layer}) "
+            f"contains no {missing} layer — re-cut the pipeline so every "
+            f"shard spans at least one full layer group (layer_group_size)."
+        )
+    inner.attn_idx = attn_layers[0]
+    inner.gla_idx = gla_layers[0]
+
+
+def _reindex_kimi(
+    inner: nn.Module, layers: list[_LayerCallable], start_layer: int, end_layer: int
+) -> None:
+    # kimi_linear / kimi_k3 compute ssm_idx and attn_idx ONCE at init from the
+    # FULL layer list, then pick cache[ssm_idx] / cache[attn_idx] for the masks.
+    # After the slice cache[] is LOCAL: a global index lands on a layer of the
+    # wrong KIND ("make_mask() got an unexpected keyword argument
+    # 'return_array'" or a broadcast failure on the 2nd turn).
+    linear_locals = [
+        i for i, layer in enumerate(layers) if getattr(layer, "is_linear", False)
+    ]
+    full_locals = [
+        i for i, layer in enumerate(layers) if not getattr(layer, "is_linear", True)
+    ]
+    if not linear_locals or not full_locals:
+        # Both masks are derived from one layer of each kind, so a shard
+        # missing a kind cannot run. Fail loudly with the re-cut hint rather
+        # than produce garbage.
+        missing = "full-attention" if not full_locals else "linear-attention"
+        raise ValueError(
+            f"kimi pipeline shard [{start_layer},{end_layer}) contains no "
+            f"{missing} layer — re-cut the pipeline so every shard spans at "
+            f"least one layer of each kind."
+        )
+    inner.ssm_idx = linear_locals[0]
+    inner.attn_idx = full_locals[0]
+
+
+def _reindex_glm5_next(
+    inner: nn.Module, layers: list[_LayerCallable], start_layer: int, end_layer: int
+) -> None:
+    # glm5_next (GLM-5.3-Flash, 3 linear + 1 sparse-attention layers per group)
+    # computes fa_idx and ssm_idx ONCE at init from the FULL layer list
+    # (glm5_next.py:801-802) and reads cache[fa_idx][0] for the attention mask.
+    # After the slice cache[] is LOCAL: on a shard starting at 22, local 3 is
+    # global 25, a linear layer, so cache[fa_idx][0] is the ArraysCache conv
+    # state and create_attention_mask dies on its first token with "[convert]
+    # Only length-1 arrays can be converted to Python scalars" (2026-10-06,
+    # .30+.31). Rank 0 alone lines up by chance.
+    linear_locals = [
+        i for i, layer in enumerate(layers) if getattr(layer, "is_linear", False)
+    ]
+    full_locals = [
+        i for i, layer in enumerate(layers) if not getattr(layer, "is_linear", True)
+    ]
+    if not linear_locals or not full_locals:
+        missing = "full-attention" if not full_locals else "linear-attention"
+        raise ValueError(
+            f"hybrid pipeline shard [{start_layer},{end_layer}) contains no "
+            f"{missing} layer — re-cut the pipeline so every shard spans at "
+            f"least one layer of each kind."
+        )
+    inner.fa_idx = full_locals[0]
+    inner.ssm_idx = linear_locals[0]
+
+
+def _reindex_nemotron_h(
+    model: nn.Module, inner: nn.Module, layers: list[_LayerCallable]
+) -> None:
+    # NemotronH uses block_type: "M" (Mamba/SSM), "*" (Attention), "E" (MoE), "-" (MLP)
+    # Only "M" and "*" blocks have cache entries, so these are CACHE-slot
+    # indices, not layer indices.
+    cache_idx = 0
+    fa_idx: int | None = None
+    ssm_idx: int | None = None
+    for layer in layers:
+        block_type = getattr(layer, "block_type", None)
+        if block_type == "*":
+            if fa_idx is None:
+                fa_idx = cache_idx
+            cache_idx += 1
+        elif block_type == "M":
+            if ssm_idx is None:
+                ssm_idx = cache_idx
+            cache_idx += 1
+    has_attn = fa_idx is not None
+    has_mamba = ssm_idx is not None
+    inner.fa_idx = fa_idx if fa_idx is not None else 0
+    inner.ssm_idx = ssm_idx if ssm_idx is not None else 0
+    if not has_attn or not has_mamba:
+        _patch_hybrid_cache(
+            cast(NemotronHModel, model),
+            fa_idx=inner.fa_idx,
+            has_full_attn=has_attn,
+            ssm_idx=inner.ssm_idx,
+            has_linear=has_mamba,
+        )
+
+
 def pipeline_auto_parallel(
     model: nn.Module,
     group: mx.distributed.Group,
@@ -582,120 +810,36 @@ def pipeline_auto_parallel(
         attn_res_total_blocks=attn_res_total_blocks,
     )
 
+    # Per-family shard reindexing. ORDER MATTERS: several predicates read
+    # attributes that an earlier family may have just written (kimi and glm5_next
+    # exclude each other through attn_idx / fa_idx). Keep this sequence and these
+    # conditions as they are.
     if isinstance(inner_model_instance, GptOssMoeModel):
-        inner_model_instance.layer_types = inner_model_instance.layer_types[
-            start_layer:end_layer
-        ]
-        # We can assume the model has at least one layer thanks to placement.
-        # If a layer type doesn't exist, we can set it to 0.
-        inner_model_instance.swa_idx = (
-            0
-            if "sliding_attention" not in inner_model_instance.layer_types
-            else inner_model_instance.layer_types.index("sliding_attention")
-        )
-        inner_model_instance.ga_idx = (
-            0
-            if "full_attention" not in inner_model_instance.layer_types
-            else inner_model_instance.layer_types.index("full_attention")
-        )
+        _reindex_gpt_oss(inner_model_instance, start_layer, end_layer)
 
     if _MIMO_V2_INNER_CLASSES and isinstance(
         inner_model_instance, _MIMO_V2_INNER_CLASSES
     ):
-        # mimo_v2_flash.LanguageModel computes swa_idx/ga_idx ONCE at init from
-        # the FULL config.hybrid_layer_pattern (.index(1)/.index(0)); its
-        # __call__ uses them to pick which layer's cache builds the SWA vs
-        # full-attention mask (cache[ga_idx] / cache[swa_idx]). After the
-        # pipeline slice, cache[] is LOCAL to this shard, so a global index
-        # points at the wrong layer's cache — the mask's KV length diverges
-        # from the real keys/values as session offsets grow, crashing with
-        # "[broadcast_shapes] ... cannot be broadcast" on the 2nd+ request of a
-        # multi-turn session (first request happens to line up). Recompute both
-        # as shard-LOCAL indices from the sliced layers' is_sliding_window flag
-        # (same fix class as GptOss above / Step35 below / bailing_moe_linear).
-        sliding_layers = [
-            i
-            for i, layer in enumerate(layers)
-            if getattr(layer, "is_sliding_window", False)
-        ]
-        full_layers = [
-            i
-            for i, layer in enumerate(layers)
-            if not getattr(layer, "is_sliding_window", True)
-        ]
-        inner_model_instance.swa_idx = sliding_layers[0] if sliding_layers else 0
-        inner_model_instance.ga_idx = full_layers[0] if full_layers else 0
+        _reindex_mimo_v2(inner_model_instance, layers)
 
     if isinstance(inner_model_instance, Step35InnerModel):
-        inner_model_instance.num_layers = len(layers)
-        sliding_layers = [
-            i for i, layer in enumerate(layers) if getattr(layer, "is_sliding", False)
-        ]
-        full_layers = [
-            i
-            for i, layer in enumerate(layers)
-            if not getattr(layer, "is_sliding", True)
-        ]
-        inner_model_instance._swa_idx = 0 if not sliding_layers else sliding_layers[0]
-        inner_model_instance._full_idx = 0 if not full_layers else full_layers[0]
+        _reindex_step35(inner_model_instance, layers)
 
     if isinstance(inner_model_instance, (Qwen3_5TextModelInner, Qwen3NextInnerModel)):
-        full_attn_layers = [
-            i for i, layer in enumerate(layers) if not getattr(layer, "is_linear", True)
-        ]
-        linear_layers = [
-            i for i, layer in enumerate(layers) if getattr(layer, "is_linear", False)
-        ]
-        inner_model_instance.fa_idx = full_attn_layers[0] if full_attn_layers else 0
-        inner_model_instance.ssm_idx = linear_layers[0] if linear_layers else 0
-        if not full_attn_layers or not linear_layers:
-            _patch_hybrid_cache(
-                cast(Qwen3_5TextModel | Qwen3NextModel, model),
-                fa_idx=inner_model_instance.fa_idx,
-                has_full_attn=bool(full_attn_layers),
-                ssm_idx=inner_model_instance.ssm_idx,
-                has_linear=bool(linear_layers),
-            )
+        _reindex_qwen3_hybrid(model, inner_model_instance, layers)
 
-    # Duck-typed: qwen4_exp (Qwen3.8-Flash-Next, hybrid HC trunk — #74). Two
-    # shard-local alignments, same fix class as GptOss/MimoV2/Step35 above
-    # (first landed 2026-08-28, lost in a resync — recommitted for good):
-    #  1. `ple_layers` is computed at init from GLOBAL layer indices
-    #     (qwen4_exp.py:814-816); Model.__call__ uses cache[ple_layers[0]] for
-    #     the n-gram tail (L841-856). After the slice the cache list is LOCAL,
-    #     so recompute ple_layers from the sliced layers (the PLE layer lives
-    #     on rank 0 in a contiguous split; other ranks get [] and skip the
-    #     n-gram block entirely, which is correct — their layers have no .ple).
-    #  2. Model.make_cache() (qwen4_exp.py:1075) builds the FULL layer_types
-    #     cache list; per-rank it must follow the local slice or cache kinds
-    #     misalign with layers (the 2026-08-28 "ArraysCache.offset" crash).
-    # The hc tile/mixer need NO patch: boundary payloads are DecoderLayer
-    # outputs (hc-wide), and the decode all_gather hands every rank the last
-    # rank's stream, so the per-rank final mixer sees identical input.
+    # qwen4_exp (Qwen3.8-Flash-Next, hybrid HC trunk — #74): index recompute and
+    # cache slicing are two separate concerns, both applied for this family.
     if (
         hasattr(inner_model_instance, "ple_layers")
         and hasattr(inner_model_instance, "hyper_connection_mixer")
         and hasattr(inner_model_instance, "hc")
     ):
-        inner_model_instance.ple_layers = [
-            i
-            for i, layer in enumerate(layers)
-            if getattr(layer, "ple", None) is not None
-        ]
+        _reindex_qwen4_exp_ple(inner_model_instance, layers)
+        _slice_qwen4_exp_make_cache(model, start_layer, end_layer)
 
-        _q4_orig_make_cache = model.make_cache
-
-        def _q4_sliced_make_cache(
-            _mc=_q4_orig_make_cache, _s=start_layer, _e=end_layer
-        ):
-            return _mc()[_s:_e]
-
-        model.make_cache = _q4_sliced_make_cache
-
-    # Duck-typed: matches mlx-lm's bailing_moe_linear.LanguageModel AND the
-    # vendored patches/bailing_hybrid_model.LanguageModel (and any future
-    # hybrid using the same attn_idx/gla_idx + per-layer is_global contract) —
-    # an isinstance on the stock class alone misses the vendored module.
+    # bailing_moe_linear (and the vendored patches/bailing_hybrid_model): duck-typed
+    # on attn_idx + gla_idx + is_global, or isinstance on the stock class.
     if (
         hasattr(inner_model_instance, "attn_idx")
         and hasattr(inner_model_instance, "gla_idx")
@@ -704,84 +848,18 @@ def pipeline_auto_parallel(
         _HAS_BAILING_MOE_LINEAR
         and isinstance(inner_model_instance, BailingMoeLinearInnerModel)
     ):
-        # bailing_moe_linear (Ling/Ring hybrid family) hardcodes attn_idx =
-        # layer_group_size - 1 and gla_idx = 0 as GLOBAL layer indices
-        # (bailing_moe_linear.py:483-484); after slicing, cache[] is local so
-        # they must point at LOCAL layers of the right kind. A shard whose
-        # start is not a multiple of layer_group_size otherwise resolves
-        # cache[attn_idx] to a linear-attention ArraysCache and dies with
-        # "make_mask() got an unexpected keyword argument 'return_array'"
-        # (#43 — observed deterministically on ranks whose start % 8 == 4).
-        # DecoderLayer.is_global marks full-attention layers; attribute reads
-        # traverse the Pipeline{First,Last}Layer wrappers via CustomMlxLayer.
-        attn_layers = [
-            i for i, layer in enumerate(layers) if getattr(layer, "is_global", False)
-        ]
-        gla_layers = [
-            i
-            for i, layer in enumerate(layers)
-            if not getattr(layer, "is_global", True)
-        ]
-        if not attn_layers or not gla_layers:
-            # The model computes BOTH masks/offsets from one layer of each
-            # kind — a shard missing a kind cannot run. Fail loudly with the
-            # re-cut hint instead of producing garbage (shards >= group size
-            # always contain both kinds; only <8-layer shards can hit this).
-            missing = "full-attention" if not attn_layers else "linear-attention"
-            raise ValueError(
-                f"bailing_moe_linear pipeline shard [{start_layer},{end_layer}) "
-                f"contains no {missing} layer — re-cut the pipeline so every "
-                f"shard spans at least one full layer group (layer_group_size)."
-            )
-        inner_model_instance.attn_idx = attn_layers[0]
-        inner_model_instance.gla_idx = gla_layers[0]
+        _reindex_bailing(inner_model_instance, layers, start_layer, end_layer)
 
-    # Duck-typed: the kimi family (kimi_linear, kimi_k3) computes ssm_idx and
-    # attn_idx ONCE at init from the FULL layer list, then uses them to pick
-    # which layer's cache builds the SSM vs the attention mask
-    # (cache[ssm_idx] / cache[attn_idx]). After the pipeline slice cache[] is
-    # LOCAL, so a global index lands on the wrong layer — and on a layer of the
-    # wrong KIND, which surfaces as "make_mask() got an unexpected keyword
-    # argument 'return_array'" or a broadcast failure on the 2nd turn. Same fix
-    # class as GptOss / MimoV2Flash / Step35 / bailing above.
-    #
-    # The predicate cannot collide with those: Qwen3-Next exposes fa_idx (not
-    # attn_idx) and is matched by isinstance earlier, bailing carries gla_idx
-    # and is excluded here explicitly.
+    # kimi family (kimi_linear, kimi_k3): ssm_idx + attn_idx, no gla_idx.
     if (
         hasattr(inner_model_instance, "ssm_idx")
         and hasattr(inner_model_instance, "attn_idx")
         and not hasattr(inner_model_instance, "gla_idx")
         and any(getattr(l, "is_linear", None) is not None for l in layers)
     ):
-        linear_locals = [
-            i for i, layer in enumerate(layers) if getattr(layer, "is_linear", False)
-        ]
-        full_locals = [
-            i for i, layer in enumerate(layers) if not getattr(layer, "is_linear", True)
-        ]
-        if not linear_locals or not full_locals:
-            # Both masks are derived from one layer of each kind, so a shard
-            # missing a kind cannot run. Fail loudly with the re-cut hint rather
-            # than produce garbage.
-            missing = "full-attention" if not full_locals else "linear-attention"
-            raise ValueError(
-                f"kimi pipeline shard [{start_layer},{end_layer}) contains no "
-                f"{missing} layer — re-cut the pipeline so every shard spans at "
-                f"least one layer of each kind."
-            )
-        inner_model_instance.ssm_idx = linear_locals[0]
-        inner_model_instance.attn_idx = full_locals[0]
+        _reindex_kimi(inner_model_instance, layers, start_layer, end_layer)
 
-    # Duck-typed: glm5_next (GLM-5.3-Flash, 3 linear + 1 sparse-attention
-    # layers per group) computes fa_idx and ssm_idx ONCE at init from the FULL
-    # layer list (glm5_next.py:801-802) and reads cache[fa_idx][0] for the
-    # attention mask. After the slice cache[] is LOCAL: on a shard starting at
-    # 22, local 3 is global 25, a linear layer, so cache[fa_idx][0] is the
-    # ArraysCache conv state and create_attention_mask dies on its first token
-    # with "[convert] Only length-1 arrays can be converted to Python scalars"
-    # (2026-10-06, .30+.31). Rank 0 alone lines up by chance. Same fix class as
-    # Qwen3-Next above (matched by isinstance there, excluded here).
+    # glm5_next: fa_idx + ssm_idx, no attn_idx, and not a class handled above.
     if (
         hasattr(inner_model_instance, "fa_idx")
         and hasattr(inner_model_instance, "ssm_idx")
@@ -792,51 +870,10 @@ def pipeline_auto_parallel(
         )
         and any(getattr(l, "is_linear", None) is not None for l in layers)
     ):
-        linear_locals = [
-            i for i, layer in enumerate(layers) if getattr(layer, "is_linear", False)
-        ]
-        full_locals = [
-            i for i, layer in enumerate(layers) if not getattr(layer, "is_linear", True)
-        ]
-        if not linear_locals or not full_locals:
-            missing = "full-attention" if not full_locals else "linear-attention"
-            raise ValueError(
-                f"hybrid pipeline shard [{start_layer},{end_layer}) contains no "
-                f"{missing} layer — re-cut the pipeline so every shard spans at "
-                f"least one layer of each kind."
-            )
-        inner_model_instance.fa_idx = full_locals[0]
-        inner_model_instance.ssm_idx = linear_locals[0]
+        _reindex_glm5_next(inner_model_instance, layers, start_layer, end_layer)
 
     if isinstance(inner_model_instance, NemotronHInnerModel):
-        # NemotronH uses block_type: "M" (Mamba/SSM), "*" (Attention), "E" (MoE), "-" (MLP)
-        # Only "M" and "*" blocks have cache entries.
-        # Recompute fa_idx and ssm_idx as cache-array indices for the shard's layers.
-        cache_idx = 0
-        fa_idx: int | None = None
-        ssm_idx: int | None = None
-        for layer in layers:
-            block_type = getattr(layer, "block_type", None)
-            if block_type == "*":
-                if fa_idx is None:
-                    fa_idx = cache_idx
-                cache_idx += 1
-            elif block_type == "M":
-                if ssm_idx is None:
-                    ssm_idx = cache_idx
-                cache_idx += 1
-        has_attn = fa_idx is not None
-        has_mamba = ssm_idx is not None
-        inner_model_instance.fa_idx = fa_idx if fa_idx is not None else 0
-        inner_model_instance.ssm_idx = ssm_idx if ssm_idx is not None else 0
-        if not has_attn or not has_mamba:
-            _patch_hybrid_cache(
-                cast(NemotronHModel, model),
-                fa_idx=inner_model_instance.fa_idx,
-                has_full_attn=has_attn,
-                ssm_idx=inner_model_instance.ssm_idx,
-                has_linear=has_mamba,
-            )
+        _reindex_nemotron_h(model, inner_model_instance, layers)
 
     _set_layers(model, layers)
 
