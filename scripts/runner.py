@@ -1901,8 +1901,25 @@ _LONGCAT_ARG_PAIR = re.compile(
 )
 
 
-def parse_tool_calls(text: str) -> tuple[list[dict], str]:
+def _offered_tool_names(tools) -> set[str] | None:
+    """Names of the tools offered in the request (OpenAI or Anthropic shape)."""
+    if not tools:
+        return None
+    names = set()
+    for t in tools:
+        if isinstance(t, dict):
+            name = (t.get("function") or {}).get("name") or t.get("name")
+            if name:
+                names.add(name)
+    return names or None
+
+
+def parse_tool_calls(text: str, allowed_names: set[str] | None = None) -> tuple[list[dict], str]:
     """Extract OpenAI-shaped tool_calls from a generated string.
+
+    allowed_names: when given (the request's tool names), a call to any other name
+    is NOT a call: it stays in the text. Models quote code that contains tool-call
+    markup (a regex, a docstring); without this, quoted examples became calls.
 
     Recognises:
       - Hermes JSON (Qwen3, GLM-4): `<tool_call>{"name":..,"arguments":..}</tool_call>`
@@ -1919,7 +1936,9 @@ def parse_tool_calls(text: str) -> tuple[list[dict], str]:
     calls: list[dict] = []
     cleaned = text
 
-    def add_call(name: str, args) -> None:
+    def add_call(name: str, args) -> bool:
+        if allowed_names is not None and name not in allowed_names:
+            return False
         calls.append({
             "id": "call_" + uuid.uuid4().hex[:12],
             "type": "function",
@@ -1928,6 +1947,7 @@ def parse_tool_calls(text: str) -> tuple[list[dict], str]:
                 "arguments": json.dumps(args) if not isinstance(args, str) else args,
             },
         })
+        return True
 
     # Pass 1: Hermes JSON single-call wrappers
     for m in _TOOL_CALL_HERMES_JSON.finditer(text):
@@ -1937,8 +1957,8 @@ def parse_tool_calls(text: str) -> tuple[list[dict], str]:
         except Exception:
             continue
         if isinstance(obj, dict) and obj.get("name"):
-            add_call(obj["name"], obj.get("arguments", {}))
-            cleaned = cleaned.replace(m.group(0), "")
+            if add_call(obj["name"], obj.get("arguments", {})):
+                cleaned = cleaned.replace(m.group(0), "")
 
     # Pass 2: Hermes JSON list wrappers
     for m in _TOOL_CALL_HERMES_LIST.finditer(text):
@@ -1948,10 +1968,10 @@ def parse_tool_calls(text: str) -> tuple[list[dict], str]:
         except Exception:
             continue
         if isinstance(arr, list):
-            for item in arr:
-                if isinstance(item, dict) and item.get("name"):
-                    add_call(item["name"], item.get("arguments", {}))
-            cleaned = cleaned.replace(m.group(0), "")
+            accepted = [add_call(item["name"], item.get("arguments", {}))
+                        for item in arr if isinstance(item, dict) and item.get("name")]
+            if accepted and all(accepted):
+                cleaned = cleaned.replace(m.group(0), "")
 
     # Pass 3: Qwen3-Coder XML format
     for m in _TOOL_CALL_QWEN_XML.finditer(text):
@@ -1969,8 +1989,8 @@ def parse_tool_calls(text: str) -> tuple[list[dict], str]:
                 args[key] = json.loads(raw)
             except Exception:
                 args[key] = raw
-        add_call(name, args)
-        cleaned = cleaned.replace(m.group(0), "")
+        if add_call(name, args):
+            cleaned = cleaned.replace(m.group(0), "")
 
     # Pass 4: Hy3 XML format (`<tool_call>NAME<tool_sep>…</tool_call>`)
     # The name comes before <tool_sep>; args are interleaved <arg_key>/<arg_value>.
@@ -1985,8 +2005,8 @@ def parse_tool_calls(text: str) -> tuple[list[dict], str]:
                 args[key] = json.loads(raw)
             except Exception:
                 args[key] = raw
-        add_call(name, args)
-        cleaned = cleaned.replace(m.group(0), "")
+        if add_call(name, args):
+            cleaned = cleaned.replace(m.group(0), "")
 
     # Pass 4b: GLM XML format (`<tool_call>NAME<arg_key>…</tool_call>`, no <tool_sep>)
     for m in _TOOL_CALL_GLM_XML.finditer(text):
@@ -1999,8 +2019,8 @@ def parse_tool_calls(text: str) -> tuple[list[dict], str]:
                 args[key] = json.loads(raw)
             except Exception:
                 args[key] = raw
-        add_call(name, args)
-        cleaned = cleaned.replace(m.group(0), "")
+        if add_call(name, args):
+            cleaned = cleaned.replace(m.group(0), "")
 
     # Pass 5: LongCat format (`<longcat_tool_call>NAME<longcat_arg_key>…</…>`)
     # Name is the first line; args are <longcat_arg_key>/<longcat_arg_value> pairs.
@@ -2018,8 +2038,8 @@ def parse_tool_calls(text: str) -> tuple[list[dict], str]:
                 args[key] = json.loads(raw)
             except Exception:
                 args[key] = raw
-        add_call(name, args)
-        cleaned = cleaned.replace(m.group(0), "")
+        if add_call(name, args):
+            cleaned = cleaned.replace(m.group(0), "")
 
     return calls, cleaned.strip()
 
@@ -3254,7 +3274,7 @@ def _run_legacy_main(model, tokenizer, repo: str, kv_q8_default: bool,
         tool_calls: list[dict] = []
         if tools:
             full_text = "".join(full_text_parts)
-            tool_calls, _ = parse_tool_calls(full_text)
+            tool_calls, _ = parse_tool_calls(full_text, _offered_tool_names(tools))
 
         # Persist the populated cache for this session so the next turn can
         # resume mid-prompt. The cache currently holds K/V for
@@ -3457,7 +3477,8 @@ def _run_batched_main(model, tokenizer, repo: str, kv_q8_default: bool,
         # Tool-call parsing on the full text
         tool_calls: list[dict] = []
         if s["tools"]:
-            tool_calls, _ = parse_tool_calls("".join(s["full_text_parts"]))
+            tool_calls, _ = parse_tool_calls("".join(s["full_text_parts"]),
+                                             _offered_tool_names(s["tools"]))
         # Session persistence: prefer the cache from the finishing Response
         # (mlx-lm attaches it as resp.prompt_cache). Fallback to extract_cache
         # by uid (works pre-removal).

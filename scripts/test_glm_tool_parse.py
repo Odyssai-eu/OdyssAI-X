@@ -70,5 +70,34 @@ class OtherFormatsUnchanged(unittest.TestCase):
         self.assertEqual(content, "Paris.")
 
 
+class AllowedNames(unittest.TestCase):
+    """A call only counts when its name is an offered tool. Quoted markup is text."""
+
+    def test_offered_name_is_a_call(self):
+        text = "<tool_call>read_file<arg_key>path</arg_key><arg_value>a.py</arg_value></tool_call>"
+        calls, content = parse_tool_calls(text, {"read_file"})
+        self.assertEqual(calls[0]["function"]["name"], "read_file")
+        self.assertEqual(content, "")
+
+    def test_unoffered_name_stays_text(self):
+        text = "<tool_call>read_file<arg_key>path</arg_key><arg_value>a.py</arg_value></tool_call>"
+        calls, content = parse_tool_calls(text, {"grep"})
+        self.assertEqual(calls, [])
+        self.assertEqual(content, text)
+
+    def test_quoted_docstring_example_is_not_a_call(self):
+        # What a model writes when it quotes runner.py: the format description itself.
+        quoted = ("The GLM form is `<tool_call>NAME<arg_key>K</arg_key><arg_value>V</arg_value>"
+                  "</tool_call>`.")
+        calls, content = parse_tool_calls(quoted, {"read_file", "grep", "list_dir", "bash"})
+        self.assertEqual(calls, [])
+        self.assertEqual(content, quoted)
+
+    def test_none_keeps_old_behaviour(self):
+        text = "<tool_call>read_file<arg_key>path</arg_key><arg_value>a.py</arg_value></tool_call>"
+        calls, _ = parse_tool_calls(text, None)
+        self.assertEqual(len(calls), 1)
+
+
 if __name__ == "__main__":
     unittest.main()
