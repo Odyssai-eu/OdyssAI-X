@@ -1871,6 +1871,19 @@ _HY3_ARG_PAIR = re.compile(
     re.DOTALL,
 )
 
+# GLM XML: `<tool_call>NAME<arg_key>K</arg_key><arg_value>V</arg_value>…</tool_call>`
+# (GLM-5.x, observed on glm-5-3-flash 2026-10-09). The name runs up to the first
+# <arg_key>; there is no <tool_sep>, so the Hy3 pattern above never matches it.
+# Before this pass the call came back as plain text with stop_reason end_turn.
+_TOOL_CALL_GLM_XML = re.compile(
+    r"<tool_call>\s*([^<\s][^<]*?)\s*((?:<arg_key>.*?</arg_key>\s*<arg_value>.*?</arg_value>\s*)*)</tool_call>",
+    re.DOTALL,
+)
+_GLM_ARG_PAIR = re.compile(
+    r"<arg_key>\s*(.*?)\s*</arg_key>\s*<arg_value>\s*(.*?)\s*</arg_value>",
+    re.DOTALL,
+)
+
 # LongCat format: <longcat_tool_call>NAME\n<longcat_arg_key>K</longcat_arg_key>
 # <longcat_arg_value>V</longcat_arg_value>…</longcat_tool_call>
 # Observed on meituan-longcat/LongCat-Flash-Lite. The name is the first line
@@ -1896,6 +1909,7 @@ def parse_tool_calls(text: str) -> tuple[list[dict], str]:
       - Hermes JSON list: `<tool_calls>[ {…}, … ]</tool_calls>`
       - Qwen3-Coder XML: `<tool_call><function=NAME><parameter=KEY>VAL</parameter>…</function></tool_call>`
       - Hy3 XML: `<tool_call>NAME<tool_sep><arg_key>K</arg_key><arg_value>V</arg_value>…</tool_call>`
+      - GLM XML: `<tool_call>NAME<arg_key>K</arg_key><arg_value>V</arg_value>…</tool_call>`
       - LongCat: `<longcat_tool_call>NAME<longcat_arg_key>K</longcat_arg_key><longcat_arg_value>V</longcat_arg_value>…</longcat_tool_call>`
 
     Returns (tool_calls, content_without_calls). Each call:
@@ -1965,6 +1979,20 @@ def parse_tool_calls(text: str) -> tuple[list[dict], str]:
         body = m.group(2)
         args: dict = {}
         for pm in _HY3_ARG_PAIR.finditer(body):
+            key = pm.group(1).strip()
+            raw = pm.group(2).strip()
+            try:
+                args[key] = json.loads(raw)
+            except Exception:
+                args[key] = raw
+        add_call(name, args)
+        cleaned = cleaned.replace(m.group(0), "")
+
+    # Pass 4b: GLM XML format (`<tool_call>NAME<arg_key>…</tool_call>`, no <tool_sep>)
+    for m in _TOOL_CALL_GLM_XML.finditer(text):
+        name = m.group(1).strip()
+        args: dict = {}
+        for pm in _GLM_ARG_PAIR.finditer(m.group(2)):
             key = pm.group(1).strip()
             raw = pm.group(2).strip()
             try:
