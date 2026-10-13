@@ -112,7 +112,26 @@ def collect_iface_data(target: str, ifaces: list[str]) -> tuple[dict[str, str], 
         parts.append(f"echo '--IFCONFIG {i}--'; ifconfig {i} 2>/dev/null")
     parts.append("echo '--NDP--'; ndp -an 2>/dev/null")
     out = ssh(target, " ; ".join(parts))
+    return parse_iface_output(out, ifaces)
 
+
+def normalize_mac(raw: str) -> str | None:
+    """Canonical lowercase MAC with two hex digits per octet, or None.
+
+    macOS `ndp -an` drops leading zeros (`36:74:32:fb:47:8`) while `ifconfig`
+    prints them (`36:74:32:fb:47:08`). Compared raw, those never matched, and a
+    17-character filter silently discarded the short form: a cabled link whose
+    peer MAC has an octet below 0x10 showed as "no peer visible" (2026-10-13,
+    ultra-96 en4/en5 -> 4/6 edges on a full 3-node mesh).
+    """
+    octets = raw.strip().lower().split(":")
+    if len(octets) != 6 or not all(re.fullmatch(r"[0-9a-f]{1,2}", o) for o in octets):
+        return None
+    return ":".join(o.zfill(2) for o in octets)
+
+
+def parse_iface_output(out: str, ifaces: list[str]) -> tuple[dict[str, str], dict[str, list[str]]]:
+    """Parse the ifconfig/ndp dump of collect_iface_data into (local, peer) MACs."""
     local_macs: dict[str, str] = {}
     current_iface: str | None = None
     ndp_section = False
@@ -129,9 +148,9 @@ def collect_iface_data(target: str, ifaces: list[str]) -> tuple[dict[str, str], 
             ndp_section = True
             continue
         if current_iface and not ndp_section:
-            em = re.search(r"\bether\s+([0-9a-f:]{17})\b", line, re.IGNORECASE)
-            if em:
-                local_macs[current_iface] = em.group(1).lower()
+            em = re.search(r"\bether\s+([0-9a-fA-F:]+)", line)
+            if em and normalize_mac(em.group(1)):
+                local_macs[current_iface] = normalize_mac(em.group(1))
         elif ndp_section:
             # NDP line format:
             #   fe80::xxxx%en3   36:ce:da:e0:b4:c4   en3   23h41m42s S
@@ -139,8 +158,8 @@ def collect_iface_data(target: str, ifaces: list[str]) -> tuple[dict[str, str], 
             if len(parts2) >= 3:
                 iface_col = parts2[2]
                 if iface_col in peer_macs:
-                    mac = parts2[1].lower()
-                    if re.fullmatch(r"[0-9a-f:]{17}", mac):
+                    mac = normalize_mac(parts2[1])
+                    if mac:
                         # Skip our own MAC (link-local addresses for the
                         # local side appear in ndp as "permanent R").
                         local = local_macs.get(iface_col)
