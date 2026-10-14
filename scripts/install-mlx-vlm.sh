@@ -8,6 +8,7 @@
 #   2. pip install mlx-vlm pinned to the merged VL commit + torch/torchvision
 #   3. apply scripts/patches/mlx_vlm_thinking_mode_disabled.patch (see below)
 #   4. smoke-import mlx_vlm + the minimax_m3_vl model module
+#   5. qwen3_coder tool-parser detection without the newline (MiMo-V2.6)
 #
 # Idempotent: re-running skips venv creation if it already imports cleanly,
 # skips pip entirely when mlx-vlm is already at MLX_VLM_REF (direct_url.json),
@@ -190,6 +191,39 @@ else:
     with open(path, "w") as f:
         f.write(content)
     print("[install-mlx-vlm] patch applied")
+PYEOF
+)
+PATCH_SCRIPT="${PATCH_SCRIPT//VENV_PLACEHOLDER/$VLM_VENV}"
+ssh -o ConnectTimeout=10 -o BatchMode=yes "$SSH_TARGET" "$VLM_VENV/bin/python -" <<<"$PATCH_SCRIPT"
+
+# 5. qwen3_coder detection without the newline (idempotent, same in-place
+#    replace as step 4). mlx_vlm/tools/registry.py picks the tool parser from
+#    markers in the chat template; qwen3_coder only matches
+#    `<tool_call>\n<function=`. MiMo-V2.6's template renders
+#    `<tool_call><function=NAME>` with no newline, so the generic json_tools
+#    parser won: non-stream returned the call as text (tool_calls null), stream
+#    returned nothing (json_tools withheld the block, then failed to parse it).
+#    With the qwen3_coder parser both modes return clean tool_calls (measured
+#    2026-10-15 on .30). Still the same marker on Blaizzy/mlx-vlm main (0.7.8).
+#    Takes effect at the next mlx_vlm.server start.
+echo "[install-mlx-vlm] applying qwen3_coder no-newline marker patch"
+PATCH_SCRIPT=$(cat <<'PYEOF'
+path = "VENV_PLACEHOLDER/lib/python3.12/site-packages/mlx_vlm/tools/registry.py"
+with open(path) as f:
+    content = f.read()
+old = r'''        (("<tool_call>\\n<function=",), ("<tool_call>\n<function=",)),'''
+new = r'''        (("<tool_call>\\n<function=",), ("<tool_call>\n<function=",), ("<tool_call><function=",)),'''
+if new in content:
+    print("[install-mlx-vlm] qwen3_coder marker patch already applied, skipping")
+elif old not in content:
+    print("[install-mlx-vlm] WARNING: qwen3_coder marker not found (upstream file changed?) — skipping")
+else:
+    import shutil
+    shutil.copy(path, path + ".bak-qwen3-coder-marker")
+    content = content.replace(old, new)
+    with open(path, "w") as f:
+        f.write(content)
+    print("[install-mlx-vlm] qwen3_coder marker patch applied")
 PYEOF
 )
 PATCH_SCRIPT="${PATCH_SCRIPT//VENV_PLACEHOLDER/$VLM_VENV}"

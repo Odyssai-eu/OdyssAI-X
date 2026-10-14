@@ -7773,7 +7773,7 @@ def _initial_default_config() -> Optional[dict]:
 #   major (1.7.2 → 2.0.0) — breaking API or topology change
 #
 # Use `./scripts/bump-version.sh patch|minor|major` to bump + auto-commit.
-APP_VERSION = "1.56.0"
+APP_VERSION = "1.56.1"
 
 app = FastAPI(
     title="OdyssAI-X (odyssai.eu)",
@@ -11649,6 +11649,10 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
         nstream_finish: Optional[str] = None
         nstream_loop = False
         nstream_effort_dropped = False
+        # The runner already took the accepted call blocks out of the tokens
+        # (ToolMarkupGate, runner 1.56.1+): stripping again would also drop a
+        # quoted call to a name that was not offered.
+        nstream_markup_withheld = False
         elapsed_s = 0.0
         ttft_s: Optional[float] = None
         tool_calls: list[dict] = []
@@ -11701,6 +11705,7 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
                     nstream_finish = ev.get("finish_reason")
                     nstream_loop = bool(ev.get("loop_detected"))
                     nstream_effort_dropped = bool(ev.get("effort_dropped"))
+                    nstream_markup_withheld = bool(ev.get("markup_withheld"))
         except RunnerRequestError as e:
             # #94: this request alone was rejected by the runner (the pool keeps
             # serving). A template that refuses the request is the client's
@@ -11725,7 +11730,8 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
                       status=run_status)
         content = "".join(text_parts)
         if tool_calls:
-            content = _strip_tool_calls_from_text(content)
+            content = (content.strip() if nstream_markup_withheld
+                       else _strip_tool_calls_from_text(content))
         # Same <think>…</think> split as the streaming path. When the caller
         # asked enable_thinking=False, the model may still emit them
         # (MiniMax M2.7-style chat templates ignore the Jinja flag).
@@ -12605,6 +12611,7 @@ async def anthropic_messages(req: AnthropicMessagesRequest, request: Request):
         elapsed_s = 0.0
         ttft_s: Optional[float] = None
         tool_calls: list[dict] = []
+        markup_withheld = False
         session_meta: dict = {}
         t_start = time.time()
         try:
@@ -12623,6 +12630,7 @@ async def anthropic_messages(req: AnthropicMessagesRequest, request: Request):
                     ntoks = ev.get("ntoks", 0)
                     elapsed_s = ev.get("elapsed_s", 0.0)
                     tool_calls = ev.get("tool_calls", []) or []
+                    markup_withheld = bool(ev.get("markup_withheld"))
                     session_meta.update(ev.get("session", {}) or {})
         except HTTPException:
             raise
@@ -12642,7 +12650,9 @@ async def anthropic_messages(req: AnthropicMessagesRequest, request: Request):
                       session_kind=session_meta.get("cache_kind"))
         # Build Anthropic content blocks
         blocks: list[dict] = []
-        text = _strip_tool_calls_from_text("".join(text_parts)) if tool_calls else "".join(text_parts)
+        text = "".join(text_parts)
+        if tool_calls:
+            text = text.strip() if markup_withheld else _strip_tool_calls_from_text(text)
         if text:
             blocks.append({"type": "text", "text": text})
         for tc in tool_calls:
