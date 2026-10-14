@@ -6696,7 +6696,7 @@ function attachHandlers() {
   document.querySelectorAll("[data-act]").forEach(el => {
     el.removeEventListener("click", handleAct);
     el.addEventListener("click", handleAct);
-    if (el.tagName === "INPUT" || el.tagName === "SELECT") {
+    if (el.tagName === "INPUT" || el.tagName === "SELECT" || el.tagName === "TEXTAREA") {
       el.removeEventListener("change", handleAct);
       el.removeEventListener("input", handleAct);
       el.addEventListener("change", handleAct);
@@ -6719,7 +6719,7 @@ async function handleAct(e) {
   // We mark it HERE, before any early-returning handler, so it covers
   // selects/inputs uniformly. (The button-based form controls — mode /
   // node pills / KV toggle — keep their own marker further down.)
-  if (el.tagName === "INPUT" || el.tagName === "SELECT") {
+  if (el.tagName === "INPUT" || el.tagName === "SELECT" || el.tagName === "TEXTAREA") {
     state.form_interaction_at = Date.now();
   }
 
@@ -7341,6 +7341,7 @@ async function handleAct(e) {
     // Debounced save on blur — typing in a textarea shouldn't fire a server
     // call per keystroke. The browser fires `change` on blur which is what
     // delegated handlers will see for non-button inputs.
+    if (e.type !== "change") return;
     const text = el.value || "";
     try {
       const r = await fetch("/admin/settings", {
@@ -8458,6 +8459,13 @@ function _isEditing() {
   // focused-but-disabled select can't stall load-progress refresh.)
   const _ae = document.activeElement;
   if (_ae && (_ae.tagName === "SELECT" || _ae.tagName === "INPUT")) {
+    return true;
+  }
+  // A settings <textarea> (decision models, prewarm prefix) being typed in: a
+  // re-render would put the saved value back over the draft. Only those with a
+  // data-act — the test-chat textarea lives in #chat-host, which no render
+  // rewrites, and it keeps focus after a send, so it must not stall the poll.
+  if (_ae && _ae.tagName === "TEXTAREA" && _ae.dataset && _ae.dataset.act) {
     return true;
   }
   // Recent form interaction (model picker, node pills, mode toggle, KV checkbox).
