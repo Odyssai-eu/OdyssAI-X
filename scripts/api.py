@@ -7773,7 +7773,7 @@ def _initial_default_config() -> Optional[dict]:
 #   major (1.7.2 → 2.0.0) — breaking API or topology change
 #
 # Use `./scripts/bump-version.sh patch|minor|major` to bump + auto-commit.
-APP_VERSION = "1.55.16"
+APP_VERSION = "1.56.0"
 
 app = FastAPI(
     title="OdyssAI-X (odyssai.eu)",
@@ -14833,11 +14833,8 @@ async def _gather_preflight(cluster_id: str, model: str,
                         "s'y chargent")
         else:
             _dcfg = await _read_decision_config(rank0, abspath)
-            if _dcfg is None:
-                _blk.append("pas de decision_config.json lisible — pas un modèle de décision")
-            elif not _decision_format_ok(_dcfg):
-                _blk.append(f"format de décision non supporté ({_dcfg.get('prompt_version')}/"
-                            f"{_dcfg.get('readout')})")
+            if not _decision_format_ok(_dcfg):
+                _blk.append(f"format de décision refusé par le node : {_dcfg.get('error')}")
             if size <= 0:
                 _blk.append("taille 0 — modèle absent du node cible ou volume non monté")
             elif per_node:
@@ -15794,8 +15791,8 @@ async def admin_cluster_load_options(cluster_id: str, model: str):
 
 async def _decision_cluster_load(cluster_id: str, cd: dict, req: "ArgoLoadRequest") -> dict:
     """Load on a `kind: decision` cluster (#95): only models tagged in
-    settings.decision_models, whose decision_config.json declares a readout the
-    vendored code implements. Launches decision_serve.py on one node over ssh
+    settings.decision_models, whose format the node's decision server recognises
+    (`decision_serve.py --probe`). Launches decision_serve.py on one node over ssh
     and registers a DecisionPool (served only through POST /v1/systemone)."""
     nodes = cd.get("nodes") or []
     if not nodes:
@@ -15835,17 +15832,13 @@ async def _decision_cluster_load(cluster_id: str, cd: dict, req: "ArgoLoadReques
     base_dir = topo[0].get("models_dir") or models_dir_for(cluster_id)
     model_abspath = _resolve_model_abspath(req.model, base_dir)
     dcfg = await _read_decision_config(ssh_target, model_abspath)
-    if dcfg is None:
-        raise HTTPException(422, f"{model_abspath} has no readable decision_config.json on {host} "
-                                 f"— not a decision model")
     if not _decision_format_ok(dcfg):
         raise HTTPException(422, {
             "error": "unsupported_decision_format",
-            "message": f"prompt_version={dcfg.get('prompt_version')!r} readout={dcfg.get('readout')!r} "
-                       f"is not implemented by the vendored readout",
-            "known": sorted(f"{p}/{r}" for p, r in DECISION_KNOWN_FORMATS),
+            "message": f"{model_abspath} on {host}: {dcfg.get('error')}",
         })
-    venv = getattr(req, "venv", None) or DECISION_DEFAULT_VENV
+    # The venv the node's decision server says this backend needs (a req.venv override wins).
+    venv = getattr(req, "venv", None) or dcfg.get("venv") or DECISION_DEFAULT_VENV
     py = f"{venv.rstrip('/')}/bin/python"
     rc, out, _ = await asyncio.to_thread(
         _ssh_exec, ssh_target,
@@ -15853,7 +15846,8 @@ async def _decision_cluster_load(cluster_id: str, cd: dict, req: "ArgoLoadReques
         f"&& echo ok || echo missing", 15)
     if (out or "").strip() != "ok":
         raise HTTPException(422, f"decision server not installed on {host} (venv {venv}, "
-                                 f"{DECISION_SERVER_REMOTE}) — run scripts/decision/install-decision.sh")
+                                 f"{DECISION_SERVER_REMOTE}) — run scripts/decision/install-decision.sh "
+                                 f"{ssh_target} {dcfg.get('install') or ''}".rstrip())
     ip = _vlm_ip_from_ssh(ssh_target)
     if getattr(req, "vlm_port", None):
         port = int(req.vlm_port)
@@ -15905,7 +15899,7 @@ async def _decision_cluster_load(cluster_id: str, cd: dict, req: "ArgoLoadReques
         "loaded": True, "cluster": cluster_id, "alias": alias, "is_decision": True,
         "dispatched": "decision-pool", "model": model_abspath, "upstream": upstream,
         "node": host, "node_index": idx, "pid": pid, "load_s": pool.load_s,
-        "decision": {k: dcfg.get(k) for k in ("prompt_version", "readout", "max_one_pass")},
+        "decision": {k: dcfg.get(k) for k in ("backend", "prompt_version", "readout", "max_one_pass")},
         "note": f"{req.model} serves typed decisions on {host}: POST /v1/systemone "
                 f"with model={alias!r}. Chat endpoints refuse it.",
     }
@@ -18954,15 +18948,8 @@ DECISION_PORT_SPAN = int(env_get("DECISION_PORT_SPAN", "10") or "10")
 DECISION_DEFAULT_VENV = env_get("DECISION_VENV", "$HOME/odyssai/decision/.venv")
 DECISION_SERVER_REMOTE = env_get("DECISION_SERVER_REMOTE",
                                  "$HOME/odyssai/decision/decision_serve.py")
-# (prompt_version, readout) pairs the vendored readout implements. Anything else
-# is refused: answering with a prompt format the weights were not trained on
-# would return wrong probabilities without any error.
-DECISION_KNOWN_FORMATS = frozenset({
-    ("letter-v1-semif", "letter-logit"),     # Eikos family (MLX letter readout)
-    ("letter-v1-ours", "letter-logit"),
-    ("julia-v1", "julia-markers"),           # Supersonic Labs Julia (PyTorch marker head)
-    ("clm-v0.1", "clm-contrastive"),         # Contrastive-LM CLM (Qwen3-8B encoder + heads)
-})
+# Which formats exist, how a folder declares one and which venv runs it is known
+# only to decision_serve.py on the node (`--probe`): the engine keeps no copy.
 
 
 def _decision_launch_cmd(log_id: str, venv: str, model_path: str,
@@ -19026,49 +19013,33 @@ def _is_decision_tagged(model: Optional[str], model_abspath: Optional[str] = Non
     return any(t in cands or t.rsplit("/", 1)[-1] in cands for t in tags)
 
 
-async def _read_decision_config(ssh_target: str, model_abspath: str) -> Optional[dict]:
-    """The decision format of a model folder on the node, or None (not a decision
-    model). Mirrors decision_serve.read_decision_config: decision_config.json (letter
-    readout), else julia_config.json + inference-policy.json (Julia)."""
-    root = model_abspath.rstrip("/")
-
-    async def _cat(name: str) -> Optional[dict]:
-        cmd = f"cat {shlex.quote(root + '/' + name)} 2>/dev/null"
-        try:
-            rc, out, _ = await asyncio.to_thread(_ssh_exec, ssh_target, cmd, 15)
-        except Exception:
-            return None
-        if rc != 0 or not (out or "").strip():
-            return None
-        try:
-            d = json.loads(out)
-        except Exception:
-            return None
-        return d if isinstance(d, dict) else None
-
-    cfg = await _cat("decision_config.json")
-    if cfg is not None:
-        return {**cfg, "backend": "letter"}
-    jc = await _cat("julia_config.json")
-    if jc is None:
-        cc = await _cat("config.json")
-        if cc is not None and cc.get("model_type") == "clm":
-            ok = bool(cc.get("checkpoints")) and cc.get("encoder_pooling") == "last-token"
-            return {"prompt_version": "clm-v0.1" if ok else "clm-unknown",
-                    "readout": "clm-contrastive", "backend": "clm",
-                    "base_model": cc.get("base_model"), "max_tokens": 2048}
-        return None
-    if jc.get("architecture") != "JuliaDecisionModel" or jc.get("format_version") != 1:
-        return {"prompt_version": f"julia-unknown:{jc.get('architecture')}/{jc.get('format_version')}",
-                "readout": "julia-markers", "backend": "julia"}
-    pol = await _cat("inference-policy.json") or {}
-    return {"prompt_version": "julia-v1", "readout": "julia-markers", "backend": "julia",
-            "max_one_pass": 20, "max_length": pol.get("max_length"),
-            "head_length": pol.get("head_length")}
+async def _read_decision_config(ssh_target: str, model_abspath: str) -> dict:
+    """The decision format of a model folder, as the node's decision server detects it
+    (`decision_serve.py --probe`): `ok`, `backend`, `prompt_version`, `readout`, the
+    `venv` that runs it — or `ok: false` and the `error` saying why the folder is
+    refused. The probe is standard-library Python, run with the base decision venv."""
+    py = f"{DECISION_DEFAULT_VENV.rstrip('/')}/bin/python"
+    cmd = (f"{_remote_path(py)} {_remote_path(DECISION_SERVER_REMOTE)} "
+           f"--probe {shlex.quote(model_abspath.rstrip('/'))}")
+    try:
+        rc, out, err = await asyncio.to_thread(_ssh_exec, ssh_target, cmd, 20)
+    except Exception as e:  # noqa: BLE001
+        return {"ok": False, "error": f"ssh {ssh_target}: {type(e).__name__}: {e}"}
+    lines = [ln for ln in (out or "").splitlines() if ln.strip()]
+    try:
+        d = json.loads(lines[-1]) if rc == 0 and lines else None
+    except ValueError:
+        d = None
+    if not isinstance(d, dict):
+        tail = ((err or out or "").strip().splitlines() or [""])[-1][-300:]
+        return {"ok": False, "error": f"decision server missing or outdated on {ssh_target} "
+                                      f"(probe exit {rc}: {tail}) — run "
+                                      f"scripts/decision/install-decision.sh"}
+    return d
 
 
 def _decision_format_ok(cfg: dict) -> bool:
-    return (cfg.get("prompt_version"), cfg.get("readout")) in DECISION_KNOWN_FORMATS
+    return bool(cfg.get("ok"))
 
 
 async def _launch_decision_server(

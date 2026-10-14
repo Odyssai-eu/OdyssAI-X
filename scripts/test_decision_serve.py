@@ -97,6 +97,118 @@ with tempfile.TemporaryDirectory() as d:
     except SystemExit:
         check("folder without decision_config refused", True)
 
+# --- declared formats and the engine's probe --------------------------------------------------
+import subprocess  # noqa: E402
+
+for pv, ro, backend, venv in (("d1-v1", "d1-answer-slot", "d1", ".venv-mlxvlm"),
+                              ("clef-v1", "clef-joint-head", "clef", ".venv-mlxvlm"),
+                              ("letter-v1-semif", "letter-logit", "letter", ".venv")):
+    with tempfile.TemporaryDirectory() as d:
+        json.dump({"prompt_version": pv, "readout": ro}, open(os.path.join(d, "decision_config.json"), "w"))
+        json.dump({"model_type": "lfm2_vl"}, open(os.path.join(d, "config.json"), "w"))
+        p = ds.probe(d)
+        check(f"probe: {pv} → backend {backend}", (p["ok"], p["backend"]) == (True, backend), p)
+        check(f"probe: {backend} runs in {venv}", p["venv"].endswith("/" + venv), p["venv"])
+with tempfile.TemporaryDirectory() as d:
+    json.dump({"model_type": "lfm2_vl", "auto_map": {"AutoModel": "modeling_d1.D1Model"}},
+              open(os.path.join(d, "config.json"), "w"))
+    p = ds.probe(d)
+    check("probe: a folder that declares no format is refused, never guessed",
+          p["ok"] is False and "not a decision model" in p["error"], p)
+    open(os.path.join(d, "decision_config.json"), "w").write("{not json")
+    p = ds.probe(d)
+    check("probe: unreadable decision_config.json → reason, no crash", p["ok"] is False and "unreadable" in p["error"], p)
+    json.dump({"prompt_version": "d1-v2", "readout": "d1-answer-slot"}, open(os.path.join(d, "decision_config.json"), "w"))
+    p = ds.probe(d)
+    check("probe: unknown version lists the known formats", "d1-v1/d1-answer-slot" in p.get("error", ""), p)
+check("probe: missing folder → reason", ds.probe("/nonexistent/x")["ok"] is False)
+with tempfile.TemporaryDirectory() as d:
+    json.dump({"prompt_version": "d1-v1", "readout": "d1-answer-slot"}, open(os.path.join(d, "decision_config.json"), "w"))
+    out = subprocess.run([sys.executable, "-I", os.path.join(HERE, "decision", "decision_serve.py"), "--probe", d],
+                         capture_output=True, text=True, timeout=30)
+    p = json.loads(out.stdout.strip().splitlines()[-1]) if out.returncode == 0 and out.stdout.strip() else {}
+    check("probe CLI: one JSON line, stdlib only (-I)", (p.get("ok"), p.get("install")) == (True, "mlxvlm"), out.stderr[-300:])
+
+
+# --- d1 backend (fake mlx-vlm model: the real one needs the mlxvlm venv) --------------------------
+class FakeD1:
+    def __init__(self):
+        self.seen = None
+
+    def probabilities(self, processor, state, questions, images=None, token_budget=65536):
+        self.seen = questions
+        out = []
+        for q in questions:
+            n = 2 if q["type"] == "noul" else len(q["criteria"])
+            out.append([0.7] + [0.3 / (n - 1)] * (n - 1))   # first option of each question wins
+        return out, 42
+
+
+fd = FakeD1()
+w1 = ds.Worker("/x", True, factory=lambda: ds.D1Backend(fd, None, decision_core))
+w1.start(); w1.ready.wait(5)
+check("d1: --sym switched off (d1 reads options in its own order)", w1.sym is False and w1.error is None, w1.error)
+res = w1.submit("I was charged twice", {
+    "refund": {"type": "noul", "instructions": "Refund?"},
+    "team": {"type": "choice", "instructions": "Team?", "criteria": {"billing": "Charges", "tech": "Bugs"}},
+    "urgency": {"type": "score", "instructions": "Urgency?", "criteria": ["Can wait", "Today", "Now"]},
+    "lst": {"type": "choice", "instructions": "Pick", "criteria": ["a", "b"]},
+})
+check("d1: noul [yes, no] → P(yes) of the first slot", res["refund"][0]["probability"] == 0.7, res["refund"])
+check("d1: choice keeps the criteria order", res["team"][0]["choice"] == "billing", res["team"])
+check("d1: score levels by index", res["urgency"][0]["score"] == 0 and set(res["urgency"][0]["probabilities"]) == {"0", "1", "2"}, res["urgency"])
+check("d1: list criteria become labels", res["lst"][0]["choice"] == "a", res["lst"])
+check("d1: questions sent as d1 reads them",
+      [q["type"] for q in fd.seen] == ["noul", "choice", "score", "choice"]
+      and fd.seen[2]["criteria"] == ["Can wait", "Today", "Now"]
+      and fd.seen[1]["criteria"] == {"billing": "Charges", "tech": "Bugs"}, fd.seen)
+check("d1: input tokens counted once", sum(v[1] for v in res.values()) == 42, [v[1] for v in res.values()])
+
+
+# --- Clef backend (fake joint-head model; needs mlx for the softmax) ------------------------------
+try:
+    import mlx.core as _mx
+except ImportError:
+    _mx = None
+if _mx is not None:
+    from types import SimpleNamespace as NS
+
+    class FakeClef:
+        def __init__(self):
+            self.record = None
+
+        def logits(self, record, **kw):
+            self.record = record
+            qs, lg = [], []
+            for qid, q in record["questions"].items():
+                if q["type"] == "noul":
+                    ids = ("true", "false")
+                elif q["type"] == "choice":
+                    ids = tuple(sorted(q["criteria"]))          # clef_mlx.question_options sorts
+                else:
+                    ids = tuple(str(i) for i in range(len(q["criteria"])))
+                qs.append(NS(question_id=qid, option_ids=ids))
+                lg.append(_mx.array([2.0] + [0.0] * (len(ids) - 1)))   # its first option id wins
+            return NS(input_ids=tuple(range(99)), questions=tuple(qs)), lg
+
+    fc = FakeClef()
+    w2 = ds.Worker("/x", False, factory=lambda: ds.ClefBackend(fc, decision_core))
+    w2.start(); w2.ready.wait(5)
+    res = w2.submit({"invoice": {"total": 1250}}, {
+        "large": {"type": "noul", "instructions": "Above 1000?"},
+        "status": {"type": "choice", "criteria": {"paid": "Paid", "draft": "Not sent"}},
+        "urgency": {"type": "score", "criteria": ["Low", "High"]},
+    })
+    check("clef: questions go in under their own IDs, one record",
+          list(fc.record["questions"]) == ["large", "status", "urgency"], fc.record)
+    check("clef: missing instructions left to Clef (it uses the ID)", fc.record["questions"]["status"]["instructions"] is None)
+    check("clef: noul true → yes", res["large"][0]["value"] is True, res["large"])
+    check("clef: choice maps Clef's sorted ids back to labels", res["status"][0]["choice"] == "draft", res["status"])
+    check("clef: score by level index", res["urgency"][0]["score"] == 0, res["urgency"])
+    check("clef: input tokens counted once", sum(v[1] for v in res.values()) == 99)
+else:
+    print("SKIP clef backend tests (no mlx)")
+
 # --- answer format (same as upstream serve.py) ----------------------------------------------
 a = ds.format_answer({"type": "noul"}, {"yes": 0.8, "no": 0.2})
 check("noul format", a["value"] is True and a["probability"] == 0.8 and a["confidence"] == 0.8)

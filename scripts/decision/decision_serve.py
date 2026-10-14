@@ -2,7 +2,7 @@
 """decision_serve — typed-decision server for OdyssAI-X decision pools (one node).
 
 Serves a *decision model* behind the TypeSafe / Jev wire protocol that OdyssAI-X already
-routes: `POST /v1/systemone` (and `/v1/evaluate`), `GET /health`. Two model formats:
+routes: `POST /v1/systemone` (and `/v1/evaluate`), `GET /health`. Model formats:
 
 - `letter` (MLX): next-token logits over option letters, e.g. Eikos-27B. Readout = the
   vendored, byte-identical `decision_core.py` + `mlx_decide.py` (MIT). The folder ships
@@ -11,9 +11,17 @@ routes: `POST /v1/systemone` (and `/v1/evaluate`), `GET /health`. Two model form
   Runtime = the vendored, byte-identical `julia/` package (Apache-2.0), pure PyTorch path
   only. The folder ships `julia_config.json` + `inference-policy.json`; the weights are
   checked against its `weights_sha256` before loading.
+- `clm` (MLX encoder + torch heads): CLM-v0.1-8B, `config.json` with `model_type: clm`.
+- `d1` (MLX): LiquidAI d1, answer-slot logits read by the pinned mlx-vlm package
+  (`mlx_vlm.models.d1`), uncalibrated as published.
+- `clef` (MLX): Cloudflare Clef / Clef-Flash, Qwen3.5 backbone + joint schema head, run by
+  the vendored, byte-identical `clef/clef_mlx.py` (Apache-2.0).
+  d1 and Clef ship no format declaration of their own: the operator writes the folder's
+  `decision_config.json` (`prompt_version` / `readout` of FORMATS below).
 
 Nothing is imported from the model folder (see UPSTREAM.md). An unknown format is refused
-at start instead of being answered with a format the weights were not trained on.
+at start instead of being answered with a format the weights were not trained on. The
+engine never keeps its own copy of this detection: it runs `--probe <dir>` on the node.
 - Threads: MLX keeps a default stream per thread, and a graph built on one thread fails
   when evaluated on another ("There is no Stream(gpu, N) in current thread", mlx-vlm#2352).
   The model is therefore loaded and run on ONE worker thread; HTTP handler threads only
@@ -21,6 +29,7 @@ at start instead of being answered with a format the weights were not trained on
 - Response shape: the same as upstream `serve.py` v1.2 (`answers`, `usage`, `latency_s`).
 
 usage: python decision_serve.py --model <dir> [--port 8095] [--host 0.0.0.0] [--name alias] [--sym]
+       python decision_serve.py --probe <dir>     # detected format as JSON (stdlib only)
 """
 from __future__ import annotations
 
@@ -38,9 +47,23 @@ os.environ.setdefault("HF_HUB_OFFLINE", "1")  # weights are local, never downloa
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)  # the vendored readout, never the model folder
 
-VERSION = "odyssai-decision-1.0"
-KNOWN_PROMPT_VERSIONS = {"letter-v1-semif", "letter-v1-ours"}
-KNOWN_READOUTS = {"letter-logit"}
+VERSION = "odyssai-decision-1.1"
+# Formats a decision_config.json may declare: (prompt_version, readout) → backend. Anything
+# else is refused: answering with a prompt format the weights were not trained on would
+# return wrong probabilities without any error.
+DECLARED_FORMATS = {
+    ("letter-v1-semif", "letter-logit"): "letter",   # Eikos family, shipped by the model
+    ("letter-v1-ours", "letter-logit"): "letter",
+    ("d1-v1", "d1-answer-slot"): "d1",               # LiquidAI d1, written by the operator
+    ("clef-v1", "clef-joint-head"): "clef",          # Cloudflare Clef, written by the operator
+}
+# The venv (next to this file) that carries each backend's packages: mlx-vlm 0.7.x needs
+# mlx and transformers versions the Julia pins exclude, so d1 and Clef get their own
+# (install-decision.sh backend `mlxvlm`).
+BACKEND_VENV = {"letter": ".venv", "julia": ".venv", "clm": ".venv",
+                "d1": ".venv-mlxvlm", "clef": ".venv-mlxvlm"}
+BACKEND_INSTALL = {"letter": "mlx", "julia": "julia", "clm": "clm",  # install-decision.sh backends
+                   "d1": "mlxvlm", "clef": "mlxvlm"}
 MAX_BODY = 8 * 1024 * 1024
 JOB_TIMEOUT_S = float(os.environ.get("DECISION_JOB_TIMEOUT_S", "600"))
 # Backpressure: beyond this many waiting requests the server answers 503 at once
@@ -61,42 +84,78 @@ JULIA_PROMPT_VERSION, JULIA_READOUT = "julia-v1", "julia-markers"
 CLM_PROMPT_VERSION, CLM_READOUT = "clm-v0.1", "clm-contrastive"
 
 
-def read_decision_config(model_dir: str) -> dict:
-    """The model's decision format. `backend` is 'letter' (decision_config.json) or 'julia'
-    (julia_config.json, architecture JuliaDecisionModel, format_version 1)."""
+def _json_file(path: str) -> dict:
+    try:
+        with open(path) as f:
+            d = json.load(f)
+    except (OSError, ValueError) as e:
+        raise ValueError(f"{os.path.basename(path)} unreadable: {e}") from None
+    if not isinstance(d, dict):
+        raise ValueError(f"{os.path.basename(path)} is not a JSON object")
+    return d
+
+
+def detect_format(model_dir: str) -> dict:
+    """The model's decision format, from what its folder declares (raises ValueError):
+    decision_config.json (letter, d1, clef — see DECLARED_FORMATS), julia_config.json
+    (Julia, architecture JuliaDecisionModel, format_version 1), or config.json with
+    model_type clm (CLM)."""
     path = os.path.join(model_dir, "decision_config.json")
     if os.path.exists(path):
-        cfg = json.load(open(path))
+        cfg = _json_file(path)
         pv, ro = cfg.get("prompt_version"), cfg.get("readout")
-        if pv not in KNOWN_PROMPT_VERSIONS or ro not in KNOWN_READOUTS:
-            raise SystemExit(f"unsupported decision model: prompt_version={pv!r} readout={ro!r} "
-                             f"(known: {sorted(KNOWN_PROMPT_VERSIONS)} / {sorted(KNOWN_READOUTS)})")
-        return {**cfg, "backend": "letter"}
+        backend = DECLARED_FORMATS.get((pv, ro))
+        if backend is None:
+            raise ValueError(f"unsupported decision format: prompt_version={pv!r} readout={ro!r} "
+                             f"(known: {sorted(f'{p}/{r}' for p, r in DECLARED_FORMATS)})")
+        return {**cfg, "backend": backend}
     jpath = os.path.join(model_dir, "julia_config.json")
     if os.path.exists(jpath):
-        jc = json.load(open(jpath))
+        jc = _json_file(jpath)
         if jc.get("architecture") != "JuliaDecisionModel" or jc.get("format_version") != 1:
-            raise SystemExit(f"unsupported Julia checkpoint: architecture={jc.get('architecture')!r} "
+            raise ValueError(f"unsupported Julia checkpoint: architecture={jc.get('architecture')!r} "
                              f"format_version={jc.get('format_version')!r}")
         pol_path = os.path.join(model_dir, "inference-policy.json")
-        pol = json.load(open(pol_path)) if os.path.exists(pol_path) else {}
+        pol = _json_file(pol_path) if os.path.exists(pol_path) else {}
         return {"backend": "julia", "prompt_version": JULIA_PROMPT_VERSION, "readout": JULIA_READOUT,
                 "max_one_pass": 20, "max_length": pol.get("max_length"),
                 "head_length": pol.get("head_length") or 512,
                 "weights_sha256": pol.get("weights_sha256")}
     cpath = os.path.join(model_dir, "config.json")
     if os.path.exists(cpath):
-        cc = json.load(open(cpath))
+        cc = _json_file(cpath)
         if cc.get("model_type") == "clm":
             ck = (cc.get("checkpoints") or [None])[0]
             if not ck or cc.get("encoder_pooling") != "last-token":
-                raise SystemExit(f"unsupported CLM checkpoint: checkpoints={cc.get('checkpoints')!r} "
+                raise ValueError(f"unsupported CLM checkpoint: checkpoints={cc.get('checkpoints')!r} "
                                  f"pooling={cc.get('encoder_pooling')!r}")
             return {"backend": "clm", "prompt_version": CLM_PROMPT_VERSION, "readout": CLM_READOUT,
                     "base_model": cc.get("base_model"), "checkpoint": ck,
                     "embedding_dim": cc.get("embedding_dim"), "max_tokens": 2048}
-    raise SystemExit(f"not a decision model: no decision_config.json, julia_config.json nor "
-                     f"CLM config.json in {model_dir}")
+    if not os.path.isdir(model_dir):
+        raise ValueError(f"{model_dir} is not a folder on this node")
+    raise ValueError(f"not a decision model: {model_dir} has no decision_config.json, "
+                     f"julia_config.json nor CLM config.json")
+
+
+def read_decision_config(model_dir: str) -> dict:
+    """detect_format for the server's start: an unknown format stops it."""
+    try:
+        return detect_format(model_dir)
+    except ValueError as e:
+        raise SystemExit(str(e)) from None
+
+
+def probe(model_dir: str) -> dict:
+    """What the engine needs before a load, as one JSON object: the detected format, its
+    backend and the venv that runs it (`ok: true`), or why the folder is refused
+    (`ok: false`, `error`). Standard library only, so any Python on the node runs it."""
+    try:
+        cfg = detect_format(model_dir)
+    except ValueError as e:
+        return {"ok": False, "error": str(e)}
+    return {**cfg, "ok": True, "venv": os.path.join(HERE, BACKEND_VENV[cfg["backend"]]),
+            "install": BACKEND_INSTALL[cfg["backend"]], "server_version": VERSION}
 
 
 def format_answer(q: dict, probs: dict) -> dict:
@@ -303,6 +362,94 @@ def _load_clm(model_dir: str, cfg: dict):
     return CLMBackend(model, tok, head, decision_core, int(cfg.get("max_tokens") or 2048))
 
 
+def _option_criteria(q: dict, opts: list) -> object:
+    """The question's options as d1 / Clef read them, in the order of `opts` (the labels
+    options_of built): a list of descriptions for a score, {label: description} otherwise."""
+    if q.get("type") == "score":
+        return [desc for _lab, desc in opts]
+    return {lab: desc for lab, desc in opts}
+
+
+class D1Backend:
+    """LiquidAI d1 (MLX, through the pinned mlx-vlm package): every question of a request in
+    one pass, the state read once as a shared trunk. Probabilities as d1 publishes them
+    (each option's best answer token, softmaxed over the options, no calibration)."""
+    device = "mlx"
+    symmetric = False  # d1 reads options in its own order; reversing them changes the answer
+
+    def __init__(self, model, processor, dc):
+        self.model, self.processor, self.dc = model, processor, dc
+
+    def dist_items(self, state, items):
+        questions = []
+        for q, opts in items:
+            noul = q.get("type") in ("noul", "boolean")
+            crit = q.get("criteria") if noul and isinstance(q.get("criteria"), dict) else (
+                None if noul else _option_criteria(q, opts))
+            questions.append({"type": "noul" if noul else (q.get("type") or "choice"),
+                              "instructions": str(q.get("instructions") or ""), "criteria": crit})
+        probs, tokens = self.model.probabilities(self.processor, state, questions)
+        out = []
+        for i, ((q, opts), p) in enumerate(zip(items, probs)):
+            labels = ["yes", "no"] if q.get("type") in ("noul", "boolean") else [lab for lab, _ in opts]
+            # d1 counts the shared state once: the request's total goes on its first question
+            out.append((dict(zip(labels, p)), tokens if i == 0 else 0, {}))
+        return out
+
+
+def _load_d1(model_dir: str, cfg: dict):
+    from mlx_vlm import load as vlm_load
+    import decision_core
+    model, processor = vlm_load(model_dir)
+    if not hasattr(model, "probabilities"):
+        raise RuntimeError(f"{model_dir} did not load as a d1 decision model "
+                           f"({type(model).__module__}) — wrong decision_config.json?")
+    return D1Backend(model, processor, decision_core)
+
+
+class ClefBackend:
+    """Cloudflare Clef / Clef-Flash (MLX, vendored clef_mlx.py): the joint schema head decides
+    every field of a request together, so the questions go in as one record, under their
+    own IDs (the ID is part of the model's input)."""
+    device = "mlx"
+    symmetric = False
+    takes_names = True
+
+    def __init__(self, model, dc):
+        self.model, self.dc = model, dc
+
+    def dist_items(self, state, items, names=None):
+        import mlx.core as mx
+        names = list(names or (f"q{i}" for i in range(len(items))))
+        record_qs, labels = {}, []
+        for name, (q, opts) in zip(names, items):
+            if q.get("type") in ("noul", "boolean"):
+                crit = q.get("criteria") if isinstance(q.get("criteria"), dict) else {}
+                record_qs[name] = {"type": "noul", "instructions": q.get("instructions"),
+                                   "criteria": {k: v for k, v in crit.items() if k in ("true", "false")}}
+                labels.append({"true": "yes", "false": "no"})
+            else:
+                kind = "score" if q.get("type") == "score" else "choice"
+                crit = _option_criteria(q, opts)
+                record_qs[name] = {"type": kind, "instructions": q.get("instructions"), "criteria": crit}
+                # Clef's option ids: the criteria keys for a choice, "0".."N-1" for a score
+                labels.append({str(i): lab for i, (lab, _) in enumerate(opts)} if kind == "score"
+                              else {lab: lab for lab, _ in opts})
+        enc, logits = self.model.logits({"state": state, "questions": record_qs})
+        tokens = len(enc.input_ids)
+        out = []
+        for i, (eq, lg, lab) in enumerate(zip(enc.questions, logits, labels)):
+            p = mx.softmax(lg.astype(mx.float32)).tolist()
+            out.append(({lab[o]: v for o, v in zip(eq.option_ids, p)}, tokens if i == 0 else 0, {}))
+        return out
+
+
+def _load_clef(model_dir: str, cfg: dict):
+    from clef import clef_mlx  # vendored, never the copy shipped in the model folder
+    import decision_core
+    return ClefBackend(clef_mlx.load(model_dir), decision_core)
+
+
 def _load_julia(model_dir: str, cfg: dict):
     import hashlib
     import torch
@@ -352,6 +499,12 @@ class Worker(threading.Thread):
             elif self.cfg.get("backend") == "clm":
                 self.backend = _load_clm(self.model_dir, self.cfg)
                 self._pin_weights(self.backend.model)
+            elif self.cfg.get("backend") == "d1":
+                self.backend = _load_d1(self.model_dir, self.cfg)
+                self._pin_weights(self.backend.model)
+            elif self.cfg.get("backend") == "clef":
+                self.backend = _load_clef(self.model_dir, self.cfg)
+                self._pin_weights(self.backend.model.backbone)
             else:
                 from mlx_decide import MLXDecider  # sets PROMPT_STYLE, then imports decision_core
                 import decision_core
@@ -359,6 +512,9 @@ class Worker(threading.Thread):
                 self.decider = self.backend.decider
                 self._pin_weights(self.decider.model)
             self.dc = self.backend.dc
+            if self.sym and not getattr(self.backend, "symmetric", True):
+                log(f"--sym ignored: backend {self.cfg.get('backend')} reads options in its own order")
+                self.sym = False
             log(f"model loaded in {time.perf_counter() - t0:.1f} s ({self.model_dir}), "
                 f"backend={self.cfg.get('backend')} device={getattr(self.backend, 'device', '?')}")
             self._decide_all("warm-up", {"w": {"type": "noul", "instructions": "Is this a warm-up?",
@@ -413,7 +569,7 @@ class Worker(threading.Thread):
         pass over a shared prefix (the state is processed once)."""
         if not isinstance(questions, dict) or not questions:
             raise ValueError("'questions' must be a non-empty object")
-        items, idx = [], []
+        items, idx, names = [], [], []
         for name, q in questions.items():
             if not isinstance(q, dict):
                 raise ValueError(f"{name}: question must be an object")
@@ -422,9 +578,14 @@ class Worker(threading.Thread):
                 raise ValueError(f"{name}: at least 2 options are required")
             idx.append((name, len(items), opts))
             items.append((q, opts))
+            names.append(str(name))
             if self.sym:
                 items.append((q, list(reversed(opts))))
-        res = self.backend.dist_items(state, items)
+                names.append(str(name))
+        if getattr(self.backend, "takes_names", False):
+            res = self.backend.dist_items(state, items, names=names)
+        else:
+            res = self.backend.dist_items(state, items)
         out = {}
         for name, k, _opts in idx:
             probs, n, extra = res[k]
@@ -541,12 +702,17 @@ def make_handler(worker: Worker, name: str, cfg: dict):
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--model", required=True)
+    mode = ap.add_mutually_exclusive_group(required=True)
+    mode.add_argument("--model", help="serve this model folder")
+    mode.add_argument("--probe", metavar="DIR", help="print the folder's decision format as JSON and exit")
     ap.add_argument("--host", default="0.0.0.0")
     ap.add_argument("--port", type=int, default=8095)
     ap.add_argument("--name", default=None, help="model id reported in responses (default: folder name)")
     ap.add_argument("--sym", action="store_true", help="average with the reversed option order (2 passes)")
     a = ap.parse_args()
+    if a.probe:
+        print(json.dumps(probe(os.path.abspath(a.probe))))
+        return
     model_dir = os.path.abspath(a.model)
     cfg = read_decision_config(model_dir)
     name = a.name or os.path.basename(model_dir.rstrip("/"))

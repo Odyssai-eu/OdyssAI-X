@@ -60,3 +60,30 @@ and server). Never called: `heads.download()` / `_count_download()` (network).
 `decision_serve.py` refuses torch < 2.6, where that default is not yet `True`.
 The encoder is not vendored: Qwen3-8B (the official `Qwen/Qwen3-8B` bf16 weights)
 runs on MLX, last-token pooled and L2-normalised like their vLLM pooling server.
+
+## Clef (`clef/`)
+
+`clef_mlx.py`, the MLX port of Cloudflare Clef / Clef-Flash (Qwen3.5 backbone through
+mlx-vlm, joint schema head in MLX), from `mlx-community/clef-8bit` at revision
+`1c8887c20827d91cb1b0c6f186e24f5bc5b0e0ce` and `mlx-community/clef-flash-8bit` at revision
+`5a195dc147926b63b1d139691ed4480ca9f92c0e` (the two copies are identical), fetched
+2026-10-14. License: Apache-2.0 (`clef/LICENSE`, the repository's own file). Byte-identical:
+
+| File | SHA-256 |
+|---|---|
+| `clef/clef_mlx.py` | `852223c944819a32fad5cf798d9d1dff30419820eaf5ad1f10cb9698afec97d5` |
+
+`clef/__init__.py` is ours and imports nothing. The model folder carries its own copy of
+`clef_mlx.py`; it is never imported. Used: `load()`, `ClefMLX.logits()` (the encoding,
+backbone and joint head); never called: `snapshot_download` (a local folder is always
+passed), the CLI and its HTTP server. Clef ships no format declaration: the operator writes
+`decision_config.json` = `{"prompt_version": "clef-v1", "readout": "clef-joint-head"}`.
+
+## d1 (no vendored file)
+
+LiquidAI d1 runs from the mlx-vlm package itself (`mlx_vlm.models.d1`), pinned in the
+`mlxvlm` venv by `install-decision.sh`: d1 subclasses mlx-vlm's LFM2-VL model, so a copy
+would mean vendoring that whole architecture. The package is installed from PyPI at an
+exact version; nothing is read from the model folder but weights, tokenizer and configs.
+d1 ships no format declaration: the operator writes `decision_config.json` =
+`{"prompt_version": "d1-v1", "readout": "d1-answer-slot"}`.

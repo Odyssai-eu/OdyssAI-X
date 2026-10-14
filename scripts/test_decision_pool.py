@@ -85,25 +85,33 @@ def stop_fake(port):
         srv.shutdown(); srv.server_close()
 
 
+# What each model folder holds on the fake node; any other folder is a letter model.
+FAKE_FILES = {
+    "CLM-Test": {"config.json": {"model_type": "clm", "base_model": "Qwen/Qwen3-8B",
+                                 "encoder_pooling": "last-token", "checkpoints": ["h.pt"]}},
+    "Julia-Test": {"julia_config.json": {"format_version": 1, "architecture": "JuliaDecisionModel"},
+                   "inference-policy.json": {"max_length": 8192, "head_length": 512}},
+    "Not-A-Decision": {"config.json": {"model_type": "llama"}},
+    "Weird-Format": {"decision_config.json": {"prompt_version": "letter-v9-x", "readout": "letter-logit"}},
+    "D1-Test": {"decision_config.json": {"prompt_version": "d1-v1", "readout": "d1-answer-slot"},
+                "config.json": {"model_type": "lfm2_vl"}},
+}
+
+
+def fake_probe(model_path):
+    """The real decision_serve.probe() over a temp folder holding the fake files."""
+    files = FAKE_FILES.get(os.path.basename(model_path.rstrip("/")), {"decision_config.json": DCFG})
+    with tempfile.TemporaryDirectory() as d:
+        for name, body in files.items():
+            json.dump(body, open(os.path.join(d, name), "w"))
+        return ds.probe(d)
+
+
 def fake_ssh(target, cmd, timeout=30):
     CALLS.append(cmd)
-    if cmd.startswith("cat ") and "CLM-Test" in cmd:
-        if cmd.endswith("/config.json' 2>/dev/null") or "CLM-Test/config.json" in cmd:
-            return 0, json.dumps({"model_type": "clm", "base_model": "Qwen/Qwen3-8B",
-                                  "encoder_pooling": "last-token", "checkpoints": ["h.pt"]}), ""
-        return 1, "", ""
-    if cmd.startswith("cat ") and "Julia-Test" in cmd:
-        if "julia_config.json" in cmd:
-            return 0, json.dumps({"format_version": 1, "architecture": "JuliaDecisionModel"}), ""
-        if "inference-policy.json" in cmd:
-            return 0, json.dumps({"max_length": 8192, "head_length": 512}), ""
-        return 1, "", ""
-    if "decision_config.json" in cmd and cmd.startswith("cat "):
-        if "Not-A-Decision" in cmd:
-            return 1, "", ""
-        if "Weird-Format" in cmd:
-            return 0, json.dumps({"prompt_version": "letter-v9-x", "readout": "letter-logit"}), ""
-        return 0, json.dumps(DCFG), ""
+    if "decision_serve.py" in cmd and "--probe " in cmd:
+        path = cmd.split("--probe ")[1].strip().strip("'")
+        return 0, json.dumps(fake_probe(path)) + "\n", ""
     if cmd.startswith("test -x"):
         return 0, "ok\n", ""
     if "decision_serve.py" in cmd and "nohup" in cmd:
@@ -259,8 +267,23 @@ async def main():
         await c.put("/admin/settings", json={"decision_models": ["Fake-Decision-27B", "Not-A-Decision", "Weird-Format"]})
         r = await c.post("/admin/clusters/dec/load", json={"model": "Not-A-Decision"})
         check("17 no decision_config.json → 422", r.status_code, 422)
+        check("17 the node's reason is passed on", "not a decision model" in str(r.json()), True)
         r = await c.post("/admin/clusters/dec/load", json={"model": "Weird-Format"})
         check("17 unknown decision format → 422", r.status_code, 422)
+        check("17 known formats listed", "d1-v1/d1-answer-slot" in str(r.json()), True)
+
+        # 24. a d1 folder (operator-written decision_config.json) launches with the venv the
+        # node's probe names, not the base one
+        await c.put("/admin/settings", json={"decision_models": ["D1-Test"]})
+        r = await c.post("/admin/clusters/dec/load", json={"model": "D1-Test"})
+        check("24 d1 loads", r.status_code, 200)
+        db = r.json()
+        check("24 d1 backend reported", (db.get("decision") or {}).get("backend"), "d1")
+        launch = [x for x in CALLS if "nohup" in x and "D1-Test" in x]
+        check("24 launched with the mlxvlm venv", bool(launch) and ".venv-mlxvlm/bin/python" in launch[-1], True)
+        dp = api.get_pool("dec", db.get("alias"))
+        check("24 venv kept for restore", (dp.venv or "").endswith(".venv-mlxvlm") if dp else None, True)
+        await c.post(f"/admin/clusters/dec/unload?alias={db.get('alias')}", json={"force": True})
 
         # 20. a Julia checkpoint (julia_config.json, no decision_config.json) loads as a decision pool
         await c.put("/admin/settings", json={"decision_models": ["Julia-Test"]})
@@ -279,6 +302,15 @@ async def main():
         cfg = await api._read_decision_config("admin@127.0.0.1", f"{MODELS_DIR}/CLM-Test")
         check("22 CLM format recognised", (cfg or {}).get("prompt_version"), "clm-v0.1")
         check("22 CLM format accepted", api._decision_format_ok(cfg or {}), True)
+        check("22 probe ran on the node, not cat", any("--probe " in x for x in CALLS)
+              and not any(x.startswith("cat ") for x in CALLS), True)
+
+        # 25. a node whose decision server is missing → refused with the reason
+        _real = api._ssh_exec
+        api._ssh_exec = lambda t, c, timeout=30: (127, "", "python: No such file or directory")
+        cfg = await api._read_decision_config("admin@127.0.0.1", f"{MODELS_DIR}/X")
+        api._ssh_exec = _real
+        check("25 missing server → not ok", (cfg.get("ok"), "install-decision.sh" in cfg.get("error", "")), (False, True))
 
         # 21. backpressure and client-disconnect cancellation
         await c.put("/admin/settings", json={"decision_models": ["Fake-Decision-27B", "Julia-Test"]})
