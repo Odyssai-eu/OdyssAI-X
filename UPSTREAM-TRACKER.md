@@ -27,6 +27,7 @@ Rules for the table (the skill parses it):
 | exo-explore/exo | 1831 | issue | Mistral Large 3 support | dormant | 2026-09-21 | close if still silent at next pass | 2026-10-15 |
 | exo-explore/exo | 1825 | issue | load private models from a local path while online | dormant | 2026-09-21 | close if still silent at next pass | 2026-10-15 |
 | exo-explore/exo | 1788 | issue | mDNS discovery broken from git source | root cause on record: Mearman (2026-10-07) reproduced without exo — an ungranted process launched over ssh loses LAN multicast (EHOSTUNREACH) once the ssh session ends, fine in the foreground; Apple TN3179 `AllowedEthernetLocalNetworkAddresses` untested. Matches our TCC finding (no kTCCServiceLocalNetwork entry) | 2026-10-07 | no longer dormant: keep open; check whether our own headless paths (node daemon `eu.odyssai.x.node`, runners launched over ssh) depend on LAN multicast; reply only on Sophie's go | - |
+| Blaizzy/mlx-vlm | 2524 | pr | qwen3_coder tool parser not detected without a newline after `<tool_call>` (MiMo-V2.6 falls to json_tools) | merge; we carry the marker as step 5 of install-mlx-vlm.sh until then | 2026-10-15 | when merged: bump MLX_VLM_REF, drop step 5 | 2026-10-29 |
 
 ## Archive
 
