@@ -27,13 +27,13 @@ Rules for the table (the skill parses it):
 | exo-explore/exo | 1831 | issue | Mistral Large 3 support | dormant | 2026-09-21 | close if still silent at next pass | 2026-10-15 |
 | exo-explore/exo | 1825 | issue | load private models from a local path while online | dormant | 2026-09-21 | close if still silent at next pass | 2026-10-15 |
 | exo-explore/exo | 1788 | issue | mDNS discovery broken from git source | root cause on record: Mearman (2026-10-07) reproduced without exo — an ungranted process launched over ssh loses LAN multicast (EHOSTUNREACH) once the ssh session ends, fine in the foreground; Apple TN3179 `AllowedEthernetLocalNetworkAddresses` untested. Matches our TCC finding (no kTCCServiceLocalNetwork entry) | 2026-10-07 | no longer dormant: keep open; check whether our own headless paths (node daemon `eu.odyssai.x.node`, runners launched over ssh) depend on LAN multicast; reply only on Sophie's go | - |
-| Blaizzy/mlx-vlm | 2524 | pr | qwen3_coder tool parser not detected without a newline after `<tool_call>` (MiMo-V2.6 falls to json_tools) | nothing; step 5 of install-mlx-vlm.sh is the fix we keep | 2026-10-15 | none: no upstream PR or follow-up on the MLX ecosystem (decision 2026-10-15); leaving or closing this PR is Sophie's call | - |
 
 ## Archive
 
 | Repo | # | Kind | Subject | Outcome | Closed |
 |---|---|---|---|---|---|
 | ml-explore/mlx | 4530 | pr | JACCL: report a dead peer instead of spinning; name device/port/peer in errors | closed unmerged 2026-09-29 by zcbenz: refused (AI-written, hacky, hard to maintain; not a priority). Our vendored patch in vendor/jaccl stays. No further upstream action on MLX (decision 2026-10-08) | 2026-09-29 |
+| Blaizzy/mlx-vlm | 2524 | pr | qwen3_coder tool parser not detected without a newline after `<tool_call>` (MiMo-V2.6 falls to json_tools) | closed by us unmerged 2026-10-15, no comment: no PR on the MLX ecosystem (decision 2026-10-15). install-mlx-vlm.sh step 5 stays | 2026-10-15 |
 | Blaizzy/mlx-vlm | 2352 | pr | MiMo-V2.6 audio requests fail across threads in mlx_vlm.server | merged 87020830 (0.7.3); pin bumped, local step 5 dropped | 2026-09-24 |
 | exo-explore/exo | 1930 | issue | Gemma 4 not tagged `vision` in /v1/models | fixed upstream | 2026-05 |
 | exo-explore/exo | 1824 | issue | event_router nack loop with 100k+ events | fixed upstream | 2026-05 |
