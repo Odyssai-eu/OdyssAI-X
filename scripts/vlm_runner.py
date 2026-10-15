@@ -57,6 +57,8 @@ from pathlib import Path
 
 import mlx.core as mx
 import mlx.nn as nn
+
+from loop_detect import LoopGuard  # one anti-loop with runner.py / mlx_vlm (#113)
 from mlx.nn.layers.distributed import shard_inplace, shard_linear
 
 # ── stdout/stderr contract ────────────────────────────────────────────────────
@@ -632,7 +634,16 @@ def main() -> None:
         req_id = req.get("id", "")
         messages = req.get("messages")
         prompt = req.get("prompt")
-        max_tokens = int(req.get("max_tokens", 512))
+        anti_loop = bool(req.get("anti_loop", True))
+        # No client cap → up to the model's context window (the 512 default is
+        # gone, 2026-10-15); the turn ends at EOS or at a proven loop.
+        max_tokens_req = req.get("max_tokens")
+        if max_tokens_req is not None:
+            max_tokens = int(max_tokens_req)
+        else:
+            _tc = config.get("text_config") or {}
+            max_tokens = int(config.get("max_position_embeddings")
+                             or _tc.get("max_position_embeddings") or 2 ** 31 - 1)
         if messages is None:
             if not prompt:
                 log("gen with neither messages nor prompt — skipping")
@@ -692,12 +703,21 @@ def main() -> None:
             finish_reason = None
             cancelled_mid_gen = False
             last = None
+            # Same token ids on every rank → same verdict at the same token.
+            loop_guard, loop_hit = LoopGuard(), None
             for res in stream_generate(model, processor, formatted,
                                        image=images or None,
                                        audio=audios or None, **gen_kwargs):
                 buf.append(res.text)
                 ntoks += 1
                 last = res
+                if anti_loop:
+                    loop_hit = loop_guard.feed(getattr(res, "token_ids", None)
+                                               or ([res.token] if res.token is not None else []))
+                    if loop_hit:
+                        log(f"req {req_id}: anti-loop stop (period={loop_hit[0]} "
+                            f"repeats={loop_hit[1]} ntoks={ntoks})")
+                        break
                 if len(buf) >= emit_batch_n:
                     emit(rank, {"event": "token", "id": req_id,
                                 "text": "".join(buf)})
@@ -723,6 +743,9 @@ def main() -> None:
             }
             if cancelled_mid_gen:
                 done_event["finish_reason"] = "cancelled"
+            elif loop_hit:
+                done_event["finish_reason"] = "stop"
+                done_event["loop_detected"] = True
             elif getattr(last, "finish_reason", None):
                 done_event["finish_reason"] = last.finish_reason
             emit(rank, done_event)

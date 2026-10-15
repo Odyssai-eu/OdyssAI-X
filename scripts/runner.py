@@ -2736,6 +2736,43 @@ def main() -> None:
 # Legacy single-stream main loop (multi-rank-safe; one gen at a time, plus
 # optional speculative decoding when a draft_model is passed)
 # ──────────────────────────────────────────────────────────────────────────────
+_CTX_WINDOW_CACHE: dict = {}
+
+
+def _context_window(repo: str) -> Optional[int]:
+    """The model's trained context (max_position_embeddings at the root, under
+    text_config or language_model), from its config.json — read once."""
+    if repo in _CTX_WINDOW_CACHE:
+        return _CTX_WINDOW_CACHE[repo]
+    win = None
+    try:
+        path = Path(repo) if Path(repo).exists() else hf_repo_to_path(repo)
+        cfg = json.loads((Path(path) / "config.json").read_text())
+        text = cfg.get("text_config") or {}
+        for c in (cfg, text, text.get("language_model") or {}, cfg.get("language_model") or {}):
+            v = c.get("max_position_embeddings")
+            if v:
+                win = int(v)
+                break
+    except Exception as e:
+        log(f"[max_tokens] {repo}: no context window in config.json ({e})")
+    _CTX_WINDOW_CACHE[repo] = win
+    return win
+
+
+def _generation_budget(requested, repo: str, prompt_len: int) -> int:
+    """max_tokens for one request: the client's value when it sent one, else the
+    room left in the model's context window — no engine-chosen cap (the 512
+    default is gone, 2026-10-15): the turn ends at EOS, at a proven loop
+    (loop_detect) or when the context is full. Unknown window: no cap."""
+    if requested is not None:
+        return int(requested)
+    win = _context_window(repo)
+    if win:
+        return max(1, win - prompt_len)
+    return 2 ** 31 - 1
+
+
 def _run_legacy_main(model, tokenizer, repo: str, kv_q8_default: bool,
                      stop_requested: dict, rank: int,
                      draft_model=None, num_draft_tokens: int = 4,
@@ -2851,7 +2888,7 @@ def _run_legacy_main(model, tokenizer, repo: str, kv_q8_default: bool,
         prompt = req.get("prompt")
         messages = req.get("messages")
         tools = req.get("tools")
-        max_tokens = int(req.get("max_tokens", 200))
+        max_tokens_req = req.get("max_tokens")  # None = no client cap
         enable_thinking = req.get("enable_thinking", None)
         kv_q8 = bool(req.get("kv_q8", kv_q8_default))
         session_id = req.get("session_id") or None
@@ -2998,6 +3035,7 @@ def _run_legacy_main(model, tokenizer, repo: str, kv_q8_default: bool,
         buf: list[str] = []
         full_text_parts: list[str] = []  # accumulate for tool-call parsing
         gen_token_ids: list[int] = []     # accumulate for session cache update
+        max_tokens = _generation_budget(max_tokens_req, repo, len(prompt_tokens_full))
         gen_kwargs = {"max_tokens": max_tokens}
         if prompt_cache is not None:
             gen_kwargs["prompt_cache"] = prompt_cache
@@ -3652,7 +3690,7 @@ def _run_batched_main(model, tokenizer, repo: str, kv_q8_default: bool,
             prompt = req.get("prompt")
             messages_in = req.get("messages")
             tools = req.get("tools")
-            max_tokens = int(req.get("max_tokens", 200))
+            max_tokens_req = req.get("max_tokens")  # None = no client cap
             enable_thinking = req.get("enable_thinking", None)
             kv_q8 = bool(req.get("kv_q8", kv_q8_default))
             session_id = req.get("session_id") or None
@@ -3739,6 +3777,7 @@ def _run_batched_main(model, tokenizer, repo: str, kv_q8_default: bool,
                         f"·{hit_kind}" if session_id else ""
                     )
 
+            max_tokens = _generation_budget(max_tokens_req, repo, len(prompt_tokens_full))
             try:
                 if cache_for_slot is not None:
                     uids = bg.insert(

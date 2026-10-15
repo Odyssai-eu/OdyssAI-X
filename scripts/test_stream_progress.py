@@ -58,7 +58,10 @@ class FakePool:
     def alive_count(self):
         return 1
 
-    async def submit(self, *a, **kw):
+    seen_max_tokens = []
+
+    async def submit(self, prompt, max_tokens, *a, **kw):
+        FakePool.seen_max_tokens.append(max_tokens)
         yield {"event": "token", "text": "Je l'écris. "}
         for i in range(12):
             await asyncio.sleep(0.1)
@@ -103,6 +106,19 @@ async def main():
         check("openai: tool_calls intact in the final chunk",
               (last.get("finish_reason"), last["delta"]["tool_calls"][0]["function"]["name"]),
               ("tool_calls", "write_file"))
+
+        check("no max_tokens from the client → no engine cap (None to the runner)",
+              FakePool.seen_max_tokens[-1], None)
+
+        # VL proxy: no client cap → the model's context window, not mlx_vlm's 2048
+        async def fake_cfg(ssh, path, timeout=6.0):
+            return {"text_config": {"max_position_embeddings": 262144}}
+        _orig = api._read_model_config
+        api._read_model_config = fake_cfg
+        class VL:
+            ssh_target, model = "admin@x", "/Volumes/models/odysseus/x/MiMo"
+        check("VL proxy: window read from config.json", await api._pool_context_window(VL()), 262144)
+        api._read_model_config = _orig
 
         # Anthropic stream
         events = []

@@ -14,7 +14,9 @@ import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from runner import ToolMarkupGate, _gated_event, parse_tool_calls  # noqa: E402
+from runner import ToolMarkupGate, _gated_event, _generation_budget, parse_tool_calls  # noqa: E402
+import json  # noqa: E402
+import tempfile  # noqa: E402
 
 GLM_CALL = "<tool_call>read_file<arg_key>path</arg_key><arg_value>/tmp/notes.txt</arg_value></tool_call>"
 QWEN_CALL = ("<tool_call><function=read_file><parameter=path>/tmp/notes.txt</parameter>"
@@ -116,6 +118,26 @@ class GatedEventTest(unittest.TestCase):
 
     def test_no_tools_no_gate(self):
         self.assertEqual(_gated_event(ToolMarkupGate(False), "<tool_call>x", "r2", 3)["event"], "token")
+
+
+class GenerationBudgetTest(unittest.TestCase):
+    """No engine default (2026-10-15): the client's max_tokens, else the room left
+    in the model's context window."""
+
+    def test_client_value_wins(self):
+        self.assertEqual(_generation_budget(300, "/nonexistent", 1000), 300)
+
+    def test_room_left_in_the_window(self):
+        with tempfile.TemporaryDirectory() as d:
+            json.dump({"text_config": {"max_position_embeddings": 32768}},
+                      open(os.path.join(d, "config.json"), "w"))
+            self.assertEqual(_generation_budget(None, d, 1000), 31768)
+            self.assertEqual(_generation_budget(None, d, 40000), 1)
+
+    def test_unknown_window_means_no_cap(self):
+        with tempfile.TemporaryDirectory() as d:
+            json.dump({"model_type": "x"}, open(os.path.join(d, "config.json"), "w"))
+            self.assertGreater(_generation_budget(None, d, 10), 10 ** 9)
 
 
 if __name__ == "__main__":

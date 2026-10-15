@@ -6076,10 +6076,12 @@ def _effort_from_aliases(d: dict) -> Optional[Union[int, str]]:
 class ChatCompletionRequest(BaseModel):
     model: Optional[str] = None
     messages: list[ChatMessage]
-    max_tokens: Optional[int] = Field(default=512)
+    # No engine default (the 512 cap is gone, 2026-10-15): without a client
+    # value the turn runs to EOS, a proven loop or the model's context window —
+    # the runner computes that budget, the VL proxy forwards the window.
+    max_tokens: Optional[int] = None
     # OpenAI's newer canonical output cap. Modern OpenAI-compatible clients
-    # (e.g. graphify) send max_completion_tokens instead of max_tokens; without
-    # this alias they get silently truncated to the max_tokens default (512).
+    # (e.g. graphify) send max_completion_tokens instead of max_tokens.
     max_completion_tokens: Optional[int] = None
     stream: Optional[bool] = False
     enable_thinking: Optional[bool] = None
@@ -7784,7 +7786,7 @@ def _initial_default_config() -> Optional[dict]:
 #   major (1.7.2 → 2.0.0) — breaking API or topology change
 #
 # Use `./scripts/bump-version.sh patch|minor|major` to bump + auto-commit.
-APP_VERSION = "1.58.0"
+APP_VERSION = "1.59.0"
 
 app = FastAPI(
     title="OdyssAI-X (odyssai.eu)",
@@ -11670,11 +11672,11 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
         t_start = time.time()
         cancel_event = _runs_register(completion_id, model=model_id, cluster=pool.cluster,
                                        pool_alias=pool.alias,
-                                       client=client_ip, max_tokens=req.max_tokens or 512,
+                                       client=client_ip, max_tokens=req.max_tokens,
                                        kind="streaming")
         run_status = "completed"
         try:
-            async for ev in pool.submit(None, req.max_tokens or 512, req.enable_thinking,
+            async for ev in pool.submit(None, req.max_tokens, req.enable_thinking,
                                         anti_loop=(req.anti_loop is not False),
                                         **_vlmdist_sampling_kw(pool, req),
                                         kv_q8=req.kv_q8,
@@ -11823,7 +11825,7 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
         run_status = "completed"
         cancel_event = _runs_register(completion_id, model=model_id, cluster=pool.cluster,
                                        pool_alias=pool.alias,
-                                       client=client_ip, max_tokens=req.max_tokens or 512,
+                                       client=client_ip, max_tokens=req.max_tokens,
                                        kind="streaming")
         try:
             first = {"id": completion_id, "object": "chat.completion.chunk",
@@ -11849,7 +11851,7 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
                 "strip": _model_think_strips(model_id),
             }
             _last_chunk_at = time.monotonic()  # #112: empty-delta pacing
-            async for ev in pool.submit(None, req.max_tokens or 512, req.enable_thinking,
+            async for ev in pool.submit(None, req.max_tokens, req.enable_thinking,
                                         anti_loop=(req.anti_loop is not False),
                                         **_vlmdist_sampling_kw(pool, req),
                                         kv_q8=req.kv_q8,
@@ -17342,6 +17344,23 @@ class _SSELoopGuard:
         return None
 
 
+async def _pool_context_window(pool) -> Optional[int]:
+    """The served model's trained context (config.json max_position_embeddings,
+    read over ssh once and cached), or None."""
+    ssh = getattr(pool, "ssh_target", None)
+    if not ssh and getattr(pool, "nodes", None):
+        ssh = pool.nodes[0].get("ssh")
+    model_path = getattr(pool, "model", None)
+    if not ssh or not model_path or not str(model_path).startswith("/"):
+        return None
+    cfg = await _read_model_config(ssh, model_path)
+    if not cfg:
+        return None
+    caps: dict = {}
+    _enrich_caps_from_config(caps, cfg)
+    return caps.get("context_length")
+
+
 async def _vlm_pool_proxy_chat_completion(pool, body: dict, stream: bool,
                                           label: Optional[str] = None):
     """Proxy a /v1/chat/completions request to a VL pool's mlx_vlm.server
@@ -17365,6 +17384,12 @@ async def _vlm_pool_proxy_chat_completion(pool, body: dict, stream: bool,
         _re_default = _default_reasoning_effort(upstream_model)
         if _re_default:
             forward_body["reasoning_effort"] = _re_default
+    if forward_body.get("max_tokens") is None:
+        # mlx_vlm.server would apply its own default (MLX_VLM_MAX_TOKENS, 2048):
+        # no client cap means the model's context window here too.
+        _win = await _pool_context_window(pool)
+        if _win:
+            forward_body["max_tokens"] = _win
     _log_proxy_sampling(label, upstream_model, forward_body)
     forward_body["model"] = upstream_model
     if stream:
