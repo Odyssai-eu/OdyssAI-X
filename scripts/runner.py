@@ -522,23 +522,12 @@ def _last_user_text(messages) -> str:
 
 
 # ── Anti-loop — detect-and-stop on degenerate repetition ──────────────────
-# When the TAIL of the generated token-id stream is >= N consecutive
-# repetitions of the same p-token block, generation ends cleanly
-# (finish_reason="stop" + `loop_detected` on the done event) instead of
-# burning tokens to the max_tokens cap.
-#
-# Deterministic — a pure function of the emitted ids — so on multi-rank
-# pools every rank reaches the same verdict at the same token and breaks in
-# lockstep, exactly like the _stop_ids break in the stream loop. Distinct
-# from the sampler-level no_repeat_ngram profiles (MODEL_SAMPLING_DEFAULTS):
-# those BEND the distribution to avoid repeats (and can garble); this never
-# touches sampling, it only ends the turn once the loop is proven. Per
-# request opt-out via the fan-out field `anti_loop: false`.
-ANTI_LOOP_CHECK_EVERY = 16   # tokens between checks
-ANTI_LOOP_MIN_SPAN = 48      # repeating tail must cover >= this many tokens
-ANTI_LOOP_MAX_PERIOD = 64    # longest repeating block considered
-ANTI_LOOP_MIN_REPEATS = 4    # and repeat at least this many times
-ANTI_LOOP_WINDOW = 640       # ids scanned (>= MAX_PERIOD * (MIN_REPEATS + 1))
+# The detector lives in loop_detect.py (one source with the vlm-replica
+# servers, #113). Per request opt-out via the fan-out field `anti_loop: false`.
+from loop_detect import (  # noqa: E402
+    ANTI_LOOP_CHECK_EVERY, ANTI_LOOP_L_CHECK_EVERY,
+    detect_loop as _detect_loop, detect_loop_large as _detect_loop_large,
+)
 
 # ── Context-limit — hard cap on total context (prompt + generated) ──────────
 # Server-wide guard, INDEPENDENT of the client's per-request max_tokens. When
@@ -549,67 +538,6 @@ ANTI_LOOP_WINDOW = 640       # ids scanned (>= MAX_PERIOD * (MIN_REPEATS + 1))
 # `context_limit` field. Inspired by Inferencer 2.3.1's contextLimit; enforced
 # per-step here, not just at enqueue (a long prefill can already exceed).
 _CONTEXT_LIMIT = int(os.environ.get("RUNNER_CONTEXT_LIMIT", "0"))
-
-
-# Large-period companion (2026-08-09, MiMo c02): multi-paragraph self-doubt
-# cycles ("Actually, let me reconsider…" + code block — ~450-token period
-# repeated 378× VERBATIM) sit far above ANTI_LOOP_MAX_PERIOD=64, invisible to
-# _detect_loop by construction. Same contract: pure function of token ids →
-# identical verdict on every rank (multi-rank lockstep safe). The anchor trick
-# keeps it cheap: a period-p loop implies ids[-1] == ids[-1-p], so we slice-
-# verify only anchored candidates; checked every 64 tokens, not 16.
-ANTI_LOOP_L_CHECK_EVERY = 64    # tokens between large-period checks
-ANTI_LOOP_L_MAX_PERIOD = 1024   # longest repeating block considered
-ANTI_LOOP_L_MIN_REPEATS = 4     # 4 EXACT reps of a 65+-token block = stuck
-ANTI_LOOP_L_WINDOW = ANTI_LOOP_L_MAX_PERIOD * (ANTI_LOOP_L_MIN_REPEATS + 1)
-
-
-def _detect_loop_large(ids: list) -> Optional[tuple]:
-    """(period, repeats) when the tail loops with period 65..1024 tokens —
-    the multi-paragraph regime _detect_loop cannot see. 4+ exact repetitions
-    of a 65+-token block does not happen in legitimate output (three identical
-    consecutive code stubs is the worst realistic case; four is pathological)."""
-    n = len(ids)
-    if n < (ANTI_LOOP_MAX_PERIOD + 1) * ANTI_LOOP_L_MIN_REPEATS:
-        return None
-    tail = ids[-ANTI_LOOP_L_WINDOW:]
-    n = len(tail)
-    last = tail[-1]
-    for p in range(ANTI_LOOP_MAX_PERIOD + 1, min(ANTI_LOOP_L_MAX_PERIOD, n // 2) + 1):
-        if tail[-1 - p] != last:
-            continue
-        r = 1
-        while (n - (r + 1) * p >= 0
-               and tail[n - (r + 1) * p: n - r * p] == tail[n - r * p: n - (r - 1) * p]):
-            r += 1
-        if r >= ANTI_LOOP_L_MIN_REPEATS:
-            return p, r
-    return None
-
-
-def _detect_loop(ids: list) -> Optional[tuple]:
-    """(period, repeats) when the tail of `ids` is a degenerate loop, else None.
-
-    Thresholds are deliberately conservative: 4+ EXACT repetitions of the
-    same token block covering 48+ tokens is vanishingly rare in legitimate
-    output (tables vary cell by cell, code lines differ), while a stuck
-    model produces hundreds. Short periods need proportionally more repeats
-    (period 1 → 48 repeats) so a stylistic "!!!" never trips it."""
-    n = len(ids)
-    if n < ANTI_LOOP_MIN_SPAN:
-        return None
-    tail = ids[-ANTI_LOOP_WINDOW:]
-    n = len(tail)
-    for p in range(1, ANTI_LOOP_MAX_PERIOD + 1):
-        if n < 2 * p:
-            break
-        r = 1
-        while (n - (r + 1) * p >= 0
-               and tail[n - (r + 1) * p: n - r * p] == tail[n - r * p: n - (r - 1) * p]):
-            r += 1
-        if r >= max(ANTI_LOOP_MIN_REPEATS, -(-ANTI_LOOP_MIN_SPAN // p)):
-            return p, r
-    return None
 
 
 def _looks_like_code_request(messages, tools=None) -> bool:
@@ -1979,14 +1907,17 @@ class ToolMarkupGate:
         return out
 
 
-def _gated_event(gate: "ToolMarkupGate", text: str, req_id, ntoks: int) -> dict:
+def _gated_event(gate: "ToolMarkupGate", text: str, req_id, ntoks: int,
+                 prompt_tokens: Optional[int] = None) -> dict:
     """The event for one batch of generated text: `token` with what the gate
     lets through, or `progress` when it held the whole batch back (#112) —
-    the batch exists only because tokens advanced, so this is never a timer."""
+    the batch exists only because tokens advanced, so this is never a timer.
+    Progress carries the counts a client shows while nothing is visible (#113)."""
     out = gate.feed(text)
     if out:
         return {"event": "token", "id": req_id, "text": out}
-    return {"event": "progress", "id": req_id, "phase": "decode", "ntoks": ntoks}
+    return {"event": "progress", "id": req_id, "phase": "decode", "ntoks": ntoks,
+            "prompt_tokens": prompt_tokens}
 
 
 def parse_tool_calls(text: str, allowed_names: set[str] | None = None) -> tuple[list[dict], str]:
@@ -3321,7 +3252,8 @@ def _run_legacy_main(model, tokenizer, repo: str, kv_q8_default: bool,
                     f"(prompt={_prompt_n} gen={ntoks} limit={context_limit})")
                 break
             if len(buf) >= emit_batch_n:
-                emit(rank, _gated_event(markup_gate, "".join(buf), req_id, ntoks))
+                emit(rank, _gated_event(markup_gate, "".join(buf), req_id, ntoks,
+                                        len(prompt_tokens_full)))
                 buf.clear()
             # Anti-loop: every N tokens, test the id stream for degenerate
             # repetition. Pure function of ids identical on every rank →
@@ -3989,7 +3921,8 @@ def _run_batched_main(model, tokenizer, repo: str, kv_q8_default: bool,
                         s["full_text_parts"].append(seg)
                         if len(s["buf"]) >= emit_batch_n:
                             emit(rank, _gated_event(s["gate"], "".join(s["buf"]),
-                                                    s["req_id"], s["ntoks"]))
+                                                    s["req_id"], s["ntoks"],
+                                                    len(s["prompt_tokens_full"])))
                             s["buf"].clear()
                 # Anti-loop (batched path): same detector as the multi-rank
                 # loop. _emit_done_for drains the buffer, emits done with the

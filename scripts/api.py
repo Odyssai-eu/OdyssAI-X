@@ -7784,7 +7784,7 @@ def _initial_default_config() -> Optional[dict]:
 #   major (1.7.2 → 2.0.0) — breaking API or topology change
 #
 # Use `./scripts/bump-version.sh patch|minor|major` to bump + auto-commit.
-APP_VERSION = "1.57.0"
+APP_VERSION = "1.58.0"
 
 app = FastAPI(
     title="OdyssAI-X (odyssai.eu)",
@@ -11909,7 +11909,13 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
                         chunk = {"id": completion_id, "object": "chat.completion.chunk",
                                  "created": created, "model": model_id,
                                  "choices": [{"index": 0, "delta": {},
-                                              "finish_reason": None}]}
+                                              "finish_reason": None}],
+                                 # #113: counts for a client that shows them while
+                                 # nothing is visible; prompt_tokens is null until
+                                 # the prefill is done.
+                                 "x_odyssai_progress": {
+                                     "prompt_tokens": ev.get("prompt_tokens"),
+                                     "completion_tokens": int(ev.get("ntoks") or 0)}}
                         yield f"data: {json.dumps(chunk)}\n\n".encode()
                         _last_chunk_at = time.monotonic()
                 elif ev.get("event") == "done":

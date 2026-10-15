@@ -10,6 +10,7 @@
 #   4. smoke-import mlx_vlm + the minimax_m3_vl model module
 #   5. qwen3_coder tool-parser detection without the newline (MiMo-V2.6)
 #   6. empty-delta progress chunk while a tool call is withheld (#112)
+#   7. anti-loop (scripts/loop_detect.py) + token counts in the progress chunk (#113)
 #
 # Idempotent: re-running skips venv creation if it already imports cleanly,
 # skips pip entirely when mlx-vlm is already at MLX_VLM_REF (direct_url.json),
@@ -280,6 +281,106 @@ else:
     with open(path, "w") as f:
         f.write(content)
     print("[install-mlx-vlm] progress chunk patch applied")
+PYEOF
+)
+PATCH_SCRIPT="${PATCH_SCRIPT//VENV_PLACEHOLDER/$VLM_VENV}"
+ssh -o ConnectTimeout=10 -o BatchMode=yes "$SSH_TARGET" "$VLM_VENV/bin/python -" <<<"$PATCH_SCRIPT"
+
+# 7. Anti-loop + token counts (#113; idempotent, same in-place replace).
+#    mlx_vlm.server has no loop detector: on 2026-10-15 a MiMo-V2.6 request
+#    (max_tokens 500000) decoded 95,020 tokens in 49.5 min, all held back by the
+#    tool parser, until the client hung up. The runner's detector (one source:
+#    scripts/loop_detect.py, copied as mlx_vlm/odyssai_loop_detect.py) now runs
+#    on the chat stream and non-stream decode loops: a proven loop ends the turn
+#    with finish_reason "stop", a chunk carrying x_mlx_cluster.loop_detected
+#    (stream), and a log line with the tail; every 8192 tokens of a long stream
+#    the tail is logged too, so a runaway that is not an exact loop leaves a trace. The step-6 progress chunk also
+#    carries x_odyssai_progress {prompt_tokens, completion_tokens}. Takes effect
+#    at the next mlx_vlm.server start.
+echo "[install-mlx-vlm] installing the anti-loop module and patch"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+scp -q "$SCRIPT_DIR/loop_detect.py" "$SSH_TARGET:$VLM_VENV/lib/python3.12/site-packages/mlx_vlm/odyssai_loop_detect.py"
+PATCH_SCRIPT=$(cat <<'PYEOF'
+path = "VENV_PLACEHOLDER/lib/python3.12/site-packages/mlx_vlm/server/openai.py"
+with open(path) as f:
+    content = f.read()
+mark = "# OdyssAI-X #113"
+ids_expr = ('(getattr(token, "token_ids", None) or '
+            '([token.token] if getattr(token, "token", None) is not None else []))')
+edits = [
+    ("from ..generate import generate, stream_generate\n",
+     "from ..generate import generate, stream_generate\n"
+     "from ..odyssai_loop_detect import LoopGuard as _odx_LoopGuard  # OdyssAI-X #113\n"),
+    ("                        tool_call_state = ToolCallStreamState(tc_start, tc_end)\n",
+     "                        tool_call_state = ToolCallStreamState(tc_start, tc_end)\n"
+     "                        _odx_guard, _odx_loop, _odx_next_log = _odx_LoopGuard(), None, 8192  # OdyssAI-X #113\n"),
+    ("                            output_tokens += getattr(token, \"token_count\", 1)\n"
+     "                            full_output += token.text\n"
+     "                            chunk_rate = metrics.record_chunk(token)\n",
+     "                            output_tokens += getattr(token, \"token_count\", 1)\n"
+     "                            full_output += token.text\n"
+     "                            chunk_rate = metrics.record_chunk(token)\n"
+     "                            # OdyssAI-X #113: the runner's anti-loop, same thresholds.\n"
+     f"                            _odx_hit = _odx_guard.feed({ids_expr})\n"
+     "                            if _odx_hit:\n"
+     "                                _odx_loop = (_odx_hit[0], _odx_hit[1], output_tokens)\n"
+     "                                logging.warning(\n"
+     "                                    \"OdyssAI-X anti-loop: request=%s period=%d repeats=%d \"\n"
+     "                                    \"after %d tokens; tail=%r\", request_id, _odx_hit[0],\n"
+     "                                    _odx_hit[1], output_tokens, full_output[-300:])\n"
+     "                                finish_reason = \"stop\"\n"
+     "                                break\n"
+     "                            if output_tokens >= _odx_next_log:  # a long turn leaves a trace\n"
+     "                                _odx_next_log += 8192\n"
+     "                                logging.info(\"OdyssAI-X long generation: request=%s tokens=%d tail=%r\",\n"
+     "                                             request_id, output_tokens, full_output[-300:])\n"),
+    ("                        # Parse tool calls from full output and emit final chunk\n",
+     "                        if _odx_loop:  # OdyssAI-X #113: say why the turn stopped\n"
+     "                            yield \"data: \" + json.dumps({\n"
+     "                                \"id\": request_id, \"object\": \"chat.completion.chunk\",\n"
+     "                                \"created\": int(time.time()), \"model\": request.model,\n"
+     "                                \"choices\": [{\"index\": 0, \"delta\": {}, \"finish_reason\": None}],\n"
+     "                                \"x_mlx_cluster\": {\"loop_detected\": True, \"loop_period\": _odx_loop[0],\n"
+     "                                                  \"loop_repeats\": _odx_loop[1], \"ntoks\": _odx_loop[2]},\n"
+     "                            }) + \"\\n\\n\"\n"
+     "                        # Parse tool calls from full output and emit final chunk\n"),
+    ("                                    \"choices\": [{\"index\": 0, \"delta\": {}, \"finish_reason\": None}],\n"
+     "                                }) + \"\\n\\n\"\n",
+     "                                    \"choices\": [{\"index\": 0, \"delta\": {}, \"finish_reason\": None}],\n"
+     "                                    \"x_odyssai_progress\": {  # OdyssAI-X #113\n"
+     "                                        \"prompt_tokens\": getattr(ctx, \"prompt_tokens\", None),\n"
+     "                                        \"completion_tokens\": output_tokens},\n"
+     "                                }) + \"\\n\\n\"\n"),
+    ("                        for token in token_iter:\n"
+     "                            text += token.text\n"
+     "                            gt += getattr(token, \"token_count\", 1)\n",
+     "                        _odx_g = _odx_LoopGuard()  # OdyssAI-X #113\n"
+     "                        for token in token_iter:\n"
+     "                            text += token.text\n"
+     "                            gt += getattr(token, \"token_count\", 1)\n"
+     f"                            _odx_hit = _odx_g.feed({ids_expr})\n"
+     "                            if _odx_hit:\n"
+     "                                logging.warning(\n"
+     "                                    \"OdyssAI-X anti-loop (non-stream): period=%d repeats=%d \"\n"
+     "                                    \"after %d tokens; tail=%r\", _odx_hit[0], _odx_hit[1], gt,\n"
+     "                                    text[-300:])\n"
+     "                                fr = \"stop\"\n"
+     "                                break\n"),
+]
+if mark in content:
+    print("[install-mlx-vlm] anti-loop patch already applied, skipping")
+elif any(content.count(old) != 1 for old, _ in edits):
+    missing = [old.strip().splitlines()[0][:60] for old, _ in edits if content.count(old) != 1]
+    print(f"[install-mlx-vlm] WARNING: anti-loop anchors not found {missing} (upstream file changed, or step 6 not applied?) — skipping")
+else:
+    import shutil
+    shutil.copy(path, path + ".bak-anti-loop")
+    for old, new in edits:
+        content = content.replace(old, new)
+    compile(content, path, "exec")
+    with open(path, "w") as f:
+        f.write(content)
+    print("[install-mlx-vlm] anti-loop patch applied")
 PYEOF
 )
 PATCH_SCRIPT="${PATCH_SCRIPT//VENV_PLACEHOLDER/$VLM_VENV}"

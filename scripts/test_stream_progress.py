@@ -62,7 +62,8 @@ class FakePool:
         yield {"event": "token", "text": "Je l'écris. "}
         for i in range(12):
             await asyncio.sleep(0.1)
-            yield {"event": "progress", "phase": "decode", "ntoks": 10 * (i + 1)}
+            yield {"event": "progress", "phase": "decode", "ntoks": 10 * (i + 1),
+                   "prompt_tokens": 16443}
         yield {"event": "done", "ntoks": 130, "elapsed_s": 1.2, "markup_withheld": True,
                "tool_calls": [{"id": "call_1", "type": "function",
                                "function": {"name": "write_file",
@@ -90,6 +91,9 @@ async def main():
                    and ch["choices"][0].get("finish_reason") is None]
         check("openai: progress relayed as empty-delta chunks", len(empties) >= 3, True)
         check("openai: at most one per STREAM_PROGRESS_CHUNK_S (12 events → ≤ 7 chunks)", len(empties) <= 7, True)
+        prog = [ch.get("x_odyssai_progress") for ch in empties]
+        check("openai: progress chunks carry the token counts (#113)",
+              all(p and p.get("prompt_tokens") == 16443 and p.get("completion_tokens") > 0 for p in prog), True)
         # (httpx's ASGITransport delivers the body at once: arrival gaps are measured
         # on the real engine, not here — the pacing is checked by the counts.)
         content = "".join((ch["choices"][0].get("delta") or {}).get("content") or ""

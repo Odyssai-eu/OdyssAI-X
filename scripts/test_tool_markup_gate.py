@@ -104,8 +104,9 @@ class GatedEventTest(unittest.TestCase):
     def test_held_batch_is_progress_without_text(self):
         gate = ToolMarkupGate(True)
         _gated_event(gate, "Je lis. ", "r1", 3)
-        ev = _gated_event(gate, "<tool_call>read_file<arg_key>path</arg_key>", "r1", 15)
-        self.assertEqual(ev, {"event": "progress", "id": "r1", "phase": "decode", "ntoks": 15})
+        ev = _gated_event(gate, "<tool_call>read_file<arg_key>path</arg_key>", "r1", 15, 812)
+        self.assertEqual(ev, {"event": "progress", "id": "r1", "phase": "decode", "ntoks": 15,
+                              "prompt_tokens": 812})
 
     def test_every_batch_after_the_opener_is_progress(self):
         gate = ToolMarkupGate(True)
