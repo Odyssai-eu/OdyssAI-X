@@ -1914,6 +1914,81 @@ def _offered_tool_names(tools) -> set[str] | None:
     return names or None
 
 
+# Openers of every format parse_tool_calls reads. `<tool_call` also covers
+# `<tool_calls>` and the Hy3 `<tool_call:opensource>` suffix.
+_TOOL_MARKUP_OPENERS = ("<tool_call", "<longcat_tool_call")
+
+
+class ToolMarkupGate:
+    """Keep tool-call markup out of the streamed text.
+
+    The non-stream path removes the call blocks from the content; the stream
+    path sent them as tokens, so a client got the markup as text AND the
+    parsed tool_calls. The gate holds the text back from the first opener to
+    the end of the generation. `feed()` returns what is safe to send now: the
+    text before an opener, minus a tail that could be an opener split across
+    chunks. `release()` returns the held text once the generation ends: the
+    blocks parse_tool_calls accepted are removed, everything else stays, so a
+    call to a name that was not offered, prose that quotes markup, or a block
+    cut by max_tokens reaches the client as text. Inactive without tools.
+
+    While it holds text back the client would hear nothing for as long as the
+    call takes (126 s for a 250-line write_file on GLM, 2026-10-15): the
+    caller emits a `progress` event for every batch it fed that produced no
+    text, so the API keeps its no-progress deadline armed and relays an
+    empty-delta chunk (#112). Only tokens that advanced trigger one — never a
+    timer, so a wedged runner still goes silent."""
+
+    def __init__(self, active: bool):
+        self.active = active
+        self.pending = ""
+        self.held: Optional[str] = None
+
+    def feed(self, text: str) -> str:
+        if not self.active or not text:
+            return text
+        if self.held is not None:
+            self.held += text
+            return ""
+        s = self.pending + text
+        self.pending = ""
+        hits = [i for i in (s.find(o) for o in _TOOL_MARKUP_OPENERS) if i >= 0]
+        if hits:
+            cut = min(hits)
+            self.held = s[cut:]
+            return s[:cut]
+        keep = 0
+        for o in _TOOL_MARKUP_OPENERS:
+            for n in range(min(len(o) - 1, len(s)), keep, -1):
+                if s.endswith(o[:n]):
+                    keep = n
+                    break
+        if keep:
+            self.pending = s[-keep:]
+            return s[:-keep]
+        return s
+
+    def release(self, allowed_names: set[str] | None = None) -> str:
+        if not self.active:
+            return ""
+        out, self.pending = self.pending, ""
+        if self.held is not None:
+            calls, cleaned = parse_tool_calls(self.held, allowed_names)
+            out += cleaned if calls else self.held
+            self.held = None
+        return out
+
+
+def _gated_event(gate: "ToolMarkupGate", text: str, req_id, ntoks: int) -> dict:
+    """The event for one batch of generated text: `token` with what the gate
+    lets through, or `progress` when it held the whole batch back (#112) —
+    the batch exists only because tokens advanced, so this is never a timer."""
+    out = gate.feed(text)
+    if out:
+        return {"event": "token", "id": req_id, "text": out}
+    return {"event": "progress", "id": req_id, "phase": "decode", "ntoks": ntoks}
+
+
 def parse_tool_calls(text: str, allowed_names: set[str] | None = None) -> tuple[list[dict], str]:
     """Extract OpenAI-shaped tool_calls from a generated string.
 
@@ -3148,6 +3223,19 @@ def _run_legacy_main(model, tokenizer, repo: str, kv_q8_default: bool,
                 restore_from_snap=_restore_from_snap,
                 stats_out=_spec_stats)
         else:
+            if "draft_model" not in gen_kwargs:  # speculative_generate_step takes no callback
+                _pf_done = [0]
+
+                def _prefill_progress(done_n, total_n, _last=_pf_done):
+                    # One event per prefill chunk that advanced (#112): a long
+                    # prompt keeps the API's deadline armed while it moves, and
+                    # a prefill wedged in a collective still goes silent.
+                    if done_n > _last[0]:
+                        _last[0] = done_n
+                        emit(rank, {"event": "progress", "id": req_id, "phase": "prefill",
+                                    "processed": int(done_n), "total": int(total_n)})
+
+                gen_kwargs["prompt_progress_callback"] = _prefill_progress
             gen_iter = stream_generate(model, tokenizer, gen_input, **gen_kwargs)
 
         # E0 harness canary: per-token cumulative sha over the emitted ids,
@@ -3166,6 +3254,7 @@ def _run_legacy_main(model, tokenizer, repo: str, kv_q8_default: bool,
         # eos_token_ids hit, "length" on the max_tokens cap). Capture it so the
         # done event can tell the API layer which one it was.
         gen_finish: Optional[str] = None
+        markup_gate = ToolMarkupGate(bool(tools))
         for res in gen_iter:
             tok_id = getattr(res, "token", None)
             rf = getattr(res, "finish_reason", None)
@@ -3232,7 +3321,7 @@ def _run_legacy_main(model, tokenizer, repo: str, kv_q8_default: bool,
                     f"(prompt={_prompt_n} gen={ntoks} limit={context_limit})")
                 break
             if len(buf) >= emit_batch_n:
-                emit(rank, {"event": "token", "id": req_id, "text": "".join(buf)})
+                emit(rank, _gated_event(markup_gate, "".join(buf), req_id, ntoks))
                 buf.clear()
             # Anti-loop: every N tokens, test the id stream for degenerate
             # repetition. Pure function of ids identical on every rank →
@@ -3258,8 +3347,10 @@ def _run_legacy_main(model, tokenizer, repo: str, kv_q8_default: bool,
                 break
             if stop_requested["flag"]:
                 break
-        if buf:
-            emit(rank, {"event": "token", "id": req_id, "text": "".join(buf)})
+        _out = markup_gate.feed("".join(buf)) + markup_gate.release(
+            _offered_tool_names(tools))
+        if _out:
+            emit(rank, {"event": "token", "id": req_id, "text": _out})
         try:
             faulthandler.cancel_dump_traceback_later()
         except Exception:
@@ -3337,6 +3428,10 @@ def _run_legacy_main(model, tokenizer, repo: str, kv_q8_default: bool,
             done_event["context_limit"] = True
         if tool_calls:
             done_event["tool_calls"] = tool_calls
+        if markup_gate.active:
+            # The tokens already went through ToolMarkupGate: the API layer
+            # must not strip the content again.
+            done_event["markup_withheld"] = True
         if session_id:
             done_event["session"] = {
                 "id": session_id,
@@ -3468,10 +3563,12 @@ def _run_batched_main(model, tokenizer, repo: str, kv_q8_default: bool,
         s = slot.get(uid)
         if s is None:
             return
-        # Drain remaining buffer
-        if s["buf"]:
-            emit(rank, {"event": "token", "id": s["req_id"], "text": "".join(s["buf"])})
-            s["buf"].clear()
+        # Drain remaining buffer, then what the markup gate held back
+        _out = s["gate"].feed("".join(s["buf"])) + s["gate"].release(
+            _offered_tool_names(s["tools"]))
+        s["buf"].clear()
+        if _out:
+            emit(rank, {"event": "token", "id": s["req_id"], "text": _out})
         elapsed = time.time() - s["t_gen"]
         tps = (s["ntoks"] / elapsed) if elapsed > 0 else 0.0
         # Tool-call parsing on the full text
@@ -3522,6 +3619,8 @@ def _run_batched_main(model, tokenizer, repo: str, kv_q8_default: bool,
             done_event["effort_dropped"] = True
         if tool_calls:
             done_event["tool_calls"] = tool_calls
+        if s["gate"].active:
+            done_event["markup_withheld"] = True
         if s["session_id"]:
             done_event["session"] = {
                 "id": s["session_id"],
@@ -3745,6 +3844,7 @@ def _run_batched_main(model, tokenizer, repo: str, kv_q8_default: bool,
                 "ntoks": 0,
                 "t_gen": time.time(),
                 "tools": tools,
+                "gate": ToolMarkupGate(bool(tools)),
                 "session_id": session_id,
                 "cache_label": cache_label,
                 "detok": tokenizer.detokenizer,  # new instance per slot
@@ -3888,8 +3988,8 @@ def _run_batched_main(model, tokenizer, repo: str, kv_q8_default: bool,
                         s["buf"].append(seg)
                         s["full_text_parts"].append(seg)
                         if len(s["buf"]) >= emit_batch_n:
-                            emit(rank, {"event": "token", "id": s["req_id"],
-                                        "text": "".join(s["buf"])})
+                            emit(rank, _gated_event(s["gate"], "".join(s["buf"]),
+                                                    s["req_id"], s["ntoks"]))
                             s["buf"].clear()
                 # Anti-loop (batched path): same detector as the multi-rank
                 # loop. _emit_done_for drains the buffer, emits done with the

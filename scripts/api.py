@@ -2368,6 +2368,10 @@ _GEN_IDLE_TIMEOUT_S = float(env_get("GEN_IDLE_TIMEOUT_S", "120"))
 # the legitimate window. Both env-overridable.
 _GEN_PREFILL_DEADLINE_S = float(env_get("GEN_PREFILL_DEADLINE_S", "600"))
 _GEN_DECODE_DEADLINE_S = float(env_get("GEN_DECODE_DEADLINE_S", "300"))
+# #112: while the runner holds tool-call markup back it sends `progress` events
+# instead of tokens; a stream relays at most one empty-delta chunk (Anthropic:
+# a ping) per this many seconds so clients and the box see the run is alive.
+_STREAM_PROGRESS_CHUNK_S = float(env_get("STREAM_PROGRESS_CHUNK_S", "2"))
 # Conservative floor prefill throughput (tok/s) used to scale the prefill
 # deadline by estimated prompt size: a 1M-token context legitimately prefills
 # for minutes, so a flat 600s would false-positive on it. prefill_deadline =
@@ -2986,8 +2990,10 @@ class RunnerPool:
     def _on_event(self, ev: dict):
         # Any token (for ANY request) proves the runner is making progress and is
         # not wedged — stamp the pool-level liveness clock the no-progress
-        # watchdog reads (head-of-line fix, 2026-06-16).
-        if ev.get("event") == "token":
+        # watchdog reads (head-of-line fix, 2026-06-16). A `progress` event is
+        # the same proof: tokens (or prefill chunks) advanced while the runner
+        # held their text back (#112).
+        if ev.get("event") in ("token", "progress"):
             self.last_token_at = time.monotonic()
         if ev.get("event") == "runner_exit":
             # Fan out to every in-flight request: none of them will ever get
@@ -3446,9 +3452,10 @@ class RunnerPool:
             # emitting zero tokens (the ~5h silent hang of 2026-06-07). So we
             # also bound the wall-clock with no `token` progress and, on breach,
             # mark the pool+cluster degraded, best-effort cancel, fire the
-            # recovery ladder, and fail the request. `token` is the only
-            # real-progress event (runner emits no heartbeat), so it is the only
-            # thing that resets the deadline.
+            # recovery ladder, and fail the request. `token` and `progress` (#112:
+            # tokens or prefill chunks that advanced while their text is held
+            # back) are the only real-progress events — the runner emits no
+            # timer heartbeat — so they are the only things that reset it.
             # Prompt-size-aware prefill budget: a 1M-token context legitimately
             # prefills for minutes, so scale the prefill deadline by an estimated
             # prompt size at a conservative floor throughput — only a TRUE hang
@@ -3572,6 +3579,10 @@ class RunnerPool:
                 if ev.get("event") == "token":
                     last_progress = time.monotonic()
                     seen_token = True
+                elif ev.get("event") == "progress":
+                    last_progress = time.monotonic()
+                    if ev.get("phase") != "prefill":
+                        seen_token = True
                 if ev.get("event") == "done":
                     _gen_finished = True
                     if ev.get("error"):
@@ -7773,7 +7784,7 @@ def _initial_default_config() -> Optional[dict]:
 #   major (1.7.2 → 2.0.0) — breaking API or topology change
 #
 # Use `./scripts/bump-version.sh patch|minor|major` to bump + auto-commit.
-APP_VERSION = "1.56.2"
+APP_VERSION = "1.57.0"
 
 app = FastAPI(
     title="OdyssAI-X (odyssai.eu)",
@@ -11837,6 +11848,7 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
                 "carry": "", "open": _open_m, "close": _close_m,
                 "strip": _model_think_strips(model_id),
             }
+            _last_chunk_at = time.monotonic()  # #112: empty-delta pacing
             async for ev in pool.submit(None, req.max_tokens or 512, req.enable_thinking,
                                         anti_loop=(req.anti_loop is not False),
                                         **_vlmdist_sampling_kw(pool, req),
@@ -11887,6 +11899,19 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
                     # full raw text so the stats reflect what the model
                     # produced, not just what we surfaced.
                     _runs_tick(completion_id, raw_text)
+                    if visible or reasoning:
+                        _last_chunk_at = time.monotonic()
+                elif ev.get("event") == "progress":
+                    # #112: the runner advanced but holds the text back (a tool
+                    # call being written). An empty delta tells the client the
+                    # run is alive; at most one per _STREAM_PROGRESS_CHUNK_S.
+                    if time.monotonic() - _last_chunk_at >= _STREAM_PROGRESS_CHUNK_S:
+                        chunk = {"id": completion_id, "object": "chat.completion.chunk",
+                                 "created": created, "model": model_id,
+                                 "choices": [{"index": 0, "delta": {},
+                                              "finish_reason": None}]}
+                        yield f"data: {json.dumps(chunk)}\n\n".encode()
+                        _last_chunk_at = time.monotonic()
                 elif ev.get("event") == "done":
                     # Flush any final carry from the think-filter so we don't
                     # drop the model's last few characters when they landed
@@ -12709,6 +12734,7 @@ async def anthropic_messages(req: AnthropicMessagesRequest, request: Request):
             text_block_open = True
 
             tool_calls_final: list[dict] = []
+            _last_chunk_at = time.monotonic()  # #112: ping pacing
             async for ev in pool.submit(None, req.max_tokens, _antc_thinking,
                                         messages=oa_messages, tools=oa_tools,
                                         session_id=session_id,
@@ -12726,6 +12752,13 @@ async def anthropic_messages(req: AnthropicMessagesRequest, request: Request):
                     delta = {"type": "content_block_delta", "index": 0,
                              "delta": {"type": "text_delta", "text": txt}}
                     yield f"event: content_block_delta\ndata: {json.dumps(delta)}\n\n".encode()
+                    _last_chunk_at = time.monotonic()
+                elif ev.get("event") == "progress":
+                    # #112: same as the OpenAI stream — the Messages API's own
+                    # keep-alive, at most one per _STREAM_PROGRESS_CHUNK_S.
+                    if time.monotonic() - _last_chunk_at >= _STREAM_PROGRESS_CHUNK_S:
+                        yield b'event: ping\ndata: {"type": "ping"}\n\n'
+                        _last_chunk_at = time.monotonic()
                 elif ev.get("event") == "done":
                     ntoks_total = ev.get("ntoks", 0)
                     elapsed_total = ev.get("elapsed_s", 0.0)

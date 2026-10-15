@@ -9,6 +9,7 @@
 #   3. apply scripts/patches/mlx_vlm_thinking_mode_disabled.patch (see below)
 #   4. smoke-import mlx_vlm + the minimax_m3_vl model module
 #   5. qwen3_coder tool-parser detection without the newline (MiMo-V2.6)
+#   6. empty-delta progress chunk while a tool call is withheld (#112)
 #
 # Idempotent: re-running skips venv creation if it already imports cleanly,
 # skips pip entirely when mlx-vlm is already at MLX_VLM_REF (direct_url.json),
@@ -224,6 +225,61 @@ else:
     with open(path, "w") as f:
         f.write(content)
     print("[install-mlx-vlm] qwen3_coder marker patch applied")
+PYEOF
+)
+PATCH_SCRIPT="${PATCH_SCRIPT//VENV_PLACEHOLDER/$VLM_VENV}"
+ssh -o ConnectTimeout=10 -o BatchMode=yes "$SSH_TARGET" "$VLM_VENV/bin/python -" <<<"$PATCH_SCRIPT"
+
+# 6. Progress chunk while a tool call is withheld (#112; idempotent, same
+#    in-place replace as steps 4-5). server/openai.py drops every chunk whose
+#    delta is empty, and the tool-call parser empties the delta for the whole
+#    call: a 250-line write_file on MiMo-V2.6 streamed nothing for 65.9 s
+#    (2026-10-15), past the desktop's 90 s silence cut on longer calls. Each
+#    token that advanced while the parser holds the markup may now yield an
+#    empty-delta chunk, at most one per 2 s — tokens only, never a timer, so a
+#    wedged server still goes silent. Takes effect at the next mlx_vlm.server
+#    start.
+echo "[install-mlx-vlm] applying withheld-tool-call progress chunk patch"
+PATCH_SCRIPT=$(cat <<'PYEOF'
+path = "VENV_PLACEHOLDER/lib/python3.12/site-packages/mlx_vlm/server/openai.py"
+with open(path) as f:
+    content = f.read()
+mark = "# OdyssAI-X #112"
+a_old = "                        tool_call_state = ToolCallStreamState(tc_start, tc_end)\n"
+a_new = a_old + "                        _odx_last_chunk = time.monotonic()  # OdyssAI-X #112\n"
+b_old = """                            # Skip empty deltas (e.g. suppressed tool-call tokens)
+                            has_payload = (
+                                bool(delta_content)
+                                or bool(delta_reasoning)
+                                or chunk_logprobs is not None
+                            )
+                            if has_payload:
+"""
+b_new = b_old.replace("                            if has_payload:\n", """                            # OdyssAI-X #112: a token advanced but the tool-call
+                            # parser holds it back: an empty delta keeps the
+                            # client informed, at most one per 2 s.
+                            if not has_payload and time.monotonic() - _odx_last_chunk >= 2.0:
+                                yield "data: " + json.dumps({
+                                    "id": request_id, "object": "chat.completion.chunk",
+                                    "created": int(time.time()), "model": request.model,
+                                    "choices": [{"index": 0, "delta": {}, "finish_reason": None}],
+                                }) + "\\n\\n"
+                                _odx_last_chunk = time.monotonic()
+                            if has_payload:
+                                _odx_last_chunk = time.monotonic()
+""")
+if mark in content:
+    print("[install-mlx-vlm] progress chunk patch already applied, skipping")
+elif content.count(a_old) != 1 or content.count(b_old) != 1:
+    print("[install-mlx-vlm] WARNING: stream loop anchors not found (upstream file changed?) — skipping")
+else:
+    import shutil
+    shutil.copy(path, path + ".bak-progress-chunk")
+    content = content.replace(a_old, a_new).replace(b_old, b_new)
+    compile(content, path, "exec")
+    with open(path, "w") as f:
+        f.write(content)
+    print("[install-mlx-vlm] progress chunk patch applied")
 PYEOF
 )
 PATCH_SCRIPT="${PATCH_SCRIPT//VENV_PLACEHOLDER/$VLM_VENV}"
