@@ -96,6 +96,13 @@ class ModelArgs(BaseModelArgs):
                 "full_attention" if (i + 1) % k == 0 else "linear_attention"
                 for i in range(n)
             ]
+        # mlx-vlm renames full attention "qwen_sparse_attention" in the configs it
+        # writes (mlx_vlm/models/qwen4_exp/config.py). Every test here compares to
+        # "full_attention", so such a layer would be neither full nor linear (#143).
+        self.text.layer_types = [
+            "full_attention" if t == "qwen_sparse_attention" else t
+            for t in self.text.layer_types
+        ]
 
 
 # --------------------------------------------------------------------------- norms
