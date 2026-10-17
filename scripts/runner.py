@@ -2430,6 +2430,30 @@ def _cpu_default_device():
         mx.set_default_device(prev)
 
 
+def _load_model_strict(repo_path, lazy: bool):
+    """mlx-lm load_model with strict=True (#116).
+
+    Under strict=False a parameter the checkpoint does not fill (a sanitize or
+    key-mapping gap) keeps its random init: the model loads, answers, and serves
+    noise without any error. Audited 2026-10-17 from the safetensors headers: the
+    18 text checkpoints on the volumes load strict; the two that do not would load
+    ENTIRELY random under strict=False (MiMo-V2.6-Flash forced through the text
+    path, DSpark-Gemma used as a plain mlx-lm draft). A mismatch now stops the
+    load with the first keys involved."""
+    try:
+        return load_model(repo_path, lazy=lazy, strict=True)
+    except ValueError as e:
+        msg = str(e)
+        if not msg.startswith(("Received ", "Missing ", "Expected shape")):
+            raise
+        head, _, body = msg.partition("\n")
+        keys = [k.strip(",. ") for k in body.splitlines() if k.strip()]
+        first = f" (first: {', '.join(keys[:5])})" if keys else ""
+        raise ValueError(
+            f"{repo_path}: checkpoint and model do not match: {head.rstrip(': ')}{first}. "
+            "Refusing a partly random model (#116).") from None
+
+
 def _warm_import_model_module(repo_path) -> None:
     """Build a model's device-sensitive Metal kernels on the GPU BEFORE the
     CPU-default-device weight load (1.49.3).
@@ -2515,7 +2539,7 @@ def main() -> None:
         log(f"single-node loading model from {repo_path}")
         _warm_import_model_module(repo_path)
         with _cpu_default_device():
-            model, model_config = load_model(repo_path, lazy=False, strict=False)
+            model, model_config = _load_model_strict(repo_path, lazy=False)
             mx.eval(model.parameters())
         # trust_remote_code=True: some model repos (mimo_v2, deepseek-v4, …) ship
         # custom tokenizer/model Python files referenced via `auto_map` in their
@@ -2532,7 +2556,7 @@ def main() -> None:
         log(f"rank {rank} loading model (lazy=True) from {repo_path}")
         _warm_import_model_module(repo_path)
         with _cpu_default_device():
-            model, model_config = load_model(repo_path, lazy=True, strict=False)
+            model, model_config = _load_model_strict(repo_path, lazy=True)
         if mode == "tensor":
             log(f"rank {rank} applying tensor_auto_parallel")
             model = shard_tensor(model, group)
@@ -2610,7 +2634,7 @@ def main() -> None:
                 + (f" (MULTIRANK harness, rank {rank})" if size > 1 else ""))
             _warm_import_model_module(draft_path)
             with _cpu_default_device():
-                draft_model, _ = load_model(draft_path, lazy=False, strict=False)
+                draft_model, _ = _load_model_strict(draft_path, lazy=False)
                 mx.eval(draft_model.parameters())
             log(f"draft model loaded in {time.time()-t_draft:.1f}s — speculative decoding ENABLED "
                 f"(num_draft_tokens={num_draft_tokens})")
