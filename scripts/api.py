@@ -7786,7 +7786,7 @@ def _initial_default_config() -> Optional[dict]:
 #   major (1.7.2 → 2.0.0) — breaking API or topology change
 #
 # Use `./scripts/bump-version.sh patch|minor|major` to bump + auto-commit.
-APP_VERSION = "1.59.0"
+APP_VERSION = "1.59.1"
 
 app = FastAPI(
     title="OdyssAI-X (odyssai.eu)",
@@ -11725,6 +11725,13 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
             # input → 422; anything else → 500. Never an empty 200.
             run_status = "error"
             msg = str(e)
+            if msg.startswith("context_length_exceeded"):
+                # #135: the prompt alone fills the model's window — the
+                # client's input, in OpenAI's own shape.
+                raise HTTPException(400, {"error": {"message": msg,
+                                                    "type": "invalid_request_error",
+                                                    "param": "messages",
+                                                    "code": "context_length_exceeded"}})
             raise HTTPException(422 if msg.startswith("chat_template") else 500,
                                 {"error": {"message": msg, "type": "runner_error"}})
         finally:
@@ -11999,7 +12006,9 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
                          "choices": [{"index": 0, "delta": {},
                                       "finish_reason": "error"}],
                          "error": {"message": str(e), "type": "server_error",
-                                   "code": ("runner_error" if isinstance(e, RunnerRequestError)
+                                   "code": ("context_length_exceeded"
+                                            if str(e).startswith("context_length_exceeded")
+                                            else "runner_error" if isinstance(e, RunnerRequestError)
                                             else "runner_died")}}
             try:
                 yield f"data: {json.dumps(err_chunk)}\n\n".encode()
@@ -12345,7 +12354,10 @@ class AnthropicTool(BaseModel):
 
 class AnthropicMessagesRequest(BaseModel):
     model: Optional[str] = None
-    max_tokens: int = 1024
+    # No engine default, as on the OpenAI route since 1.59.0 (#136): None means
+    # the room left in the model's context window. Proxied to api.anthropic.com
+    # the field is dropped when None and upstream asks for it, as it does.
+    max_tokens: Optional[int] = None
     messages: list[AnthropicMessage]
     system: Optional[Any] = None  # str | list[{type:"text",text:"..."}]
     tools: Optional[list[AnthropicTool]] = None
@@ -12600,7 +12612,7 @@ async def anthropic_messages(req: AnthropicMessagesRequest, request: Request):
     _refuse_image_on_text_pool(req.model, pool, req.messages)
 
     # Request classification (same logic as /v1/chat/completions).
-    # Anthropic shape always has max_tokens, no need to guard for None.
+    # max_tokens may be None (#136): classify_request takes Optional.
     prompt_chars_pre = sum(
         len(b.text or "")
         for m in (req.messages or [])
@@ -12673,6 +12685,10 @@ async def anthropic_messages(req: AnthropicMessagesRequest, request: Request):
             record_metric(client_ip, ntoks, elapsed_s, ttft_s, prompt_chars, model_id,
                           cluster=pool.cluster, tool_calls=0, status="error")
             msg = str(e)[:300]
+            if msg.startswith("context_length_exceeded"):
+                raise HTTPException(400, {"type": "error",
+                                          "error": {"type": "invalid_request_error",
+                                                    "message": msg}})
             raise HTTPException(
                 422 if msg.startswith("chat_template") else 500,
                 {"type": "error",
@@ -12810,7 +12826,10 @@ async def anthropic_messages(req: AnthropicMessagesRequest, request: Request):
             gen_status = "error"
             sys.stderr.write(f"[antc-stream {msg_id}] ended with error: {e}\n")
             err_ev = {"type": "error",
-                      "error": {"type": "server_error", "message": str(e)[:300]}}
+                      "error": {"type": ("invalid_request_error"
+                                         if str(e).startswith("context_length_exceeded")
+                                         else "server_error"),
+                                "message": str(e)[:300]}}
             try:
                 yield f"event: error\ndata: {json.dumps(err_ev)}\n\n".encode()
             except Exception:

@@ -2813,6 +2813,13 @@ def _context_window(repo: str) -> Optional[int]:
             v = c.get("max_position_embeddings")
             if v:
                 win = int(v)
+                # A YaRN/linear rope scaling stretches the trained context past
+                # max_position_embeddings in some configs; never refuse below it.
+                rs = c.get("rope_scaling")
+                if isinstance(rs, dict):
+                    f, orig = rs.get("factor"), rs.get("original_max_position_embeddings")
+                    if f and orig and float(f) > 1:
+                        win = max(win, int(float(f) * int(orig)))
                 break
     except Exception as e:
         log(f"[max_tokens] {repo}: no context window in config.json ({e})")
@@ -2821,16 +2828,29 @@ def _context_window(repo: str) -> Optional[int]:
 
 
 def _generation_budget(requested, repo: str, prompt_len: int) -> int:
-    """max_tokens for one request: the client's value when it sent one, else the
-    room left in the model's context window — no engine-chosen cap (the 512
+    """max_tokens for one request: the room left in the model's context window,
+    or the client's value when it asked for less — no engine-chosen cap (the 512
     default is gone, 2026-10-15): the turn ends at EOS, at a proven loop
-    (loop_detect) or when the context is full. Unknown window: no cap."""
-    if requested is not None:
-        return int(requested)
+    (loop_detect) or when the context is full. A client value past the window
+    is bounded to it instead of overrunning the trained context (#135).
+    Unknown window: the client's value, else no cap."""
     win = _context_window(repo)
-    if win:
-        return max(1, win - prompt_len)
-    return 2 ** 31 - 1
+    room = max(1, win - prompt_len) if win else None
+    if requested is not None:
+        requested = int(requested)
+        return min(requested, room) if room is not None else requested
+    return room if room is not None else 2 ** 31 - 1
+
+
+def _context_overflow(repo: str, prompt_len: int) -> Optional[str]:
+    """Refusal message when the prompt alone fills the model's window (#135):
+    there is no room for a single token, so the request fails at admission
+    (HTTP 400 context_length_exceeded) instead of generating past the window."""
+    win = _context_window(repo)
+    if win and prompt_len >= win:
+        return (f"context_length_exceeded: the prompt is {prompt_len} tokens and the "
+                f"model's context window is {win} tokens")
+    return None
 
 
 def _run_legacy_main(model, tokenizer, repo: str, kv_q8_default: bool,
@@ -3004,6 +3024,15 @@ def _run_legacy_main(model, tokenizer, repo: str, kv_q8_default: bool,
             prompt_tokens_full = list(tokenizer.apply_chat_template(messages, **ids_kwargs))
         except Exception:
             prompt_tokens_full = list(tokenizer.encode(templated, add_special_tokens=False))
+
+        # Same decision on every rank (same prompt, same config): they all skip.
+        _overflow = _context_overflow(repo, len(prompt_tokens_full))
+        if _overflow:
+            log(f"req {req_id}: {_overflow} — request rejected")
+            emit(rank, {"event": "done", "id": req_id, "ntoks": 0, "elapsed_s": 0.0,
+                        "tps": 0.0, "finish_reason": "error", "error": _overflow,
+                        "prompt_tokens": len(prompt_tokens_full)})
+            continue
 
         # Prefix cache lookup BEFORE building a fresh cache. On a hit we reuse
         # the existing populated cache and feed only the suffix tokens.
@@ -3805,6 +3834,14 @@ def _run_batched_main(model, tokenizer, repo: str, kv_q8_default: bool,
                 prompt_tokens_full = list(tokenizer.apply_chat_template(messages_in, **ids_kwargs))
             except Exception:
                 prompt_tokens_full = list(tokenizer.encode(templated, add_special_tokens=False))
+
+            _overflow = _context_overflow(repo, len(prompt_tokens_full))
+            if _overflow:
+                log(f"req {req_id}: {_overflow} — request rejected, batch continues")
+                emit(rank, {"event": "done", "id": req_id, "ntoks": 0, "elapsed_s": 0.0,
+                            "tps": 0.0, "finish_reason": "error", "error": _overflow,
+                            "prompt_tokens": len(prompt_tokens_full)})
+                continue
 
             cached_cache, suffix_tokens, hit_kind = (
                 _session_lookup(session_id, repo, prompt_tokens_full)

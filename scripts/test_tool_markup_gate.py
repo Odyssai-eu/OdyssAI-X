@@ -14,7 +14,7 @@ import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from runner import ToolMarkupGate, _gated_event, _generation_budget, parse_tool_calls  # noqa: E402
+from runner import ToolMarkupGate, _context_overflow, _gated_event, _generation_budget, parse_tool_calls  # noqa: E402
 import json  # noqa: E402
 import tempfile  # noqa: E402
 
@@ -138,6 +138,29 @@ class GenerationBudgetTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             json.dump({"model_type": "x"}, open(os.path.join(d, "config.json"), "w"))
             self.assertGreater(_generation_budget(None, d, 10), 10 ** 9)
+
+    def test_client_value_past_the_window_is_bounded(self):
+        # #135: a client max_tokens no longer overruns the trained context.
+        with tempfile.TemporaryDirectory() as d:
+            json.dump({"max_position_embeddings": 32768}, open(os.path.join(d, "config.json"), "w"))
+            self.assertEqual(_generation_budget(50000, d, 1000), 31768)
+            self.assertEqual(_generation_budget(300, d, 1000), 300)
+
+    def test_rope_scaling_widens_the_window(self):
+        with tempfile.TemporaryDirectory() as d:
+            json.dump({"max_position_embeddings": 32768,
+                       "rope_scaling": {"rope_type": "yarn", "factor": 4.0,
+                                        "original_max_position_embeddings": 32768}},
+                      open(os.path.join(d, "config.json"), "w"))
+            self.assertEqual(_generation_budget(None, d, 1000), 130072)
+            self.assertIsNone(_context_overflow(d, 40000))
+
+    def test_prompt_filling_the_window_is_refused(self):
+        with tempfile.TemporaryDirectory() as d:
+            json.dump({"max_position_embeddings": 32768}, open(os.path.join(d, "config.json"), "w"))
+            self.assertTrue(_context_overflow(d, 32768).startswith("context_length_exceeded"))
+            self.assertIsNone(_context_overflow(d, 32767))
+        self.assertIsNone(_context_overflow("/nonexistent", 10 ** 7))
 
 
 if __name__ == "__main__":

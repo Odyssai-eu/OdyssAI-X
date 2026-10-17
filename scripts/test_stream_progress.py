@@ -134,6 +134,43 @@ async def main():
         check("anthropic: tool_use block still emitted", "content_block_start" in events
               and events.count("content_block_start") >= 2, True)
 
+        # #136: /v1/messages without max_tokens → None to the runner, like OpenAI
+        r = await c.post("/v1/messages", json={
+            "model": "fake", "messages": [{"role": "user", "content": "bonjour"}]})
+        check("anthropic: max_tokens optional (no 422)", r.status_code, 200)
+        check("anthropic: no max_tokens → None to the runner", FakePool.seen_max_tokens[-1], None)
+
+        # #135: the runner refuses a prompt that fills the window → 400
+        api._route_pool = lambda model: OverflowPool()
+        r = await c.post("/v1/chat/completions", json={
+            "model": "fake", "messages": [{"role": "user", "content": "trop long"}]})
+        check("openai: context overflow → 400", r.status_code, 400)
+        check("openai: code context_length_exceeded", "context_length_exceeded" in r.text, True)
+        r = await c.post("/v1/messages", json={
+            "model": "fake", "messages": [{"role": "user", "content": "trop long"}]})
+        check("anthropic: context overflow → 400 invalid_request_error",
+              (r.status_code, "invalid_request_error" in r.text), (400, True))
+        chunks = []
+        async with c.stream("POST", "/v1/chat/completions", json={
+                "model": "fake", "stream": True,
+                "messages": [{"role": "user", "content": "trop long"}]}) as rs:
+            async for line in rs.aiter_lines():
+                if line.startswith("data: ") and line != "data: [DONE]":
+                    chunks.append(json.loads(line[6:]))
+        check("openai stream: error chunk with code context_length_exceeded",
+              (chunks[-1].get("error") or {}).get("code"), "context_length_exceeded")
+
+
+class OverflowPool(FakePool):
+    """What RunnerPool.submit raises when the runner's done event refuses the
+    prompt for filling the context window (#135)."""
+
+    async def submit(self, prompt, max_tokens, *a, **kw):
+        raise api.RunnerRequestError(
+            "context_length_exceeded: the prompt is 40000 tokens and the model's "
+            "context window is 32768 tokens")
+        yield  # pragma: no cover — makes this an async generator
+
 
 asyncio.run(main())
 if FAILS:
