@@ -365,11 +365,13 @@ class KimiK3DeltaAttention(nn.Module):
       * output gate is FULL RANK (`g_proj`) instead of the g_a/g_b pair. Note
         f_a_proj/f_b_proj still exist and are a different gate — they feed the
         DECAY, not the output. Do not merge the two.
-      * `A_log` is per head_dim, not per head. The published reference declares
-        it `[num_heads]` but every checkpoint tensor is `[head_dim]` (verified
-        on layers 1-2), and dt_bias `[num_heads*head_dim]` fixes the rest of the
-        broadcast. It therefore broadcasts along the LAST axis, shared across
-        heads.
+      * `A_log` is one value per HEAD (reference `modeling_kimi_linear.py`
+        declares `[num_heads]`, fla reads `A_log + i_h`), but the checkpoint
+        stores it padded to `[head_dim]`: on layers 0-2 the first 96 values are
+        trained and the last 32 are exactly 0 (read 2026-10-17, #141). The
+        parameter keeps the stored shape; only the first num_heads entries are
+        used, broadcast over head_dim (dt_bias `[num_heads*head_dim]` carries
+        the per-channel part).
       * `gate_lower_bound` selects the bounded gate formula above.
     """
 
@@ -452,7 +454,7 @@ class KimiK3DeltaAttention(nn.Module):
         a_logits = self.f_b_proj(self.f_a_proj(x)).reshape(shape)
         beta = mx.sigmoid(self.b_proj(x).reshape(B, T, self.num_heads))
 
-        A_log = self.A_log.reshape(1, self.head_dim)
+        A_log = self.A_log[: self.num_heads].reshape(self.num_heads, 1)
         dt_bias = self.dt_bias.reshape(self.num_heads, self.head_dim)
         if self.gate_lower_bound is not None:
             g = _kda_decay_bounded(A_log, a_logits, dt_bias, self.gate_lower_bound)
