@@ -1842,6 +1842,50 @@ def _offered_tool_names(tools) -> set[str] | None:
     return names or None
 
 
+def _is_string_schema(prop) -> bool:
+    """True when a JSON-schema property only admits a string (null allowed)."""
+    if not isinstance(prop, dict):
+        return False
+    t = prop.get("type")
+    if t is None:
+        alts = [a for a in (prop.get("anyOf") or prop.get("oneOf") or [])
+                if isinstance(a, dict) and a.get("type") != "null"]
+        return bool(alts) and all(_is_string_schema(a) for a in alts)
+    if isinstance(t, list):
+        return [x for x in t if x != "null"] == ["string"]
+    return t == "string"
+
+
+def _string_params(tools) -> dict[str, set[str]]:
+    """Per offered tool, the parameters whose schema type is string.
+
+    The XML formats (Qwen3-Coder, Hy3, GLM, LongCat) carry every value as text.
+    A string-typed value must stay the raw text — "1.10", "true", "0" are
+    strings there — and only the others are JSON-decoded, as the GLM reference
+    parser does (#124). OpenAI (`function.parameters`) or Anthropic
+    (`input_schema`) shape.
+    """
+    out: dict[str, set[str]] = {}
+    for t in tools or []:
+        if not isinstance(t, dict):
+            continue
+        fn = t.get("function") or t
+        schema = fn.get("parameters") or fn.get("input_schema") or {}
+        props = schema.get("properties") if isinstance(schema, dict) else None
+        if fn.get("name") and isinstance(props, dict):
+            out[fn["name"]] = {k for k, p in props.items() if _is_string_schema(p)}
+    return out
+
+
+def _xml_arg_value(raw: str, is_string: bool):
+    if is_string:
+        return raw
+    try:
+        return json.loads(raw)
+    except Exception:
+        return raw
+
+
 # Openers of every format parse_tool_calls reads. `<tool_call` also covers
 # `<tool_calls>` and the Hy3 `<tool_call:opensource>` suffix.
 _TOOL_MARKUP_OPENERS = ("<tool_call", "<longcat_tool_call")
@@ -1920,9 +1964,12 @@ def _gated_event(gate: "ToolMarkupGate", text: str, req_id, ntoks: int,
             "prompt_tokens": prompt_tokens}
 
 
-def parse_tool_calls(text: str, allowed_names: set[str] | None = None) -> tuple[list[dict], str]:
+def parse_tool_calls(text: str, allowed_names: set[str] | None = None,
+                     string_params: dict[str, set[str]] | None = None) -> tuple[list[dict], str]:
     """Extract OpenAI-shaped tool_calls from a generated string.
 
+    string_params: per tool, the parameters typed string in its schema
+    (`_string_params`); their XML values stay raw text instead of JSON-decoded.
     allowed_names: when given (the request's tool names), a call to any other name
     is NOT a call: it stays in the text. Models quote code that contains tool-call
     markup (a regex, a docstring); without this, quoted examples became calls.
@@ -1941,6 +1988,7 @@ def parse_tool_calls(text: str, allowed_names: set[str] | None = None) -> tuple[
     """
     calls: list[dict] = []
     cleaned = text
+    strs = string_params or {}
 
     def add_call(name: str, args) -> bool:
         if allowed_names is not None and name not in allowed_names:
@@ -1990,11 +2038,8 @@ def parse_tool_calls(text: str, allowed_names: set[str] | None = None) -> tuple[
         for pm in _QWEN_PARAM.finditer(body):
             key = pm.group(1).strip()
             raw = pm.group(2).strip()
-            # Try to JSON-decode each value (numbers/bools/objects); fall back to str.
-            try:
-                args[key] = json.loads(raw)
-            except Exception:
-                args[key] = raw
+            # JSON-decode numbers/bools/objects; a string-typed parameter stays text.
+            args[key] = _xml_arg_value(raw, key in strs.get(name, ()))
         if add_call(name, args):
             cleaned = cleaned.replace(m.group(0), "")
 
@@ -2007,10 +2052,7 @@ def parse_tool_calls(text: str, allowed_names: set[str] | None = None) -> tuple[
         for pm in _HY3_ARG_PAIR.finditer(body):
             key = pm.group(1).strip()
             raw = pm.group(2).strip()
-            try:
-                args[key] = json.loads(raw)
-            except Exception:
-                args[key] = raw
+            args[key] = _xml_arg_value(raw, key in strs.get(name, ()))
         if add_call(name, args):
             cleaned = cleaned.replace(m.group(0), "")
 
@@ -2021,10 +2063,7 @@ def parse_tool_calls(text: str, allowed_names: set[str] | None = None) -> tuple[
         for pm in _GLM_ARG_PAIR.finditer(m.group(2)):
             key = pm.group(1).strip()
             raw = pm.group(2).strip()
-            try:
-                args[key] = json.loads(raw)
-            except Exception:
-                args[key] = raw
+            args[key] = _xml_arg_value(raw, key in strs.get(name, ()))
         if add_call(name, args):
             cleaned = cleaned.replace(m.group(0), "")
 
@@ -2040,10 +2079,7 @@ def parse_tool_calls(text: str, allowed_names: set[str] | None = None) -> tuple[
         for pm in _LONGCAT_ARG_PAIR.finditer(body):
             key = pm.group(1).strip()
             raw = pm.group(2).strip()
-            try:
-                args[key] = json.loads(raw)
-            except Exception:
-                args[key] = raw
+            args[key] = _xml_arg_value(raw, key in strs.get(name, ()))
         if add_call(name, args):
             cleaned = cleaned.replace(m.group(0), "")
 
@@ -3335,7 +3371,8 @@ def _run_legacy_main(model, tokenizer, repo: str, kv_q8_default: bool,
         tool_calls: list[dict] = []
         if tools:
             full_text = "".join(full_text_parts)
-            tool_calls, _ = parse_tool_calls(full_text, _offered_tool_names(tools))
+            tool_calls, _ = parse_tool_calls(full_text, _offered_tool_names(tools),
+                                             _string_params(tools))
 
         # Persist the populated cache for this session so the next turn can
         # resume mid-prompt. The cache currently holds K/V for
@@ -3545,7 +3582,8 @@ def _run_batched_main(model, tokenizer, repo: str, kv_q8_default: bool,
         tool_calls: list[dict] = []
         if s["tools"]:
             tool_calls, _ = parse_tool_calls("".join(s["full_text_parts"]),
-                                             _offered_tool_names(s["tools"]))
+                                             _offered_tool_names(s["tools"]),
+                                             _string_params(s["tools"]))
         # Session persistence: prefer the cache from the finishing Response
         # (mlx-lm attaches it as resp.prompt_cache). Fallback to extract_cache
         # by uid (works pre-removal).
