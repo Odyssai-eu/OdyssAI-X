@@ -16,9 +16,13 @@
 #     BLOCKWISE via deepseek_v32.Model.sanitize (mx.from_fp8, blocs 128,
 #     weight_scale_inv) : le checkpoint fp8 officiel se charge/convertit tel
 #     quel, sans driver dédié.
+#   - swiglu_limit réappliqué (Glm5NextMLP, Glm5NextMoE) : la substitution
+#     DeepseekMLP → DeepseekV32MLP l'avait perdu ; la référence borne le MLP
+#     dense, l'expert partagé et les experts routés (#115, 2026-10-17).
 # Si mlx-vlm ou mlx-lm publient une version amont, re-vendoriser et re-diff.
 
 from dataclasses import dataclass, field
+from functools import partial
 from typing import Any, Dict, List, Optional
 
 import mlx.core as mx
@@ -32,6 +36,7 @@ from .dsv4_hyper_connection import HyperConnection, hc_expand
 from .glm5_gated_delta import gated_delta_update
 from .mla import MultiLinear
 from .rope_utils import initialize_rope
+from .switch_layers import SwitchGLU
 
 
 @dataclass
@@ -701,6 +706,49 @@ class Glm5NextSparseAttention(nn.Module):
         return self.o_proj(output)
 
 
+@partial(mx.compile, shapeless=True)
+def _clamped_swiglu(x, gate, limit):
+    gate = mx.minimum(gate, limit)
+    x = mx.clip(x, -limit, limit)
+    return nn.silu(gate) * x
+
+
+class ClampedSwiGLU(nn.Module):
+    def __init__(self, limit: float):
+        super().__init__()
+        self.limit = limit
+
+    def __call__(self, x, gate):
+        return _clamped_swiglu(x, gate, self.limit)
+
+
+class Glm5NextMLP(DeepseekV32MLP):
+    # swiglu_limit on the dense MLP and the shared expert, as in the reference
+    # (transformers glm5_next Glm5NextTextMLP: gate clamped above, up to +-limit).
+    # The checkpoint crosses the limit from the first MoE layer (#115).
+    def __call__(self, x):
+        return self.down_proj(
+            _clamped_swiglu(self.up_proj(x), self.gate_proj(x), self.config.swiglu_limit)
+        )
+
+
+class Glm5NextMoE(DeepseekV32MoE):
+    def __init__(self, config: ModelArgs):
+        super().__init__(config)
+        # Unlike hy_v4, the reference clamps the routed AND the shared experts.
+        self.switch_mlp = SwitchGLU(
+            config.hidden_size,
+            config.moe_intermediate_size,
+            config.n_routed_experts,
+            activation=ClampedSwiGLU(config.swiglu_limit),
+        )
+        if config.n_shared_experts is not None:
+            self.shared_experts = Glm5NextMLP(
+                config=config,
+                intermediate_size=config.moe_intermediate_size * config.n_shared_experts,
+            )
+
+
 class Glm5NextDecoderLayer(nn.Module):
     def __init__(self, config: ModelArgs, layer_idx: int):
         super().__init__()
@@ -716,7 +764,7 @@ class Glm5NextDecoderLayer(nn.Module):
             and layer_idx >= config.first_k_dense_replace
             and config.mlp_layer_types[layer_idx] == "sparse"
         )
-        self.mlp = DeepseekV32MoE(config) if is_sparse else DeepseekV32MLP(config)
+        self.mlp = Glm5NextMoE(config) if is_sparse else Glm5NextMLP(config)
 
         self.input_layernorm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = nn.RMSNorm(
@@ -770,7 +818,7 @@ class Glm5NextMTPLayer(nn.Module):
     def __init__(self, config: ModelArgs, layer_idx: Optional[int] = None):
         super().__init__()
         self.self_attn = Glm5NextSparseAttention(config)
-        self.mlp = DeepseekV32MoE(config)
+        self.mlp = Glm5NextMoE(config)
         self.input_layernorm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = nn.RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
