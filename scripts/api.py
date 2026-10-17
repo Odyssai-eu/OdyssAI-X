@@ -7786,7 +7786,7 @@ def _initial_default_config() -> Optional[dict]:
 #   major (1.7.2 → 2.0.0) — breaking API or topology change
 #
 # Use `./scripts/bump-version.sh patch|minor|major` to bump + auto-commit.
-APP_VERSION = "1.59.1"
+APP_VERSION = "1.59.2"
 
 app = FastAPI(
     title="OdyssAI-X (odyssai.eu)",
@@ -10085,10 +10085,19 @@ async def _list_upstream_models(prov: dict) -> list[dict]:
     sidecars (mlx-vlm etc.) we probe anonymously.
     """
     api_key = _cloud_provider_key(prov)
-    url = f"{prov['api_base'].rstrip('/')}/models"
+    base = prov['api_base'].rstrip('/')
     headers: dict[str, str] = {}
-    if api_key:
-        headers["authorization"] = f"Bearer {api_key}"
+    if _provider_protocol(prov) == "anthropic":
+        # Same contract as _proxy_anthropic_messages: /v1/ under the base and
+        # x-api-key + anthropic-version, not an OpenAI Bearer on /models.
+        url = f"{base}/v1/models"
+        headers["anthropic-version"] = "2023-06-01"
+        if api_key:
+            headers["x-api-key"] = api_key
+    else:
+        url = f"{base}/models"
+        if api_key:
+            headers["authorization"] = f"Bearer {api_key}"
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
             r = await client.get(url, headers=headers)
@@ -10512,9 +10521,11 @@ async def admin_providers_upsert(provider_id: str, req: CloudProviderUpdate):
         cur["api_key_env"] = req.api_key_env or None
         if cur["api_key_env"] is None:
             cur.pop("api_key_env", None)
+    # Clear first, then store: the dashboard sends both when a key is removed
+    # and a new one pasted in the same edit — the new key must survive.
     if req.clear_api_key:
         cur.pop("api_key", None)
-    elif req.api_key is not None and req.api_key.strip():
+    if req.api_key is not None and req.api_key.strip():
         cur["api_key"] = req.api_key.strip()
     if req.published is not None:
         cur["published"] = [e.model_dump(exclude_none=True) for e in req.published]
