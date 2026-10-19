@@ -320,6 +320,13 @@ MODEL_SAMPLING_DEFAULTS: dict[str, dict] = {
         "temp": 0.9,
         "top_p": 1.0,
     },
+    # Meta Muse-Spark-Open (muse_spark). generation_config.json: do_sample,
+    # temperature 1.0, top_p 1, top_k 64. No repetition penalty.
+    "muse-spark": {
+        "temp": 1.0,
+        "top_p": 1.0,
+        "top_k": 64,
+    },
 }
 
 

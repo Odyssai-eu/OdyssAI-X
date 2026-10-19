@@ -881,6 +881,9 @@ TENSOR_CAPABLE_MODEL_TYPES = frozenset({
     # hy_v4: no auto_parallel strategy — the module's own Model.shard() is the
     # tensor split, reached through sharded_load (see FORCE_NO_AP_MODEL_TYPES).
     "hy_v4",
+    # muse_spark (Meta Muse-Spark-Open, mlx-lm >= 0.32.2): same as hy_v4, the
+    # module's own shard() (16 KV heads, vocab 202048 -> 2 or 4 ranks).
+    "muse_spark",
 })
 
 # Model types whose pipeline path is a runner-side patch (patches/) rather than
@@ -912,6 +915,11 @@ FORCE_NO_AP_MODEL_TYPES = frozenset({
     # entrés, watchdog 300 s, pool à décharger) ; le pipeline natif tient
     # 4 requêtes d'affilée (10 tok/s, Argo 4 nœuds).
     "hy_v4",
+    # muse_spark (2026-10-19) : module mlx-lm 0.32.2 tel quel. get_inner_model
+    # ne voit pas ses couches (propriété en lecture seule vers
+    # language_model.layers) et son pipeline fusionne la norme du bloc suivant :
+    # seuls ses propres shard()/pipeline() via sharded_load sont valides.
+    "muse_spark",
 })
 
 # Model types that carry a vision_config but must NOT route to mlx_vlm.server.
@@ -928,7 +936,11 @@ FORCE_NO_AP_MODEL_TYPES = frozenset({
 # loads it text-only by construction — mlx_lm qwen4_exp.sanitize drops the
 # visual tower and remaps language_model.* — and pipeline_auto_parallel is
 # its ONLY multi-node path. mlx-vlm has no qwen4_exp support at all.
-TEXT_ONLY_DESPITE_VISION_CONFIG: frozenset = frozenset({"qwen4_exp"})
+#
+# muse_spark (Muse-Spark-Open, 2026-10-19): vision_config + audio_config, but
+# mlx-vlm has no muse_spark and the mlx-lm module serves the text tower (its
+# sanitize drops audio). Text runner, tensor via the module's own shard().
+TEXT_ONLY_DESPITE_VISION_CONFIG: frozenset = frozenset({"qwen4_exp", "muse_spark"})
 
 
 def _config_is_vision(cfg: dict) -> bool:
@@ -5499,6 +5511,10 @@ _THINK_MARKERS = {
     # Tencent Hy4-preview: <think:opensource>…</think:opensource>, the open tag
     # prefilled by the template (reasoning_effort high, its default).
     "hy4": ("<think:opensource>", "</think:opensource>"),
+    # Meta Muse-Spark-Open (harmony-like recipients, no <|channel|>): the model
+    # opens its own reasoning message `to=self<|message|>…<|eom|>`, then answers
+    # in `<|start|>assistant to=user<|message|>…` (stop on eos 200001/200008).
+    "muse-spark": ("to=self<|message|>", "<|eom|>"),
 }
 
 
@@ -5511,6 +5527,9 @@ _THINK_STRIP = {
     # end-message that the (open, close) pair doesn't consume.
     "inkling": ("<|message_model|>", "<|content_text|>",
                 "<|content_thinking|>", "<|end_message|>"),
+    # Muse-Spark answer envelope (longest first: replaced in order).
+    "muse-spark": ("<|start|>assistant to=user<|message|>", "to=user<|message|>",
+                   "<|start|>assistant", "<|message|>", "<|eom|>"),
 }
 
 
@@ -5551,6 +5570,9 @@ def _seed_in_think(model_id: Optional[str], enable_thinking) -> bool:
     # is on); seeding True would route the answer after `</think>`... into
     # reasoning and eat the literal open tag.
     if "mimo" in (model_id or "").lower():
+        return False
+    # Muse-Spark writes its own `to=self<|message|>` open; same rule as Inkling.
+    if "muse-spark" in (model_id or "").lower():
         return False
     return True
 
@@ -5620,7 +5642,13 @@ _MODELS_AUTO_OPEN_THINK = ("minimax", "qwen3.5", "qwen3.6", "step-3.7", "step3p7
                            # `<think:opensource>` ; le modèle émet le raisonnement +
                            # `</think:opensource>` en clair (vérifié 2026-10-05 sur
                            # Argo : tout dans `content`). Marqueurs : _THINK_MARKERS.
-                           "hy4")
+                           "hy4",
+                           # Muse-Spark-Open — le modèle ouvre lui-même son message de
+                           # raisonnement `to=self<|message|>` (vérifié 2026-10-19 en
+                           # pipeline : tout partait dans le texte). Marqueurs et
+                           # enveloppe : _THINK_MARKERS / _THINK_STRIP ; départ hors
+                           # bloc : _seed_in_think.
+                           "muse-spark")
 # Subset of _MODELS_AUTO_OPEN_THINK that IGNORES the `enable_thinking`
 # kwarg and always wraps reasoning in <think>...</think>. Per MiniMax M2
 # docs (2026-05-20 update): "The model's reasoning is wrapped in <think>
@@ -5662,7 +5690,10 @@ _MODELS_IGNORE_ENABLE_THINKING_FLAG = ("minimax-m2", "step-3.7", "step3p7",
                                        # Hy4-preview : pas d'enable_thinking dans le template
                                        # (reasoning_effort no_think/high seulement), il pense
                                        # donc quand même avec enable_thinking=false.
-                                       "hy4")
+                                       "hy4",
+                                       # Muse-Spark : reasoning_strength low/medium/high,
+                                       # pas d'enable_thinking ; il raisonne dans tous les modes.
+                                       "muse-spark")
 
 # Models whose chat template reads a `reasoning_effort` system directive
 # (OpenAI o-series convention: minimal/low/medium/high). Step-3.7-Flash is a
@@ -7786,7 +7817,7 @@ def _initial_default_config() -> Optional[dict]:
 #   major (1.7.2 → 2.0.0) — breaking API or topology change
 #
 # Use `./scripts/bump-version.sh patch|minor|major` to bump + auto-commit.
-APP_VERSION = "1.59.2"
+APP_VERSION = "1.60.0"
 
 app = FastAPI(
     title="OdyssAI-X (odyssai.eu)",
