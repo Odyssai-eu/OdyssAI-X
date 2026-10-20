@@ -320,13 +320,11 @@ MODEL_SAMPLING_DEFAULTS: dict[str, dict] = {
         "temp": 0.9,
         "top_p": 1.0,
     },
-    # Meta Muse-Spark-Open (muse_spark). generation_config.json: do_sample,
-    # temperature 1.0, top_p 1, top_k 64. No repetition penalty.
-    "muse-spark": {
-        "temp": 1.0,
-        "top_p": 1.0,
-        "top_k": 64,
-    },
+    # Muse-Spark-Open (muse_spark) deliberately has NO entry: with Meta's
+    # generation_config (temperature 1.0, top_k 64) the reasoning came out with
+    # dropped and swapped words on the Q6a8h16 tensor pool ("The is capital of
+    # Australia?"), while greedy gives the same clean, deterministic text as the
+    # Q8h16 reference (2026-10-20). The anti-loop detector guards greedy.
 }
 
 
