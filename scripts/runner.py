@@ -19,6 +19,7 @@ Stdout events (rank 0 only, one JSON per line):
 import hashlib
 import faulthandler
 import contextlib
+import html
 import json
 import os
 import pickle
@@ -1893,7 +1894,105 @@ def _xml_arg_value(raw: str, is_string: bool):
 
 # Openers of every format parse_tool_calls reads. `<tool_call` also covers
 # `<tool_calls>` and the Hy3 `<tool_call:opensource>` suffix.
-_TOOL_MARKUP_OPENERS = ("<tool_call", "<longcat_tool_call")
+_TOOL_MARKUP_OPENERS = ("<tool_call", "<longcat_tool_call", "<atem:function_calls")
+
+# ATEM (Muse-Spark-Open, `tool_parser_type: muse_spark`): a tool message is
+# `<|start|>assistant to=NAME<|message|><atem:function_calls><atem:invoke name="NAME">
+# <atem:parameter name="K">V</atem:parameter>…</atem:invoke></atem:function_calls>`.
+# Names are HTML-escaped attributes; a value is raw text, true/false/null or JSON
+# (the template's render_atem), decoded with JSON first and kept as text otherwise.
+_ATEM_BLOCK = re.compile(
+    r"(?:<\|start\|>assistant)?[ \t]*(?:to=[^\s<]+<\|message\|>)?\s*"
+    r"<atem:function_calls>(.*?)</atem:function_calls>(?:\s*<\|eom\|>)?",
+    re.DOTALL,
+)
+_ATEM_INVOKE = re.compile(r'<atem:invoke\b[^>]*?\bname="([^"]+)"[^>]*>(.*?)</atem:invoke>',
+                          re.DOTALL)
+_ATEM_PARAM = re.compile(r'<atem:parameter\b[^>]*?\bname="([^"]+)"[^>]*>(.*?)</atem:parameter>',
+                         re.DOTALL)
+
+
+class MuseRecipientRouter:
+    """Muse-Spark-Open's assistant turn is a run of messages
+    `<|start|>assistant to=RECIPIENT<|message|>BODY<|eom|>` (the template prefills
+    the first `<|start|>assistant`). RECIPIENT `self` is the reasoning, `user` and
+    `commentary` are text for the user, any other name is a tool whose BODY is an
+    ATEM block (tokenizer_config `response_template`). The API split only knew
+    `to=self` and `to=user`: the commentary and tool headers reached `content` as
+    ` to=commentary…`, ` to=list_dir<atem:…>` (Bench A, 2026-10-20).
+
+    `feed()` rewrites the stream before the markup gate: the `to=self<|message|>`
+    header stays (the API splits reasoning on it), every other header goes, so a
+    user or commentary body reads as content and a tool body meets the gate's
+    `<atem:function_calls` opener. A header split across chunks is held until it
+    is complete. Inactive for every other model."""
+
+    _HEAD = re.compile(r"(?:<\|start\|>assistant)?[ \t]*to=([^\s<]+)<\|message\|>")
+    _RECIPIENT_SO_FAR = re.compile(r"to=[^\s<]*(<.*)?", re.DOTALL)
+
+    @classmethod
+    def _partial(cls, s: str, lead: str) -> bool:
+        """`s` may still become `lead` + `to=NAME<|message|>`: hold it."""
+        if lead.startswith(s):
+            return True
+        if not s.startswith(lead):
+            return False
+        rest = s[len(lead):].lstrip(" \t")
+        if "to=".startswith(rest):
+            return True
+        m = cls._RECIPIENT_SO_FAR.fullmatch(rest)
+        return bool(m) and "<|message|>".startswith(m.group(1) or "")
+
+    def __init__(self, active: bool):
+        self.active = active
+        self.pending = ""
+        self.first = True   # the first message has no <|start|> (prefilled)
+
+    def _route(self, recipient: str) -> str:
+        return "to=self<|message|>" if recipient == "self" else ""
+
+    def feed(self, text: str) -> str:
+        if not self.active or not text:
+            return text
+        s, out = self.pending + text, []
+        self.pending = ""
+        while s:
+            if self.first:
+                m = self._HEAD.match(s)
+                if m:
+                    out.append(self._route(m.group(1)))
+                    s, self.first = s[m.end():], False
+                    continue
+                if self._partial(s, ""):
+                    self.pending = s
+                    break
+                self.first = False
+                continue
+            i = s.find("<|start|>")
+            if i < 0:
+                # the chunk may end inside a "<|start|>"
+                k = next((n for n in range(min(len(s), 8), 0, -1)
+                          if "<|start|>".startswith(s[-n:])), 0)
+                out.append(s[:len(s) - k])
+                self.pending = s[len(s) - k:]
+                break
+            out.append(s[:i])
+            s = s[i:]
+            m = self._HEAD.match(s)
+            if m:
+                out.append(self._route(m.group(1)))
+                s = s[m.end():]
+            elif self._partial(s, "<|start|>assistant"):
+                self.pending = s
+                break
+            else:
+                out.append("<|start|>")
+                s = s[len("<|start|>"):]
+        return "".join(out)
+
+    def flush(self) -> str:
+        out, self.pending = self.pending, ""
+        return out
 
 
 class ToolMarkupGate:
@@ -1986,6 +2085,7 @@ def parse_tool_calls(text: str, allowed_names: set[str] | None = None,
       - Hy3 XML: `<tool_call>NAME<tool_sep><arg_key>K</arg_key><arg_value>V</arg_value>…</tool_call>`
       - GLM XML: `<tool_call>NAME<arg_key>K</arg_key><arg_value>V</arg_value>…</tool_call>`
       - LongCat: `<longcat_tool_call>NAME<longcat_arg_key>K</longcat_arg_key><longcat_arg_value>V</longcat_arg_value>…</longcat_tool_call>`
+      - ATEM (Muse-Spark-Open): `<atem:function_calls><atem:invoke name="NAME"><atem:parameter name="K">V</atem:parameter>…</atem:invoke></atem:function_calls>`, with its `to=NAME<|message|>` header
 
     Returns (tool_calls, content_without_calls). Each call:
       `{"id": "call_xxx", "type": "function", "function": {"name", "arguments"}}`.
@@ -2087,6 +2187,22 @@ def parse_tool_calls(text: str, allowed_names: set[str] | None = None,
             args[key] = _xml_arg_value(raw, key in strs.get(name, ()))
         if add_call(name, args):
             cleaned = cleaned.replace(m.group(0), "")
+
+    # Pass 6: ATEM (Muse-Spark-Open). A block is a call only when every invoke
+    # in it names an offered tool; the block goes with its recipient header.
+    for m in _ATEM_BLOCK.finditer(text):
+        invokes = [(html.unescape(n), body) for n, body in _ATEM_INVOKE.findall(m.group(1))]
+        if not invokes or (allowed_names is not None
+                           and any(n not in allowed_names for n, _ in invokes)):
+            continue
+        for name, body in invokes:
+            args: dict = {}
+            for key, raw in _ATEM_PARAM.findall(body):
+                key = html.unescape(key)
+                is_string = key in strs.get(name, ())
+                args[key] = raw if is_string else _xml_arg_value(raw.strip(), False)
+            add_call(name, args)
+        cleaned = cleaned.replace(m.group(0), "")
 
     return calls, cleaned.strip()
 
@@ -2802,6 +2918,20 @@ def main() -> None:
 # optional speculative decoding when a draft_model is passed)
 # ──────────────────────────────────────────────────────────────────────────────
 _CTX_WINDOW_CACHE: dict = {}
+_MODEL_TYPE_CACHE: dict = {}
+
+
+def _model_type(repo: str) -> Optional[str]:
+    """model_type of the served checkpoint (config.json), read once."""
+    if repo not in _MODEL_TYPE_CACHE:
+        mt = None
+        try:
+            path = Path(repo) if Path(repo).exists() else hf_repo_to_path(repo)
+            mt = json.loads((Path(path) / "config.json").read_text()).get("model_type")
+        except Exception:
+            pass
+        _MODEL_TYPE_CACHE[repo] = mt
+    return _MODEL_TYPE_CACHE[repo]
 
 
 def _context_window(repo: str) -> Optional[int]:
@@ -3318,6 +3448,7 @@ def _run_legacy_main(model, tokenizer, repo: str, kv_q8_default: bool,
         # done event can tell the API layer which one it was.
         gen_finish: Optional[str] = None
         markup_gate = ToolMarkupGate(bool(tools))
+        muse_router = MuseRecipientRouter(_model_type(repo) == "muse_spark")
         for res in gen_iter:
             tok_id = getattr(res, "token", None)
             rf = getattr(res, "finish_reason", None)
@@ -3384,8 +3515,8 @@ def _run_legacy_main(model, tokenizer, repo: str, kv_q8_default: bool,
                     f"(prompt={_prompt_n} gen={ntoks} limit={context_limit})")
                 break
             if len(buf) >= emit_batch_n:
-                emit(rank, _gated_event(markup_gate, "".join(buf), req_id, ntoks,
-                                        len(prompt_tokens_full)))
+                emit(rank, _gated_event(markup_gate, muse_router.feed("".join(buf)),
+                                        req_id, ntoks, len(prompt_tokens_full)))
                 buf.clear()
             # Anti-loop: every N tokens, test the id stream for degenerate
             # repetition. Pure function of ids identical on every rank →
@@ -3411,8 +3542,8 @@ def _run_legacy_main(model, tokenizer, repo: str, kv_q8_default: bool,
                 break
             if stop_requested["flag"]:
                 break
-        _out = markup_gate.feed("".join(buf)) + markup_gate.release(
-            _offered_tool_names(tools))
+        _out = markup_gate.feed(muse_router.feed("".join(buf)) + muse_router.flush()) \
+            + markup_gate.release(_offered_tool_names(tools))
         if _out:
             emit(rank, {"event": "token", "id": req_id, "text": _out})
         try:
@@ -3629,8 +3760,8 @@ def _run_batched_main(model, tokenizer, repo: str, kv_q8_default: bool,
         if s is None:
             return
         # Drain remaining buffer, then what the markup gate held back
-        _out = s["gate"].feed("".join(s["buf"])) + s["gate"].release(
-            _offered_tool_names(s["tools"]))
+        _out = s["gate"].feed(s["router"].feed("".join(s["buf"])) + s["router"].flush()) \
+            + s["gate"].release(_offered_tool_names(s["tools"]))
         s["buf"].clear()
         if _out:
             emit(rank, {"event": "token", "id": s["req_id"], "text": _out})
@@ -3920,6 +4051,7 @@ def _run_batched_main(model, tokenizer, repo: str, kv_q8_default: bool,
                 "t_gen": time.time(),
                 "tools": tools,
                 "gate": ToolMarkupGate(bool(tools)),
+                "router": MuseRecipientRouter(_model_type(repo) == "muse_spark"),
                 "session_id": session_id,
                 "cache_label": cache_label,
                 "detok": tokenizer.detokenizer,  # new instance per slot
@@ -4063,7 +4195,7 @@ def _run_batched_main(model, tokenizer, repo: str, kv_q8_default: bool,
                         s["buf"].append(seg)
                         s["full_text_parts"].append(seg)
                         if len(s["buf"]) >= emit_batch_n:
-                            emit(rank, _gated_event(s["gate"], "".join(s["buf"]),
+                            emit(rank, _gated_event(s["gate"], s["router"].feed("".join(s["buf"])),
                                                     s["req_id"], s["ntoks"],
                                                     len(s["prompt_tokens_full"])))
                             s["buf"].clear()

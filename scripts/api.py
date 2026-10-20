@@ -6227,6 +6227,29 @@ def _model_ignores_enable_thinking_flag(model_id: Optional[str]) -> bool:
     return any(key in needle for key in _MODELS_IGNORE_ENABLE_THINKING_FLAG)
 
 
+# Templates with no tool_choice whose model calls a tool whenever tools are
+# rendered: tool_choice "none" is honoured by not rendering them. Muse-Spark-Open
+# (Bench A, 2026-10-20: a03/a06 called list_dir instead of writing the plan with
+# tool_choice "none"; 297/500 locally vs 479 via OpenRouter). Every other model
+# keeps its tools: Bench A sends them with "none" on purpose, GLM rambles
+# without them in its template.
+_MODELS_TOOLS_OFF_WHEN_NONE = ("muse-spark",)
+
+
+def _tool_choice_is_none(tool_choice) -> bool:
+    if isinstance(tool_choice, str):
+        return tool_choice == "none"
+    return isinstance(tool_choice, dict) and tool_choice.get("type") == "none"
+
+
+def _tools_for_template(model_id: Optional[str], tools, tool_choice):
+    """The tools a local pool renders into its chat template."""
+    if (tools and _tool_choice_is_none(tool_choice)
+            and any(k in (model_id or "").lower() for k in _MODELS_TOOLS_OFF_WHEN_NONE)):
+        return None
+    return tools
+
+
 def _should_filter_think(model_id: Optional[str], enable_thinking) -> bool:
     """Whether to split a <think> block off the wire into reasoning_content.
 
@@ -8287,7 +8310,7 @@ def _initial_default_config() -> Optional[dict]:
 #   major (1.7.2 → 2.0.0) — breaking API or topology change
 #
 # Use `./scripts/bump-version.sh patch|minor|major` to bump + auto-commit.
-APP_VERSION = "1.61.1"
+APP_VERSION = "1.61.2"
 
 app = FastAPI(
     title="OdyssAI-X (odyssai.eu)",
@@ -12196,7 +12219,9 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
                                         ignore_eos=bool(req.ignore_eos),
                                         mtp_on=req.mtp_on,
                                         clear_thinking=req.clear_thinking,
-                                        messages=messages, tools=req.tools,
+                                        messages=messages,
+                                        tools=_tools_for_template(model_id, req.tools,
+                                                                  req.tool_choice),
                                         session_id=session_id,
                                         request_id=completion_id,
                                         reasoning_effort=(req.reasoning_effort
@@ -12378,7 +12403,9 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
                                         ignore_eos=bool(req.ignore_eos),
                                         mtp_on=req.mtp_on,
                                         clear_thinking=req.clear_thinking,
-                                        messages=messages, tools=req.tools,
+                                        messages=messages,
+                                        tools=_tools_for_template(model_id, req.tools,
+                                                                  req.tool_choice),
                                         session_id=session_id,
                                         request_id=completion_id,
                                         reasoning_effort=(req.reasoning_effort
@@ -13173,7 +13200,9 @@ async def anthropic_messages(req: AnthropicMessagesRequest, request: Request):
         t_start = time.time()
         try:
             async for ev in pool.submit(None, req.max_tokens, _antc_thinking,
-                                        messages=oa_messages, tools=oa_tools,
+                                        messages=oa_messages,
+                                        tools=_tools_for_template(model_id, oa_tools,
+                                                                  req.tool_choice),
                                         session_id=session_id,
                                         request_id=msg_id,
                                         reasoning_effort=_antc_effort):
@@ -13272,7 +13301,9 @@ async def anthropic_messages(req: AnthropicMessagesRequest, request: Request):
             tool_calls_final: list[dict] = []
             _last_chunk_at = time.monotonic()  # #112: ping pacing
             async for ev in pool.submit(None, req.max_tokens, _antc_thinking,
-                                        messages=oa_messages, tools=oa_tools,
+                                        messages=oa_messages,
+                                        tools=_tools_for_template(model_id, oa_tools,
+                                                                  req.tool_choice),
                                         session_id=session_id,
                                         request_id=msg_id,
                                         reasoning_effort=_antc_effort):

@@ -134,6 +134,17 @@ async def main():
         check("anthropic: tool_use block still emitted", "content_block_start" in events
               and events.count("content_block_start") >= 2, True)
 
+        # tool_choice "none": Muse-Spark's template never sees the tools; other
+        # models keep them (Bench A sends them with "none" on purpose).
+        muse = "/Volumes/models/odysseus/odyssai/Muse-Spark-Open-816B-A42B-Q6a8h16"
+        check("muse: tool_choice none → no tools in the template",
+              api._tools_for_template(muse, TOOLS, "none"), None)
+        check("muse: anthropic {type: none} → no tools",
+              api._tools_for_template(muse, TOOLS, {"type": "none"}), None)
+        check("muse: tool_choice auto keeps the tools", api._tools_for_template(muse, TOOLS, "auto"), TOOLS)
+        check("glm: tool_choice none keeps the tools",
+              api._tools_for_template("/Volumes/models/odysseus/odyssai/GLM-5.3-Flash-Q8h16", TOOLS, "none"), TOOLS)
+
         # #136: /v1/messages without max_tokens → None to the runner, like OpenAI
         r = await c.post("/v1/messages", json={
             "model": "fake", "messages": [{"role": "user", "content": "bonjour"}]})
