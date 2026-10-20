@@ -98,6 +98,7 @@ class FakeNode:
     def __init__(self):
         self.live = set()
         self.calls = []
+        self.find_rc, self.find_out = 0, "1\n2048\n"     # partial files remain
 
     def ssh(self, target, cmd, timeout=12):
         self.calls.append(cmd)
@@ -114,7 +115,7 @@ class FakeNode:
             alive = any(ere_match(p, l) for l in self.live)
             return 0, ("ALIVE" if alive else "DEAD") + "\n1024\n", ""
         if cmd.startswith("find "):
-            return 0, "1\n2048\n", ""     # partial files remain
+            return self.find_rc, self.find_out, ""
         return 0, "", ""
 
 
@@ -219,8 +220,48 @@ async def main():
     api._downloads[ling_id]["status"] = "running"
     api._dl_save()
     check("frozen snapshot untouched", open(os.environ["ODYSSAI_X_DOWNLOADS_FILE"]).read(), before)
+    api._dl_persist_frozen = False
     for t in list(api._dl_tasks.values()):
         t.cancel()
+
+    # Verdict on a node that cannot be read (rebooting, volume not mounted):
+    # no label, the watcher asks again — unless it gives up.
+    slot = {"ssh": "admin@node", "status": "running", "local_dir": f"{MD}/{DS}",
+            "target": f"{MD}/{DS}", "bytes": 5}
+    for rc, out, label in [(255, "", "ssh down"), (0, "0\n", "volume not mounted")]:
+        node.find_rc, node.find_out = rc, out
+        check(f"verdict waits when {label}", (api._dl_slot_verdict(slot, 1000), slot["status"]),
+              (False, "running"))
+    check("verdict gives up when told to", (api._dl_slot_verdict(slot, 1000, give_up=True),
+                                              slot["status"]), (True, "failed"))
+    slot.update(status="running", error=None)
+    node.find_rc, node.find_out = 0, "0\n1\n"          # no .incomplete, 1 KiB on disk
+    check("readable and complete → completed", (api._dl_slot_verdict(slot, 1024), slot["status"]),
+          (True, "completed"))
+
+    # The launch command always takes hf's HTTP path (Xet does not resume).
+    seen = []
+
+    async def fake_exec(*argv, **kw):
+        seen.append(argv[-1])
+
+        class P:
+            returncode = 0
+
+            async def communicate(self):
+                return b"", b""
+        return P()
+    real_exec = api.asyncio.create_subprocess_exec
+    api.asyncio.create_subprocess_exec = fake_exec
+    try:
+        await api._hf_dl_one("x1", HOST, DS, "tok", {})
+    finally:
+        api.asyncio.create_subprocess_exec = real_exec
+    check("launch disables Xet", "HF_HUB_DISABLE_XET=1 HF_TOKEN=tok " in seen[0], True)
+    check("launched argv still matches the kill pattern",
+          ere_match(pat, f"{PY} {BIN} download {DS} --local-dir {MD}/{DS} --max-workers 4")
+          and f"{BIN.split('/Users/admin', 1)[1]} download {DS} --local-dir {MD}/{DS} --max-workers 4" in seen[0],
+          True)
 
 
 asyncio.run(main())

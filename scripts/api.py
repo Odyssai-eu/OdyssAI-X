@@ -1880,14 +1880,21 @@ async def _hf_dl_one(dl_id: str, host: dict, repo: str,
     slot["bytes"] = 0
     slot["started_at"] = time.time()
 
-    env_prefix = ""
+    # HF_HUB_DISABLE_XET=1 is what makes the resume real. With hf_xet installed
+    # (it is, in the node venv) huggingface_hub 1.16 hands Xet-backed repos to
+    # `xet_get`, which takes no resume offset and rewrites the `.incomplete`
+    # from byte 0; only the plain HTTP path (`http_get`) continues it with a
+    # Range request. 2026-10-20: a /retry of DeepSeek-V4.1-Flash-1017 on .29
+    # zeroed ~170 GiB of partials that way. Pause/resume/retry all rely on
+    # the partials surviving, so the downloader always takes the HTTP path.
+    env_prefix = "HF_HUB_DISABLE_XET=1 "
     if hf_token:
-        env_prefix = f"HF_TOKEN={shlex.quote(hf_token)} "
+        env_prefix += f"HF_TOKEN={shlex.quote(hf_token)} "
     include = ""
     if lay["include"]:
         include = f"--include {shlex.quote(lay['include'])} "
-    # `hf download` resumes partial files by default. 4 workers keeps the
-    # per-file resume granular even on multi-GB safetensors shards.
+    # `hf download` resumes partial files (HTTP path, see above). 4 workers
+    # keeps the per-file resume granular even on multi-GB safetensors shards.
     cmd = (
         f"mkdir -p {shlex.quote(local_dir)} && "
         f"{env_prefix}{HF_BIN_REMOTE} download {shlex.quote(repo_id)} "
@@ -2398,13 +2405,21 @@ def _dl_scan_host(h: dict) -> Optional[list[dict]]:
     return procs
 
 
-def _dl_slot_verdict(slot: dict, repo_bytes: Optional[int]) -> None:
+def _dl_slot_verdict(slot: dict, repo_bytes: Optional[int],
+                     give_up: bool = False) -> bool:
     """Label a slot whose `hf download` ended while no runner of ours held it
     (so there is no exit code). `completed` only when BOTH signs agree: no
     `.incomplete` partial left in the local-dir cache, and the bytes on disk
     reach the repo size. Anything else is `failed` with a message: /retry
     continues from the partial files (hf resumes natively) and is a quick no-op
-    if the files were in fact complete."""
+    if the files were in fact complete.
+
+    Returns False — slot untouched — when the disk cannot be read: ssh down,
+    or the models volume not mounted yet (no `du` output). That is a node
+    rebooting, not a verdict: on 2026-10-20 the 10:26 reboot of Argo was read
+    mid-shutdown and both downloads were labelled "node not readable", one of
+    them complete on disk. The caller asks again; only with `give_up` does an
+    unreadable node become `failed`."""
     local_dir = slot.get("local_dir") or slot.get("target") or ""
     cache = f"{local_dir}/.cache/huggingface/download"
     if slot.get("include"):
@@ -2415,11 +2430,14 @@ def _dl_slot_verdict(slot: dict, repo_bytes: Optional[int]) -> None:
         f"find {shlex.quote(cache)} -name '*.incomplete' 2>/dev/null | head -1 | wc -l; "
         f"du -sk {shlex.quote(tgt)} 2>/dev/null | cut -f1", 20)
     lines = (out or "").split()
-    slot["finished_at"] = time.time()
     if rc != 0 or len(lines) < 2:
+        if not give_up:
+            return False
+        slot["finished_at"] = time.time()
         slot["status"] = "failed"
         slot["error"] = "transfer ended while detached; node not readable — /retry resumes"
-        return
+        return True
+    slot["finished_at"] = time.time()
     incomplete = lines[0].strip() != "0"
     try:
         slot["bytes"] = int(lines[1]) * 1024
@@ -2434,6 +2452,12 @@ def _dl_slot_verdict(slot: dict, repo_bytes: Optional[int]) -> None:
         slot["error"] = ("hf download ended while the orchestrator was not attached "
                          f"({'partial files remain' if incomplete else 'size short of the repo'})"
                          " — /retry resumes from the partial files")
+    return True
+
+
+# How long a dead transfer's disk may stay unreadable (reboot, volume not yet
+# mounted) before the watcher stops waiting and labels the slot failed.
+_DL_VERDICT_GIVE_UP_S = 600
 
 
 async def _hf_dl_watch_one(dl_id: str, job: dict, slot: dict, gen: int) -> dict:
@@ -2444,6 +2468,7 @@ async def _hf_dl_watch_one(dl_id: str, job: dict, slot: dict, gen: int) -> dict:
     tgt = slot.get("target") or slot["local_dir"]
     probe = (f"pgrep -f -- {shlex.quote(pat)} >/dev/null && echo ALIVE || echo DEAD; "
              f"du -sk {shlex.quote(tgt)} 2>/dev/null | cut -f1")
+    unreadable_since: Optional[float] = None
     while True:
         if slot.get("status") != "running" or int(job.get("_gen") or 0) != gen:
             return slot                 # operator stop, or superseded
@@ -2456,8 +2481,14 @@ async def _hf_dl_watch_one(dl_id: str, job: dict, slot: dict, gen: int) -> dict:
             if words[0] == "DEAD":
                 if slot.get("status") != "running":
                     return slot
-                await asyncio.to_thread(_dl_slot_verdict, slot, job.get("repo_bytes"))
-                return slot
+                now = time.time()
+                unreadable_since = unreadable_since or now
+                give_up = now - unreadable_since >= _DL_VERDICT_GIVE_UP_S
+                if await asyncio.to_thread(_dl_slot_verdict, slot,
+                                           job.get("repo_bytes"), give_up):
+                    return slot
+            else:
+                unreadable_since = None
         job["bytes"] = sum(int(p.get("bytes") or 0) for p in job.get("per_target") or [])
         job["size"] = _human_bytes(job["bytes"])
         await asyncio.sleep(5)
@@ -8256,7 +8287,7 @@ def _initial_default_config() -> Optional[dict]:
 #   major (1.7.2 → 2.0.0) — breaking API or topology change
 #
 # Use `./scripts/bump-version.sh patch|minor|major` to bump + auto-commit.
-APP_VERSION = "1.61.0"
+APP_VERSION = "1.61.1"
 
 app = FastAPI(
     title="OdyssAI-X (odyssai.eu)",
