@@ -8380,7 +8380,12 @@ async function handleAct(e) {
   }
   if (act === "dl-cancel") {
     if (!confirm("Cancel this download?\n\nPartial files stay on the nodes — Retry continues from there.")) return;
-    try { await postJson(`/admin/downloads/${encodeURIComponent(el.dataset.id)}/cancel`, {}); toast("cancelled", "ok"); }
+    try {
+      const r = await postJson(`/admin/downloads/${encodeURIComponent(el.dataset.id)}/cancel`, {});
+      // remote_alive: nodes where the hf process could not be confirmed gone.
+      if (r.remote_alive && r.remote_alive.length) toast("cancelled, but hf may still run on " + r.remote_alive.join(", "), "err");
+      else toast("cancelled", "ok");
+    }
     catch (err) { toast("cancel failed: " + err.message, "err"); }
     await refreshAll(); return;
   }
