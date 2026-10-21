@@ -2,7 +2,7 @@
 # Install the OdyssAI-patched libjaccl.dylib (vendor/jaccl, see PATCHES.md) into
 # each node's mlx wheels — the text cluster venv and, when present, the mlx-vlm
 # venv (distributed vlm_runner.py) — replacing the stock one. Drop-in: same @rpath name, same
-# exported symbol set as the mlx 0.32.2 wheel (verified nm -gU equality on the
+# exported symbol set as the mlx 0.32.4 wheel (verified nm -gU equality on the
 # unpatched build), ad-hoc signed like the wheel's own dylibs.
 #
 # Usage:
@@ -10,7 +10,7 @@
 #   scripts/install-jaccl.sh --check <ssh-target>…     report only
 #   scripts/install-jaccl.sh --restore <ssh-target>…   put the stock dylib back
 #
-# Order on a fresh node: pip install -r requirements-node.txt (mlx==0.32.2) →
+# Order on a fresh node: pip install -r requirements-node.txt (mlx==0.32.4) →
 # install-model-modules.sh → install-jaccl.sh. A `pip install -U mlx` replaces
 # the dylib with the stock one: re-run this script after any wheel change.
 set -euo pipefail
@@ -38,27 +38,30 @@ for VENV in "${VENVS[@]}"; do
   fi
   VER="$(ssh "$NODE" "~/$VENV/bin/python -c 'import mlx.core as m;print(m.__version__)'" 2>/dev/null || echo '?')"
   SUM="$(ssh "$NODE" "shasum -a 256 '$REMOTE_LIB' | cut -c1-16")"
-  HAS_ORIG="$(ssh "$NODE" "[ -f '$REMOTE_LIB.orig' ] && echo yes || echo no")"
+  # The stock backup is per mlx version: a wheel upgrade replaces the dylib, and
+  # restoring a backup taken under another mlx would mix two JACCL builds.
+  ORIG="$REMOTE_LIB.orig-$VER"
+  HAS_ORIG="$(ssh "$NODE" "[ -f '$ORIG' ] && echo yes || echo no")"
   if [ "$VER" != "$WANT_MLX" ]; then echo "$TAG: mlx $VER != required $WANT_MLX — upgrade the wheel first"; rc=1; continue; fi
   case "$MODE" in
     check)
       if [ "$SUM" = "$LOCAL_SUM" ]; then echo "$TAG: patched (mlx $VER, orig backup: $HAS_ORIG)"; else echo "$TAG: STOCK or stale ($SUM, orig backup: $HAS_ORIG)"; rc=1; fi ;;
     restore)
-      if [ "$HAS_ORIG" = yes ]; then ssh "$NODE" "cp -p '$REMOTE_LIB.orig' '$REMOTE_LIB'" && echo "$TAG: stock dylib restored"; else echo "$TAG: no .orig backup, nothing to restore"; fi ;;
+      if [ "$HAS_ORIG" = yes ]; then ssh "$NODE" "cp -p '$ORIG' '$REMOTE_LIB'" && echo "$TAG: stock dylib restored"; else echo "$TAG: no $(basename "$ORIG") backup, nothing to restore"; fi ;;
     install)
       if [ "$SUM" = "$LOCAL_SUM" ]; then echo "$TAG: already patched"; continue; fi
-      [ "$HAS_ORIG" = yes ] || ssh "$NODE" "cp -p '$REMOTE_LIB' '$REMOTE_LIB.orig'"
+      [ "$HAS_ORIG" = yes ] || ssh "$NODE" "cp -p '$REMOTE_LIB' '$ORIG'"
       scp -q "$DYLIB" "$NODE:/tmp/libjaccl.dylib.new"
-      ssh "$NODE" "set -e; W='$REMOTE_LIB'; N=/tmp/libjaccl.dylib.new
+      ssh "$NODE" "set -e; W='$REMOTE_LIB'; O='$ORIG'; N=/tmp/libjaccl.dylib.new
         codesign -dv \$N 2>&1 | grep -q adhoc || codesign --force --sign - \$N
-        nm -gU \$W.orig | awk '{print \$3}' | sort > /tmp/sym_orig; nm -gU \$N | awk '{print \$3}' | sort > /tmp/sym_new
+        nm -gU \$O | awk '{print \$3}' | sort > /tmp/sym_orig; nm -gU \$N | awk '{print \$3}' | sort > /tmp/sym_new
         comm -13 /tmp/sym_new /tmp/sym_orig | grep -q . && { echo 'ABI: symbols missing vs stock:'; comm -13 /tmp/sym_new /tmp/sym_orig | c++filt | head; exit 3; }
         mv \$N \$W
         ~/$VENV/bin/python - <<'PY'
 import mlx.core as mx, os
 assert mx.distributed.is_available('jaccl'), 'jaccl not available after install'
 print('import ok', mx.__version__)
-PY" && echo "$TAG: patched dylib installed (mlx $VER)" || { echo "$TAG: INSTALL FAILED — restoring stock"; ssh "$NODE" "cp -p '$REMOTE_LIB.orig' '$REMOTE_LIB'"; rc=1; } ;;
+PY" && echo "$TAG: patched dylib installed (mlx $VER)" || { echo "$TAG: INSTALL FAILED — restoring stock"; ssh "$NODE" "cp -p '$ORIG' '$REMOTE_LIB'"; rc=1; } ;;
   esac
 done
 done

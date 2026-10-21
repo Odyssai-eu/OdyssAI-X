@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Build the OdyssAI-patched JACCL (vendor/jaccl, base MLX v0.32.2 + PATCHES.md)
-# as a drop-in libjaccl.dylib for the mlx 0.32.2 wheel.
+# Build the OdyssAI-patched JACCL (vendor/jaccl, base MLX v0.32.4 + PATCHES.md)
+# as a drop-in libjaccl.dylib for the mlx 0.32.4 wheel.
 #
 # The build runs on a cluster node (needs Xcode/CLT with the macOS 26.2+ SDK and
 # cmake — /opt/homebrew/bin/cmake on the Ultras); the resulting dylib is copied

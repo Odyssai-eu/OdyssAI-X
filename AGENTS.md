@@ -369,7 +369,7 @@ needs none of this.
 - Node provisioning from a checkout: `scripts/bootstrap-node.sh`, `install-model-modules.sh`,
   `install-jaccl.sh`, `build-jaccl.sh`, `install-mlx-vlm.sh`, `wired-limit/`,
   `rdma-onboard.sh`, `odyssai-network-setup.sh`, `discover-rdma-wiring.py`.
-- `vendor/jaccl/`: JACCL (MLX v0.32.2) and our patches (`PATCHES.md`, `UPSTREAM.md`);
+- `vendor/jaccl/`: JACCL (MLX v0.32.4) and our patches (`PATCHES.md`, `UPSTREAM.md`);
   `scripts/jaccl/`: libibverbs probes and the 2-rank smoke test behind section E.
 - `vendor/exo/`: licence and provenance of the files derived from exo (see `NOTICE`).
 - `scripts/topology.py`, `config/topology.example.yaml`: topology schema and template.

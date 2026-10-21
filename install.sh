@@ -35,7 +35,7 @@
 set -euo pipefail
 
 REPO="Odyssai-eu/OdyssAI-X"
-JACCL_TAG="jaccl-0.32.2-odyssai.1"
+JACCL_TAG="jaccl-0.32.4-odyssai.1"
 PY_VERSION="3.11"
 
 T0=$(date +%s)
@@ -208,11 +208,14 @@ main() {
       || die "cannot download $JACCL_TAG/libjaccl.dylib"
     [ "$(shasum -a 256 "$TMP/libjaccl.dylib" | cut -d' ' -f1)" = "$WANT" ] \
       || die "downloaded libjaccl.dylib does not match the manifest sha256: refusing it"
-    [ -f "$LIB.orig" ] || cp -p "$LIB" "$LIB.orig"
+    # Stock backup per mlx version: restoring one taken under another wheel would
+    # mix two JACCL builds.
+    local ORIG; ORIG="$LIB.orig-$("$PY" -c 'import importlib.metadata as m; print(m.version("mlx"))')"
+    [ -f "$ORIG" ] || cp -p "$LIB" "$ORIG"
     cp "$TMP/libjaccl.dylib" "$LIB.odx-new" && mv "$LIB.odx-new" "$LIB"
     rm -rf "$TMP"
     if ! "$PY" -c 'import mlx.core as mx; mx.distributed.is_available()' >/dev/null 2>&1; then
-      cp -p "$LIB.orig" "$LIB.odx-new" && mv "$LIB.odx-new" "$LIB"
+      cp -p "$ORIG" "$LIB.odx-new" && mv "$LIB.odx-new" "$LIB"
       die "mlx does not import with the patched JACCL: stock one restored"
     fi
     stage_changed

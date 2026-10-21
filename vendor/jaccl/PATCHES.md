@@ -1,4 +1,4 @@
-# OdyssAI patches on top of upstream JACCL (MLX v0.32.2)
+# OdyssAI patches on top of upstream JACCL (MLX v0.32.4)
 
 Every hunk is marked `OdyssAI patch (PATCHES.md #n)` in the source. Base and
 licence: see UPSTREAM.md. Rebuild with `scripts/build-jaccl.sh`, deploy with
@@ -6,9 +6,19 @@ licence: see UPSTREAM.md. Rebuild with `scripts/build-jaccl.sh`, deploy with
 libibverbs-only probes in `scripts/jaccl/` (`rdma_probe.c`, `rdma_pair.c`) on
 two M3 Ultras over Thunderbolt 5, macOS 26.6.1 (2026-09-18).
 
-## #0 — upstream cherry-pick: ring all_gather direction-1 mirror (MLX #4443, 2026-09-15)
-`jaccl/ring_impl.h`, 29 lines. The only JACCL commit after v0.32.2 at the time
-of vendoring.
+## #0 — dropped: ring all_gather direction-1 mirror (MLX #4443) is upstream
+The 29-line cherry-pick carried on v0.32.2 is part of v0.32.4, so the rebase
+(2026-10-20) took upstream's version unchanged.
+
+## Rebase onto v0.32.4 (2026-10-20)
+v0.32.4 adds a second cable per mesh peer (MLX #4607): `MeshGroup` now owns one
+`MeshImpl` per wire and runs them through `dispatch_wires` (the ring's thread
+pool, moved to `threadpool.h`). #1 follows that change: every per-wire
+`MeshImpl` gets the same `liveness_fds()` (the guard only polls and peeks, so
+concurrent wires sharing the fds are safe, as on the ring). The only conflict
+of the three-way merge (base v0.32.2, ours, theirs v0.32.4) was that
+constructor call in `mesh.cpp`. The patched build exports every symbol of the
+mlx 0.32.4 wheel's stock `libjaccl.dylib` (`nm -gU`), plus #1's own.
 
 ## #1 — peer death is visible: side-channel liveness + progress timeout (MLX #4278)
 Files: `rdma.h`, `rdma.cpp`, `jaccl.cpp`, `mesh_impl.h`, `ring_impl.h`, `mesh.cpp`, `ring.cpp`.

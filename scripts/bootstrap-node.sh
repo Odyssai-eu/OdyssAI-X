@@ -35,7 +35,7 @@
 #     either an absolute path (`/Volumes/...`) or a shell-quoted string
 #     like '$HOME/mlx-models' that expands on the remote.
 #   - Python versions on the node are pinned via requirements-node.txt
-#     in the repo root (currently mlx==0.31.2, mlx-lm==0.31.3).
+#     in the repo root (currently mlx==0.32.4, mlx-lm==0.32.2).
 #
 # Prerequisites on the node:
 #   - macOS with Apple Silicon (M-series)

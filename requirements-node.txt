@@ -8,8 +8,12 @@
 # this repo. If you bump these, re-run bench + at least one multi-node
 # load on a 100B+ MoE before merging.
 
-mlx==0.32.2
-mlx-lm==0.31.3
+# mlx-lm 0.32.2 needs mlx >= 0.32.3 although its pyproject says >= 0.32.2:
+# switch_layers passes `global_scale=` to mx.gather_qmm, which arrived in 0.32.3,
+# so with 0.32.2 every quantized MoE dies on its first token.
+mlx==0.32.4
+mlx-metal==0.32.4
+mlx-lm==0.32.2
 
 # Tokenizer support for the Kimi family (K2, Kimi-Linear, K3): their
 # tokenizer is tiktoken-based custom code. Without these the model load
