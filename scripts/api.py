@@ -884,7 +884,40 @@ TENSOR_CAPABLE_MODEL_TYPES = frozenset({
     # muse_spark (Meta Muse-Spark-Open, mlx-lm >= 0.32.2): same as hy_v4, the
     # module's own shard() (16 KV heads, vocab 202048 -> 2 or 4 ranks).
     "muse_spark",
+    # bailing_moe_v3 (Ling-3.1, 2026-10-21): the module's own shard() from the
+    # mlx-lm overlay (KDA + MLA split by head, 64 -> 16; MoE on the intermediate
+    # dim). Keyed on the mlx-lm MODULE, not the config model_type: Ling-3.1 says
+    # bailing_hybrid like Ring-2.5 / Ling-2.6, which have no shard().
+    "bailing_moe_v3",
 })
+
+# Mirror of mlx_lm.utils.MODEL_ARCHITECTURE_REMAPPING (mlx-lm 0.32.2): a
+# (model_type, architecture) pair that mlx-lm loads with another module than the
+# one model_type names. Only this table is mirrored, not MODEL_REMAPPING, so
+# every other model keeps its config model_type as module type.
+MLX_ARCHITECTURE_REMAPPING = {
+    ("bailing_hybrid", "BailingMoeV3ForCausalLM"): "bailing_moe_v3",
+}
+
+
+def _mlx_module_type(cfg: dict) -> Optional[str]:
+    """The mlx-lm module that will load this config (see
+    MLX_ARCHITECTURE_REMAPPING), else the config model_type."""
+    model_type = cfg.get("model_type")
+    architectures = cfg.get("architectures") or ()
+    if isinstance(architectures, str):
+        architectures = (architectures,)
+    for architecture in architectures:
+        remapped = MLX_ARCHITECTURE_REMAPPING.get((model_type, architecture))
+        if remapped is not None:
+            return remapped
+    return model_type
+
+
+# Module types with no multi-node pipeline path: no pipeline() of their own and
+# no auto_parallel reindex. bailing_moe_v3 picks its masks from layers at GLOBAL
+# indices (linear_index 0, attention_index 7), which a layer slice breaks.
+NO_PIPELINE_MODEL_TYPES = frozenset({"bailing_moe_v3"})
 
 # Model types whose pipeline path is a runner-side patch (patches/) rather than
 # mlx-lm auto_parallel. auto_parallel (use_ap=True) would (a) read the wrong
@@ -920,6 +953,9 @@ FORCE_NO_AP_MODEL_TYPES = frozenset({
     # language_model.layers) et son pipeline fusionne la norme du bloc suivant :
     # seuls ses propres shard()/pipeline() via sharded_load sont valides.
     "muse_spark",
+    # bailing_moe_v3 (Ling-3.1, 2026-10-21) : pas de stratégie auto_parallel,
+    # le tensoriel est le shard() du module via sharded_load.
+    "bailing_moe_v3",
 })
 
 # Model types that carry a vision_config but must NOT route to mlx_vlm.server.
@@ -1050,7 +1086,7 @@ async def get_model_arch_meta(ssh: str, abspath: str) -> dict:
     Used to decide mode validity (tensor vs pipeline) WITHOUT loading the model.
     Cascades into text_config/language_model like runner.py does for the
     multimodal nests."""
-    miss = {"model_type": None, "num_hidden_layers": None,
+    miss = {"model_type": None, "module_type": None, "num_hidden_layers": None,
             "num_key_value_heads": None, "is_vision": False}
     cmd = f"cat {shlex.quote(abspath.rstrip('/') + '/config.json')} 2>/dev/null"
     try:
@@ -1078,6 +1114,8 @@ async def get_model_arch_meta(ssh: str, abspath: str) -> dict:
     is_vision = _config_is_vision(cfg)
     return {
         "model_type": cfg.get("model_type"),
+        # What the tensor / pipeline gates key on: the mlx-lm module that loads it.
+        "module_type": _mlx_module_type(cfg),
         "num_hidden_layers": _nested("num_hidden_layers"),
         "num_key_value_heads": _nested("num_key_value_heads"),
         "is_vision": is_vision,
@@ -1095,15 +1133,21 @@ def _validate_load_mode(model_type, num_layers, num_kv_heads,
     """Is (mode, nodes_count) valid for this model's ARCHITECTURE? Independent
     of RAM — that's `_validate_load_fits`. Single-node is always mode-valid.
 
-      - pipeline : needs num_hidden_layers >= nodes_count (one stage per node).
-      - tensor   : needs the model_type to have a ShardingStrategy AND
+      - pipeline : needs a pipeline path (not in NO_PIPELINE_MODEL_TYPES) and
+                   num_hidden_layers >= nodes_count (one stage per node).
+      - tensor   : needs the module type to have a tensor split AND
                    num_key_value_heads divisible by nodes_count.
+
+    `model_type` is the mlx-lm module type (arch["module_type"]), which differs
+    from the config model_type only for MLX_ARCHITECTURE_REMAPPING pairs.
 
     Unknown metadata degrades to permissive (returns ok) so a config we can't
     read never hard-blocks a load — the runtime remains the final arbiter."""
     if nodes_count <= 1:
         return True, ""
     if mode == "pipeline":
+        if model_type in NO_PIPELINE_MODEL_TYPES:
+            return False, f"{model_type} n'a pas de chemin pipeline (tensor only)"
         if num_layers and num_layers < nodes_count:
             return False, f"pipeline impossible : {num_layers} layers < {nodes_count} nodes"
         return True, ""
@@ -8310,7 +8354,7 @@ def _initial_default_config() -> Optional[dict]:
 #   major (1.7.2 → 2.0.0) — breaking API or topology change
 #
 # Use `./scripts/bump-version.sh patch|minor|major` to bump + auto-commit.
-APP_VERSION = "1.61.2"
+APP_VERSION = "1.62.0"
 
 app = FastAPI(
     title="OdyssAI-X (odyssai.eu)",
@@ -16380,6 +16424,7 @@ async def admin_cluster_load_options(cluster_id: str, model: str):
     arch = await get_model_arch_meta(rank0_ssh, model_abspath)
     size_bytes = await get_model_size_bytes(rank0_ssh, model_abspath)
     mt = arch.get("model_type")
+    module_type = arch.get("module_type") or mt
     layers = arch.get("num_hidden_layers")
     kv = arch.get("num_key_value_heads")
     # Native-MTP availability: sidecar at the canonical auto-discovery path AND
@@ -16400,7 +16445,7 @@ async def admin_cluster_load_options(cluster_id: str, model: str):
                 arch=arch)
             # solo reuses the pipeline arch-validity (always ok for n==1).
             mode_ok, mode_reason = _validate_load_mode(
-                mt, layers, kv, n, "pipeline" if mode == "solo" else mode)
+                module_type, layers, kv, n, "pipeline" if mode == "solo" else mode)
             fits = bool(fit_ok and mode_ok)
             reason = mode_reason or ("" if fit_ok else fit_reason)
             options.append({
@@ -16417,11 +16462,13 @@ async def admin_cluster_load_options(cluster_id: str, model: str):
         "model_meta": {
             "model": model,
             "model_type": mt,
+            "module_type": module_type,
             "num_hidden_layers": layers,
             "num_key_value_heads": kv,
             "size_bytes": size_bytes,
             "size_gb": round(size_bytes / 1024**3, 1) if size_bytes else None,
-            "tensor_capable": (mt in TENSOR_CAPABLE_MODEL_TYPES) if mt else None,
+            "tensor_capable": (
+                (module_type in TENSOR_CAPABLE_MODEL_TYPES) if module_type else None),
             "mtp_sidecar_present": mtp_sidecar,
             "mtp_family_supported": mtp_family,
             "mtp_available": bool(mtp_sidecar and mtp_family),
@@ -17303,8 +17350,9 @@ async def admin_cluster_load(cluster_id: str, req: ArgoLoadRequest):
             ),
         }
 
+    module_type = arch.get("module_type") or arch.get("model_type")
     mode_ok, mode_reason = _validate_load_mode(
-        arch.get("model_type"), arch.get("num_hidden_layers"),
+        module_type, arch.get("num_hidden_layers"),
         arch.get("num_key_value_heads"), nodes_count, req.mode,
     )
     if not mode_ok and not getattr(req, "force", False):
@@ -17320,9 +17368,9 @@ async def admin_cluster_load(cluster_id: str, req: ArgoLoadRequest):
     # (longcat2 — see FORCE_NO_AP_MODEL_TYPES). The dashboard defaults use_ap
     # to True, which routes to auto_parallel: it reads `num_hidden_layers`
     # (longcat2 has `num_layers`) and skips our ngram-dropping pipeline() patch.
-    if req.use_ap and arch.get("model_type") in FORCE_NO_AP_MODEL_TYPES:
+    if req.use_ap and module_type in FORCE_NO_AP_MODEL_TYPES:
         sys.stderr.write(
-            f"[load] {cluster_id}: model_type={arch.get('model_type')} requires "
+            f"[load] {cluster_id}: model_type={module_type} requires "
             f"the runner-side pipeline patch — forcing use_ap=False "
             f"(auto_parallel would die on num_hidden_layers / skip the patch)\n"
         )
@@ -17330,9 +17378,9 @@ async def admin_cluster_load(cluster_id: str, req: ArgoLoadRequest):
 
     # Symmetric guard — see FORCE_AP_MODEL_TYPES. glm_moe_dsa's ap=False path
     # dies on shared-layer indexer params missing from the weight index.
-    if not req.use_ap and arch.get("model_type") in FORCE_AP_MODEL_TYPES:
+    if not req.use_ap and module_type in FORCE_AP_MODEL_TYPES:
         sys.stderr.write(
-            f"[load] {cluster_id}: model_type={arch.get('model_type')} only "
+            f"[load] {cluster_id}: model_type={module_type} only "
             f"loads via auto_parallel — forcing use_ap=True\n"
         )
         req.use_ap = True
