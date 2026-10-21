@@ -6147,7 +6147,14 @@ _MODELS_AUTO_OPEN_THINK = ("minimax", "qwen3.5", "qwen3.6", "step-3.7", "step3p7
                            # pipeline : tout partait dans le texte). Marqueurs et
                            # enveloppe : _THINK_MARKERS / _THINK_STRIP ; départ hors
                            # bloc : _seed_in_think.
-                           "muse-spark")
+                           "muse-spark",
+                           # Ling-3.1-flash (bailing_moe_v3) — le template termine le
+                           # prompt par `<role>ASSISTANT</role>\n<think>` en thinking-ON
+                           # (défaut), le modèle émet le raisonnement + `</think>` en
+                           # clair (vérifié 2026-10-21 sur Argo : tout dans `content`).
+                           # Thinking-off → `<think></think>` fermé, honoré → PAS dans
+                           # _MODELS_IGNORE_*. Alias avec points OU tirets.
+                           "ling-3.1", "ling-3-1")
 # Subset of _MODELS_AUTO_OPEN_THINK that IGNORES the `enable_thinking`
 # kwarg and always wraps reasoning in <think>...</think>. Per MiniMax M2
 # docs (2026-05-20 update): "The model's reasoning is wrapped in <think>

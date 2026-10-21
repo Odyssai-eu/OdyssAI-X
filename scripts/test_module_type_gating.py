@@ -4,7 +4,8 @@
 Ling-3.1-flash says model_type bailing_hybrid like Ring-2.5 / Ling-2.6, but
 mlx-lm loads it with bailing_moe_v3 (architecture BailingMoeV3ForCausalLM),
 whose overlay shard() splits it 4 ways. Ring-2.5 stays on bailing_hybrid, which
-has no shard(). bailing_moe_v3 has no pipeline path. No node is reached.
+has no shard(). bailing_moe_v3 has no pipeline path. Ling-3.1's reasoning
+is split off like the other auto-open-think models. No node is reached.
 
     .venv/bin/python scripts/test_module_type_gating.py
 """
@@ -75,6 +76,14 @@ check("Ring-2.5 tensor refused", mode(ring, 4, "tensor"), False)
 check("Ring-2.5 pipeline allowed", mode(ring, 4, "pipeline"), True)
 check("bailing_moe_v3 forces use_ap=False", "bailing_moe_v3" in api.FORCE_NO_AP_MODEL_TYPES, True)
 check("bailing_hybrid not tensor-capable", "bailing_hybrid" in api.TENSOR_CAPABLE_MODEL_TYPES, False)
+
+# Ling-3.1's template opens <think> in the prompt when thinking is on (the
+# default) and closes it empty when off: filter + seed in the block, unless off.
+for model_id in ("ling-3-1-flash", "odyssai/Ling-3.1-flash-Q8h16-gs32"):
+    check(f"{model_id}: thinking on -> filtered", api._should_filter_think(model_id, True), True)
+    check(f"{model_id}: default -> filtered", api._should_filter_think(model_id, None), True)
+    check(f"{model_id}: thinking off -> not filtered", api._should_filter_think(model_id, False), False)
+    check(f"{model_id}: starts inside the block", api._seed_in_think(model_id, True), True)
 
 print(f"\n{'ALL OK' if not FAILS else f'{len(FAILS)} FAIL'}")
 sys.exit(1 if FAILS else 0)
