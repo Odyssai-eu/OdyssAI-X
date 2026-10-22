@@ -1518,8 +1518,9 @@ _OLD_STOP_TIMEOUT_S = 150.0
 # 256 GB node and macOS killed 344 processes to make room — on three nodes, and
 # again at every watchdog retry. Checkpoint SIZE does not predict this: MiniMax
 # M2.7 is 173 GiB on disk and serves fine at 173 GB RSS, DeepSeek V4 is 146 GiB
-# and blows to 271 GB. So the guard is on the MEASURED RSS, sampled by the load
-# poller that already SSHes every node every 3 s. Ceiling = the node's
+# and blows to 271 GB. So the guard is on the MEASURED memory, sampled by the load
+# poller that already SSHes every node every 3 s — the physical footprint since
+# 2026-10-22 (RSS no longer counts MLX's Metal buffers, see _runner_footprint_cmd). Ceiling = the node's
 # iogpu.wired_limit_mb (the Metal pin ceiling it is configured with, 200 GiB on
 # a 256 GB Studio, 460 GiB on ultra-512), else a fraction of its RAM. Breach =>
 # kill that node's runner for THIS model, before the OS starts jettisoning
@@ -1663,6 +1664,22 @@ def _kill_model_runner_on_host(ssh: str, model: str) -> None:
         sys.stderr.write(f"[load-guard] pkill on {ssh} failed: {e}\n")
 
 
+def _runner_footprint_cmd(match: str) -> str:
+    """Shell command summing the physical footprint, in bytes, of every process
+    whose command line matches `match`.
+
+    Physical footprint, not RSS: MLX keeps the weights in Metal buffers, which
+    `footprint` reports as "IOAccelerator (graphics)" and RSS does not count.
+    A loaded Muse rank (2026-10-22): RSS 8.1 GiB, footprint 171 GiB. On RSS the
+    load poller saw a few GB that stopped growing, froze the progress bar and
+    flagged a healthy load as STALLED. The footprint also leaves out clean,
+    reclaimable file pages, which is what the capacity guard needs."""
+    return (f"for p in $(pgrep -f {shlex.quote(match)}); do "
+            "footprint -f bytes --noCategories -p $p 2>/dev/null; done "
+            "| sed -n 's/.*Footprint: \\([0-9][0-9]*\\) B.*/\\1/p' "
+            "| awk '{s+=$1} END{printf \"%.0f\\n\", s}'")
+
+
 async def _poll_load_progress(cluster_id: str, state: dict,
                               ssh_targets: list, total_bytes: int,
                               ceilings: Optional[list] = None,
@@ -1672,17 +1689,15 @@ async def _poll_load_progress(cluster_id: str, state: dict,
     (bytes materialized) so the UI shows TRUE progress + throughput + ETA +
     stall detection instead of a frozen elapsed/estimated 95 %. Self-terminates
     when the load's in_progress flag clears (set by _end_loading)."""
-    match = RUNNER_MATCH_PATTERN
-    cmd = (f"ps -Ao rss,command | grep {shlex.quote(match)} "
-           "| grep -v grep | awk '{s+=$1} END{print s+0}'")
+    cmd = _runner_footprint_cmd(RUNNER_MATCH_PATTERN)
 
-    async def _rss(ssh: str) -> int:
+    async def _footprint(ssh: str) -> int:
         try:
             out = await asyncio.to_thread(
                 subprocess.run,
                 ["ssh", "-o", "ConnectTimeout=4", "-o", "BatchMode=yes", ssh, cmd],
                 capture_output=True, text=True, timeout=8)
-            return int((out.stdout or "0").strip() or 0) * 1024   # KB → B
+            return int((out.stdout or "0").strip() or 0)
         except Exception:
             return 0
 
@@ -1691,7 +1706,7 @@ async def _poll_load_progress(cluster_id: str, state: dict,
     await asyncio.sleep(2)
     try:
         while state.get("in_progress"):
-            per_rank = list(await asyncio.gather(*[_rss(s) for s in ssh_targets]))
+            per_rank = list(await asyncio.gather(*[_footprint(s) for s in ssh_targets]))
             loaded = sum(per_rank)
             now = time.time()
             dt = max(now - last_t, 0.1)
@@ -1708,7 +1723,7 @@ async def _poll_load_progress(cluster_id: str, state: dict,
             # daemons with it. Stop it ourselves and record why, so the load
             # fails with a cause instead of "1 rank(s) died during load".
             if LOAD_RSS_GUARD and ceilings and model:
-                # NB: not `_rss` as the loop var — that name is the RSS
+                # NB: not `_footprint` as the loop var — that name is the
                 # probe closure above, and rebinding it here breaks the NEXT
                 # tick ("'int' object is not callable", caught by the smoke).
                 for _i, _used in enumerate(per_rank):
