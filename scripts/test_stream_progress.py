@@ -134,6 +134,23 @@ async def main():
         check("anthropic: tool_use block still emitted", "content_block_start" in events
               and events.count("content_block_start") >= 2, True)
 
+        # A second VL pool on a node: the default port is held by our gemma pool,
+        # the next free one is taken (skipping our other pools and any listener).
+        class P:
+            def __init__(self, ssh, port): self.ssh_target, self.port = ssh, port
+        _lap, _pl = api.list_all_pools, api._port_listening
+        api.list_all_pools = lambda: [("fith", "gemma", P("admin@192.168.86.33", 8080)),
+                                      ("fith", "other", P("admin@192.168.86.33", 8082)),
+                                      ("x", "y", P("admin@192.168.86.49", 8083))]
+        async def listening(ip, port, timeout=1.5): return port == 8081
+        api._port_listening = listening
+        check("vlm port: owner of 8080 on .33 is fith/gemma",
+              api._pool_on_node_port("admin@192.168.86.33", 8080), ("fith", "gemma"))
+        check("vlm port: nobody owns 8080 on .49", api._pool_on_node_port("admin@192.168.86.49", 8080), None)
+        check("vlm port: skips a listener (8081) and our pool (8082) → 8083",
+              await api._free_vlm_port("192.168.86.33", "admin@192.168.86.33", 8081), 8083)
+        api.list_all_pools, api._port_listening = _lap, _pl
+
         # tool_choice "none": Muse-Spark's template never sees the tools; other
         # models keep them (Bench A sends them with "none" on purpose).
         muse = "/Volumes/models/odysseus/odyssai/Muse-Spark-Open-816B-A42B-Q6a8h16"

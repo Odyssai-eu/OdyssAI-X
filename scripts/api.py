@@ -8361,7 +8361,7 @@ def _initial_default_config() -> Optional[dict]:
 #   major (1.7.2 → 2.0.0) — breaking API or topology change
 #
 # Use `./scripts/bump-version.sh patch|minor|major` to bump + auto-commit.
-APP_VERSION = "1.62.0"
+APP_VERSION = "1.62.1"
 
 app = FastAPI(
     title="OdyssAI-X (odyssai.eu)",
@@ -17285,20 +17285,30 @@ async def admin_cluster_load(cluster_id: str, req: ArgoLoadRequest):
         vlm_topo = build_topology_from_indices(cluster_id, [vlm_index])
         vlm_ssh = vlm_topo[0]["ssh"]
         vlm_host = vlm_topo[0].get("host") or _host_id_from_ssh(vlm_ssh)
-        vlm_port = int(getattr(req, "vlm_port", None) or VLM_DEFAULT_PORT)
+        explicit_port = getattr(req, "vlm_port", None)
+        vlm_port = int(explicit_port or VLM_DEFAULT_PORT)
         vlm_model_path = _vlm_resolve_model_path(req.model, base_dir)
         vlm_ip = _vlm_ip_from_ssh(vlm_ssh)
-        vlm_upstream = f"http://{vlm_ip}:{vlm_port}"
         log_id = _vlm_pool_log_id(cluster_id, alias)
-        # If a server is already serving on this port (zombie / duplicate),
-        # surface it rather than launching a second one that fights for the port.
+        # A server already on this port: when it is another pool of ours on the
+        # same node (a second VL pool next to gemma on .33, 2026-10-22) and the
+        # client named no port, take the next free one. A server no pool owns
+        # (zombie / duplicate) or an explicit port stays a 409.
         if await _vlm_probe_ready(vlm_ip, vlm_port) is True:
-            raise HTTPException(
-                409,
-                f"{vlm_ip}:{vlm_port} already serving a model — unload the VL "
-                f"pool first (POST /admin/clusters/{cluster_id}/unload"
-                f"?alias={alias}) or pick another port",
-            )
+            owner = _pool_on_node_port(vlm_ssh, vlm_port)
+            free = (await _free_vlm_port(vlm_ip, vlm_ssh, vlm_port + 1)
+                    if owner and not explicit_port else None)
+            if free is None:
+                raise HTTPException(
+                    409,
+                    f"{vlm_ip}:{vlm_port} already serving a model — unload the VL "
+                    f"pool first (POST /admin/clusters/{cluster_id}/unload"
+                    f"?alias={alias}) or pick another port",
+                )
+            sys.stderr.write(f"[vlm] {cluster_id}/{alias}: port {vlm_port} held by pool "
+                             f"{owner[0]}/{owner[1]} on {vlm_ip} → serving on {free}\n")
+            vlm_port = free
+        vlm_upstream = f"http://{vlm_ip}:{vlm_port}"
         # Populate the SAME loading-progress state the text path uses (2026-07-08
         # fix): without this, /status never reports `.loading` for a VLM load —
         # the dashboard shows nothing for the ~60-90s the server takes to come
@@ -19313,6 +19323,36 @@ def _vlm_kill_cmd(port: int, model_path: str) -> str:
         f"  else echo 'cleaned (SIGTERM)'; fi; "
         f"else echo 'no process'; fi"
     )
+
+
+def _pool_on_node_port(ssh_target: str, port: int) -> Optional[tuple[str, str]]:
+    """(cluster, alias) of the pool of ours serving `port` on this node."""
+    for cid, alias, pool in list_all_pools():
+        if (getattr(pool, "ssh_target", None) == ssh_target
+                and getattr(pool, "port", None) and int(pool.port) == int(port)):
+            return cid, alias
+    return None
+
+
+async def _port_listening(ip: str, port: int, timeout: float = 1.5) -> bool:
+    try:
+        _r, w = await asyncio.wait_for(asyncio.open_connection(ip, port), timeout)
+        w.close()
+        return True
+    except Exception:
+        return False
+
+
+async def _free_vlm_port(ip: str, ssh_target: str, start: int,
+                         span: int = 20) -> Optional[int]:
+    """First port from `start` that no pool of ours uses on this node and that
+    nothing listens on, so a second VL pool gets its own mlx_vlm.server."""
+    used = {int(p.port) for _c, _a, p in list_all_pools()
+            if getattr(p, "ssh_target", None) == ssh_target and getattr(p, "port", None)}
+    for port in range(start, start + span):
+        if port not in used and not await _port_listening(ip, port):
+            return port
+    return None
 
 
 async def _vlm_probe_ready(ip: str, port: int, timeout: float = 5.0) -> Optional[bool]:
