@@ -23,7 +23,6 @@ from .bailing_hybrid_alias import apply_bailing_hybrid
 from .g9v3_alias import apply_g9v3
 from .minimax_m3_alias import apply_minimax_m3
 from .mimo_v2_alias import apply_mimo_v2_alias
-from .opt_batch_gen import apply_batch_gen_patch
 from .pipeline_split_coverage import apply_pipeline_split_fix
 from .standard_yarn_rope import patch_yarn_rope
 
@@ -61,7 +60,16 @@ def apply_mlx_patches() -> None:
     # tout patch qui redefinit pipeline() pour un modele donne.
     apply_pipeline_split_fix()
     patch_yarn_rope()
-    apply_batch_gen_patch()
+    # opt_batch_gen (exo's GenerationBatch._step with top-k logprobs) is GONE
+    # (2026-10-23). Nothing in OdyssAI-X ever read its top-k buffers, and its
+    # April-2026 mirror of _step stored `_next_logprobs` as an mx.array where
+    # mlx-lm 0.32.x keeps a list: upstream GenerationBatch.extend then died
+    # with 'array' object has no attribute 'extend' on every second batched
+    # request. The runner's own shim over `extend` hid that for five months
+    # until mlx-lm#1830 renamed the attributes the shim touched and every
+    # batched request failed (amigos / Qwen3-Coder-Next, 0 toks). mlx-lm's
+    # BatchGenerator now runs unpatched; scripts/test_batch_generation_extend.py
+    # asserts `_step` and `extend` are upstream's.
     apply_mimo_v2_alias()
     apply_bailing_hybrid()
     apply_minimax_m3()

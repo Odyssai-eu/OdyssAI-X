@@ -17,7 +17,7 @@ OdyssAI-X (see `LICENSE` and `NOTICE` at the repository root).
 | File in this repo | Upstream path | Upstream commit | Relation |
 |---|---|---|---|
 | `scripts/auto_parallel.py` | `src/exo/worker/engines/mlx/auto_parallel.py` | `f0d1371d89a7f899e96977014cce7307a53682f2` (2026-04-28) | upstream file nearly verbatim (~84% of our non-blank lines are exo's), OdyssAI additions |
-| `scripts/patches/opt_batch_gen.py` | `src/exo/worker/engines/mlx/patches/opt_batch_gen.py` | `f0d1371d89a7f899e96977014cce7307a53682f2` | byte-identical below the header (136 lines) |
+| `scripts/patches/opt_batch_gen.py` (removed 2026-10-23, see below) | `src/exo/worker/engines/mlx/patches/opt_batch_gen.py` | `f0d1371d89a7f899e96977014cce7307a53682f2` | was byte-identical below the header (136 lines) |
 | `scripts/patches/standard_yarn_rope.py` | `src/exo/worker/engines/mlx/patches/standard_yarn_rope.py` | `f0d1371d89a7f899e96977014cce7307a53682f2` | byte-identical below the header (118 lines) |
 | `scripts/patches/__init__.py` | `src/exo/worker/engines/mlx/patches/__init__.py` | `f0d1371d89a7f899e96977014cce7307a53682f2` | exo's 13-line skeleton, extended |
 | `scripts/odyssai-network-setup.sh` | script embedded in `app/EXO/EXO/Services/NetworkSetupHelper.swift` (lines 16-69) | `09f9ea313f72e261f40a94cea4c0e3681b31af23` (2026-06-03) | 10 of 96 code lines identical, structure follows exo |
@@ -33,8 +33,13 @@ OdyssAI-X (see `LICENSE` and `NOTICE` at the repository root).
   DeepSeek V4, Bailing/Ling, MiMo, GLM DSA, Kimi K3, qwen4_exp and the
   Qwen3.5-MoE vision pipeline, plus the pipeline prefill transport. See
   `git log --follow scripts/auto_parallel.py`.
-- `patches/opt_batch_gen.py`, `patches/standard_yarn_rope.py`: attribution
-  header added; everything below it is byte-identical to upstream.
+- `patches/standard_yarn_rope.py`: attribution header added; everything below
+  it is byte-identical to upstream.
+- `patches/opt_batch_gen.py`: same relation until its removal on 2026-10-23
+  (1.62.3). Its `GenerationBatch._step` replacement, written against the
+  mlx-lm of April 2026, stored `_next_logprobs` as an array where mlx-lm 0.32.x
+  keeps a list and broke every batched request after the 0.32.2 alignment;
+  nothing in OdyssAI-X consumed its top-k logprobs. Still in `git log`.
 - `patches/__init__.py`: same `_applied` guard and `apply_mlx_patches()` entry
   point as upstream, with relative imports and OdyssAI's own model patches and
   pipeline split-coverage fix added to the list.

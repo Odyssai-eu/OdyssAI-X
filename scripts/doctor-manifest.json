@@ -4,6 +4,7 @@
  "mlx": "0.32.4",
  "mlx_lm": "0.32.2",
  "modules": {
+  "bailing_moe_v3.py": "c9faadebf2501e6d23d0d90c35a02aff",
   "deepseek_v4.py": "e5ec120854b4e799cf42179759f2ae10",
   "dsv4_cache.py": "fe867f467ceb5ef34d24512bf0aa0103",
   "dsv4_hyper_connection.py": "3a2064a6d517b7134af741d537c0f11a",
@@ -18,7 +19,7 @@
   "qwen4_exp.py": "b4c1744ba4d770b4cfeb730f6b717189"
  },
  "patches": {
-  "__init__.py": "c79c852fdd64cffb0484b7718b25d90a",
+  "__init__.py": "e95fddc1792922b8d42d3a73a8b3cf46",
   "bailing_hybrid_alias.py": "109154fa41427bcccf6c9cb8cab9d244",
   "bailing_hybrid_model.py": "3f4d65717cfad083c2c874c97dfa9da9",
   "g9v3_alias.py": "eab0efadecf3ce9f31eb1637e6b73db6",
@@ -28,7 +29,6 @@
   "mimo_v2_alias.py": "2ff38dc53fde4171f7e7f207ab1c2e7c",
   "minimax_m3_alias.py": "323029f936a5c333019e93d69a794dff",
   "minimax_m3_model.py": "d6c6d5def7827485479578344ba298cb",
-  "opt_batch_gen.py": "b33414fd4f1bc2d88e28d3164baeaa93",
   "pipeline_split_coverage.py": "bda0b9872fa3f1faba1b0beb0bd32e7a",
   "standard_yarn_rope.py": "ffcc5fee24c9300d40dedb565a0e3758"
  }

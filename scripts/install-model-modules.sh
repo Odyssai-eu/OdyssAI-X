@@ -13,8 +13,8 @@
 # to resolve the model_type at load.
 #
 # Patches: `runner.py` does `from patches import apply_mlx_patches` at spawn and
-# monkey-patches mlx-lm in place (pipeline split coverage, YaRN RoPE, batch gen,
-# model aliases…). They are plain files next to the runner, NOT in the venv.
+# monkey-patches mlx-lm in place (pipeline split coverage, YaRN RoPE, model
+# aliases…; the exo batch-gen patch was dropped on 2026-10-23). They are plain files next to the runner, NOT in the venv.
 #
 # Both drifted exactly as you would expect while they were copied by hand:
 #   - 2026-07-25: the Argo nodes carried THREE different states of hy_v3

@@ -16,7 +16,8 @@ exo (https://github.com/exo-explore/exo)
   below carries an Apache-2.0 header and a "Modified by OdyssAI" line.
 
   From upstream commit f0d1371d89a7f899e96977014cce7307a53682f2 (2026-04-28):
-  * scripts/patches/opt_batch_gen.py: byte-identical to exo's
+  * scripts/patches/opt_batch_gen.py (removed 2026-10-23; present from the
+    initial release to 1.62.2): byte-identical to exo's
     src/exo/worker/engines/mlx/patches/opt_batch_gen.py (136 lines) below
     the attribution header
   * scripts/patches/standard_yarn_rope.py: byte-identical to exo's

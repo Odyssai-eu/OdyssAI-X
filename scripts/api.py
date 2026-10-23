@@ -5258,6 +5258,7 @@ class ReplicaPool(RunnerPool):
             for i in range(len(node_indices))}
         self._watchdog_task: Optional[asyncio.Task] = None
         self._stopping = False
+        self._was_registered = False   # armed by set_pool(); see _watchdog
 
     @property
     def runners(self) -> list:
@@ -5489,11 +5490,44 @@ class ReplicaPool(RunnerPool):
         except Exception:
             return False
 
+    def mark_registered(self) -> None:
+        """set_pool() calls this: the zombie guard is armed from the first
+        registration on. A pool that was never registered is left alone, so a
+        slow path between start() and set_pool() can never tear a fresh pool
+        down."""
+        self._was_registered = True
+
+    def _is_registered(self) -> bool:
+        """True while the registry holds THIS object (any alias, any cluster)."""
+        if _pool is self:
+            return True
+        return any(p is self for _cid, _a, p in list_all_pools())
+
     async def _watchdog(self) -> None:
         try:
             while not self._stopping:
                 await asyncio.sleep(REPLICA_WATCHDOG_S)
                 if self._stopping:
+                    break
+                # Zombie guard (2026-10-23): a pool the registry no longer holds
+                # was replaced or dropped without stop(). Its watchdog must not
+                # keep resurrecting runners next to the registered pool's (the
+                # amigos reboot-reload leak): stop the replicas it still owns
+                # and end here. Identity check, not alias lookup, so a key
+                # mismatch can never make a live pool tear itself down.
+                try:
+                    zombie = self._was_registered and not self._is_registered()
+                except Exception:
+                    zombie = False      # never let the guard kill the self-healing
+                if zombie:
+                    sys.stderr.write(
+                        f"[replica-pool] {self.cluster}[{self.alias}] is no longer "
+                        f"the registered pool — zombie watchdog stopping its "
+                        f"{len(self._live)} live replica(s) and exiting\n")
+                    self._stopping = True
+                    await asyncio.gather(
+                        *(r.stop() for r in self._replicas), return_exceptions=True)
+                    self._live.clear()
                     break
                 try:
                     await self._heal_tick()
@@ -6892,6 +6926,12 @@ def list_all_pools() -> list[tuple[str, str, RunnerPool]]:
 
 def set_pool(cluster_id: str, alias: str, pool: RunnerPool) -> None:
     _pools.setdefault(cluster_id, {})[alias] = pool
+    # Pools with a self-healing watchdog arm their zombie guard here: from now
+    # on, losing the registry slot means "replaced or dropped", never "not yet
+    # registered" (2026-10-23, ReplicaPool._watchdog).
+    mark = getattr(pool, "mark_registered", None)
+    if callable(mark):
+        mark()
 
 
 def del_pool(cluster_id: str, alias: str) -> None:
@@ -7078,6 +7118,19 @@ async def _restore_cluster_pools(cid: str, leaked_hosts: Optional[set] = None,
     for entry in saved_pools:
         alias = entry.get("alias", DEFAULT_ALIAS)
         try:
+            # Never duplicate a pool that is still registered (2026-10-23). The
+            # reboot-all reload runs after the dead-pool purge, which leaves a
+            # replica pool alone while its watchdog is healing; registering a
+            # second pool under the same alias here overwrote the registry
+            # entry and LEAKED the first object with its watchdog alive — a
+            # zombie that resurrected its runners after every sweep (amigos:
+            # three orphan Qwen3-Coder-Next runners next to the serving ones).
+            # A registered pool is alive or self-healing: it IS the restore.
+            if get_pool(cid, alias) is not None:
+                sys.stderr.write(
+                    f"[api] restore ({cid}:{alias}): a pool is already "
+                    f"registered under this alias — left to it, not duplicated\n")
+                continue
             # Graveyard guard (container-startup only): a `down` entry is kept
             # on disk (intent preserved for a later reboot-all / manual reload)
             # but not relaunched here — see the restore_down docstring.
@@ -8376,7 +8429,7 @@ def _initial_default_config() -> Optional[dict]:
 #   major (1.7.2 → 2.0.0) — breaking API or topology change
 #
 # Use `./scripts/bump-version.sh patch|minor|major` to bump + auto-commit.
-APP_VERSION = "1.62.2"
+APP_VERSION = "1.62.3"
 
 app = FastAPI(
     title="OdyssAI-X (odyssai.eu)",
