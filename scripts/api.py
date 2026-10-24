@@ -8429,7 +8429,7 @@ def _initial_default_config() -> Optional[dict]:
 #   major (1.7.2 → 2.0.0) — breaking API or topology change
 #
 # Use `./scripts/bump-version.sh patch|minor|major` to bump + auto-commit.
-APP_VERSION = "1.62.3"
+APP_VERSION = "1.62.4"
 
 app = FastAPI(
     title="OdyssAI-X (odyssai.eu)",
@@ -15615,7 +15615,8 @@ async def _gather_preflight(cluster_id: str, model: str,
     # Single source of truth (get_model_arch_meta / _model_capabilities use it
     # too) — recognises flattened `vision_*` configs, not just nested ones.
     is_vision = _config_is_vision(cfg)
-    vlm_present = await _vlm_venv_present(rank0, venv) if is_vision else None
+    vlm_present = (await _vlm_venv_present(rank0, _vlm_venv_for(abspath, venv))
+                   if is_vision else None)
     draft_cfg = draft_size = None
     if draft:
         d_abs = _resolve_model_abspath(draft, base_dir)
@@ -17393,7 +17394,7 @@ async def admin_cluster_load(cluster_id: str, req: ArgoLoadRequest):
         _t_launch = time.time()
         try:
             async with get_admin_lock(cluster_id):
-                vlm_venv = getattr(req, "venv", None) or VLM_DEFAULT_VENV
+                vlm_venv = _vlm_venv_for(vlm_model_path, getattr(req, "venv", None))
                 ready, launched_pid, tail = await _launch_vlm_server(
                     vlm_ssh, log_id, vlm_model_path, vlm_port, vlm_venv,
                     float(getattr(req, "ready_timeout_s", None) or VLM_READY_TIMEOUT_S),
@@ -19272,6 +19273,28 @@ async def admin_connection_test(nodes: int = 1, cluster: str = "default"):
 # ──────────────────────────────────────────────────────────────────────────────
 VLM_DEFAULT_VENV = env_get("VLM_VENV", "$HOME/.venvs/mlx-vlm")
 VLM_DEFAULT_PORT = int(env_get("VLM_PORT", "8080") or "8080")
+# Checkpoints the default mlx-vlm venv cannot load, keyed by the checkpoint
+# directory name, mapped to a venv that can.
+#
+# MiniMax-M3.1-Flash (2026-10-24): mlx-vlm 0.7.3 / mlx 0.32.2 packs the MXFP8
+# shared expert into the NVFP4 routed-expert bank ("Received 741 parameters not
+# in model") and has no per-expert NVFP4 global scale. mlx-vlm PR #2580
+# (8779e8c4) on mlx 0.32.4 loads the released checkpoint unchanged, text and
+# image. Only the source checkpoint: the mlx-lm repack (-nvfp4h16) is not in
+# the layout mlx-vlm reads.
+VLM_MODEL_VENVS: dict[str, str] = {
+    "MiniMax-M3.1-Flash": "$HOME/.venvs/mlx-vlm-m31",
+}
+
+
+def _vlm_venv_for(model: str, requested: Optional[str] = None) -> str:
+    """Venv whose mlx_vlm.server serves `model` (an id or a path): the one the
+    request names, else the checkpoint's entry in VLM_MODEL_VENVS, else
+    VLM_DEFAULT_VENV."""
+    if requested and requested.strip():
+        return requested.strip()
+    name = (model or "").strip().rstrip("/").rsplit("/", 1)[-1]
+    return VLM_MODEL_VENVS.get(name) or VLM_DEFAULT_VENV
 
 
 def _remote_path(path: str) -> str:
@@ -19613,7 +19636,7 @@ async def _load_vlm_replica(cluster_id: str, alias: str, req, model_path: str,
     capacity floor as the text replica (every node holds a full copy), then
     one mlx_vlm.server per node under the cluster admin lock."""
     port = int(getattr(req, "vlm_port", None) or VLM_DEFAULT_PORT)
-    venv = getattr(req, "venv", None) or VLM_DEFAULT_VENV
+    venv = _vlm_venv_for(model_path, getattr(req, "venv", None))
     size = await get_model_size_bytes(rank0_ssh, model_path)
     caps = _node_load_ceilings(cluster_id, len(indices))
     if size and not getattr(req, "force", False):
@@ -20179,9 +20202,9 @@ async def admin_vlm_load(req: VLMLoadRequest):
         raise HTTPException(400, "model is required")
 
     port = int(req.port or VLM_DEFAULT_PORT)
-    venv = (req.venv or VLM_DEFAULT_VENV).strip()
     ready_timeout = float(req.ready_timeout_s or VLM_READY_TIMEOUT_S)
     model_path = _vlm_resolve_model_path(req.model, req.models_dir)
+    venv = _vlm_venv_for(model_path, req.venv)
     ip = _vlm_ip_from_ssh(ssh_target)
     host_id = _host_id_from_ssh(ssh_target)
     upstream = f"http://{ip}:{port}"
