@@ -150,11 +150,21 @@ def _shard_lm_replicated_indexer(lm, group):
     else mirrors upstream shard(): q/k/v all-to-sharded, o_proj
     sharded-to-all, head counts divided, MoE switch_mlp shard_inplace +
     sharding_group for the block all_sum.
+
+    mlx-vlm 0.7.10 (PR #2580) selects blocks PER index head, each covering a
+    contiguous group of query_heads // index_heads query heads. With the
+    indexer replicated and the query heads sharded, that ratio is computed
+    from the LOCAL head count: on 2 ranks 32 // 4 = 8 instead of 16, so local
+    heads 16-31 of rank 0 attend to the blocks chosen by index heads 2 and 3
+    instead of head 1. Dense below 2048 tokens (exact), wrong beyond it: the
+    1..2500 count derailed at token 3754 (2026-10-24). _RankIndexer keeps the
+    replicated compute and hands each rank only its own index heads, so the
+    ratio is the single-node one again.
     """
     from mlx_vlm.models.minimax_m3_vl import language as _lang
     shard_linear = _lang.shard_linear
     shard_inplace = _lang.shard_inplace
-    n = group.size()
+    n, rank = group.size(), group.rank()
     for layer in lm.layers:
         sa = layer.self_attn
         sa.q_proj = shard_linear(sa.q_proj, "all-to-sharded", group=group)
@@ -163,7 +173,10 @@ def _shard_lm_replicated_indexer(lm, group):
         sa.o_proj = shard_linear(sa.o_proj, "sharded-to-all", group=group)
         sa.num_attention_heads //= n
         sa.num_key_value_heads //= n
-        # index_q_proj / index_k_proj / index_heads deliberately NOT sharded.
+        # index_q_proj / index_k_proj / index_heads deliberately NOT sharded;
+        # the selection is sliced to this rank's index heads instead.
+        if getattr(sa, "has_sparse_index", False):
+            sa.indexer = _RankIndexer(sa.indexer, sa.index_heads, rank, n)
         if not layer.is_moe_layer:
             continue
         moe = layer.block_sparse_moe
@@ -185,6 +198,29 @@ def _shard_lm_replicated_indexer(lm, group):
         shard_inplace(moe.switch_mlp.down_proj,
                       _expert_sharding("sharded-to-all"), group=group)
         moe.sharding_group = group
+
+
+class _RankIndexer:
+    """A replicated MiniMaxM3Indexer whose block selection is sliced to one
+    rank's index heads (index_heads // n of them, contiguous, in rank order),
+    matching the query heads an all-to-sharded q_proj leaves on that rank.
+    Everything else (build_block_mask, attributes) is the wrapped indexer's."""
+
+    def __init__(self, inner, index_heads: int, rank: int, n: int):
+        if index_heads % n:
+            raise ValueError(f"{index_heads} index heads do not split over {n} ranks")
+        per_rank = index_heads // n
+        self.inner = inner
+        self.lo, self.hi = rank * per_rank, (rank + 1) * per_rank
+
+    def __call__(self, *args, **kwargs):
+        block_indices, total_len, q_positions = self.inner(*args, **kwargs)
+        if block_indices is not None:
+            block_indices = block_indices[:, self.lo:self.hi]
+        return block_indices, total_len, q_positions
+
+    def __getattr__(self, name):
+        return getattr(self.inner, name)
 
 
 # Per-expert NVFP4 global scales of a ScaledQuantizedSwitchLinear (mlx-vlm

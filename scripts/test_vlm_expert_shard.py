@@ -83,6 +83,26 @@ if mx is not None:
     check("mlx all-to-sharded slices the [E] scale (the bug)",
           _all_to_sharded(1)("weight_global_scale", up["weight_global_scale"])[0], 0)
 
+    # The replicated indexer hands each rank its own index heads: 4 heads on
+    # 2 ranks -> rank 1 gets heads 2 and 3, so 32 local query heads map 16 per
+    # index head as on a single node.
+    class _FakeIndexer:
+        block_size = 128
+        def __call__(self, x):
+            return mx.arange(4)[None, :, None, None] * mx.ones((1, 4, 3, 16), dtype=mx.int32), 4096, x
+    ri = vlm_runner._RankIndexer(_FakeIndexer(), 4, 1, 2)
+    bi, total, qpos = ri("qpos")
+    check("rank 1 of 2 keeps index heads 2 and 3", (bi.shape, bi[0, :, 0, 0].tolist()), ((1, 2, 3, 16), [2, 3]))
+    check("total_len and q_positions pass through", (total, qpos), (4096, "qpos"))
+    check("attributes come from the wrapped indexer", ri.block_size, 128)
+    check("None selection (dense context) passes through",
+          vlm_runner._RankIndexer(lambda x: (None, 100, x), 4, 0, 2)("q")[0], None)
+    try:
+        vlm_runner._RankIndexer(_FakeIndexer(), 4, 0, 3)
+        check("3 ranks refused for 4 index heads", False, True)
+    except ValueError:
+        check("3 ranks refused for 4 index heads", True, True)
+
 try:
     import api
 except ImportError as e:
