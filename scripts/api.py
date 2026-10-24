@@ -6254,7 +6254,15 @@ _MODELS_IGNORE_ENABLE_THINKING_FLAG = ("minimax-m2", "step-3.7", "step3p7",
                                        "hy4",
                                        # Muse-Spark : reasoning_strength low/medium/high,
                                        # pas d'enable_thinking ; il raisonne dans tous les modes.
-                                       "muse-spark")
+                                       "muse-spark",
+                                       # MiniMax-M3.1 (Flash) pense toujours : son template code
+                                       # en dur « Current thinking mode: adaptive » (aucun
+                                       # thinking_mode lu) et l'API MiniMax renvoie 400 si
+                                       # « disabled » est envoyé. Vérifié 2026-10-24 :
+                                       # enable_thinking=false émet quand même <mm:think>…, qui
+                                       # partait dans `content` (Bench A TMB). Le M3 non-.1
+                                       # honore thinking_mode et reste hors liste.
+                                       "minimax-m3.1", "minimax-m3-1")
 
 # Models whose chat template reads a `reasoning_effort` system directive
 # (OpenAI o-series convention: minimal/low/medium/high). Step-3.7-Flash is a
@@ -8435,7 +8443,7 @@ def _initial_default_config() -> Optional[dict]:
 #   major (1.7.2 → 2.0.0) — breaking API or topology change
 #
 # Use `./scripts/bump-version.sh patch|minor|major` to bump + auto-commit.
-APP_VERSION = "1.62.6"
+APP_VERSION = "1.62.7"
 
 app = FastAPI(
     title="OdyssAI-X (odyssai.eu)",
