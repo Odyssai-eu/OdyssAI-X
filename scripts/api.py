@@ -2869,12 +2869,18 @@ def remote_vlm_cmd(node: dict, nodes: list[dict], model: str, port: int,
             env["JACCL_PROGRESS_TIMEOUT_S"] = os.environ["JACCL_PROGRESS_TIMEOUT_S"]
         write_prefix = (f"echo {shlex.quote(devices_json)} > "
                         f"{env['MLX_IBV_DEVICES']}")
+    if _vlm_model_name(model) in VLM_NO_FAST_SYNCH:
+        del env["MLX_METAL_FAST_SYNCH"]
     env_str = " ".join(f"{k}={shlex.quote(v)}" for k, v in env.items())
     cd_prefix = ""
     if not model.startswith("/"):
         node_models_dir = node.get("models_dir") or DEFAULT_MODELS_DIR
         cd_prefix = f"cd {shlex.quote(node_models_dir)} && "
-    return f"{write_prefix} && {cd_prefix}{env_str} {VLM_PYTHON_REMOTE} {VLM_RUNNER_REMOTE}"
+    # A checkpoint mapped to its own mlx-vlm venv (VLM_MODEL_VENVS) runs the
+    # distributed runner from that venv too.
+    venv = _vlm_venv_for(model)
+    python = VLM_PYTHON_REMOTE if venv == VLM_DEFAULT_VENV else f"{venv}/bin/python"
+    return f"{write_prefix} && {cd_prefix}{env_str} {python} {VLM_RUNNER_REMOTE}"
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -8429,7 +8435,7 @@ def _initial_default_config() -> Optional[dict]:
 #   major (1.7.2 → 2.0.0) — breaking API or topology change
 #
 # Use `./scripts/bump-version.sh patch|minor|major` to bump + auto-commit.
-APP_VERSION = "1.62.4"
+APP_VERSION = "1.62.5"
 
 app = FastAPI(
     title="OdyssAI-X (odyssai.eu)",
@@ -19285,6 +19291,19 @@ VLM_DEFAULT_PORT = int(env_get("VLM_PORT", "8080") or "8080")
 VLM_MODEL_VENVS: dict[str, str] = {
     "MiniMax-M3.1-Flash": "$HOME/.venvs/mlx-vlm-m31",
 }
+# Checkpoints whose distributed runner must NOT get MLX_METAL_FAST_SYNCH=1.
+# MiniMax-M3.1-Flash TP2 on .30+.31 (2026-10-24, mlx 0.32.4): the first
+# request wedged both ranks in the fence spin (ml-explore/mlx#3830, closed
+# "not reliable", no fix), the GPU stayed busy after SIGKILL and both nodes
+# needed a reboot. Without the flag the same run finished 8.8k-token prompts
+# and 6.6k-token generations. Keyed per checkpoint, not per mlx version: the
+# text runners serve on 0.32.4 with the flag without wedging.
+VLM_NO_FAST_SYNCH: frozenset[str] = frozenset({"MiniMax-M3.1-Flash"})
+
+
+def _vlm_model_name(model: str) -> str:
+    """Last path component of a model id or path (the checkpoint's name)."""
+    return (model or "").strip().rstrip("/").rsplit("/", 1)[-1]
 
 
 def _vlm_venv_for(model: str, requested: Optional[str] = None) -> str:
@@ -19293,8 +19312,7 @@ def _vlm_venv_for(model: str, requested: Optional[str] = None) -> str:
     VLM_DEFAULT_VENV."""
     if requested and requested.strip():
         return requested.strip()
-    name = (model or "").strip().rstrip("/").rsplit("/", 1)[-1]
-    return VLM_MODEL_VENVS.get(name) or VLM_DEFAULT_VENV
+    return VLM_MODEL_VENVS.get(_vlm_model_name(model)) or VLM_DEFAULT_VENV
 
 
 def _remote_path(path: str) -> str:

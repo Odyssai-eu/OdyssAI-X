@@ -178,12 +178,43 @@ def _shard_lm_replicated_indexer(lm, group):
             # quantization tolerance: relmax 0.0033 on layer-1 forward).
             _shard_fused_gate_up_inplace(moe.switch_mlp.gate_up_proj, group)
         else:
-            shard_inplace(moe.switch_mlp.gate_proj, "all-to-sharded",
-                          group=group)
-            shard_inplace(moe.switch_mlp.up_proj, "all-to-sharded",
-                          group=group)
-        shard_inplace(moe.switch_mlp.down_proj, "sharded-to-all", group=group)
+            shard_inplace(moe.switch_mlp.gate_proj,
+                          _expert_sharding("all-to-sharded"), group=group)
+            shard_inplace(moe.switch_mlp.up_proj,
+                          _expert_sharding("all-to-sharded"), group=group)
+        shard_inplace(moe.switch_mlp.down_proj,
+                      _expert_sharding("sharded-to-all"), group=group)
         moe.sharding_group = group
+
+
+# Per-expert NVFP4 global scales of a ScaledQuantizedSwitchLinear (mlx-vlm
+# PR #2580: weight_global_scale for compressed-tensors, weight_scale_2 for
+# ModelOpt), one value per expert, shape [E].
+_EXPERT_GLOBAL_SCALES = ("weight_global_scale", "weight_scale_2")
+
+
+def _expert_sharding(sharding):
+    """shard_inplace predicate for a routed-expert bank that keeps the
+    per-expert global scales whole.
+
+    mlx's string predicates slice every array: a 1-D [E] global scale is cut
+    on the expert axis (all-to-sharded: axis max(ndim-2, 0) = 0;
+    sharded-to-all: axis -1), so each rank keeps the scales of E/n experts
+    while still holding a slice of all E expert matrices; the NVFP4 gather_qmm
+    then broadcasts E/n scales to E experts and fails. A global scale covers a
+    whole expert matrix, so it is replicated. Every other array is sliced as
+    mlx's own predicate would."""
+    def predicate(path, weight):
+        if path.endswith(_EXPERT_GLOBAL_SCALES):
+            return None
+        if path.endswith("pre_quant_scale"):
+            # Input-dim AWQ scale: replicated for all-to-sharded, sliced for
+            # sharded-to-all. No checkpoint served here has one.
+            raise ValueError(f"tensor split of {path} is not implemented")
+        if sharding == "all-to-sharded":
+            return (-1, 1) if path.endswith("bias") else (max(weight.ndim - 2, 0), 1)
+        return None if path.endswith("bias") else (-1, 1)
+    return predicate
 
 
 def _shard_fused_gate_up_inplace(sl, group):
