@@ -6518,6 +6518,14 @@ def _split_think_stream(text: str, state: dict) -> tuple[str, str]:
                 state["in_think"] = False
         else:
             idx = text.find(open_m)
+            stray = text.find(close_m)
+            if stray != -1 and (idx == -1 or stray < idx):
+                # Close with no open: MiniMax-M3.1 skips thinking by emitting
+                # only `</mm:think>` (its template's "disabled" prefix), which
+                # leaked into `content` (verified 2026-10-24). Drop the marker.
+                visible_parts.append(_clean(text[:stray]))
+                text = text[stray + len(close_m):]
+                continue
             if idx == -1:
                 tail_len = _holdback(text)
                 if len(text) > tail_len:
@@ -8443,7 +8451,7 @@ def _initial_default_config() -> Optional[dict]:
 #   major (1.7.2 → 2.0.0) — breaking API or topology change
 #
 # Use `./scripts/bump-version.sh patch|minor|major` to bump + auto-commit.
-APP_VERSION = "1.62.7"
+APP_VERSION = "1.62.8"
 
 app = FastAPI(
     title="OdyssAI-X (odyssai.eu)",
