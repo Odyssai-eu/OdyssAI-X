@@ -108,6 +108,8 @@ ssh $SSH_OPTS "$NODE" "
 echo "[2/5] Syncing runner + helpers + requirements to $NODE…"
 scp $SSH_OPTS -q \
   "$REPO_ROOT/scripts/runner.py" \
+  "$REPO_ROOT/scripts/vlm_runner.py" \
+  "$REPO_ROOT/scripts/loop_detect.py" \
   "$REPO_ROOT/scripts/auto_parallel.py" \
   "$REPO_ROOT/scripts/exo_stubs.py" \
   "$REPO_ROOT/scripts/inference.py" \

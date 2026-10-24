@@ -28,7 +28,8 @@ def check(label, got, want):
 
 MANIFEST = {"mlx": "0.32.2", "mlx_lm": "0.31.3", "jaccl_sha256_16": "03ecbe4b8ad93f26",
             "modules": {"glm5_next.py": "aa", "qwen4_exp.py": "bb"},
-            "patches": {"__init__.py": "cc", "opt_batch_gen.py": "dd"}}
+            "patches": {"__init__.py": "cc", "opt_batch_gen.py": "dd"},
+            "files": {"runner.py": "ee", "vlm_runner.py": "ff", "loop_detect.py": "11"}}
 HEALTHY = {  # an Argo node as measured on .30 (2026-09-28), all in order
     "host": "ultra-256a", "macos": "26.6.1", "macos_build": "25G76", "arch": "arm64",
     "python": {"executable": "/Users/admin/mlx-cluster/.venv/bin/python", "version": "3.11.15", "in_venv": True},
@@ -37,6 +38,7 @@ HEALTHY = {  # an Argo node as measured on .30 (2026-09-28), all in order
     "jaccl": {"path": "/x/libjaccl.dylib", "sha256_16": "03ecbe4b8ad93f26"},
     "modules": {"glm5_next.py": "aa", "qwen4_exp.py": "bb"},
     "patches": {"__init__.py": "cc", "opt_batch_gen.py": "dd"},
+    "files": {"runner.py": "ee", "vlm_runner.py": "ff", "loop_detect.py": "11"},
     "rdma_ctl": {"rc": 0, "out": "enabled"},
     "rdma_devices": [{"device": "rdma_en3", "interface": "en3", "state": "PORT_ACTIVE", "link_local": "169.254.250.13"},
                      {"device": "rdma_en2", "interface": "en2", "state": "PORT_DOWN", "link_local": None}],
@@ -157,6 +159,16 @@ if cur["jaccl_sha256_16"] is None:          # no local JACCL build: compare the 
     cur["jaccl_sha256"] = committed.get("jaccl_sha256")
 check("doctor-manifest.json is up to date (else: doctor_node.py --write-manifest . > scripts/doctor-manifest.json)",
       cur == committed, True)
+
+# node files: the runners the engine spawns are md5-checked like the patches,
+# so a node that missed an install.sh run shows up instead of running old code
+check("manifest lists the node files install.sh copies",
+      sorted(committed.get("files") or {}), sorted(d.NODE_FILES))
+rows, _ = run(lambda f: f["files"].update({"vlm_runner.py": "0" * 32, "loop_detect.py": None}))
+bad = [r for r in rows if r["check"] == "node-files"]
+check("a stale or missing node file is a FAIL naming it",
+      (bad[0]["status"], "stale vlm_runner.py" in bad[0]["message"], "missing loop_detect.py" in bad[0]["message"]) if bad else None,
+      ("FAIL", True, True))
 
 # read-only by construction: no mutating command in the node script, no api import
 src = open(os.path.join(HERE, "doctor_node.py")).read()

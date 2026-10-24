@@ -163,7 +163,7 @@ main() {
   local SITE; SITE=$("$PY" -c 'import sysconfig; print(sysconfig.get_paths()["purelib"])')
   local n=0 f
   local pending=""
-  for f in runner.py loop_detect.py auto_parallel.py exo_stubs.py inference.py inference_pipe.py persistence.py \
+  for f in runner.py vlm_runner.py loop_detect.py auto_parallel.py exo_stubs.py inference.py inference_pipe.py persistence.py \
            doctor_node.py doctor-manifest.json odyssai-x; do
     [ -f "$DIR/$f" ] && cmp -s "$SRC/scripts/$f" "$DIR/$f" || pending="$pending $f"
   done
@@ -172,7 +172,7 @@ main() {
   for f in "$SRC"/scripts/mlx_models/*.py; do cmp -s "$f" "$SITE/mlx_lm/models/$(basename "$f")" 2>/dev/null || pending="$pending models/$(basename "$f")"; done
   if [ -n "$pending" ]; then
     guard_change "node files"
-    for f in runner.py loop_detect.py auto_parallel.py exo_stubs.py inference.py inference_pipe.py persistence.py \
+    for f in runner.py vlm_runner.py loop_detect.py auto_parallel.py exo_stubs.py inference.py inference_pipe.py persistence.py \
              doctor_node.py doctor-manifest.json odyssai-x; do
       copy_if_changed "$SRC/scripts/$f" "$DIR/$f" && n=$((n + 1)) || true
     done

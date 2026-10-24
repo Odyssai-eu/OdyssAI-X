@@ -113,6 +113,8 @@ def gather(manifest: dict, models_dir: str | None = None,
     patches_dir = os.path.join(cluster_dir, "patches")
     facts["patches"] = {n: _digest(os.path.join(patches_dir, n))
                         for n in (manifest.get("patches") or {})}
+    facts["files"] = {n: _digest(os.path.join(cluster_dir, n))
+                      for n in (manifest.get("files") or {})}
 
     rc, out, err = _run(["rdma_ctl", "status"])
     facts["rdma_ctl"] = {"rc": rc, "out": (out or err).strip()[:200]}
@@ -220,8 +222,9 @@ def evaluate(facts: dict, manifest: dict) -> list[dict]:
         else:
             rows.append(_row("jaccl", "OK", "patched libjaccl.dylib"))
 
-    # vendored model modules and runtime patches
+    # the runners and their helpers, vendored model modules, runtime patches
     for key, label, fix in (
+            ("files", "node-files", "Rerun install.sh on this node: it copies the node files from main."),
             ("modules", "model-modules", "Run scripts/install-model-modules.sh for this node."),
             ("patches", "patches", "Run scripts/install-model-modules.sh for this node.")):
         ref, got = manifest.get(key) or {}, facts.get(key) or {}
@@ -304,6 +307,15 @@ def render(rows: list[dict], host: str = "") -> str:
 
 
 # ── manifest ───────────────────────────────────────────────────────────
+# The files install.sh copies into ~/mlx-cluster (its "files" stage) that the
+# engine spawns or imports on a node. A stale copy runs silently with the
+# engine's newer api.py: vlm_runner.py was missing from the installer until
+# 2026-10-24 and .30/.31 had to be patched by hand. Keep in sync with
+# install.sh and scripts/bootstrap-node.sh.
+NODE_FILES = ("runner.py", "vlm_runner.py", "loop_detect.py", "auto_parallel.py",
+              "exo_stubs.py", "inference.py", "inference_pipe.py", "persistence.py")
+
+
 def build_manifest(repo: str) -> dict:
     """Reference versions and hashes, from a checkout."""
     req = open(os.path.join(repo, "requirements-node.txt")).read()
@@ -315,6 +327,7 @@ def build_manifest(repo: str) -> dict:
         "mlx": pin("mlx"), "mlx_lm": pin("mlx-lm"),
         "jaccl_sha256": sha,               # full: install.sh verifies the download
         "jaccl_sha256_16": sha[:16] if sha else None,
+        "files": {f: _digest(os.path.join(repo, "scripts", f)) for f in NODE_FILES},
         "modules": {f: _digest(os.path.join(repo, "scripts", "mlx_models", f)) for f in top("scripts/mlx_models")},
         "patches": {f: _digest(os.path.join(repo, "scripts", "patches", f)) for f in top("scripts/patches")},
     }
