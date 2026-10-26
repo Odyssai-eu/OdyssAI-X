@@ -7325,9 +7325,11 @@ async def lifespan(app: FastAPI):
     except Exception:
         pass
     _persist.init_db(str(PERSIST_DB_PATH))
-    # Any sync_jobs left in 'running' state are orphaned from a previous
-    # container life — mark them as interrupted so the UI shows truth.
-    _persist.mark_orphans_interrupted()
+    # Chat runs left running are orphaned from a previous container life —
+    # marked interrupted. Sync jobs are NOT: their remote rsync / tar survive
+    # the restart, so they are reattached and judged (_sync_reattach).
+    _persist.mark_orphans_interrupted(sync_jobs=False)
+    sync_boot_task = asyncio.create_task(_sync_reattach())
     # HF downloads: the remote `hf download` survives a restart (sshd does not
     # signal it), so the registry is reloaded from downloads.json and matched
     # against the transfers actually running on the nodes — watched, never
@@ -8498,7 +8500,7 @@ def _initial_default_config() -> Optional[dict]:
 #   major (1.7.2 → 2.0.0) — breaking API or topology change
 #
 # Use `./scripts/bump-version.sh patch|minor|major` to bump + auto-commit.
-APP_VERSION = "1.62.9"
+APP_VERSION = "1.62.10"
 
 app = FastAPI(
     title="OdyssAI-X (odyssai.eu)",
@@ -14952,6 +14954,8 @@ async def _tb5_fast_copy(job_id: str, model: str, src: dict, dst: dict,
         if not src_man:
             return False   # unreadable/empty source — let rsync report it
         for rnd in range(1, 4):
+            if _sync_stopped(job_id):
+                return False
             dst_man = await _dir_manifest(dst["ssh"], dst_dir)
             if dst_man is None:
                 return False
@@ -14968,7 +14972,7 @@ async def _tb5_fast_copy(job_id: str, model: str, src: dict, dst: dict,
             # paths); tar reads it with -T. Paths are parent-relative so the
             # archive keeps the `leaf/...` layout the receiver expects.
             manifest_body = "\n".join(f"{leaf}/{rel}" for rel in sorted(delta))
-            mpath = f"/tmp/tbsync_manifest_{job_id}.txt"
+            mpath = _sync_tb5_list_path(job_id, dst["id"])
             recv = await asyncio.create_subprocess_exec(
                 "ssh", "-o", "ConnectTimeout=5", "-o", "BatchMode=yes", dst["ssh"],
                 f"mkdir -p {shlex.quote(dst_parent)} && "
@@ -15023,6 +15027,93 @@ def _resolve_host(host_id: str) -> Optional[dict]:
     return None
 
 
+# ── Sync job lifecycle (1.62.10) ─────────────────────────────────────────────
+# A sync slot's transfer runs ON THE SOURCE node: `rsync -a <src> <dst>:<path>`,
+# or for the TB5 fast path `tar cf - -T <list> | python3 <sender>`. Like the
+# `hf download` of the downloader, these survive the death of the local ssh
+# client (sshd does not signal a non-tty command), so:
+#   - cancel kills them on the node and checks they are gone, not just the
+#     local ssh (until 1.62.9 the UI said "cancelled" while rsync kept writing);
+#   - a cancelled job launches nothing more (until 1.62.9 the next TB5 round and
+#     the rsync verify pass still started after the cancel, and the job then
+#     ended "failed" instead of "cancelled");
+#   - a restart no longer labels a running job "interrupted" while its bytes
+#     still move: _sync_reattach watches the remote transfer until it ends and
+#     judges the slot by comparing source and target file sizes.
+_SYNC_TERMINAL = {"done", "failed", "cancelled", "interrupted"}
+
+
+def _sync_paths(model: str, src: dict, dst: dict) -> tuple[str, str]:
+    """(source dir, target dir) of a sync slot, trailing slash = rsync contents."""
+    return (f"{src['models_dir'].rstrip('/')}/{model}/",
+            f"{dst['models_dir'].rstrip('/')}/{model}/")
+
+
+def _sync_tb5_list_path(job_id: str, dst_id: str) -> str:
+    """File list `tar -T` reads on the source. One per TARGET: until 1.62.9 it
+    was per job, so parallel targets fed from one source overwrote and deleted
+    each other's list."""
+    safe = re.sub(r"[^A-Za-z0-9_-]", "_", dst_id)
+    return f"/tmp/tbsync_manifest_{job_id}_{safe}.txt"
+
+
+def _sync_kill_patterns(job_id: str, model: str, src: dict, dst: dict) -> list[str]:
+    """`pgrep -f` / `pkill -f` patterns matching ONLY this slot's processes on
+    the source: its rsync (exact argv, anchored on the target path) and its TB5
+    tar (its own list file). The first letter is a class so the pattern never
+    matches the shell that runs pkill. The TB5 python sender exits on EOF once
+    its tar is gone, and the receiver on the target when the socket closes."""
+    src_path, dst_path = _sync_paths(model, src, dst)
+    return [
+        f"[r]sync -a {_dl_ere(src_path)} {_dl_ere(dst['ssh'])}:{_dl_ere(dst_path)}( |$)",
+        f"[t]ar cf - -T {_dl_ere(_sync_tb5_list_path(job_id, dst['id']))}( |$)",
+    ]
+
+
+def _sync_remote_alive(ssh: str, patterns: list[str]) -> Optional[bool]:
+    """True if any of the slot's processes runs on the source, False if none,
+    None if the node could not be asked."""
+    cmd = "".join(f"pgrep -f -- {shlex.quote(p)} >/dev/null && echo ALIVE; "
+                  for p in patterns) + "echo END"
+    try:
+        rc, out, _ = _ssh_exec(ssh, cmd, 15)
+    except Exception:
+        return None
+    if "END" not in (out or ""):
+        return None
+    return "ALIVE" in out
+
+
+def _sync_reap_remote(job_id: str, model: str, src: dict, dst: dict) -> Optional[bool]:
+    """Kill a slot's processes on the source and CHECK they are gone (same
+    SIGTERM, wait, SIGKILL sequence as the downloader). True if something is
+    still alive, False if all gone, None if the node could not be asked."""
+    alive = False
+    for pat in _sync_kill_patterns(job_id, model, src, dst):
+        r = _dl_pkill_remote(src["ssh"], pat)
+        if r is None:
+            return None
+        alive = alive or r
+    try:
+        _ssh_exec(src["ssh"],
+                  f"rm -f {shlex.quote(_sync_tb5_list_path(job_id, dst['id']))}", 10)
+    except Exception:
+        pass
+    return alive
+
+
+def _sync_converged(src_man: Optional[dict], dst_man: Optional[dict]) -> bool:
+    """Every non-hidden source file is on the target with the same size."""
+    return bool(src_man) and dst_man is not None and all(
+        dst_man.get(rel) == size for rel, size in src_man.items())
+
+
+def _sync_stopped(job_id: str) -> bool:
+    """The operator cancelled this job (or it is gone): launch nothing more."""
+    job = _sync_jobs.get(job_id)
+    return job is None or job.get("status") == "cancelled"
+
+
 async def _sync_expected_sizes(src: dict, src_path: str) -> Optional[dict]:
     """Weight sizes a sync target must end up with: the source's SIZES_MANIFEST
     when it has one (the sizes HF announced, so a truncated source is not
@@ -15044,15 +15135,36 @@ async def _sync_expected_sizes(src: dict, src_path: str) -> Optional[dict]:
     return {k: v for k, v in listing.items() if _is_weight_file(k)}
 
 
+def _sync_persist(job_id: str) -> None:
+    """Write the job as it is now. Called at every slot transition, so a restart
+    finds the running slots (and _sync_reattach can watch them)."""
+    job = _sync_jobs.get(job_id)
+    if job is not None:
+        _persist.persist_job(job_id, job)
+
+
+def _sync_slot_end(job_id: str, slot: dict, status: str,
+                   error: Optional[str] = None) -> dict:
+    """Close a slot. A slot of a cancelled job stays `cancelled`: the forced
+    exit of its rsync is the cancel, not a failure."""
+    if _sync_stopped(job_id) and status != "done":
+        status, error = "cancelled", None
+    slot["status"] = status
+    slot["error"] = error
+    slot["finished_at"] = time.time()
+    _sync_persist(job_id)
+    return slot
+
+
 async def _run_one_rsync(job_id: str, model: str, src: dict, dst: dict, slot: dict) -> dict:
     """Run rsync from src to dst host for the given model directory.
 
     `slot` is the per_target dict for this destination — mutated in place so
     /admin/sync/jobs reflects live status (running → done/failed) without
-    waiting for the whole job to finish.
+    waiting for the whole job to finish. Nothing is launched once the job is
+    cancelled (checked before every spawn), and every transition is persisted.
     """
-    src_path = f"{src['models_dir'].rstrip('/')}/{model}/"
-    dst_path = f"{dst['models_dir'].rstrip('/')}/{model}/"
+    src_path, dst_path = _sync_paths(model, src, dst)
     # Model names can now contain a `/` (org/model layout). rsync creates the
     # last component but not intermediate parents — make sure the org dir
     # exists on the destination before transferring.
@@ -15067,20 +15179,21 @@ async def _run_one_rsync(job_id: str, model: str, src: dict, dst: dict, slot: di
     # which lacks --mkpath, so an explicit mkdir on the target is the portable fix.
     inner = f"rsync -a {shlex.quote(src_path)} {dst['ssh']}:{shlex.quote(dst_path)}"
     cmd = ["ssh", "-o", "ConnectTimeout=5", "-o", "BatchMode=yes", src["ssh"], inner]
+    if _sync_stopped(job_id):
+        return _sync_slot_end(job_id, slot, "cancelled")
     slot["status"] = "running"
     slot["started_at"] = time.time()
     slot["finished_at"] = None
     slot["error"] = None
+    _sync_persist(job_id)
     try:
         # The expected weight sizes land on the target BEFORE any data: the TB5
         # receiver writes shards under their final names, so a cancel mid-stream
         # leaves truncated files that only this manifest lets the load probe see.
         expected = await _sync_expected_sizes(src, src_path)
         if expected is None:
-            slot["status"] = "failed"
-            slot["error"] = "could not read the source weight sizes"
-            slot["finished_at"] = time.time()
-            return slot
+            return _sync_slot_end(job_id, slot, "failed",
+                                  "could not read the source weight sizes")
         prep = f"mkdir -p {shlex.quote(dst_parent)}"
         if expected:
             prep = (f"mkdir -p {shlex.quote(dst_path)} && printf %s "
@@ -15094,13 +15207,10 @@ async def _run_one_rsync(job_id: str, model: str, src: dict, dst: dict, slot: di
         _sync_procs.setdefault(job_id, []).append(mkproc)
         mko, mke = await mkproc.communicate()
         if mkproc.returncode != 0:
-            slot["status"] = "failed"
-            slot["error"] = (
+            return _sync_slot_end(job_id, slot, "failed", (
                 "preparing the target (mkdir / size manifest) failed: "
                 + (mke.decode("utf-8", "ignore") or mko.decode("utf-8", "ignore"))
-            )[:400]
-            slot["finished_at"] = time.time()
-            return slot
+            )[:400])
         # TB5 fast-path (2026-07-08): raw tar-over-TCP on the Thunderbolt mesh
         # (~3.1 GB/s vs ~110 MB/s LAN rsync). Whatever it returns, the rsync
         # below still runs — as a near-instant VERIFY pass after a successful
@@ -15108,22 +15218,20 @@ async def _run_one_rsync(job_id: str, model: str, src: dict, dst: dict, slot: di
         if _SYNC_TB5_ENABLED:
             slot["transport"] = "tb5+rsync-verify" if await _tb5_fast_copy(
                 job_id, model, src, dst, slot) else "rsync"
+            _sync_persist(job_id)
+        if _sync_stopped(job_id):
+            return _sync_slot_end(job_id, slot, "cancelled")
         proc = await asyncio.create_subprocess_exec(
             *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
         )
         _sync_procs.setdefault(job_id, []).append(proc)
         stdout, stderr = await proc.communicate()
-        slot["finished_at"] = time.time()
         if proc.returncode == 0:
-            slot["status"] = "done"
-        else:
-            slot["status"] = "failed"
-            slot["error"] = (stderr.decode("utf-8", "ignore") or stdout.decode("utf-8", "ignore"))[:400]
+            return _sync_slot_end(job_id, slot, "done")
+        return _sync_slot_end(job_id, slot, "failed", (
+            stderr.decode("utf-8", "ignore") or stdout.decode("utf-8", "ignore"))[:400])
     except Exception as e:
-        slot["status"] = "failed"
-        slot["error"] = str(e)[:400]
-        slot["finished_at"] = time.time()
-    return slot
+        return _sync_slot_end(job_id, slot, "failed", str(e)[:400])
 
 
 async def _drive_sync_job(job_id: str, model: str, source_id: str, target_ids: list[str]) -> None:
@@ -15181,18 +15289,99 @@ async def _drive_sync_job(job_id: str, model: str, source_id: str, target_ids: l
             if kb is not None:
                 slot["bytes_transferred"] = kb * 1024
 
-    job["finished_at"] = time.time()
-    failed = [r for r in results if r["status"] != "done"]
-    if not failed:
-        job["status"] = "done"
-    elif len(failed) == len(results):
-        job["status"] = "failed"
-    else:
-        job["status"] = "partial"
+    _sync_conclude(job_id, job)
+
+
+def _sync_conclude(job_id: str, job: dict) -> None:
+    """Pronounce a job's verdict from its slots (live run and boot reattach).
+    A cancelled job stays cancelled: its slots ended because of the cancel."""
+    slots = job.get("per_target") or []
+    if job.get("status") != "cancelled":
+        done = [p for p in slots if p.get("status") == "done"]
+        if slots and len(done) == len(slots):
+            job["status"] = "done"
+        elif not done:
+            # All slots stopped by a restart and none failed outright: the
+            # truthful label is interrupted (retry resumes), not failed.
+            job["status"] = ("interrupted" if slots and all(
+                p.get("status") == "interrupted" for p in slots) else "failed")
+        else:
+            job["status"] = "partial"
+    job["finished_at"] = job.get("finished_at") or time.time()
     _persist.persist_job(job_id, job)
     # Invalidate matrix cache so next /admin/sync/matrix sees the new files.
     _sync_matrix_cache["data"] = None
     _sync_matrix_cache["ts"] = 0.0
+
+
+_SYNC_WATCH_EVERY_S = 15.0
+_sync_watchers: set = set()
+_SYNC_WATCH_UNREACHABLE_MAX = 20     # ~5 min of a source that cannot be asked
+
+
+async def _sync_watch_slot(job_id: str, job: dict, slot: dict,
+                           src: Optional[dict]) -> None:
+    """Boot reattach of one slot: wait while its transfer still runs on the
+    source, then judge it by comparing source and target sizes (the exit code
+    died with the previous process). Never relaunches anything."""
+    if slot.get("status") in _SYNC_TERMINAL:
+        return
+    model = job.get("model") or ""
+    dst = _resolve_host(slot.get("target") or "")
+    if not src or not dst:
+        slot.update(status="interrupted", finished_at=time.time(),
+                    error="source or target host no longer configured")
+        return
+    if slot.get("status") == "running":
+        misses = 0
+        patterns = _sync_kill_patterns(job_id, model, src, dst)
+        while not _sync_stopped(job_id):
+            alive = await asyncio.to_thread(_sync_remote_alive, src["ssh"], patterns)
+            if alive is False:
+                break
+            misses = misses + 1 if alive is None else 0
+            if misses >= _SYNC_WATCH_UNREACHABLE_MAX:
+                break
+            await asyncio.sleep(_SYNC_WATCH_EVERY_S)
+    if _sync_stopped(job_id):
+        return                      # the cancel endpoint labels and reaps
+    src_path, dst_path = _sync_paths(model, src, dst)
+    src_man, dst_man = await asyncio.gather(
+        _dir_manifest(src["ssh"], src_path), _dir_manifest(dst["ssh"], dst_path))
+    if _sync_converged(src_man, dst_man):
+        slot.update(status="done", finished_at=time.time(), error=None)
+    else:
+        slot.update(status="interrupted", finished_at=time.time(),
+                    error="stopped before completion by an engine restart — "
+                          "retry resumes from what is on the target")
+    _sync_persist(job_id)
+
+
+async def _sync_watch_job(job_id: str) -> None:
+    job = _sync_jobs.get(job_id)
+    if not job:
+        return
+    src = _resolve_host(job.get("source") or "")
+    await asyncio.gather(*[_sync_watch_slot(job_id, job, p, src)
+                           for p in (job.get("per_target") or [])],
+                         return_exceptions=True)
+    if job.get("status") == "running":
+        _sync_conclude(job_id, job)
+
+
+async def _sync_reattach() -> None:
+    """Boot: every sync job persisted as running is put back in the registry and
+    watched (see the lifecycle note above _sync_paths). Its remote rsync / tar
+    may still be moving bytes: until 1.62.9 the boot labelled it `interrupted`
+    on the spot, and a retry then ran a second writer into the same dir."""
+    for job in _persist.load_unfinished_jobs():
+        jid = job.get("id")
+        if not jid or job.get("status") != "running" or jid in _sync_jobs:
+            continue
+        _sync_jobs[jid] = job
+        t = asyncio.create_task(_sync_watch_job(jid))
+        _sync_watchers.add(t)               # the loop only keeps weak refs
+        t.add_done_callback(_sync_watchers.discard)
 
 
 @app.post("/admin/sync/rsync")
@@ -16176,20 +16365,51 @@ async def admin_sync_jobs_clear():
 
 @app.delete("/admin/sync/jobs/{job_id}")
 async def admin_sync_job_cancel(job_id: str):
-    """A running job is cancelled (rsync terminated). A terminal job is removed
-    from the list — the dashboard '(x)' per job (#57)."""
+    """A running job is cancelled. A terminal job is removed from the list —
+    the dashboard '(x)' per job (#57).
+
+    Cancel = the transfers are gone ON THE NODES, checked: the job is labelled
+    first (so the runners launch nothing more and keep `cancelled`), the local
+    ssh clients are terminated, then each unfinished slot's rsync / TB5 tar is
+    killed on its source and confirmed gone (_sync_reap_remote). Until 1.62.9
+    only the local ssh was terminated and the remote rsync kept writing. Slots
+    whose processes could not be confirmed gone are listed in `unconfirmed`."""
     job = _sync_jobs.get(job_id)
     if job and job["status"] == "running":
+        job["status"] = "cancelled"
+        job["finished_at"] = time.time()
+        _persist.persist_job(job_id, job)
         for proc in _sync_procs.get(job_id, []) or []:
             try:
                 if proc.returncode is None:
                     proc.terminate()
             except Exception:
                 pass
-        job["status"] = "cancelled"
-        job["finished_at"] = time.time()
+        src = _resolve_host(job.get("source") or "")
+        open_slots = [p for p in (job.get("per_target") or [])
+                      if p.get("status") not in _SYNC_TERMINAL]
+        unconfirmed: list[str] = []
+        if src:
+            async def reap(slot: dict) -> None:
+                dst = _resolve_host(slot.get("target") or "")
+                if not dst:
+                    return
+                alive = await asyncio.to_thread(
+                    _sync_reap_remote, job_id, job.get("model") or "", src, dst)
+                if alive is not False:
+                    unconfirmed.append(slot["target"])
+            await asyncio.gather(*[reap(p) for p in open_slots])
+        elif open_slots:
+            unconfirmed = [p.get("target") for p in open_slots]
+        for p in open_slots:
+            if p.get("status") not in _SYNC_TERMINAL:
+                p["status"] = "cancelled"
+                p["finished_at"] = p.get("finished_at") or time.time()
+                if p.get("target") in unconfirmed:
+                    p["error"] = ("cancelled, but the transfer could not be "
+                                  "confirmed stopped on the source node")
         _persist.persist_job(job_id, job)
-        return {"ok": True, "cancelled": True}
+        return {"ok": True, "cancelled": True, "unconfirmed": unconfirmed}
     # Terminal (or only in history): remove the entry entirely.
     _sync_jobs.pop(job_id, None)
     _persist.delete_job(job_id)

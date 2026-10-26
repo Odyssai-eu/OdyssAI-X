@@ -263,7 +263,7 @@ def clear_terminal_jobs() -> int:
         return 0
 
 
-def mark_orphans_interrupted() -> int:
+def mark_orphans_interrupted(sync_jobs: bool = True) -> int:
     """On startup, any sync_job still 'running' AND any chat run still in
     a non-terminal status ('running', 'streaming', 'cancelling') is
     actually orphaned (the container or runner has restarted since).
@@ -286,13 +286,16 @@ def mark_orphans_interrupted() -> int:
     try:
         with _lock:
             now = time.time()
+            # sync_jobs=False: the caller reattaches running sync jobs itself
+            # (api._sync_reattach, 1.62.10) — their remote rsync / tar survive
+            # a restart, so 'interrupted' would be a lie while bytes still move.
             # We rewrite BOTH the SQL columns and the JSON payload so the
             # downstream readers stay consistent. recent_runs() / recent_jobs()
             # deserialise the payload column and return it as-is — without
             # the json_set, a row marked 'interrupted' at the SQL level still
             # reports its pre-restart status ('cancelling', 'streaming',
             # 'running') in the dashboard, exactly the symptom #17 describes.
-            cur = _conn.execute(
+            cur = None if not sync_jobs else _conn.execute(
                 "UPDATE sync_jobs SET status='interrupted', "
                 "  finished_at=COALESCE(finished_at, ?), "
                 "  payload=json_set(payload, "
@@ -301,7 +304,7 @@ def mark_orphans_interrupted() -> int:
                 "WHERE status='running'",
                 (now, now),
             )
-            n_jobs = cur.rowcount or 0
+            n_jobs = (cur.rowcount or 0) if cur is not None else 0
             if n_jobs:
                 _log(f"marked {n_jobs} orphaned sync_jobs as interrupted")
             total += n_jobs
