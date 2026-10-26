@@ -1643,30 +1643,141 @@ def _node_load_ceilings(cluster: str, nodes_count: int) -> list[dict]:
     return out
 
 
-def _kill_model_runner_on_host(ssh: str, model: str) -> None:
-    """SIGTERM then SIGKILL the runner serving `model` on ONE host.
+# ── Runner ownership (#215, 1.62.11) ─────────────────────────────────────────
+# A runner.py / vlm_runner.py has no argument that names it: its identity is
+# only in its environment. Every launch now carries
+#     RUNNER_LAUNCH_ID=<orchestrator>/<cluster>/<alias>/<nonce>
+# and every kill, footprint read and sweep selects processes by that token
+# (`ps -Eww` shows a process's environment on macOS; `pgrep -f` does not, which
+# is why the RUNNER_MODEL match used here until 1.62.10 never found anything).
+# Until 1.62.10 the generic `[m]lx-cluster/runner.py` match made a pool's stop,
+# an unload's sweep or a reset kill EVERY runner on the node: the other pools of
+# a shared node (fith's five on .33), another cluster's pool on the same Mac,
+# and the runners of the other orchestrator (dev .18 and prod .39 drive the same
+# Argo nodes). The 2026-09-07 incident, #211, and the 2026-10-26 near-miss on
+# Ling are that match.
+#
+# Rules: a pool kills only its own token; a sweep kills only the tokens of THIS
+# orchestrator that no live pool claims (and, at boot only, runners launched
+# before 1.62.11, which carry no token); a token of another orchestrator is
+# never killed, only counted.
+_ORCH_ID: Optional[str] = None
+_LIVE_LAUNCH_IDS: set = set()       # tokens of pools started and not stopped
+_TOKEN_SEGMENT_RE = re.compile(r"[^A-Za-z0-9._:#-]")
 
-    Deliberately NOT RUNNER_MATCH_PATTERN: that generic `mlx-cluster/runner.py`
-    match is what makes _sweep_orphan_runners kill every pool on a shared node
-    (the 2026-09-07 09:54 incident — an unload on `main` decapitated three
-    replicas). remote_cmd puts `RUNNER_MODEL=<model>` on the command line, so
-    matching that kills this load's runner and leaves another cluster's pool on
-    the same machine alone. SIGTERM first so Metal releases wired pages.
-    """
-    pat = "RUNNER_MODEL=" + shlex.quote(model) + " "
-    q = shlex.quote(pat)
-    sh = (f"pkill -f {q} ; sleep 5 ; "
-          f"pgrep -f {q} >/dev/null 2>&1 && pkill -9 -f {q} ; true")
+
+def _orchestrator_id() -> str:
+    """Stable id of this orchestrator, kept on the data volume next to the
+    history DB so a restart or a container re-create keeps recognising its own
+    runners (a new id would turn them into "another orchestrator's", never
+    swept). ODYSSAI_ORCHESTRATOR_ID overrides."""
+    global _ORCH_ID
+    if _ORCH_ID:
+        return _ORCH_ID
+    val = (os.environ.get("ODYSSAI_ORCHESTRATOR_ID") or "").strip()
+    if not val:
+        f = PERSIST_DB_PATH.parent / "orchestrator-id"
+        try:
+            val = f.read_text().strip()
+        except Exception:
+            val = ""
+        if not val:
+            val = uuid.uuid4().hex[:12]
+            try:
+                f.parent.mkdir(parents=True, exist_ok=True)
+                f.write_text(val + "\n")
+            except Exception as e:
+                sys.stderr.write(f"[api] orchestrator id not persisted ({e})\n")
+    _ORCH_ID = _TOKEN_SEGMENT_RE.sub("_", val)
+    return _ORCH_ID
+
+
+def _launch_prefix(cluster: str, alias: str) -> str:
+    seg = lambda x: _TOKEN_SEGMENT_RE.sub("_", str(x or "-"))  # noqa: E731
+    return f"{_orchestrator_id()}/{seg(cluster)}/{seg(alias)}"
+
+
+def _new_launch_id(cluster: str, alias: str) -> str:
+    return f"{_launch_prefix(cluster, alias)}/{uuid.uuid4().hex[:8]}"
+
+
+def _runner_sel_sh(case_arms: str) -> str:
+    """Shell defining `lid PID` (the process's RUNNER_LAUNCH_ID, empty if none)
+    and `sel` (the runner.py / vlm_runner.py PIDs whose token `t` matches one of
+    `case_arms`, a `case "$t" in … esac` body). The pgrep patterns keep their
+    bracketed first letter, so the shell running this never matches itself."""
+    pg = "; ".join(f"pgrep -f {shlex.quote(p)}"
+                   for p in (RUNNER_MATCH_PATTERN, VLM_RUNNER_MATCH_PATTERN))
+    return ("lid() { ps -Eww -o command= -p \"$1\" 2>/dev/null | tr ' ' '\\n' "
+            "| sed -n 's/^RUNNER_LAUNCH_ID=//p' | head -1; }; "
+            f"sel() {{ for p in $({pg}); do t=$(lid $p); "
+            f"case \"$t\" in {case_arms} *) ;; esac; done; }}; ")
+
+
+def _sel_exact(token: str) -> str:
+    return _runner_sel_sh(f"{shlex.quote(token)}) echo $p ;;")
+
+
+def _sel_prefix(prefix: str, exclude=()) -> str:
+    """Tokens of one cluster/alias (its replicas `<alias>#rN` included), minus
+    `exclude` (pools of that alias already live when the selection was made)."""
+    arms = "".join(f"{shlex.quote(e)}) ;; " for e in sorted(exclude))
+    arms += f"{shlex.quote(prefix + '/')}*|{shlex.quote(prefix + '#')}*) echo $p ;;"
+    return _runner_sel_sh(arms)
+
+
+def _sel_orphans(claimed, include_untagged: bool) -> str:
+    """This orchestrator's tokens no live pool claims; at boot also the runners
+    without token (launched before 1.62.11). Other orchestrators: never."""
+    arms = "".join(f"{shlex.quote(c)}) ;; " for c in sorted(claimed))
+    arms += f"{shlex.quote(_orchestrator_id() + '/')}*) echo $p ;; "
+    if include_untagged:
+        arms += "'') echo $p ;;"
+    return _runner_sel_sh(arms)
+
+
+def _foreign_count_sh() -> str:
+    """Shell printing how many runners carry ANOTHER orchestrator's token."""
+    mine = shlex.quote(_orchestrator_id() + "/")
+    return (f"foreign=$(for p in $(pgrep -f {shlex.quote(RUNNER_MATCH_PATTERN)}; "
+            f"pgrep -f {shlex.quote(VLM_RUNNER_MATCH_PATTERN)}); do t=$(lid $p); "
+            f"case \"$t\" in ''|{mine}*) ;; *) echo $p ;; esac; done | wc -l | tr -d ' '); ")
+
+
+def _kill_sel_sh(none_msg: str = "no process") -> str:
+    """Kill what `sel` selects: SIGTERM, up to _SWEEP_GRACE_ITERS × 0.5 s for
+    the runner's Metal cleanup, then — only for what still runs — a `sample`
+    stack capture to /tmp/wedge-<pid>-<ts>.txt and SIGKILL. `sel` is re-run at
+    each step, so a PID that changed owner is never hit. Prints one line:
+    `none_msg`, `cleaned (SIGTERM)` or `killed (SIGKILL)`."""
+    # Iterate over `$(sel)` itself: the nodes' login shell is zsh, which does
+    # not word-split an unquoted `$var`, so `kill $pids` with two PIDs would
+    # pass one bogus argument. Command substitution IS split.
+    return (f"if [ -z \"$(sel)\" ]; then echo {shlex.quote(none_msg)}; else "
+            "for p in $(sel); do kill -TERM $p 2>/dev/null; done; "
+            f"for i in $(seq 1 {_SWEEP_GRACE_ITERS}); do [ -z \"$(sel)\" ] && break; sleep 0.5; done; "
+            "if [ -n \"$(sel)\" ]; then "
+            "echo 'SIGTERM ignored, escalating to SIGKILL — wired memory will leak' >&2; "
+            "for p in $(sel); do sample $p 2 -file /tmp/wedge-$p-$(date +%Y%m%d-%H%M%S).txt "
+            ">/dev/null 2>&1; done; for p in $(sel); do kill -9 $p 2>/dev/null; done; "
+            "echo 'killed (SIGKILL)'; else echo 'cleaned (SIGTERM)'; fi; fi")
+
+
+def _kill_launch_on_host(ssh: str, sel_sh: str) -> None:
+    """Stop the runners `sel_sh` selects on ONE host (capacity guard of a load:
+    the runners of the pool being loaded, never another pool on the Mac)."""
     try:
         subprocess.run(["ssh", "-o", "ConnectTimeout=5", "-o", "BatchMode=yes",
-                        ssh, sh], capture_output=True, text=True, timeout=30)
+                        ssh, sel_sh + _kill_sel_sh()],
+                       capture_output=True, text=True, timeout=32)
     except Exception as e:
-        sys.stderr.write(f"[load-guard] pkill on {ssh} failed: {e}\n")
+        sys.stderr.write(f"[load-guard] kill on {ssh} failed: {e}\n")
 
 
-def _runner_footprint_cmd(match: str) -> str:
-    """Shell command summing the physical footprint, in bytes, of every process
-    whose command line matches `match`.
+def _runner_footprint_cmd(sel_sh: str) -> str:
+    """Shell command summing the physical footprint, in bytes, of the runner
+    processes `sel_sh` selects (the pool being loaded — until 1.62.11 every
+    runner on the node, so a load on a shared node counted its neighbours).
 
     Physical footprint, not RSS: MLX keeps the weights in Metal buffers, which
     `footprint` reports as "IOAccelerator (graphics)" and RSS does not count.
@@ -1674,7 +1785,7 @@ def _runner_footprint_cmd(match: str) -> str:
     load poller saw a few GB that stopped growing, froze the progress bar and
     flagged a healthy load as STALLED. The footprint also leaves out clean,
     reclaimable file pages, which is what the capacity guard needs."""
-    return (f"for p in $(pgrep -f {shlex.quote(match)}); do "
+    return (sel_sh + "for p in $(sel); do "
             "footprint -f bytes --noCategories -p $p 2>/dev/null; done "
             "| sed -n 's/.*Footprint: \\([0-9][0-9]*\\) B.*/\\1/p' "
             "| awk '{s+=$1} END{printf \"%.0f\\n\", s}'")
@@ -1684,12 +1795,18 @@ async def _poll_load_progress(cluster_id: str, state: dict,
                               ssh_targets: list, total_bytes: int,
                               ceilings: Optional[list] = None,
                               hosts: Optional[list] = None,
-                              model: Optional[str] = None) -> None:
+                              model: Optional[str] = None,
+                              alias: Optional[str] = None,
+                              exclude: Optional[set] = None) -> None:
     """While a load is in progress, read each rank's runner memory footprint
     (bytes materialized) so the UI shows TRUE progress + throughput + ETA +
     stall detection instead of a frozen elapsed/estimated 95 %. Self-terminates
     when the load's in_progress flag clears (set by _end_loading)."""
-    cmd = _runner_footprint_cmd(RUNNER_MATCH_PATTERN)
+    # The pool being loaded = this cluster/alias's tokens, minus those already
+    # live now (a hot-swapped old pool of the same alias keeps serving).
+    sel_sh = _sel_prefix(_launch_prefix(cluster_id, alias or cluster_id),
+                         exclude=exclude or set())
+    cmd = _runner_footprint_cmd(sel_sh)
 
     async def _footprint(ssh: str) -> int:
         try:
@@ -1740,8 +1857,8 @@ async def _poll_load_progress(cluster_id: str, state: dict,
                         f"[load-guard] {cluster_id}: {_h} at {_used / 1e9:.1f} GB "
                         f"loading {model} > ceiling {_cap / 1e9:.1f} GB — "
                         f"stopping this runner before macOS jetsam does\n")
-                    await asyncio.to_thread(_kill_model_runner_on_host,
-                                            ssh_targets[_i], model)
+                    await asyncio.to_thread(_kill_launch_on_host,
+                                            ssh_targets[_i], sel_sh)
             last_bytes, last_t = loaded, now
             await asyncio.sleep(3)
     except asyncio.CancelledError:
@@ -1754,8 +1871,11 @@ def _start_progress_poller(cluster_id: str, state: dict,
                            ssh_targets: list, total_bytes: int,
                            ceilings: Optional[list] = None,
                            hosts: Optional[list] = None,
-                           model: Optional[str] = None) -> None:
-    """Spawn the observable-load poller for a load (no-op without targets)."""
+                           model: Optional[str] = None,
+                           alias: Optional[str] = None) -> None:
+    """Spawn the observable-load poller for a load (no-op without targets).
+    Call it BEFORE the new pool starts: the tokens live at this instant are the
+    ones the poller must not count or kill."""
     if not ssh_targets or not total_bytes:
         return
     old = _progress_pollers.get(cluster_id)
@@ -1765,7 +1885,8 @@ def _start_progress_poller(cluster_id: str, state: dict,
         _progress_pollers[cluster_id] = asyncio.create_task(
             _poll_load_progress(cluster_id, state, list(ssh_targets),
                                 int(total_bytes), ceilings=ceilings,
-                                hosts=hosts, model=model))
+                                hosts=hosts, model=model, alias=alias,
+                                exclude=set(_LIVE_LAUNCH_IDS)))
     except RuntimeError:
         pass   # no running loop (shouldn't happen inside a request)
 
@@ -2797,7 +2918,8 @@ def remote_cmd(node: dict, nodes: list[dict], model: str, mode: str, port: int,
                ram_weights_csv: Optional[str] = None,
                backend: str = "jaccl",
                mtp: Optional[dict] = None,
-               batch: bool = False) -> str:
+               batch: bool = False,
+               launch_id: Optional[str] = None) -> str:
     world_size = len(nodes)
     env = {
         "MLX_RANK": str(node["rank"]),
@@ -2814,6 +2936,8 @@ def remote_cmd(node: dict, nodes: list[dict], model: str, mode: str, port: int,
         "RUNNER_EMIT_BATCH": str(emit_batch),
         "SPEC_SESS_DEBUG": os.environ.get("SPEC_SESS_DEBUG", ""),
     }
+    if launch_id:
+        env["RUNNER_LAUNCH_ID"] = launch_id   # ownership token (#215)
     if backend == "ring":
         # #40 WU4 — ring/TCP transport: MLX ring hostfile ([["ip:port"], ...]
         # in rank order, the format the 2026-07-02 distributed-VLM night
@@ -2881,7 +3005,8 @@ def remote_cmd(node: dict, nodes: list[dict], model: str, mode: str, port: int,
 def remote_vlm_cmd(node: dict, nodes: list[dict], model: str, port: int,
                    emit_batch: int = 10, backend: str = "jaccl",
                    devices_json: str = "", shard_mode: str = "",
-                   ram_weights_csv: Optional[str] = None) -> str:
+                   ram_weights_csv: Optional[str] = None,
+                   launch_id: Optional[str] = None) -> str:
     """Per-node command for the distributed VLM runner.
 
     Same transport env as remote_cmd: JACCL (coordinator + RDMA devices json)
@@ -2898,6 +3023,8 @@ def remote_vlm_cmd(node: dict, nodes: list[dict], model: str, port: int,
         "RUNNER_BACKEND": backend,
         "RUNNER_EMIT_BATCH": str(emit_batch),
     }
+    if launch_id:
+        env["RUNNER_LAUNCH_ID"] = launch_id   # ownership token (#215)
     if shard_mode:
         env["RUNNER_SHARD_MODE"] = shard_mode
     if ram_weights_csv:
@@ -2970,16 +3097,15 @@ _WATCHDOG_RECOVERY_BY_CLUSTER: dict = {}
 
 class RunnerProc:
     def __init__(self, node: dict, cmd: str, on_event, cluster: str = "nautilus",
-                 match_pattern: Optional[str] = None, pool=None):
+                 pool=None, launch_id: Optional[str] = None):
         self.node = node
         self.cluster = cluster
         # Backref to the owning RunnerPool (None for standalone procs, e.g.
         # the VLM proxy) — used by the [canary] stderr hook (MTP alignment).
         self.pool = pool
-        # pkill pattern for the REMOTE process this proc spawned. Text pools
-        # keep the runner.py default; the distributed VLM pool passes its own
-        # so a graceful_stop never touches runner.py (or vice versa).
-        self._match_pattern = match_pattern or RUNNER_MATCH_PATTERN
+        # Ownership token of the pool that launched this rank (#215): the
+        # remote kill selects THIS token, never every runner on the node.
+        self.launch_id = launch_id
         # Only rank 0 produces events we parse; ranks > 0 would otherwise fill
         # their stdout pipe buffer (no reader) and block the remote process on
         # write(), stalling the distributed barrier -> deadlock. Send their
@@ -3182,37 +3308,22 @@ class RunnerProc:
             if not ssh:
                 return
             sys.stderr.write(f"[rank{rank}] remote graceful kill on {ssh} ({reason})\n")
-            # `pkill -TERM` (default signal) → wait 5s for cleanup → check
-            # → SIGKILL only if still alive. Returns 0 if any process was
-            # signalled (TERM phase), 1 if no match. We don't care about
-            # the exact rc here, just that we tried both phases.
-            pattern = shlex.quote(self._match_pattern)
+            # Only this pool's ranks: the processes whose RUNNER_LAUNCH_ID is
+            # this rank's token (#215). Until 1.62.11 this was `pkill -f` on
+            # the generic runner.py match, so stopping one pool killed every
+            # other pool's runner on the same node.
             # 24×0.5s = 12s grace so the runner's SIGTERM-driven Metal
             # cleanup (free_metal) finishes on big models before SIGKILL.
             # Capture-before-kill (2026-07-24, panel Phase 0): a runner that
-            # ignored SIGTERM is wedged inside a NATIVE call — exactly the
-            # class-B state nobody has ever stack-dumped (every prior wedge
-            # was SIGKILLed uncaptured). `sample <pid> 2` costs ~2s and writes
-            # the native stack to /tmp/wedge-<pid>-<ts>.txt ON THE NODE before
-            # the SIGKILL, so the next wedge tells us which layer it is stuck
-            # in (libjaccl send/recv vs MLX eval vs ibv_reg_mr) WITHOUT
-            # disarming the self-healing. Grace 12s + sample 2s → ssh timeout
-            # raised 15→32s.
-            cmd = (
-                f"pkill -TERM -f {pattern} 2>/dev/null && "
-                f"for i in $(seq 1 {_SWEEP_GRACE_ITERS}); do "
-                f"  pgrep -f {pattern} >/dev/null 2>&1 || break; "
-                f"  sleep 0.5; "
-                f"done; "
-                f"pgrep -f {pattern} >/dev/null 2>&1 && "
-                f"  (echo 'SIGTERM ignored, escalating to SIGKILL — wired memory will leak' >&2 && "
-                f"   for p in $(pgrep -f {pattern}); do "
-                f"     sample $p 2 -file /tmp/wedge-$p-$(date +%Y%m%d-%H%M%S).txt >/dev/null 2>&1; "
-                f"   done; "
-                f"   echo 'wedge stack captured to /tmp/wedge-*.txt' >&2 && "
-                f"   pkill -9 -f {pattern}) || "
-                f"  echo 'clean exit'"
-            )
+            # ignored SIGTERM is wedged inside a NATIVE call — `sample <pid> 2`
+            # writes the native stack to /tmp/wedge-<pid>-<ts>.txt ON THE NODE
+            # before the SIGKILL (see _kill_sel_sh). Grace 12s + sample 2s →
+            # ssh timeout 32s.
+            if not self.launch_id:
+                sys.stderr.write(f"[rank{rank}] no launch id — remote kill skipped "
+                                 f"(would hit every runner on {ssh})\n")
+                return
+            cmd = _sel_exact(self.launch_id) + _kill_sel_sh("clean exit")
             r = subprocess.run(
                 ["ssh", "-o", "ConnectTimeout=5", "-o", "StrictHostKeyChecking=no", ssh, cmd],
                 capture_output=True, text=True, timeout=32,
@@ -3224,8 +3335,17 @@ class RunnerProc:
 
 
 def _sweep_orphan_runners(cluster_id: str,
-                          timeout_per_node: float = 15.0) -> dict:
-    """Two-phase pkill of any lingering runner.py on every node of `cluster_id`.
+                          timeout_per_node: float = 15.0,
+                          include_untagged: bool = False) -> dict:
+    """Two-phase kill of the ORPHAN runners on every node of `cluster_id`.
+
+    Orphan (#215, 1.62.11) = a runner.py / vlm_runner.py carrying THIS
+    orchestrator's RUNNER_LAUNCH_ID that no live pool claims (in any cluster),
+    plus — `include_untagged`, boot only — a runner without token (launched
+    before 1.62.11). A runner of another orchestrator (dev .18 / prod .39 on the
+    same nodes) is never killed, only counted. Until 1.62.10 this killed every
+    runner on the node: the other pools of a shared node, another cluster's
+    pool on the same Mac, the other orchestrator's runners.
 
     Why this exists:
       The orchestrator container is the only thing that should launch runner.py
@@ -3257,46 +3377,23 @@ def _sweep_orphan_runners(cluster_id: str,
     if cd.get("kind") == "decision":
         return {"cluster": cluster_id, "swept": [], "warnings": [],
                 "note": "decision cluster: no runner to sweep"}
-    pattern = shlex.quote(RUNNER_MATCH_PATTERN)
-    pattern_vlm = shlex.quote(VLM_RUNNER_MATCH_PATTERN)
     # The sweep does three things in one SSH round-trip per node:
-    #   1. kill any runner.py (two-phase SIGTERM → grace → SIGKILL)
+    #   1. kill the orphans (two-phase SIGTERM → grace → SIGKILL, see
+    #      _kill_sel_sh), counting the other orchestrator's runners it spares
     #   2. probe wired memory AFTER the kill — surfaces the Metal-leak
     #      symptom where a SIGKILL'd process leaves wired pages reserved
-    #      until reboot (the very thing v1.4.2's SIGTERM-first pattern
-    #      tries to avoid). High residual wired post-sweep = node still
+    #      until reboot. High residual wired post-sweep = node still
     #      has a problem the sweep couldn't fix.
     #   3. report the kill result + wired bytes so the caller can warn.
+    claimed = set(_LIVE_LAUNCH_IDS)
+    kill_line = (_sel_orphans(claimed, include_untagged) + _foreign_count_sh()
+                 + "res=$(" + _kill_sel_sh("no orphan") + " 2>/dev/null | tail -1); "
+                 "if [ \"$foreign\" != 0 ]; then "
+                 "echo \"$res ($foreign of another orchestrator spared)\"; "
+                 "else echo \"$res\"; fi; ")
     cmd = (
         # ── phase 1: kill ────────────────────────────────────────────
-        # 24×0.5s = 12s grace. The runner now frees its Metal cache in its
-        # SIGTERM-driven exit path (runner.py free_metal); for a 200 GB+
-        # model the array deallocation + clear_cache can take several
-        # seconds, so we give it room before escalating to SIGKILL (which
-        # is what leaks the wired pages).
-        f"if pgrep -f {pattern} >/dev/null 2>&1; then "
-        f"  pkill -TERM -f {pattern} 2>/dev/null; "
-        f"  for i in $(seq 1 {_SWEEP_GRACE_ITERS}); do "
-        f"    pgrep -f {pattern} >/dev/null 2>&1 || break; "
-        f"    sleep 0.5; "
-        f"  done; "
-        f"  if pgrep -f {pattern} >/dev/null 2>&1; then "
-        f"    pkill -9 -f {pattern}; echo 'killed (SIGKILL)'; "
-        f"  else echo 'cleaned (SIGTERM)'; fi; "
-        f"else echo 'no orphan'; fi; "
-        # Same two-phase kill for orphaned DISTRIBUTED VLM runners
-        # (vlm_runner.py) — a pattern disjoint from both runner.py and the
-        # prod mlx_vlm.server processes, which this sweep must never touch.
-        f"if pgrep -f {pattern_vlm} >/dev/null 2>&1; then "
-        f"  pkill -TERM -f {pattern_vlm} 2>/dev/null; "
-        f"  for i in $(seq 1 {_SWEEP_GRACE_ITERS}); do "
-        f"    pgrep -f {pattern_vlm} >/dev/null 2>&1 || break; "
-        f"    sleep 0.5; "
-        f"  done; "
-        f"  if pgrep -f {pattern_vlm} >/dev/null 2>&1; then "
-        f"    pkill -9 -f {pattern_vlm}; echo 'vlm killed (SIGKILL)'; "
-        f"  else echo 'vlm cleaned (SIGTERM)'; fi; "
-        f"else echo 'no vlm orphan'; fi; "
+        kill_line +
         # ── phase 2: wired memory probe ──────────────────────────────
         # vm_stat reports in pages; multiply by page size for bytes.
         f"PS=$(vm_stat | head -1 | awk '{{print $8}}' | tr -d '.'); "
@@ -3588,6 +3685,22 @@ class RunnerPool:
                 self._loop.call_soon_threadsafe(q.put_nowait, ev)
 
     async def start(self):
+        """Claim a fresh ownership token (#215), then launch. A failed start
+        releases it: whatever its runners left on the nodes is an orphan the
+        next sweep may kill (the auto-reload path does not stop a pool whose
+        start failed). A pool started again (replica heal) drops its old token."""
+        old = getattr(self, "launch_id", None)
+        if old:
+            _LIVE_LAUNCH_IDS.discard(old)
+        self.launch_id = _new_launch_id(self.cluster, self.alias)
+        _LIVE_LAUNCH_IDS.add(self.launch_id)
+        try:
+            await self._start()
+        except BaseException:
+            _LIVE_LAUNCH_IDS.discard(self.launch_id)
+            raise
+
+    async def _start(self):
         self._loop = asyncio.get_running_loop()
         # Pre-flight: validate the model is PRESENT and COMPLETE on EVERY target
         # node (not just rank-0) before sshing the runners. A model rsync'd to
@@ -3694,9 +3807,11 @@ class RunnerPool:
                              ram_weights_csv=ram_weights_csv,
                              backend=getattr(self, "backend", "jaccl"),
                              mtp=self.mtp_cfg,
-                             batch=getattr(self, "batch", False))
+                             batch=getattr(self, "batch", False),
+                             launch_id=self.launch_id)
             self.runners.append(RunnerProc(node, cmd, self._on_event,
-                                           cluster=self.cluster, pool=self))
+                                           cluster=self.cluster, pool=self,
+                                           launch_id=self.launch_id))
         rank0 = next(r for r in self.runners if r.node["rank"] == 0)
 
         # Wait for rank 0 to emit `ready` while watching EVERY rank for death.
@@ -3820,6 +3935,9 @@ class RunnerPool:
         await asyncio.to_thread(_stop_all, list(self.runners))
         sys.stderr.write("[api] all runners stopped\n")
         self.runners.clear()
+        # Released only now: a runner that survived its kill becomes an orphan
+        # of this orchestrator, which the next sweep handles (#215).
+        _LIVE_LAUNCH_IDS.discard(getattr(self, "launch_id", None))
 
     def alive_count(self) -> int:
         return sum(1 for r in self.runners if r.proc.poll() is None)
@@ -4318,8 +4436,8 @@ class VLMDistPool(RunnerPool):
         # no ring for distributed models).
         self.backend = backend or "jaccl"
 
-    async def start(self):
-        """Mirror of RunnerPool.start() for the VLM runner: same model-layout
+    async def _start(self):
+        """Mirror of RunnerPool._start() for the VLM runner: same model-layout
         preflight, RDMA edge preflight (jaccl), capacity-aware pipeline split
         and wait-ready-while-scanning-deaths loop, minus the text-only extras
         (AP, draft, MTP). Deliberately a contained copy — the text start()
@@ -4387,10 +4505,11 @@ class VLMDistPool(RunnerPool):
                                  backend=self.backend,
                                  devices_json=devices_json,
                                  shard_mode=self.shard_mode,
-                                 ram_weights_csv=ram_weights_csv)
+                                 ram_weights_csv=ram_weights_csv,
+                                 launch_id=self.launch_id)
             self.runners.append(RunnerProc(
                 node, cmd, self._on_event, cluster=self.cluster,
-                match_pattern=VLM_RUNNER_MATCH_PATTERN,
+                launch_id=self.launch_id,
             ))
         rank0 = next(r for r in self.runners if r.node["rank"] == 0)
         load_timeout_s = 900.0   # 327GB Q6 loads in ~75-90s warm; cold FS
@@ -7361,7 +7480,10 @@ async def lifespan(app: FastAPI):
     # blind to them (Sophie: "au restart odyssai ne les voit pas").
     _sweep_cids = active_cluster_ids()
     _sweep_results = await asyncio.gather(
-        *[asyncio.to_thread(_sweep_orphan_runners, _cid) for _cid in _sweep_cids],
+        # include_untagged: runners launched before 1.62.11 carry no token;
+        # at boot no pool is live yet, so an untagged runner is an orphan.
+        *[asyncio.to_thread(_sweep_orphan_runners, _cid, include_untagged=True)
+          for _cid in _sweep_cids],
         return_exceptions=True,
     )
     # Wired-guard for the restore below: any host still holding leaked wired
@@ -8500,7 +8622,7 @@ def _initial_default_config() -> Optional[dict]:
 #   major (1.7.2 → 2.0.0) — breaking API or topology change
 #
 # Use `./scripts/bump-version.sh patch|minor|major` to bump + auto-commit.
-APP_VERSION = "1.62.10"
+APP_VERSION = "1.62.11"
 
 app = FastAPI(
     title="OdyssAI-X (odyssai.eu)",
@@ -17320,11 +17442,11 @@ async def admin_cluster_load(cluster_id: str, req: ArgoLoadRequest):
                 _rep_size * len(_rep_indices),
                 ceilings=[c["ceiling"] for c in _rep_targets],
                 hosts=[c["host"] for c in _rep_targets],
-                model=req.model)
+                model=req.model, alias=alias)
         else:
             _start_progress_poller(cluster_id, _rep_state,
                                    [n.get("ssh") for n in _rep_topo if n.get("ssh")],
-                                   _rep_size * len(_rep_indices))
+                                   _rep_size * len(_rep_indices), alias=alias)
         try:
             async with get_admin_lock(cluster_id):
                 _old = get_pool(cluster_id, alias)
@@ -17834,7 +17956,7 @@ async def admin_cluster_load(cluster_id: str, req: ArgoLoadRequest):
         _begin_loading(loading_state, req.model, nodes_count, size_bytes, estimated_s)
         _start_progress_poller(cluster_id, loading_state,
                                [n.get("ssh") for n in topo if n.get("ssh")],
-                               size_bytes)
+                               size_bytes, alias=alias)
         try:
             old = get_pool(cluster_id, alias)
             if old is not None and not req.force_hot_swap:
