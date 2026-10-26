@@ -2067,6 +2067,75 @@ async def _hf_repo_total_bytes(repo: str, token: Optional[str]) -> Optional[int]
     return (sum(sizes.values()) or None) if sizes else None
 
 
+# huggingface_hub 1.16 refuses, CLIENT-side, to start any file over 50 GB on the
+# plain HTTP path (file_download.http_get: `expected_size >
+# constants.MAX_HTTP_DOWNLOAD_SIZE` with resume_size == 0 -> ValueError "too
+# large ... install hf_xet"). The downloader must stay on that path (see
+# HF_HUB_DISABLE_XET below), so every shard over 50 GB failed at once:
+# 2026-10-26, stepfun-ai/Step-5-Preview-BF16 has 21 shards of 54.2 GB and the
+# job died after the 27 smaller files. The premise of the guard is false for
+# these files, checked from .29 the same day: HF answers a plain GET with 200
+# and the full 54,208,650,568-byte Content-Length, and open-ended Range
+# requests (`bytes=N-`, what the resume sends) with 206 up to the last byte.
+# The constant is lifted for the downloader's own process only, by a
+# sitecustomize put on its PYTHONPATH: no edit of the node venv (a pip upgrade
+# cannot silently undo it) and no change to the `hf download` argv, which the
+# kill pattern, the live probe and the boot-time reattach all match on.
+_HF_SITE_DIR_REMOTE = f"{REMOTE_CLUSTER_DIR}/hfdl-site"
+_HF_SITECUSTOMIZE = (
+    "# Written by the OdyssAI-X downloader (api._hf_dl_cmd). Loaded only by the\n"
+    "# `hf download` it launches, through PYTHONPATH. Lifts huggingface_hub's\n"
+    "# 50 GB client-side refusal of the plain HTTP path; HF serves those files.\n"
+    "try:\n"
+    "    import huggingface_hub.constants as _c\n"
+    "    _c.MAX_HTTP_DOWNLOAD_SIZE = 1 << 62\n"
+    "except Exception:\n"
+    "    pass\n"
+)
+
+
+def _hf_dl_cmd(lay: dict, hf_token: Optional[str],
+               sizes: Optional[dict] = None) -> str:
+    """Remote shell command of one target download (see _hf_dl_one)."""
+    # HF_HUB_DISABLE_XET=1 is what makes the resume real. With hf_xet installed
+    # (it is, in the node venv) huggingface_hub 1.16 hands Xet-backed repos to
+    # `xet_get`, which takes no resume offset and rewrites the `.incomplete`
+    # from byte 0; only the plain HTTP path (`http_get`) continues it with a
+    # Range request. 2026-10-20: a /retry of DeepSeek-V4.1-Flash-1017 on .29
+    # zeroed ~170 GiB of partials that way. Pause/resume/retry all rely on
+    # the partials surviving, so the downloader always takes the HTTP path.
+    site = _HF_SITE_DIR_REMOTE
+    env_prefix = "HF_HUB_DISABLE_XET=1 "
+    if hf_token:
+        env_prefix += f"HF_TOKEN={shlex.quote(hf_token)} "
+    env_prefix += f'PYTHONPATH="{site}" '
+    include = ""
+    if lay["include"]:
+        include = f"--include {shlex.quote(lay['include'])} "
+    # `hf download` resumes partial files (HTTP path, see above). 4 workers
+    # keeps the per-file resume granular even on multi-GB safetensors shards.
+    # Expected weight sizes go in first (SIZES_MANIFEST): from that point the
+    # load probe refuses this dir until every listed shard has its exact size.
+    manifest = ""
+    if sizes and any(_is_weight_file(k) for k in sizes):
+        target = lay["target"]
+        manifest = (f"mkdir -p {shlex.quote(target)} && "
+                    f"printf %s {shlex.quote(_sizes_manifest_json(sizes))} > "
+                    f"{shlex.quote(target + '/' + SIZES_MANIFEST)} && ")
+    # The site dir path holds $HOME: double quotes so the remote shell expands it.
+    sitefile = (f'mkdir -p "{site}" && '
+                f'printf %s {shlex.quote(_HF_SITECUSTOMIZE)} > "{site}/sitecustomize.py" && ')
+    return (
+        f"mkdir -p {shlex.quote(lay['local_dir'])} && "
+        f"{sitefile}"
+        f"{manifest}"
+        f"{env_prefix}{HF_BIN_REMOTE} download {shlex.quote(lay['repo_id'])} "
+        f"{include}"
+        f"--local-dir {shlex.quote(lay['local_dir'])} "
+        f"--max-workers 4"
+    )
+
+
 async def _hf_dl_one(dl_id: str, host: dict, repo: str,
                      hf_token: Optional[str], slot: dict,
                      sizes: Optional[dict] = None) -> dict:
@@ -2098,36 +2167,7 @@ async def _hf_dl_one(dl_id: str, host: dict, repo: str,
     slot["bytes"] = 0
     slot["started_at"] = time.time()
 
-    # HF_HUB_DISABLE_XET=1 is what makes the resume real. With hf_xet installed
-    # (it is, in the node venv) huggingface_hub 1.16 hands Xet-backed repos to
-    # `xet_get`, which takes no resume offset and rewrites the `.incomplete`
-    # from byte 0; only the plain HTTP path (`http_get`) continues it with a
-    # Range request. 2026-10-20: a /retry of DeepSeek-V4.1-Flash-1017 on .29
-    # zeroed ~170 GiB of partials that way. Pause/resume/retry all rely on
-    # the partials surviving, so the downloader always takes the HTTP path.
-    env_prefix = "HF_HUB_DISABLE_XET=1 "
-    if hf_token:
-        env_prefix += f"HF_TOKEN={shlex.quote(hf_token)} "
-    include = ""
-    if lay["include"]:
-        include = f"--include {shlex.quote(lay['include'])} "
-    # `hf download` resumes partial files (HTTP path, see above). 4 workers
-    # keeps the per-file resume granular even on multi-GB safetensors shards.
-    # Expected weight sizes go in first (SIZES_MANIFEST): from that point the
-    # load probe refuses this dir until every listed shard has its exact size.
-    manifest = ""
-    if sizes and any(_is_weight_file(k) for k in sizes):
-        manifest = (f"mkdir -p {shlex.quote(target)} && "
-                    f"printf %s {shlex.quote(_sizes_manifest_json(sizes))} > "
-                    f"{shlex.quote(target + '/' + SIZES_MANIFEST)} && ")
-    cmd = (
-        f"mkdir -p {shlex.quote(local_dir)} && "
-        f"{manifest}"
-        f"{env_prefix}{HF_BIN_REMOTE} download {shlex.quote(repo_id)} "
-        f"{include}"
-        f"--local-dir {shlex.quote(local_dir)} "
-        f"--max-workers 4"
-    )
+    cmd = _hf_dl_cmd(lay, hf_token, sizes)
     proc = await asyncio.create_subprocess_exec(
         "ssh", "-o", "ConnectTimeout=5", "-o", "BatchMode=yes", ssh, cmd,
         stdout=asyncio.subprocess.PIPE,
@@ -8622,7 +8662,7 @@ def _initial_default_config() -> Optional[dict]:
 #   major (1.7.2 → 2.0.0) — breaking API or topology change
 #
 # Use `./scripts/bump-version.sh patch|minor|major` to bump + auto-commit.
-APP_VERSION = "1.62.11"
+APP_VERSION = "1.62.12"
 
 app = FastAPI(
     title="OdyssAI-X (odyssai.eu)",
