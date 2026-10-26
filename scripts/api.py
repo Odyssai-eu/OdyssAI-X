@@ -8662,7 +8662,7 @@ def _initial_default_config() -> Optional[dict]:
 #   major (1.7.2 → 2.0.0) — breaking API or topology change
 #
 # Use `./scripts/bump-version.sh patch|minor|major` to bump + auto-commit.
-APP_VERSION = "1.62.12"
+APP_VERSION = "1.62.13"
 
 app = FastAPI(
     title="OdyssAI-X (odyssai.eu)",
@@ -10461,6 +10461,8 @@ async def _proxy_chat_completion(prov_id: str, prov: dict, entry: dict,
 #                  end_turn → stop
 #                  tool_use → tool_calls
 #                  max_tokens → length
+#                  refusal → content_filter (1.62.13 : avant, un refus devenait
+#                  « stop » avec un contenu vide, indiscernable d'une réponse vide)
 #               usage.input_tokens              →  usage.prompt_tokens
 #               usage.output_tokens             →  usage.completion_tokens
 #               usage.cache_read_input_tokens   →  usage.prompt_tokens_details.cached_tokens
@@ -10474,7 +10476,17 @@ _ANTC_STOP_REASON_TO_OPENAI = {
     "stop_sequence": "stop",
     "max_tokens": "length",
     "tool_use": "tool_calls",
+    "refusal": "content_filter",
 }
+
+
+def _antc_finish(stop_reason: str | None) -> str:
+    """finish_reason OpenAI d'un stop_reason Anthropic ; un stop_reason inconnu
+    reste « stop » mais se voit dans les logs."""
+    sr = stop_reason or ""
+    if sr and sr not in _ANTC_STOP_REASON_TO_OPENAI:
+        sys.stderr.write(f"[anthropic] stop_reason inconnu : {sr} (rendu « stop »)\n")
+    return _ANTC_STOP_REASON_TO_OPENAI.get(sr, "stop")
 
 
 def _openai_to_anthropic_request(body: dict, upstream_model: str) -> dict:
@@ -10614,7 +10626,7 @@ def _anthropic_to_openai_response(payload: dict, openai_model: str) -> dict:
         # clients reliably parse. Future: surface as reasoning_content.
 
     msg: dict = {"role": "assistant", "content": ("".join(text_parts) or None)}
-    finish = _ANTC_STOP_REASON_TO_OPENAI.get(payload.get("stop_reason") or "", "stop")
+    finish = _antc_finish(payload.get("stop_reason"))
     if tool_calls:
         msg["tool_calls"] = tool_calls
         finish = "tool_calls"
@@ -10640,6 +10652,8 @@ def _anthropic_to_openai_response(payload: dict, openai_model: str) -> dict:
             "index": 0,
             "message": msg,
             "finish_reason": finish,
+            # stop_reason d'origine : diagnostic (ex. refusal), ignoré des clients OpenAI
+            "stop_reason": payload.get("stop_reason"),
         }],
         "usage": usage,
     }
@@ -10776,7 +10790,7 @@ async def _translate_anthropic_sse_to_openai(
                     d = ev.get("delta") or {}
                     sr = d.get("stop_reason")
                     if sr:
-                        final_stop = _ANTC_STOP_REASON_TO_OPENAI.get(sr, "stop")
+                        final_stop = _antc_finish(sr)
                         if any(k == "tool_use" for k in block_kind.values()):
                             final_stop = "tool_calls"
                     u = ev.get("usage") or {}
