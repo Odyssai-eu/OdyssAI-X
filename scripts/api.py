@@ -1883,12 +1883,49 @@ _dl_persist_frozen = False
 _dl_last_saved: Optional[str] = None
 
 
-async def _hf_repo_total_bytes(repo: str, token: Optional[str]) -> Optional[int]:
-    """Best-effort total size of an HF repo = sum of file sizes, via the HF tree
-    API. Mechanism borrowed from the HF tools app (#14) to drive a real progress
-    bar. Returns None on any failure so the caller falls back to indeterminate."""
+# Expected weight sizes, written into the model dir when a download starts and
+# copied to a sync target BEFORE any data moves. The load-time probe
+# (_validate_model_layout) refuses a model whose listed shards are missing or
+# not exactly this size. Why sizes and not names only: the TB5 sync receiver
+# (`tar xf -`) writes straight to the final file names, so a cancel mid-stream
+# left a truncated shard under its real name, and the name check passed it.
+# Weights only: config / template files are sometimes fixed by hand after the
+# download, and a size check on them would refuse a deliberately edited model.
+SIZES_MANIFEST = ".odyssai-sizes.json"
+
+
+def _is_weight_file(rel: str) -> bool:
+    return rel.endswith(".safetensors")
+
+
+def _hf_tree_sizes(entries: list, subfolder: Optional[str]) -> dict:
+    """{path relative to the served model dir: size} from an HF tree listing.
+    A subfolder spec (`<repo>/6bit`) keeps only that variant, prefix stripped,
+    because its files land at `<models_dir>/<repo>/6bit/…` = the model dir."""
+    prefix = (subfolder.rstrip("/") + "/") if subfolder else ""
+    out = {}
+    for e in entries or []:
+        if not isinstance(e, dict) or e.get("type") != "file":
+            continue
+        path = str(e.get("path", ""))
+        if prefix and not path.startswith(prefix):
+            continue
+        sz = e.get("size") or (e.get("lfs") or {}).get("size") or 0
+        out[path[len(prefix):]] = int(sz)
+    return out
+
+
+def _sizes_manifest_json(sizes: dict) -> str:
+    """Manifest body: weight files only (see SIZES_MANIFEST)."""
+    return json.dumps({"files": {k: v for k, v in sorted(sizes.items())
+                                 if _is_weight_file(k)}},
+                      separators=(",", ":"))
+
+
+async def _hf_repo_sizes(repo: str, token: Optional[str]) -> Optional[dict]:
+    """{relative path: size} of every file of an HF repo (or of its subfolder
+    variant), via the HF tree API. None on any failure."""
     repo_id, subfolder = _split_hf_repo(repo)
-    prefix = (subfolder.rstrip("/") + "/") if subfolder else None
     url = f"https://huggingface.co/api/models/{repo_id}/tree/main?recursive=true"
     headers = {"Authorization": f"Bearer {token}"} if token else {}
     try:
@@ -1896,21 +1933,22 @@ async def _hf_repo_total_bytes(repo: str, token: Optional[str]) -> Optional[int]
             r = await c.get(url, headers=headers)
             if r.status_code != 200:
                 return None
-            total = 0
-            for e in r.json():
-                if e.get("type") == "file":
-                    # Subfolder spec (e.g. `<repo>/6bit`): only that variant's bytes.
-                    if prefix and not str(e.get("path", "")).startswith(prefix):
-                        continue
-                    sz = e.get("size") or (e.get("lfs") or {}).get("size") or 0
-                    total += int(sz)
-            return total or None
+            return _hf_tree_sizes(r.json(), subfolder) or None
     except Exception:
         return None
 
 
+async def _hf_repo_total_bytes(repo: str, token: Optional[str]) -> Optional[int]:
+    """Best-effort total size of an HF repo = sum of file sizes, via the HF tree
+    API. Mechanism borrowed from the HF tools app (#14) to drive a real progress
+    bar. Returns None on any failure so the caller falls back to indeterminate."""
+    sizes = await _hf_repo_sizes(repo, token)
+    return (sum(sizes.values()) or None) if sizes else None
+
+
 async def _hf_dl_one(dl_id: str, host: dict, repo: str,
-                     hf_token: Optional[str], slot: dict) -> dict:
+                     hf_token: Optional[str], slot: dict,
+                     sizes: Optional[dict] = None) -> dict:
     """One target download. Mutates `slot` in place so the parent job's
     aggregated `per_target` array reflects live status. Uses HF CLI's
     built-in resume (snapshot_download.resume_download=True) so re-running
@@ -1954,8 +1992,16 @@ async def _hf_dl_one(dl_id: str, host: dict, repo: str,
         include = f"--include {shlex.quote(lay['include'])} "
     # `hf download` resumes partial files (HTTP path, see above). 4 workers
     # keeps the per-file resume granular even on multi-GB safetensors shards.
+    # Expected weight sizes go in first (SIZES_MANIFEST): from that point the
+    # load probe refuses this dir until every listed shard has its exact size.
+    manifest = ""
+    if sizes and any(_is_weight_file(k) for k in sizes):
+        manifest = (f"mkdir -p {shlex.quote(target)} && "
+                    f"printf %s {shlex.quote(_sizes_manifest_json(sizes))} > "
+                    f"{shlex.quote(target + '/' + SIZES_MANIFEST)} && ")
     cmd = (
         f"mkdir -p {shlex.quote(local_dir)} && "
+        f"{manifest}"
         f"{env_prefix}{HF_BIN_REMOTE} download {shlex.quote(repo_id)} "
         f"{include}"
         f"--local-dir {shlex.quote(local_dir)} "
@@ -2046,7 +2092,8 @@ async def _hf_dl_run(dl_id: str, repo: str, hf_token: Optional[str],
     # Real progress bar (#14): each target pulls the FULL repo, so the aggregate
     # target = repo_size × N targets. Best-effort via the HF API (HF tools idea);
     # None → the UI keeps the indeterminate bar.
-    repo_bytes = await _hf_repo_total_bytes(repo, hf_token)
+    repo_sizes = await _hf_repo_sizes(repo, hf_token)
+    repo_bytes = (sum(repo_sizes.values()) or None) if repo_sizes else None
     if repo_bytes:
         job["repo_bytes"] = repo_bytes
         job["total_bytes"] = repo_bytes * max(1, len(targets))
@@ -2066,7 +2113,7 @@ async def _hf_dl_run(dl_id: str, repo: str, hf_token: Optional[str],
     # Same window, per-target: `POST .../cancel?host=` may have retired one slot
     # while the job as a whole stays running. Only launch slots still queued.
     startable = [t for t in targets if by_id[t["id"]].get("status") == "queued"]
-    coros = [_hf_dl_one(dl_id, t, repo, hf_token, by_id[t["id"]])
+    coros = [_hf_dl_one(dl_id, t, repo, hf_token, by_id[t["id"]], repo_sizes)
              for t in startable]
     results = list(await asyncio.gather(*coros, return_exceptions=True))
     # Targets stopped before they ever started have no gather result, but their
@@ -8451,7 +8498,7 @@ def _initial_default_config() -> Optional[dict]:
 #   major (1.7.2 → 2.0.0) — breaking API or topology change
 #
 # Use `./scripts/bump-version.sh patch|minor|major` to bump + auto-commit.
-APP_VERSION = "1.62.8"
+APP_VERSION = "1.62.9"
 
 app = FastAPI(
     title="OdyssAI-X (odyssai.eu)",
@@ -9446,6 +9493,48 @@ def _attribute_jaccl_cause(deaths: list[tuple[int, int, str]]) -> Optional[str]:
     return msg
 
 
+def _layout_probe_py(p: str, models_dir: Optional[str]) -> str:
+    """Python run ON the node by _validate_model_layout. Prints OK or the first
+    failing check. Checks PRESENCE (config.json + >=1 safetensors + tokenizer)
+    and COMPLETENESS: when the dir carries a SIZES_MANIFEST (written by the
+    downloader, or by a sync before any data moved), every weight file it lists
+    that is ON DISK must have exactly that size — a truncated shard under its
+    final name (TB5 sync cancelled mid-stream) fails here. A listed file that is
+    absent is not an error by itself: repos ship duplicate weights that get
+    deleted on purpose (Mistral's consolidated.safetensors). Presence is the
+    index's job: every shard listed in model.safetensors.index.json must be on
+    disk (the only check a dir without manifest gets: models converted locally,
+    or fetched before 1.62.9).
+    Until 1.62.9 the completeness half also refused `*.hfdl` markers, which
+    nothing ever wrote: that check never fired and is gone."""
+    return (
+        "import json,os,glob,sys\n"
+        "p=" + json.dumps(p) + "\n"
+        "md=" + json.dumps(models_dir or "") + "\n"
+        "d=p if os.path.isabs(p) else (os.path.join(md,p) if md else p)\n"
+        "cj=os.path.join(d,'config.json')\n"
+        "if not (os.path.isfile(cj) and os.path.getsize(cj)>0): print('MISSING_CONFIG'); sys.exit()\n"
+        "st=glob.glob(os.path.join(d,'*.safetensors'))\n"
+        "if not st: print('MISSING_WEIGHTS'); sys.exit()\n"
+        "if not any(os.path.isfile(os.path.join(d,t)) and os.path.getsize(os.path.join(d,t))>0 "
+        "for t in ('tokenizer.json','tokenizer.model','tokenizer_config.json')): print('MISSING_TOKENIZER'); sys.exit()\n"
+        "mf=os.path.join(d," + json.dumps(SIZES_MANIFEST) + ")\n"
+        "if os.path.isfile(mf):\n"
+        " try: files=json.load(open(mf)).get('files') or {}\n"
+        " except Exception: print('INCOMPLETE_SIZES:manifest unreadable'); sys.exit()\n"
+        " bad=[r for r,n in files.items() if os.path.isfile(os.path.join(d,r)) and os.path.getsize(os.path.join(d,r))!=int(n)]\n"
+        " if bad: print('INCOMPLETE_SIZES:%d'%len(bad)); sys.exit()\n"
+        "ix=os.path.join(d,'model.safetensors.index.json')\n"
+        "sharded=any('-of-' in os.path.basename(f) for f in st) or len(st)>1\n"
+        "if sharded:\n"
+        " if not (os.path.isfile(ix) and os.path.getsize(ix)>0): print('INCOMPLETE_INDEX'); sys.exit()\n"
+        " want=set(json.load(open(ix)).get('weight_map',{}).values())\n"
+        " have=set(os.path.basename(f) for f in st)\n"
+        " if want-have: print('INCOMPLETE_SHARDS:%d'%len(want-have)); sys.exit()\n"
+        "print('OK')\n"
+    )
+
+
 async def _validate_model_layout(ssh_target: str, model_path: str,
                                   models_dir: Optional[str] = None,
                                   timeout: float = 8.0) -> tuple[bool, Optional[str]]:
@@ -9466,32 +9555,7 @@ async def _validate_model_layout(ssh_target: str, model_path: str,
     are checked as-is regardless of models_dir.
     """
     p = model_path.rstrip("/")
-    # One SSH round-trip running a python3 probe on the node. Checks PRESENCE
-    # (config.json + >=1 safetensors + tokenizer) AND COMPLETENESS (no in-progress
-    # *.hfdl download markers, and every shard listed in model.safetensors.index.json
-    # actually on disk). The completeness half catches a half-finished rsync — a
-    # partial copy used to pass the old shell probe and crash mid-load per-rank.
-    remote_py = (
-        "import json,os,glob,sys\n"
-        "p=" + json.dumps(p) + "\n"
-        "md=" + json.dumps(models_dir or "") + "\n"
-        "d=p if os.path.isabs(p) else (os.path.join(md,p) if md else p)\n"
-        "cj=os.path.join(d,'config.json')\n"
-        "if not (os.path.isfile(cj) and os.path.getsize(cj)>0): print('MISSING_CONFIG'); sys.exit()\n"
-        "st=glob.glob(os.path.join(d,'*.safetensors'))\n"
-        "if not st: print('MISSING_WEIGHTS'); sys.exit()\n"
-        "if not any(os.path.isfile(os.path.join(d,t)) and os.path.getsize(os.path.join(d,t))>0 "
-        "for t in ('tokenizer.json','tokenizer.model','tokenizer_config.json')): print('MISSING_TOKENIZER'); sys.exit()\n"
-        "if glob.glob(os.path.join(d,'*.hfdl')): print('INCOMPLETE_DOWNLOAD'); sys.exit()\n"
-        "ix=os.path.join(d,'model.safetensors.index.json')\n"
-        "sharded=any('-of-' in os.path.basename(f) for f in st) or len(st)>1\n"
-        "if sharded:\n"
-        " if not (os.path.isfile(ix) and os.path.getsize(ix)>0): print('INCOMPLETE_INDEX'); sys.exit()\n"
-        " want=set(json.load(open(ix)).get('weight_map',{}).values())\n"
-        " have=set(os.path.basename(f) for f in st)\n"
-        " if want-have: print('INCOMPLETE_SHARDS:%d'%len(want-have)); sys.exit()\n"
-        "print('OK')\n"
-    )
+    remote_py = _layout_probe_py(p, models_dir)
     # Run the probe with the cluster venv's python (PYTHON_REMOTE — the same
     # interpreter that spawns the runner), NOT the node's bare `python3`. On a
     # Mac with Xcode.app, `/usr/bin/python3` is the Xcode shim: after an Xcode
@@ -9524,8 +9588,11 @@ async def _validate_model_layout(ssh_target: str, model_path: str,
             return False, f"no *.safetensors files at {p}"
         if out == "MISSING_TOKENIZER":
             return False, f"no tokenizer (tokenizer.json/model) at {p}"
-        if out == "INCOMPLETE_DOWNLOAD":
-            return False, f"download still in progress (.hfdl markers) at {p}"
+        if out.startswith("INCOMPLETE_SIZES"):
+            n = out.split(":", 1)[1] if ":" in out else "?"
+            return False, (f"incomplete — {n} weight file(s) not the expected "
+                           f"size ({SIZES_MANIFEST}) at {p} "
+                           f"(download or sync unfinished?)")
         if out == "INCOMPLETE_INDEX":
             return False, f"sharded model missing model.safetensors.index.json at {p} (rsync unfinished?)"
         if out.startswith("INCOMPLETE_SHARDS"):
@@ -14956,6 +15023,27 @@ def _resolve_host(host_id: str) -> Optional[dict]:
     return None
 
 
+async def _sync_expected_sizes(src: dict, src_path: str) -> Optional[dict]:
+    """Weight sizes a sync target must end up with: the source's SIZES_MANIFEST
+    when it has one (the sizes HF announced, so a truncated source is not
+    propagated as the truth), else the sizes on the source disk. None when the
+    source cannot be read."""
+    rc, out, _ = await asyncio.to_thread(
+        _ssh_exec, src["ssh"],
+        f"cat {shlex.quote(src_path.rstrip('/') + '/' + SIZES_MANIFEST)} 2>/dev/null", 15)
+    if rc == 0 and out:
+        try:
+            files = json.loads(out).get("files")
+            if isinstance(files, dict):
+                return {str(k): int(v) for k, v in files.items()}
+        except Exception:
+            pass
+    listing = await _dir_manifest(src["ssh"], src_path)
+    if listing is None:
+        return None
+    return {k: v for k, v in listing.items() if _is_weight_file(k)}
+
+
 async def _run_one_rsync(job_id: str, model: str, src: dict, dst: dict, slot: dict) -> dict:
     """Run rsync from src to dst host for the given model directory.
 
@@ -14984,9 +15072,23 @@ async def _run_one_rsync(job_id: str, model: str, src: dict, dst: dict, slot: di
     slot["finished_at"] = None
     slot["error"] = None
     try:
+        # The expected weight sizes land on the target BEFORE any data: the TB5
+        # receiver writes shards under their final names, so a cancel mid-stream
+        # leaves truncated files that only this manifest lets the load probe see.
+        expected = await _sync_expected_sizes(src, src_path)
+        if expected is None:
+            slot["status"] = "failed"
+            slot["error"] = "could not read the source weight sizes"
+            slot["finished_at"] = time.time()
+            return slot
+        prep = f"mkdir -p {shlex.quote(dst_parent)}"
+        if expected:
+            prep = (f"mkdir -p {shlex.quote(dst_path)} && printf %s "
+                    f"{shlex.quote(_sizes_manifest_json(expected))} > "
+                    f"{shlex.quote(dst_path.rstrip('/') + '/' + SIZES_MANIFEST)}")
         mkproc = await asyncio.create_subprocess_exec(
             "ssh", "-o", "ConnectTimeout=5", "-o", "BatchMode=yes",
-            dst["ssh"], f"mkdir -p {shlex.quote(dst_parent)}",
+            dst["ssh"], prep,
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
         )
         _sync_procs.setdefault(job_id, []).append(mkproc)
@@ -14994,7 +15096,7 @@ async def _run_one_rsync(job_id: str, model: str, src: dict, dst: dict, slot: di
         if mkproc.returncode != 0:
             slot["status"] = "failed"
             slot["error"] = (
-                "mkdir on target failed: "
+                "preparing the target (mkdir / size manifest) failed: "
                 + (mke.decode("utf-8", "ignore") or mko.decode("utf-8", "ignore"))
             )[:400]
             slot["finished_at"] = time.time()
