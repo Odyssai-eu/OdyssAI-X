@@ -252,7 +252,6 @@ VLM_DIST_SUPPORTED: dict[str, tuple[str, ...]] = {
     "minimax_m3_vl": ("tensor",),
     "qwen3_5_moe": ("pipeline",),
     "mimo_v2": ("tensor", "pipeline"),
-    "step5_vl": ("tensor",),
 }
 # SIGTERM->SIGKILL grace for remote pkills/sweeps, in seconds (0.5s polls).
 # 12s default: big-model clean exits need the room for free_metal; ranks stuck
@@ -8663,7 +8662,7 @@ def _initial_default_config() -> Optional[dict]:
 #   major (1.7.2 → 2.0.0) — breaking API or topology change
 #
 # Use `./scripts/bump-version.sh patch|minor|major` to bump + auto-commit.
-APP_VERSION = "1.63.0"
+APP_VERSION = "1.63.1"
 
 app = FastAPI(
     title="OdyssAI-X (odyssai.eu)",

@@ -11,8 +11,6 @@
 #   5. qwen3_coder tool-parser detection without the newline (MiMo-V2.6)
 #   6. empty-delta progress chunk while a tool call is withheld (#112)
 #   7. anti-loop (scripts/loop_detect.py) + token counts in the progress chunk (#113)
-#   8. vendored model packages (scripts/mlx_vlm_models/*: step5_vl, mlx-vlm PR #2539
-#      never reached a release) into mlx_vlm/models/, unless mlx-vlm ships its own
 #
 # Idempotent: re-running skips venv creation if it already imports cleanly,
 # skips pip entirely when mlx-vlm is already at MLX_VLM_REF (direct_url.json),
@@ -387,21 +385,5 @@ PYEOF
 )
 PATCH_SCRIPT="${PATCH_SCRIPT//VENV_PLACEHOLDER/$VLM_VENV}"
 ssh -o ConnectTimeout=10 -o BatchMode=yes "$SSH_TARGET" "$VLM_VENV/bin/python -" <<<"$PATCH_SCRIPT"
-
-# 8. Vendored model packages. Each carries an UPSTREAM.md; a package dir in the
-#    venv WITHOUT it is mlx-vlm's own and is left alone (the pin then has it).
-for pkg in "$SCRIPT_DIR"/mlx_vlm_models/*/; do
-  name="$(basename "$pkg")"
-  dest="$VLM_VENV/lib/python3.12/site-packages/mlx_vlm/models/$name"
-  if ssh -o ConnectTimeout=10 -o BatchMode=yes "$SSH_TARGET" "[ -d '$dest' ] && [ ! -f '$dest/UPSTREAM.md' ]"; then
-    echo "[install-mlx-vlm] mlx-vlm ships its own $name, vendored copy not installed"
-    continue
-  fi
-  echo "[install-mlx-vlm] installing vendored model package $name"
-  ssh -o ConnectTimeout=10 -o BatchMode=yes "$SSH_TARGET" "rm -rf '$dest' && mkdir -p '$dest'"
-  scp -q "$pkg"*.py "$pkg"UPSTREAM.md "$SSH_TARGET:$dest/"
-  ssh -o ConnectTimeout=10 -o BatchMode=yes "$SSH_TARGET" \
-    "$VLM_VENV/bin/python -c 'import mlx_vlm.models.$name as m; print(\"[install-mlx-vlm] import ok:\", m.Model.__module__)'"
-done
 
 echo "[install-mlx-vlm] done on $SSH_TARGET"

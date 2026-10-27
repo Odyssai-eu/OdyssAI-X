@@ -340,87 +340,6 @@ def _shard_lm_mimo_tensor(lm, group):
             mlp.down_proj = shard_linear(mlp.down_proj, "sharded-to-all", group=group)
 
 
-def _shard_lm_step5_tensor(lm, group):
-    """Tensor-shard the Step-5 language model (step5_vl, vendored from mlx-vlm
-    PR #2539, scripts/mlx_vlm_models/step5_vl).
-
-    The port has no shard(). Attention: q/k/v all-to-sharded, o_proj
-    sharded-to-all, the head-wise gate g_proj all-to-sharded, head counts
-    divided. 64 q heads over 4 KV groups, so on 4 ranks rank r keeps KV head r
-    and q heads [16r, 16r+16): with contiguous GQA grouping they pair up
-    exactly. MoE: routed experts and the shared expert sharded in place on the
-    intermediate dim, one all_sum of the block output (_AllSumAfter; the
-    upstream MoE has no sharding hook). Dense MLP layers: gate/up
-    all-to-sharded, down sharded-to-all. Router, embeddings and lm_head stay
-    replicated, so every rank routes identically.
-
-    The sparse indexer of the full-attention layers stays REPLICATED and runs
-    with the single-node head counts: each KV group selects its own regions
-    from 4 of the 16 index heads, and the mask is then cut to this rank's KV
-    group (_rank_sparse_mask). Sharding the indexer would change which index
-    heads each group sums over.
-
-    Numerics: the MoE block rounds its routed sum to bf16 before adding the
-    shared expert; under the split each rank rounds its partial sum, so the
-    result differs from one node by bf16 rounding, not by selection."""
-    n, r = group.size(), group.rank()
-    for layer in lm.layers:
-        sa = layer.self_attn
-        if sa.n_heads % n or sa.n_kv_heads % n:
-            raise ValueError(
-                f"step5 tensor split: {sa.n_heads} q / {sa.n_kv_heads} kv heads "
-                f"do not divide by {n} ranks")
-        full_heads, full_kv = sa.n_heads, sa.n_kv_heads
-        sa.q_proj = shard_linear(sa.q_proj, "all-to-sharded", group=group)
-        sa.k_proj = shard_linear(sa.k_proj, "all-to-sharded", group=group)
-        sa.v_proj = shard_linear(sa.v_proj, "all-to-sharded", group=group)
-        sa.o_proj = shard_linear(sa.o_proj, "sharded-to-all", group=group)
-        if getattr(sa, "use_head_wise_attn_gate", False):
-            sa.g_proj = shard_linear(sa.g_proj, "all-to-sharded", group=group)
-        sa.n_heads //= n
-        sa.n_kv_heads //= n
-        if getattr(sa, "is_sparse", False):
-            sa._sparse_mask = _rank_sparse_mask(sa, full_heads, full_kv, r, n)
-        mlp = layer.mlp
-        if hasattr(mlp, "switch_mlp"):
-            shard_inplace(mlp.switch_mlp.gate_proj, "all-to-sharded", group=group)
-            shard_inplace(mlp.switch_mlp.up_proj, "all-to-sharded", group=group)
-            shard_inplace(mlp.switch_mlp.down_proj, "sharded-to-all", group=group)
-            shared = mlp.share_expert
-            shard_inplace(shared.gate_proj, "all-to-sharded", group=group)
-            shard_inplace(shared.up_proj, "all-to-sharded", group=group)
-            shard_inplace(shared.down_proj, "sharded-to-all", group=group)
-            layer.mlp = _AllSumAfter(mlp, group)
-        else:
-            mlp.gate_proj = shard_linear(mlp.gate_proj, "all-to-sharded", group=group)
-            mlp.up_proj = shard_linear(mlp.up_proj, "all-to-sharded", group=group)
-            mlp.down_proj = shard_linear(mlp.down_proj, "sharded-to-all", group=group)
-
-
-def _rank_sparse_mask(sa, full_heads: int, full_kv: int, rank: int, n: int):
-    """The step5 region selection computed with the single-node head counts,
-    then cut to this rank's q heads. The selection mask is
-    [B, full_heads, L, T], each KV group's selection repeated over its
-    full_heads // full_kv q heads, so rank r's contiguous q heads are exactly
-    the slice [r * full_heads/n, (r+1) * full_heads/n). Below the region budget
-    the method returns the plain [L, T] causal mask, which needs no cut."""
-    inner = type(sa)._sparse_mask
-    per_rank = full_heads // n
-
-    def sparse_mask(x, cache, offset):
-        local = sa.n_heads, sa.n_kv_heads
-        sa.n_heads, sa.n_kv_heads = full_heads, full_kv
-        try:
-            mask = inner(sa, x, cache, offset)
-        finally:
-            sa.n_heads, sa.n_kv_heads = local
-        if mask.ndim == 4:
-            mask = mask[:, rank * per_rank:(rank + 1) * per_rank]
-        return mask
-
-    return sparse_mask
-
-
 # Distributed split per model type. The first mode listed is the type's
 # default (RUNNER_SHARD_MODE unset); api.py's VLM_DIST_SUPPORTED mirrors this
 # table — keep them in sync.
@@ -432,13 +351,11 @@ def _rank_sparse_mask(sa, full_heads: int, full_kv: int, rank: int, n: int):
 _TENSOR_SHARDERS = {
     "minimax_m3_vl": _shard_lm_replicated_indexer,
     "mimo_v2": _shard_lm_mimo_tensor,
-    "step5_vl": _shard_lm_step5_tensor,
 }
 _DIST_MODES = {
     "minimax_m3_vl": ("tensor",),
     "qwen3_5_moe": ("pipeline",),
     "mimo_v2": ("tensor", "pipeline"),
-    "step5_vl": ("tensor",),
 }
 
 
