@@ -11,6 +11,8 @@
 #   5. qwen3_coder tool-parser detection without the newline (MiMo-V2.6)
 #   6. empty-delta progress chunk while a tool call is withheld (#112)
 #   7. anti-loop (scripts/loop_detect.py) + token counts in the progress chunk (#113)
+#   8. vendored model packages (scripts/mlx_vlm_models/*: unlimited_ocr from PR #2601,
+#      Unlimited-OCR-2) over mlx_vlm/models/, only over the pin they were checked on
 #
 # Idempotent: re-running skips venv creation if it already imports cleanly,
 # skips pip entirely when mlx-vlm is already at MLX_VLM_REF (direct_url.json),
@@ -385,5 +387,23 @@ PYEOF
 )
 PATCH_SCRIPT="${PATCH_SCRIPT//VENV_PLACEHOLDER/$VLM_VENV}"
 ssh -o ConnectTimeout=10 -o BatchMode=yes "$SSH_TARGET" "$VLM_VENV/bin/python -" <<<"$PATCH_SCRIPT"
+
+# 8. Vendored model packages. Each UPSTREAM.md names the mlx-vlm pin it was
+#    checked against (`overlays-pin:`); on any other pin it is not installed,
+#    since a newer mlx-vlm may ship the package itself.
+for pkg in "$SCRIPT_DIR"/mlx_vlm_models/*/; do
+  name="$(basename "$pkg")"
+  pin="$(awk '/^overlays-pin:/{print $2}' "$pkg/UPSTREAM.md")"
+  if [ "$pin" != "$MLX_VLM_REF" ]; then
+    echo "[install-mlx-vlm] $name vendored for $pin, pin is $MLX_VLM_REF: not installed"
+    continue
+  fi
+  dest="$VLM_VENV/lib/python3.12/site-packages/mlx_vlm/models/$name"
+  echo "[install-mlx-vlm] installing vendored model package $name"
+  ssh -o ConnectTimeout=10 -o BatchMode=yes "$SSH_TARGET" "rm -rf '$dest' && mkdir -p '$dest'"
+  scp -q "$pkg"*.py "$pkg"UPSTREAM.md "$SSH_TARGET:$dest/"
+  ssh -o ConnectTimeout=10 -o BatchMode=yes "$SSH_TARGET" \
+    "cd /tmp && $VLM_VENV/bin/python -c 'import mlx_vlm.models.$name as m; print(\"[install-mlx-vlm] import ok:\", m.Model.__module__)'"
+done
 
 echo "[install-mlx-vlm] done on $SSH_TARGET"
