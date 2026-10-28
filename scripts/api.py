@@ -6415,7 +6415,13 @@ _MODELS_AUTO_OPEN_THINK = ("minimax", "qwen3.5", "qwen3.6", "step-3.7", "step3p7
                            # clair (vérifié 2026-10-21 sur Argo : tout dans `content`).
                            # Thinking-off → `<think></think>` fermé, honoré → PAS dans
                            # _MODELS_IGNORE_*. Alias avec points OU tirets.
-                           "ling-3.1", "ling-3-1")
+                           "ling-3.1", "ling-3-1",
+                           # Nanbeige4.3-33B — thinking-ON, le modèle émet le
+                           # raisonnement + `</think>` en clair sans balise ouvrante
+                           # (vérifié 2026-10-28 sur Hades : reasoning_content vide,
+                           # tout dans `content`, témoin TMB en échec). Thinking-off
+                           # → `content` propre, honoré → PAS dans _MODELS_IGNORE_*.
+                           "nanbeige")
 # Subset of _MODELS_AUTO_OPEN_THINK that IGNORES the `enable_thinking`
 # kwarg and always wraps reasoning in <think>...</think>. Per MiniMax M2
 # docs (2026-05-20 update): "The model's reasoning is wrapped in <think>
@@ -8662,7 +8668,7 @@ def _initial_default_config() -> Optional[dict]:
 #   major (1.7.2 → 2.0.0) — breaking API or topology change
 #
 # Use `./scripts/bump-version.sh patch|minor|major` to bump + auto-commit.
-APP_VERSION = "1.63.2"
+APP_VERSION = "1.63.3"
 
 app = FastAPI(
     title="OdyssAI-X (odyssai.eu)",
