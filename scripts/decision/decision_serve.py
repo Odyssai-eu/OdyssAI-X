@@ -543,6 +543,11 @@ class Worker(threading.Thread):
                 box["error"] = (500, f"{type(e).__name__}: {e}")
             finally:
                 self.busy = False
+                if getattr(self.backend, "device", None) == "mlx":
+                    # MLX keeps freed buffers in its cache, unbounded by default: d1-3B
+                    # (3.7 GB) reached a 51 GB footprint on max-64 after 801 requests.
+                    import mlx.core as mx
+                    mx.clear_cache()
                 self.served += 1
                 done.set()
 
