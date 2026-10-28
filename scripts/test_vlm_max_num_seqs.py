@@ -49,6 +49,28 @@ check("le reste de la commande est intact (model quoté, port, PID)",
        and "echo VLM_PID=$!" in CMD()), True)
 check("déterminisme", CMD() == CMD(), True)
 
+# --- remote code: on by default, off for deepseekocr_2 (2026-10-28) ---
+check("--trust-remote-code par défaut", "--trust-remote-code " in CMD(), True)
+check("trust_remote_code=False: pas de drapeau, reste intact",
+      ("--trust-remote-code" not in api._vlm_launch_cmd("t", "/v/mlx-vlm", "/m/x", 8080, None, False)
+       and "--port 8080 > " in api._vlm_launch_cmd("t", "/v/mlx-vlm", "/m/x", 8080, None, False)), True)
+
+
+async def _trc(model_type):
+    real = api._read_model_config
+
+    async def fake(ssh, path, timeout=6.0):
+        return None if model_type is None else {"model_type": model_type}
+    api._read_model_config = fake
+    try:
+        return await api._vlm_trust_remote_code("admin@198.51.100.1", "/m/x")
+    finally:
+        api._read_model_config = real
+
+check("deepseekocr_2: sans remote code", asyncio.run(_trc("deepseekocr_2")), False)
+check("autre type: remote code gardé", asyncio.run(_trc("kimi_vl")), True)
+check("config illisible: remote code gardé", asyncio.run(_trc(None)), True)
+
 # --- request validation: strict, never coerced (GLM-1/Kimi-1) ---
 def req_field(v):
     try:

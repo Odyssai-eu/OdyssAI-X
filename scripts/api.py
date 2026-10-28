@@ -8662,7 +8662,7 @@ def _initial_default_config() -> Optional[dict]:
 #   major (1.7.2 → 2.0.0) — breaking API or topology change
 #
 # Use `./scripts/bump-version.sh patch|minor|major` to bump + auto-commit.
-APP_VERSION = "1.63.1"
+APP_VERSION = "1.63.2"
 
 app = FastAPI(
     title="OdyssAI-X (odyssai.eu)",
@@ -19880,8 +19880,24 @@ def _vlm_log_path(vlm_id: str) -> str:
     return f"~/mlx-vlm-{vlm_id}.log"
 
 
+# Model types mlx-vlm implements natively (model + processor) whose checkpoint
+# also ships torch remote code that no longer imports: DeepSeek-OCR-2's
+# modeling_deepseekv2.py wants transformers' LlamaFlashAttention2, gone in
+# transformers 5. With --trust-remote-code the processor's tokenizer load runs
+# that code and fails as "Unrecognized processing class"; without it mlx-vlm's
+# own processor loads (measured 2026-10-28 on max-64, bf16 and 8bit).
+_VLM_NO_REMOTE_CODE = {"deepseekocr_2"}
+
+
+async def _vlm_trust_remote_code(ssh_target: str, model_path: str) -> bool:
+    """False when the checkpoint's model_type is in _VLM_NO_REMOTE_CODE."""
+    cfg = await _read_model_config(ssh_target, model_path) or {}
+    return str(cfg.get("model_type", "")).lower() not in _VLM_NO_REMOTE_CODE
+
+
 def _vlm_launch_cmd(vlm_id: str, venv: str, model_path: str, port: int,
-                   max_num_seqs: Optional[int] = None) -> str:
+                   max_num_seqs: Optional[int] = None,
+                   trust_remote_code: bool = True) -> str:
     """Build the proven nohup launch command with a full exported env block.
 
     Mirrors the manual launch that ran on .29 tonight: export a clean env
@@ -19910,8 +19926,8 @@ def _vlm_launch_cmd(vlm_id: str, venv: str, model_path: str, port: int,
         f"nohup {_remote_path(server_bin)} "
         f"--model {shlex.quote(model_path)} "
         f"--host 0.0.0.0 --port {int(port)} "
-        f"--trust-remote-code "
-        f"> {log} 2>&1 & "
+        + ("--trust-remote-code " if trust_remote_code else "")
+        + f"> {log} 2>&1 & "
         f"echo VLM_PID=$!"
     )
 
@@ -20141,7 +20157,8 @@ async def _launch_vlm_server(
     server log so the caller can surface WHY (OOM, bad checkpoint, import err).
     """
     ip = _vlm_ip_from_ssh(ssh_target)
-    launch = _vlm_launch_cmd(log_id, venv, model_path, port, max_num_seqs)
+    launch = _vlm_launch_cmd(log_id, venv, model_path, port, max_num_seqs,
+                             await _vlm_trust_remote_code(ssh_target, model_path))
     launched_pid: Optional[str] = None
     rc, out, err = await asyncio.to_thread(_ssh_exec, ssh_target, launch, 20)
     if rc != 0:
@@ -20771,7 +20788,8 @@ async def admin_vlm_load(req: VLMLoadRequest):
         )
 
     # (b) launch
-    launch = _vlm_launch_cmd(vlm_id, venv, model_path, port)
+    launch = _vlm_launch_cmd(vlm_id, venv, model_path, port,
+                             trust_remote_code=await _vlm_trust_remote_code(ssh_target, model_path))
     launched_pid: Optional[str] = None
     try:
         rc, out, err = await asyncio.to_thread(_ssh_exec, ssh_target, launch, 20)
