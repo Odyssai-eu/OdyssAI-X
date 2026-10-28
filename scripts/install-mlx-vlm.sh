@@ -6,12 +6,15 @@
 #   1. create a dedicated python3.12 venv at ~/.venvs/mlx-vlm on the node
 #      (NOT the python3.11 cluster venv ~/mlx-cluster/.venv — never touched)
 #   2. pip install mlx-vlm pinned to the merged VL commit + torch/torchvision
+#      (+ addict, matplotlib: remote-code imports of DeepSeek-OCR-2)
 #   3. apply scripts/patches/mlx_vlm_thinking_mode_disabled.patch (see below)
 #   4. smoke-import mlx_vlm + the minimax_m3_vl model module
 #   5. qwen3_coder tool-parser detection without the newline (MiMo-V2.6)
 #   6. empty-delta progress chunk while a tool call is withheld (#112)
 #   7. anti-loop (scripts/loop_detect.py) + token counts in the progress chunk (#113)
-#   8. vendored model packages (scripts/mlx_vlm_models/*: unlimited_ocr from PR #2601,
+#   8. server: evaluate the processor outputs on the request thread (cross-thread
+#      lazy graphs, "There is no Stream(gpu, N) in current thread")
+#   9. vendored model packages (scripts/mlx_vlm_models/*: unlimited_ocr from PR #2601,
 #      Unlimited-OCR-2) over mlx_vlm/models/, only over the pin they were checked on
 #
 # Idempotent: re-running skips venv creation if it already imports cleanly,
@@ -148,6 +151,15 @@ else
   # mlx-vlm itself from the exact ref, deps untouched. The patch step below
   # runs after, so it is re-applied on the fresh files.
   "\$VENV/bin/python" -m pip install --force-reinstall --no-deps "\$SPEC"
+fi
+
+# 2b. Imports of the remote code some processors load (trust_remote_code):
+#     DeepSeek-OCR-2's modeling_deepseekocr2.py needs addict + matplotlib, and
+#     without them AutoProcessor fails as "Unrecognized processing class" (the
+#     processor patch swallows the ImportError). Outside the pin check on purpose.
+if ! "\$VENV/bin/python" -c "import addict, matplotlib" >/dev/null 2>&1; then
+  echo "[install-mlx-vlm] pip install addict matplotlib (remote-code imports)"
+  "\$VENV/bin/python" -m pip install addict matplotlib
 fi
 
 # 3. smoke import — fails loudly if the VL model module isn't present.
@@ -388,7 +400,61 @@ PYEOF
 PATCH_SCRIPT="${PATCH_SCRIPT//VENV_PLACEHOLDER/$VLM_VENV}"
 ssh -o ConnectTimeout=10 -o BatchMode=yes "$SSH_TARGET" "$VLM_VENV/bin/python -" <<<"$PATCH_SCRIPT"
 
-# 8. Vendored model packages. Each UPSTREAM.md names the mlx-vlm pin it was
+# 8. Processor outputs evaluated where they are built (idempotent, same in-place
+#    replace as steps 4-7). The server runs the processor on the request thread
+#    and the model on the generation thread; a processor that returns lazy mx
+#    arrays (mx.where / mx.stack, e.g. deepseekocr_2) fails there with "There is
+#    no Stream(gpu, N) in current thread" (HTTP 500 on every image request,
+#    measured 2026-10-28 with DeepSeek-OCR-2 on max-64). Upstream fixes it one
+#    processor at a time (#2352 MiMo audio, #1591); this covers them all.
+#    Takes effect at the next mlx_vlm.server start.
+echo "[install-mlx-vlm] applying processor-output eval patch"
+PATCH_SCRIPT=$(cat <<'PYEOF'
+path = "VENV_PLACEHOLDER/lib/python3.12/site-packages/mlx_vlm/server/generation.py"
+with open(path) as f:
+    content = f.read()
+old = '''    def _preprocess_request(self, prompt, images=None, audio=None, videos=None) -> dict:
+        if videos is None:
+            return self._cpu_preprocess(prompt, images, audio)
+        return self._cpu_preprocess(prompt, images, audio, videos)
+'''
+new = '''    def _preprocess_request(self, prompt, images=None, audio=None, videos=None) -> dict:
+        if videos is None:
+            out = self._cpu_preprocess(prompt, images, audio)
+        else:
+            out = self._cpu_preprocess(prompt, images, audio, videos)
+        # OdyssAI-X: a lazy graph built on this (request) thread cannot be
+        # evaluated on the generation thread ("There is no Stream(gpu, N) in
+        # current thread"): materialise the processor arrays here.
+        arrays = []
+        for v in (out.values() if isinstance(out, dict) else ()):
+            if isinstance(v, mx.array):
+                arrays.append(v)
+            elif isinstance(v, (list, tuple)):
+                arrays.extend(x for x in v if isinstance(x, mx.array))
+        if arrays:
+            mx.eval(arrays)
+        return out
+'''
+if new in content:
+    print("[install-mlx-vlm] processor-output eval patch already applied, skipping")
+elif old not in content:
+    print("[install-mlx-vlm] WARNING: _preprocess_request not found (upstream file changed?) — skipping")
+elif "\nimport mlx.core as mx" not in content:
+    print("[install-mlx-vlm] WARNING: generation.py does not import mlx.core as mx — skipping")
+else:
+    import shutil
+    shutil.copy(path, path + ".bak-preprocess-eval")
+    content = content.replace(old, new)
+    with open(path, "w") as f:
+        f.write(content)
+    print("[install-mlx-vlm] processor-output eval patch applied")
+PYEOF
+)
+PATCH_SCRIPT="${PATCH_SCRIPT//VENV_PLACEHOLDER/$VLM_VENV}"
+ssh -o ConnectTimeout=10 -o BatchMode=yes "$SSH_TARGET" "$VLM_VENV/bin/python -" <<<"$PATCH_SCRIPT"
+
+# 9. Vendored model packages. Each UPSTREAM.md names the mlx-vlm pin it was
 #    checked against (`overlays-pin:`); on any other pin it is not installed,
 #    since a newer mlx-vlm may ship the package itself.
 for pkg in "$SCRIPT_DIR"/mlx_vlm_models/*/; do
