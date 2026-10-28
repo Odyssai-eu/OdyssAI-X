@@ -6,7 +6,7 @@
 #   1. create a dedicated python3.12 venv at ~/.venvs/mlx-vlm on the node
 #      (NOT the python3.11 cluster venv ~/mlx-cluster/.venv — never touched)
 #   2. pip install mlx-vlm pinned to the merged VL commit + torch/torchvision
-#      (+ addict, matplotlib: remote-code imports of DeepSeek-OCR-2)
+#      (+ addict, einops, matplotlib: remote-code imports of DeepSeek-OCR-2)
 #   3. apply scripts/patches/mlx_vlm_thinking_mode_disabled.patch (see below)
 #   4. smoke-import mlx_vlm + the minimax_m3_vl model module
 #   5. qwen3_coder tool-parser detection without the newline (MiMo-V2.6)
@@ -154,12 +154,14 @@ else
 fi
 
 # 2b. Imports of the remote code some processors load (trust_remote_code):
-#     DeepSeek-OCR-2's modeling_deepseekocr2.py needs addict + matplotlib, and
+#     DeepSeek-OCR-2's modeling_deepseekocr2.py needs addict + matplotlib, its
+#     modeling_deepseekv2.py einops (the bf16 repo; listed with transformers'
+#     get_imports over every *OCR* repo on max-64, 2026-10-28), and
 #     without them AutoProcessor fails as "Unrecognized processing class" (the
 #     processor patch swallows the ImportError). Outside the pin check on purpose.
-if ! "\$VENV/bin/python" -c "import addict, matplotlib" >/dev/null 2>&1; then
-  echo "[install-mlx-vlm] pip install addict matplotlib (remote-code imports)"
-  "\$VENV/bin/python" -m pip install addict matplotlib
+if ! "\$VENV/bin/python" -c "import addict, einops, matplotlib" >/dev/null 2>&1; then
+  echo "[install-mlx-vlm] pip install addict einops matplotlib (remote-code imports)"
+  "\$VENV/bin/python" -m pip install addict einops matplotlib
 fi
 
 # 3. smoke import — fails loudly if the VL model module isn't present.
