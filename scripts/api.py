@@ -6479,12 +6479,11 @@ _MODELS_IGNORE_ENABLE_THINKING_FLAG = ("minimax-m2", "step-3.7", "step3p7",
                                        # enable_thinking=false émet quand même <mm:think>…, qui
                                        # partait dans `content` (Bench A TMB). Le M3 non-.1
                                        # honore thinking_mode et reste hors liste.
-                                       "minimax-m3.1", "minimax-m3-1",
-                                       # LFM3-1.7B : le template pré-remplit `<think></think>`
-                                       # quand enable_thinking=false, mais le modèle raisonne
-                                       # quand même et ferme par `</think>` (vérifié 2026-10-29
-                                       # sur .39) : le filtre doit rester actif dans tous les modes.
-                                       "lfm3")
+                                       "minimax-m3.1", "minimax-m3-1")
+# LFM3-1.7B volontairement HORS de cette liste (2026-10-29) : en
+# enable_thinking=false il raisonne PARFOIS (puis `</think>`), PARFOIS répond
+# directement. L'y mettre vidait `content` dans le second cas (TMB A, 4 réponses
+# vides). Mode fiable = thinking ON, géré par _MODELS_AUTO_OPEN_THINK.
 
 # Models whose chat template reads a `reasoning_effort` system directive
 # (OpenAI o-series convention: minimal/low/medium/high). Step-3.7-Flash is a
@@ -8678,7 +8677,7 @@ def _initial_default_config() -> Optional[dict]:
 #   major (1.7.2 → 2.0.0) — breaking API or topology change
 #
 # Use `./scripts/bump-version.sh patch|minor|major` to bump + auto-commit.
-APP_VERSION = "1.63.4"
+APP_VERSION = "1.63.5"
 
 app = FastAPI(
     title="OdyssAI-X (odyssai.eu)",
