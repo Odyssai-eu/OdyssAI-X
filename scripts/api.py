@@ -6421,7 +6421,12 @@ _MODELS_AUTO_OPEN_THINK = ("minimax", "qwen3.5", "qwen3.6", "step-3.7", "step3p7
                            # (vérifié 2026-10-28 sur Hades : reasoning_content vide,
                            # tout dans `content`, témoin TMB en échec). Thinking-off
                            # → `content` propre, honoré → PAS dans _MODELS_IGNORE_*.
-                           "nanbeige")
+                           "nanbeige",
+                           # LFM3 (LiquidAI) — le template pré-ouvre `<think>`
+                           # (chat_template.jinja officiel, vérifié 2026-10-29) :
+                           # sans ce match tout le raisonnement partait dans
+                           # `content`, témoin TMB en échec.
+                           "lfm3")
 # Subset of _MODELS_AUTO_OPEN_THINK that IGNORES the `enable_thinking`
 # kwarg and always wraps reasoning in <think>...</think>. Per MiniMax M2
 # docs (2026-05-20 update): "The model's reasoning is wrapped in <think>
@@ -6474,7 +6479,12 @@ _MODELS_IGNORE_ENABLE_THINKING_FLAG = ("minimax-m2", "step-3.7", "step3p7",
                                        # enable_thinking=false émet quand même <mm:think>…, qui
                                        # partait dans `content` (Bench A TMB). Le M3 non-.1
                                        # honore thinking_mode et reste hors liste.
-                                       "minimax-m3.1", "minimax-m3-1")
+                                       "minimax-m3.1", "minimax-m3-1",
+                                       # LFM3-1.7B : le template pré-remplit `<think></think>`
+                                       # quand enable_thinking=false, mais le modèle raisonne
+                                       # quand même et ferme par `</think>` (vérifié 2026-10-29
+                                       # sur .39) : le filtre doit rester actif dans tous les modes.
+                                       "lfm3")
 
 # Models whose chat template reads a `reasoning_effort` system directive
 # (OpenAI o-series convention: minimal/low/medium/high). Step-3.7-Flash is a
@@ -8668,7 +8678,7 @@ def _initial_default_config() -> Optional[dict]:
 #   major (1.7.2 → 2.0.0) — breaking API or topology change
 #
 # Use `./scripts/bump-version.sh patch|minor|major` to bump + auto-commit.
-APP_VERSION = "1.63.3"
+APP_VERSION = "1.63.4"
 
 app = FastAPI(
     title="OdyssAI-X (odyssai.eu)",
