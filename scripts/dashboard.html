@@ -4615,8 +4615,9 @@ function renderLoadingBanner(p, clusterId) {
   if (!loading) return "";
   const pct = Math.max(2, Math.min(100, loading.progress_pct || 0));
   const elapsed = loading.elapsed_s || 0;
-  // Observable path: real ETA from throughput; fallback to est-based.
-  const eta = (loading.eta_s != null) ? loading.eta_s
+  // Observable path (loaded_gb present): the poller's ETA, or "—" when it has
+  // none. Only the time-based fallback derives one from the estimate.
+  const eta = (loading.loaded_gb != null) ? loading.eta_s
               : Math.max(0, (loading.estimated_s || 0) - elapsed);
   const sizeGb = loading.size_gb != null ? loading.size_gb
                  : (loading.size_bytes ? (loading.size_bytes / (1024**3)).toFixed(1) : null);

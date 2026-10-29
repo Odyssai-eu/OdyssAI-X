@@ -78,5 +78,18 @@ api._begin_loading(state2, "m", 1, 1, 1.0)
 api._end_loading(state2)
 check("_end_loading clears the task handle too", "_task_ref" in state2, False)
 
+# Past the checkpoint size the footprint (weights + the runner's own memory)
+# no longer measures what is left: no ETA, phase says so (Ling-3.1-flash
+# Q8h16, 2026-10-29: 660 GB for 592 GB, dashboard stuck on "99 %, ETA 0 s").
+G = 1024 ** 3
+for label, loaded, phase, eta in (("below the size", 300 * G, "materializing weights", 120.0),
+                                  ("past the size", 660 * G, "finishing load", None)):
+    st = {"in_progress": True, "model": "m", "nodes": 4, "size_bytes": 592 * G,
+          "estimated_s": 150.0, "started_at": time.time(),
+          "loaded_bytes": loaded, "eta_s": 120.0, "throughput_bps": 0.0}
+    snap = api._loading_snapshot(st)
+    check(f"{label}: phase", snap["phase"], phase)
+    check(f"{label}: eta", snap["eta_s"], eta)
+
 print("all OK" if not FAILS else f"{len(FAILS)} FAILED: {FAILS}")
 sys.exit(1 if FAILS else 0)

@@ -1600,13 +1600,19 @@ def _loading_snapshot(state: dict) -> Optional[dict]:
     if loaded is not None and total:
         pct = min(99.0, loaded / total * 100.0)
         tp = float(state.get("throughput_bps") or 0)
+        # The footprint counts the runner's own memory on top of the weights,
+        # so it passes the checkpoint size before the load ends (Ling-3.1-flash
+        # Q8h16, 2026-10-29: 660 GB for 592 GB, still reading shards for
+        # minutes). From there bytes say nothing about what is left: name the
+        # phase and give no ETA rather than a 99 % with "ETA 0 s".
+        past_size = loaded >= total
         base.update({
             "progress_pct": round(pct, 1),
-            "phase": "materializing weights",
+            "phase": "finishing load" if past_size else "materializing weights",
             "loaded_bytes": loaded,
             "loaded_gb": round(loaded / 1024**3, 1),
             "throughput_gbs": round(tp / 1024**3, 2),
-            "eta_s": state.get("eta_s"),
+            "eta_s": None if past_size else state.get("eta_s"),
             "stalled": bool(state.get("stalled")),
             "per_rank_gb": [round(b / 1024**3, 1)
                             for b in (state.get("per_rank_bytes") or [])],
@@ -8677,7 +8683,7 @@ def _initial_default_config() -> Optional[dict]:
 #   major (1.7.2 → 2.0.0) — breaking API or topology change
 #
 # Use `./scripts/bump-version.sh patch|minor|major` to bump + auto-commit.
-APP_VERSION = "1.63.5"
+APP_VERSION = "1.63.6"
 
 app = FastAPI(
     title="OdyssAI-X (odyssai.eu)",
