@@ -6285,6 +6285,9 @@ _THINK_MARKERS = {
     # opens its own reasoning message `to=self<|message|>…<|eom|>`, then answers
     # in `<|start|>assistant to=user<|message|>…` (stop on eos 200001/200008).
     "muse-spark": ("to=self<|message|>", "<|eom|>"),
+    # Mistral-Large-4: [THINK]…[/THINK], written by the model itself (the
+    # template prefills nothing, chat_template.jinja checked 2026-10-30).
+    "mistral-large-4": ("[THINK]", "[/THINK]"),
 }
 
 
@@ -6343,6 +6346,9 @@ def _seed_in_think(model_id: Optional[str], enable_thinking) -> bool:
         return False
     # Muse-Spark writes its own `to=self<|message|>` open; same rule as Inkling.
     if "muse-spark" in (model_id or "").lower():
+        return False
+    # Mistral-Large-4 writes its own [THINK]; same rule.
+    if "mistral-large-4" in (model_id or "").lower():
         return False
     return True
 
@@ -6436,7 +6442,11 @@ _MODELS_AUTO_OPEN_THINK = ("minimax", "qwen3.5", "qwen3.6", "step-3.7", "step3p7
                            # (chat_template.jinja officiel, vérifié 2026-10-29) :
                            # sans ce match tout le raisonnement partait dans
                            # `content`, témoin TMB en échec.
-                           "lfm3")
+                           "lfm3",
+                           # Mistral-Large-4 : [THINK]…[/THINK] écrit par le modèle,
+                           # qui partait tel quel dans `content` (vérifié 2026-10-30,
+                           # « [THINK]17 × 23 = 391.[/THINK]17 × 23 = 391. »).
+                           "mistral-large-4")
 # Subset of _MODELS_AUTO_OPEN_THINK that IGNORES the `enable_thinking`
 # kwarg and always wraps reasoning in <think>...</think>. Per MiniMax M2
 # docs (2026-05-20 update): "The model's reasoning is wrapped in <think>
@@ -6489,7 +6499,11 @@ _MODELS_IGNORE_ENABLE_THINKING_FLAG = ("minimax-m2", "step-3.7", "step3p7",
                                        # enable_thinking=false émet quand même <mm:think>…, qui
                                        # partait dans `content` (Bench A TMB). Le M3 non-.1
                                        # honore thinking_mode et reste hors liste.
-                                       "minimax-m3.1", "minimax-m3-1")
+                                       "minimax-m3.1", "minimax-m3-1",
+                                       # Mistral-Large-4 : pas d'enable_thinking dans le
+                                       # template, reasoning_effort low/medium/high
+                                       # (défaut high) ; il raisonne dans tous les modes.
+                                       "mistral-large-4")
 # LFM3-1.7B volontairement HORS de cette liste (2026-10-29) : en
 # enable_thinking=false il raisonne PARFOIS (puis `</think>`), PARFOIS répond
 # directement. L'y mettre vidait `content` dans le second cas (TMB A, 4 réponses
@@ -6532,6 +6546,8 @@ _MODELS_REASONING_EFFORT_MAP = {
     # (2026-09-26, replica pool qwen3-8-flash-next). "high" has no equivalent
     # short of the top bucket; map it there. "minimal" -> low.
     "qwen3.8-flash-next": {"minimal": "low", "high": "xhigh"},
+    # Mistral-Large-4: template raises on anything outside low/medium/high.
+    "mistral-large-4": {"minimal": "low", "none": "low", "xhigh": "high", "max": "high"},
 }
 
 
@@ -8687,7 +8703,7 @@ def _initial_default_config() -> Optional[dict]:
 #   major (1.7.2 → 2.0.0) — breaking API or topology change
 #
 # Use `./scripts/bump-version.sh patch|minor|major` to bump + auto-commit.
-APP_VERSION = "1.64.0"
+APP_VERSION = "1.64.1"
 
 app = FastAPI(
     title="OdyssAI-X (odyssai.eu)",
