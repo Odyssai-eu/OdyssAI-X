@@ -35,6 +35,11 @@ import mlx.core as mx
 sys.path.insert(0, "/Users/admin/mlx-cluster")
 
 from mlx_lm.models.mistral_large4 import Model, ModelArgs  # noqa: E402
+# The runner patches PipelineMixin.pipeline at startup: run under the same
+# patch (an earlier version of it dropped the `split` argument).
+from patches.pipeline_split_coverage import apply_pipeline_split_fix  # noqa: E402
+
+apply_pipeline_split_fix()
 
 VOCAB, T, STEPS = 512, 10, 3
 N = 12

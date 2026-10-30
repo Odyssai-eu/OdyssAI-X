@@ -53,5 +53,13 @@ def _pipeline_fixed(self, group):
 def apply_pipeline_split_fix() -> None:
     if getattr(PipelineMixin.pipeline, "_odyssai_split_fix", False):
         return
+    # mlx-lm 0.32.2 ships the same chained bounds plus a `split` argument
+    # (per-rank layer counts). Replacing it would drop that argument:
+    # mistral_large4 passes the orchestrator's RAM split through it and died
+    # on "_pipeline_fixed() takes 2 positional arguments" (2026-10-30).
+    import inspect
+
+    if "split" in inspect.signature(PipelineMixin.pipeline).parameters:
+        return
     _pipeline_fixed._odyssai_split_fix = True
     PipelineMixin.pipeline = _pipeline_fixed
