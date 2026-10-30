@@ -956,6 +956,10 @@ FORCE_NO_AP_MODEL_TYPES = frozenset({
     # bailing_moe_v3 (Ling-3.1, 2026-10-21) : pas de stratégie auto_parallel,
     # le tensoriel est le shard() du module via sharded_load.
     "bailing_moe_v3",
+    # mistral_large4 (2026-10-30) : pipeline() du module, qui fait passer le
+    # latent de la couche 35 (lu par 39..71) d'un rang à l'autre ; le chemin AP
+    # ne le transporte pas. Répartition RUNNER_RAM_WEIGHTS lue par le module.
+    "mistral_large4",
 })
 
 # Model types that carry a vision_config but must NOT route to mlx_vlm.server.
@@ -8683,7 +8687,7 @@ def _initial_default_config() -> Optional[dict]:
 #   major (1.7.2 → 2.0.0) — breaking API or topology change
 #
 # Use `./scripts/bump-version.sh patch|minor|major` to bump + auto-commit.
-APP_VERSION = "1.63.6"
+APP_VERSION = "1.64.0"
 
 app = FastAPI(
     title="OdyssAI-X (odyssai.eu)",

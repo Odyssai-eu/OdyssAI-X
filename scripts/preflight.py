@@ -33,7 +33,7 @@ PIPELINE_CAPABLE = frozenset({
     "deepseek_v2", "deepseek_v3", "deepseek_v32", "deepseek_v4",
     "glm4_moe", "glm4_moe_lite", "glm_moe_dsa", "ministral3", "hy_v3", "hy_v4",
     "kimi_k3", "longcat2", "qwen3_5_moe", "qwen3_5_mixed", "bailing_moe_linear",
-    "minimax_m3", "g9v3",
+    "minimax_m3", "g9v3", "mistral_large4",
 })
 
 # Types the cluster knows how to serve at all (stock mlx-lm families + our
@@ -151,9 +151,17 @@ def plan_nodes(meta: dict, capacity_by_nodes: dict, max_nodes: int) -> dict:
                    int(cap_max.get("max_loadable_bytes", 0)))
         gap = round((meta["size_bytes"] - best) / 1024**3, 1)
         kvh = meta.get("num_key_value_heads")
-        reason = (f"ne tient sur aucune topologie (jusqu'à {max_nodes} nodes) : "
-                  f"{meta['size_gb']} GB > {round(best/1024**3,1)} GB de budget max "
-                  f"(manque {gap} GB)")
+        if gap > 0:
+            reason = (f"ne tient sur aucune topologie (jusqu'à {max_nodes} nodes) : "
+                      f"{meta['size_gb']} GB > {round(best/1024**3,1)} GB de budget max "
+                      f"(manque {gap} GB)")
+        else:
+            # Fits in memory: what is missing is a split mode (pipeline not
+            # supported, tensor ruled out by the KV heads or the even split).
+            reason = (f"aucun mode de répartition possible (jusqu'à {max_nodes} nodes) : "
+                      f"{meta['size_gb']} GB tiendraient en pipeline "
+                      f"({round(best/1024**3,1)} GB de budget), mais "
+                      f"{meta.get('model_type')} n'a pas de chemin pipeline")
         if kvh and not meta.get("pipeline_capable"):
             reason += (f" — et tensor-only avec kv_heads={kvh} limite les world_size "
                        f"aux diviseurs de {kvh}")
