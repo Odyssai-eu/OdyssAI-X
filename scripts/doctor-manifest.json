@@ -26,6 +26,8 @@
   "inkling_mm_model.py": "4db92deaaf5fd48a1801488f7cc06b0c",
   "kimi_k3.py": "ad77659e0a26d0f5efc2001b99483844",
   "laguna.py": "6616f947b928ba0014d32c5645e8b19d",
+  "lfm3.py": "595ceb2d90392e2b22ca83b647945a97",
+  "mistral_large4.py": "b697e10d1c304a4afbdb6fd35cf08569",
   "qwen4_exp.py": "b4c1744ba4d770b4cfeb730f6b717189"
  },
  "patches": {
@@ -39,7 +41,7 @@
   "mimo_v2_alias.py": "2ff38dc53fde4171f7e7f207ab1c2e7c",
   "minimax_m3_alias.py": "323029f936a5c333019e93d69a794dff",
   "minimax_m3_model.py": "d6c6d5def7827485479578344ba298cb",
-  "pipeline_split_coverage.py": "bda0b9872fa3f1faba1b0beb0bd32e7a",
+  "pipeline_split_coverage.py": "ac445a8810aab49c45656b54cc1e5949",
   "standard_yarn_rope.py": "ffcc5fee24c9300d40dedb565a0e3758"
  }
 }
