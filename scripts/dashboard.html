@@ -6965,6 +6965,7 @@ async function handleAct(e) {
     return;
   }
   if (act === "saved-pools-autostart") {
+    if (e.type !== "change") return;   // click + input + change all fire on a checkbox
     const cid = el.dataset.cluster;
     const next = !!el.checked;
     try {
