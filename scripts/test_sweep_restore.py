@@ -83,7 +83,7 @@ ok = asyncio.run(api._wait_models_readable("t", timeout_s=0.2, every_s=0.05))
 check("gives up after the timeout (restores anyway)", ok, False)
 rr = src[src.index("async def _reboot_reload_after"):][:2500]
 check("reboot-reload waits before restoring",
-      rr.index("await _wait_models_readable(cluster_id)") < rr.index("await _restore_cluster_pools(cluster_id)"), True)
+      rr.index("await _wait_models_readable(cluster_id") < rr.index("await _restore_cluster_pools(cluster_id"), True)
 
 print("all OK" if not FAILS else f"{len(FAILS)} FAILED: {FAILS}")
 sys.exit(1 if FAILS else 0)

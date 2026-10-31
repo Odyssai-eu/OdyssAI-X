@@ -65,6 +65,7 @@ def run_with_state(entries):
     api._AUTO_RELOAD_PENDING.clear()
     api._AUTO_RELOAD_RETRIES.clear()
     api.load_cluster_state_v2 = lambda cid: entries
+    api.load_saved_pools = lambda cid: {"saved_at": None, "pools": entries}
     try:
         asyncio.run(api._auto_reload_purged("argo", [e["alias"] for e in entries]))
     except AssertionError as e:

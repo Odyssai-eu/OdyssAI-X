@@ -527,7 +527,7 @@ def get_cluster_def(cluster_id: str) -> dict:
     default = DEFAULT_CLUSTER_DEFS.get(cluster_id, {})
     overlay = cfg.get(cluster_id, {})
     merged = json.loads(json.dumps(default))  # deep copy
-    for k in ("name", "kind", "backend", "max_nodes", "models_dir", "enabled", "reload_on_restart", "reload_on_reboot", "upstream", "supports_vision", "_vlm_managed", "_vlm_port", "_vlm_model_path", "_vlm_pid"):
+    for k in ("name", "kind", "backend", "max_nodes", "models_dir", "enabled", "reload_on_restart", "reload_on_reboot", "autostart", "upstream", "supports_vision", "_vlm_managed", "_vlm_port", "_vlm_model_path", "_vlm_pid"):
         if k in overlay:
             merged[k] = overlay[k]
     if "nodes" in overlay and overlay["nodes"]:
@@ -619,6 +619,51 @@ def _reload_on_reboot(cluster_id: str) -> bool:
     for the nodes to come back SSH-up, sweeps orphans, then re-loads the pools
     that were loaded before the reboot."""
     return get_cluster_def(cluster_id).get("reload_on_reboot", True) is not False
+
+
+def _autostart(cluster_id: str) -> bool:
+    """The one gate for every automatic load on this cluster (1.65.0): container
+    restart, reboot-all and the self-heal after a runner crash all load the
+    SAVED pools when on, and load nothing when off. A cluster that never stored
+    the flag inherits its old reload_on_restart toggle."""
+    cd = get_cluster_def(cluster_id)
+    if "autostart" in cd:
+        return cd["autostart"] is not False
+    return _reload_on_restart(cluster_id)
+
+
+def saved_pools_file_for(cluster_id: str) -> Path:
+    """The operator's saved pool set (Save button), next to state-<cid>.json."""
+    return state_file_for(cluster_id).with_name(f"saved-pools-{cluster_id}.json")
+
+
+def load_saved_pools(cluster_id: str) -> dict:
+    """{"saved_at": epoch|None, "pools": [desired-state entries]}. A cluster with
+    no file yet gets one seeded from the pools live at its last state-save
+    (the entries not stamped `down`), so autostart keeps loading what it loaded
+    before the Save button existed."""
+    f = saved_pools_file_for(cluster_id)
+    try:
+        raw = json.loads(f.read_text())
+        if isinstance(raw, dict) and isinstance(raw.get("pools"), list):
+            return {"saved_at": raw.get("saved_at"), "pools": raw["pools"]}
+    except FileNotFoundError:
+        pools = [dict(p) for p in load_cluster_state_v2(cluster_id)
+                 if isinstance(p, dict) and not p.get("down")]
+        return _write_saved_pools(cluster_id, pools, saved_at=None)
+    except Exception as e:
+        sys.stderr.write(f"[api] unreadable {f.name}: {e}\n")
+    return {"saved_at": None, "pools": []}
+
+
+def _write_saved_pools(cluster_id: str, pools: list[dict],
+                       saved_at: Optional[float]) -> dict:
+    payload = {"saved_at": saved_at, "pools": pools}
+    try:
+        saved_pools_file_for(cluster_id).write_text(json.dumps(payload, indent=2))
+    except Exception as e:
+        sys.stderr.write(f"[api] failed to write saved pools of {cluster_id}: {e}\n")
+    return payload
 
 
 def save_cluster_def(cluster_id: str, updates: dict) -> None:
@@ -7316,7 +7361,8 @@ def _clear_cluster_degraded(cluster_id: str) -> None:
 
 
 async def _restore_cluster_pools(cid: str, leaked_hosts: Optional[set] = None,
-                                 restore_down: bool = True) -> list[str]:
+                                 restore_down: bool = True,
+                                 entries: Optional[list[dict]] = None) -> list[str]:
     """Restore a cluster's persisted desired-state pools (state-<cid>.json v2).
 
     Shared by the container-startup restore (reload_on_restart) and the
@@ -7334,10 +7380,13 @@ async def _restore_cluster_pools(cid: str, leaked_hosts: Optional[set] = None,
     .30-.32 vs hercules on .30-.33) would overcommit and OOM. Only the pools
     that were LIVE at the last state-save (the ones the operator is actually
     serving) come back. The reboot-all path keeps the default True: it targets
-    ONE cluster deliberately and wants its full desired-set back."""
+    ONE cluster deliberately and wants its full desired-set back.
+
+    `entries`: restore these pools instead of the desired state — every caller
+    passes the saved set (load_saved_pools) since 1.65.0."""
     leaked_hosts = leaked_hosts or set()
     restored: list[str] = []
-    saved_pools = load_cluster_state_v2(cid)
+    saved_pools = [dict(p) for p in entries] if entries is not None else load_cluster_state_v2(cid)
     if not saved_pools:
         return restored
     # Prune STRUCTURALLY-dead entries: a desired-state pool whose node_indices
@@ -7616,12 +7665,12 @@ async def lifespan(app: FastAPI):
     # dispatches to its correct branch (vlm-dist / vlm-adopt / dflash / normal)
     # inside _restore_cluster_pools, so this is safe for every cluster kind.
     for cid in active_cluster_ids():
-        if not _reload_on_restart(cid):
+        if not _autostart(cid):
             sys.stderr.write(
-                f"[api] reload_on_restart=false ({cid}) — skipping startup "
-                f"restore of its pools (desired-state kept)\n")
+                f"[api] autostart off ({cid}) — no pool loaded at startup\n")
             continue
-        await _restore_cluster_pools(cid, _leaked_hosts, restore_down=False)
+        await _restore_cluster_pools(cid, _leaked_hosts, restore_down=False,
+                                     entries=load_saved_pools(cid)["pools"])
     # Apply persisted default TTL to any pool that just started up.
     _apply_default_ttl_to_pools()
     # Background TTL sweeper — auto-unloads pools idle for > ttl_seconds.
@@ -7830,6 +7879,11 @@ async def _auto_reload_purged(cid: str, purged: list) -> None:
     # #2 of 2026-09-18 found the guard here, and no retry ever ran).
     if cid in _WATCHDOG_RECOVERY_BY_CLUSTER:
         return
+    # Autostart off = no automatic load at all, the self-heal included (1.65.0).
+    if not _autostart(cid):
+        for k in [k for k in _AUTO_RELOAD_PENDING if k[0] == cid]:
+            _AUTO_RELOAD_PENDING.pop(k, None)
+        return
     # Degraded gate (2026-08-09, fix #1 of the cascade review). Without it, a
     # pool purged BECAUSE the cluster is sick gets reloaded onto the same sick
     # nodes -> immediate re-wedge -> re-purge -> reload loop (the observed
@@ -7851,6 +7905,7 @@ async def _auto_reload_purged(cid: str, purged: list) -> None:
         return
     try:
         desired = {e.get("alias"): e for e in load_cluster_state_v2(cid)}
+        saved_aliases = {e.get("alias") for e in load_saved_pools(cid)["pools"]}
     except Exception:
         return
     cd_nodes = (get_cluster_def(cid) or {}).get("nodes") or []
@@ -7858,7 +7913,8 @@ async def _auto_reload_purged(cid: str, purged: list) -> None:
     for alias in purged:
         key = (cid, alias)
         entry = desired.get(alias)
-        if entry is None or alias in live_aliases:
+        # Only the saved pools come back on their own (1.65.0).
+        if entry is None or alias in live_aliases or alias not in saved_aliases:
             _AUTO_RELOAD_PENDING.pop(key, None)   # gone from desired state, or back
             continue
         # VLM pools are not RunnerPool text pools. A distributed VL pool is
@@ -8703,7 +8759,7 @@ def _initial_default_config() -> Optional[dict]:
 #   major (1.7.2 → 2.0.0) — breaking API or topology change
 #
 # Use `./scripts/bump-version.sh patch|minor|major` to bump + auto-commit.
-APP_VERSION = "1.64.1"
+APP_VERSION = "1.65.0"
 
 app = FastAPI(
     title="OdyssAI-X (odyssai.eu)",
@@ -15783,6 +15839,9 @@ class ClusterConfigUpdate(BaseModel):
     # reboot-all re-load the pools once the nodes come back up.
     reload_on_restart: Optional[bool] = None
     reload_on_reboot: Optional[bool] = None
+    # Autostart (1.65.0): the one gate for restart / reboot / crash loads, which
+    # load the saved pools (POST .../saved-pools/save).
+    autostart: Optional[bool] = None
 
 
 def _pool_for_cluster(cluster_id: str):
@@ -16000,6 +16059,8 @@ async def admin_cluster_get(cluster_id: str):
         # for each in Cluster settings.
         "reload_on_restart": _reload_on_restart(cluster_id),
         "reload_on_reboot": _reload_on_reboot(cluster_id),
+        "autostart": _autostart(cluster_id),
+        "saved_pools": _saved_pools_summary(cluster_id),
         "capacity_by_nodes": capacity_by_nodes,
         "model_overhead_factor": _model_load_overhead_factor(),
     }
@@ -16311,6 +16372,8 @@ async def admin_cluster_update(cluster_id: str, req: ClusterConfigUpdate):
         persist["reload_on_restart"] = bool(req.reload_on_restart)
     if req.reload_on_reboot is not None:
         persist["reload_on_reboot"] = bool(req.reload_on_reboot)
+    if req.autostart is not None:
+        persist["autostart"] = bool(req.autostart)
     if req.upstream is not None: persist["upstream"] = candidate["upstream"]
     if req.fallback is not None:
         # Empty string clears the fallback; non-empty validates against published cloud aliases.
@@ -16378,13 +16441,16 @@ async def _wait_nodes_up(cluster_id: str, timeout_s: int = 420,
 
 
 async def _wait_models_readable(cluster_id: str, timeout_s: float = 180.0,
-                                every_s: float = 5.0) -> bool:
+                                every_s: float = 5.0,
+                                entries: Optional[list[dict]] = None) -> bool:
     """Poll until every model of the cluster's desired state has a non-empty
     config.json on each of its target nodes (the external models volume mounts
     after ssh is up). Returns False on timeout — the caller restores anyway and
     the normal per-pool failure is logged."""
     try:
-        entries = [e for e in load_cluster_state_v2(cluster_id) if isinstance(e, dict) and e.get("model")]
+        if entries is None:
+            entries = load_cluster_state_v2(cluster_id)
+        entries = [e for e in entries if isinstance(e, dict) and e.get("model")]
     except Exception:
         return True
     checks: list[tuple[str, str]] = []
@@ -16448,8 +16514,9 @@ async def _reboot_reload_after(cluster_id: str) -> None:
         # #93: ssh answers before the external models volume is mounted; the
         # restore then failed on every pool with "config.json missing"
         # (2026-09-26, the volume came up seconds later). Wait for it.
-        await _wait_models_readable(cluster_id)
-        restored = await _restore_cluster_pools(cluster_id)
+        saved = load_saved_pools(cluster_id)["pools"]
+        await _wait_models_readable(cluster_id, entries=saved)
+        restored = await _restore_cluster_pools(cluster_id, entries=saved)
         sys.stderr.write(
             f"[api] reboot-reload ({cluster_id}): restored "
             f"{restored if restored else 'nothing'}\n")
@@ -16471,11 +16538,130 @@ async def admin_cluster_reboot_all(cluster_id: str):
         raise HTTPException(404, "no resolved hosts")
     results = await asyncio.gather(*[_reboot_one(h) for h in hosts])
     reload_scheduled = False
-    if _reload_on_reboot(cluster_id):
+    if _autostart(cluster_id):
         asyncio.create_task(_reboot_reload_after(cluster_id))
         reload_scheduled = True
     return {"ok": True, "cluster": cluster_id, "results": results,
             "reload_scheduled": reload_scheduled}
+
+
+def _saved_pools_summary(cluster_id: str) -> dict:
+    sp = load_saved_pools(cluster_id)
+    return {"saved_at": sp["saved_at"],
+            "pools": [{"alias": p.get("alias", DEFAULT_ALIAS),
+                       "model": p.get("model"),
+                       "nodes": len(p.get("node_indices") or []) or p.get("nodes")}
+                      for p in sp["pools"]]}
+
+
+@app.post("/admin/clusters/{cluster_id}/saved-pools/save")
+async def admin_saved_pools_save(cluster_id: str):
+    """Save button: the pools live right now become the saved set — what Load
+    and autostart bring back."""
+    if not cluster_exists(cluster_id):
+        raise HTTPException(404, f"unknown cluster {cluster_id}")
+    save_cluster_state_v2(cluster_id)
+    live = {a for a, _ in list_pools(cluster_id)}
+    pools = [{k: v for k, v in p.items() if k != "down"}
+             for p in load_cluster_state_v2(cluster_id)
+             if isinstance(p, dict) and p.get("alias", DEFAULT_ALIAS) in live]
+    _write_saved_pools(cluster_id, pools, saved_at=time.time())
+    return _saved_pools_summary(cluster_id)
+
+
+_SAVED_LOAD_TASKS: dict[str, asyncio.Task] = {}
+
+
+@app.post("/admin/clusters/{cluster_id}/saved-pools/load", status_code=202)
+async def admin_saved_pools_load(cluster_id: str):
+    """Load button: load the saved pools that are not already up, in the
+    background (a big pool takes minutes). Same path as autostart."""
+    if not cluster_exists(cluster_id):
+        raise HTTPException(404, f"unknown cluster {cluster_id}")
+    if _cluster_is_degraded(cluster_id):
+        raise HTTPException(409, f"{cluster_id} is degraded — reset it before loading")
+    t = _SAVED_LOAD_TASKS.get(cluster_id)
+    if t is not None and not t.done():
+        raise HTTPException(409, f"saved pools of {cluster_id} are already loading")
+    saved = load_saved_pools(cluster_id)["pools"]
+    if not saved:
+        raise HTTPException(409, f"no saved pools on {cluster_id} — Save first")
+
+    async def _run():
+        try:
+            async with get_admin_lock(cluster_id):
+                restored = await _restore_cluster_pools(cluster_id, entries=saved)
+                if restored:
+                    save_cluster_state_v2(cluster_id)
+            sys.stderr.write(f"[api] saved-pools load ({cluster_id}): "
+                             f"{restored or 'nothing'}\n")
+        except Exception as e:
+            sys.stderr.write(f"[api] saved-pools load ({cluster_id}) failed: {e}\n")
+
+    _SAVED_LOAD_TASKS[cluster_id] = asyncio.create_task(_run())
+    live = {a for a, _ in list_pools(cluster_id)}
+    return {"ok": True, "loading": [p.get("alias", DEFAULT_ALIAS) for p in saved
+                                    if p.get("alias", DEFAULT_ALIAS) not in live]}
+
+
+# Node software versions for the cluster editor (macOS, mlx, mlx-vlm). One ssh
+# per node; cached because the editor re-renders every few seconds.
+_NODE_VERSIONS_TTL_S = 300.0
+_node_versions_cache: dict[str, tuple[float, list]] = {}
+_PKG_VERSION_PY = '-c "import importlib.metadata as m,sys; print(m.version(sys.argv[1]))"'
+
+
+def _node_versions_cmd() -> str:
+    """mlx from the runner venv, mlx-vlm from the VLM venv (VLM_DEFAULT_VENV,
+    where the vision pools run it), falling back to the runner venv."""
+    return (
+        'echo "macos=$(sw_vers -productVersion 2>/dev/null)"; '
+        'PY="$HOME/mlx-cluster/.venv/bin/python"; '
+        f'VPY="{VLM_DEFAULT_VENV}/bin/python"; [ -x "$VPY" ] || VPY="$PY"; '
+        f'echo "mlx=$("$PY" {_PKG_VERSION_PY} mlx 2>/dev/null)"; '
+        f'echo "mlx-vlm=$("$VPY" {_PKG_VERSION_PY} mlx-vlm 2>/dev/null)"')
+
+
+async def _node_versions(node: dict) -> dict:
+    host = node.get("host")
+    out = {"host": host, "macos": None, "mlx": None, "mlx_vlm": None, "error": None}
+    ssh = node.get("ssh") or (_resolve_host(host) or {}).get("ssh")
+    if not ssh:
+        out["error"] = "no ssh target"
+        return out
+    try:
+        rc, stdout, stderr = await asyncio.to_thread(_ssh_exec, ssh, _node_versions_cmd(), 10)
+    except Exception as e:
+        out["error"] = str(e)[:200]
+        return out
+    for line in (stdout or "").splitlines():
+        k, _, v = line.partition("=")
+        key = {"macos": "macos", "mlx": "mlx", "mlx-vlm": "mlx_vlm"}.get(k.strip())
+        if key:
+            out[key] = v.strip() or None
+    if rc != 0 and not any(out[k] for k in ("macos", "mlx", "mlx_vlm")):
+        out["error"] = (stderr or "").strip()[:200] or f"ssh rc={rc}"
+    return out
+
+
+@app.get("/admin/clusters/{cluster_id}/node-versions")
+async def admin_cluster_node_versions(cluster_id: str, fresh: bool = False):
+    """macOS / mlx / mlx-vlm per member node, plus which of the three differ
+    across the nodes (the dashboard paints those red)."""
+    if not cluster_exists(cluster_id):
+        raise HTTPException(404, f"unknown cluster {cluster_id}")
+    now = time.time()
+    hit = _node_versions_cache.get(cluster_id)
+    if hit and not fresh and now - hit[0] < _NODE_VERSIONS_TTL_S:
+        nodes, ts = hit[1], hit[0]
+    else:
+        members = get_cluster_def(cluster_id).get("nodes") or []
+        nodes = list(await asyncio.gather(*[_node_versions(n) for n in members]))
+        ts = now
+        _node_versions_cache[cluster_id] = (ts, nodes)
+    mismatch = [k for k in ("macos", "mlx", "mlx_vlm")
+                if len({n[k] for n in nodes if not n["error"]}) > 1]
+    return {"nodes": nodes, "mismatch": mismatch, "ts": ts}
 
 
 class BulkDeleteRequest(BaseModel):

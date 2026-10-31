@@ -2714,19 +2714,6 @@ function renderMlxClusterEditorBody(id, draft, cfg, poolLoaded, kindOpts, backen
       <div class="field-label">Models directory <span style="font-weight:400;color:var(--ink-3)">(shared path — every node in this cluster reads models from here)</span></div>
       <input class="ce-input mono" data-act="cluster-edit-models-dir" data-cluster="${id}" value="${escapeHtml(draft.models_dir || "")}" placeholder="/Volumes/models/odysseus"/>
     </div>
-    <div class="field" style="margin-bottom:14px">
-      <div class="field-label">Auto-reload <span style="font-weight:400;color:var(--ink-3)">(automatically re-load this cluster's last-loaded pools)</span></div>
-      <div style="display:flex;flex-direction:column;gap:8px;margin-top:6px">
-        <label style="display:flex;align-items:center;gap:8px;font-size:13px;cursor:pointer">
-          <input type="checkbox" data-act="cluster-toggle-reload-restart" data-cluster="${id}" ${cfg.reload_on_restart !== false ? "checked" : ""}/>
-          <span>On container <b>restart</b> <span style="color:var(--ink-3)">— redeploy / crash → restore the pools that were loaded</span></span>
-        </label>
-        <label style="display:flex;align-items:center;gap:8px;font-size:13px;cursor:pointer">
-          <input type="checkbox" data-act="cluster-toggle-reload-reboot" data-cluster="${id}" ${cfg.reload_on_reboot !== false ? "checked" : ""}/>
-          <span>On node <b>reboot</b> <span style="color:var(--ink-3)">— Reboot all → wait for nodes up → reload the pools</span></span>
-        </label>
-      </div>
-    </div>
     <div>
       <div style="display:flex;justify-content:space-between;align-items:center;padding-bottom:14px">
         <div>
@@ -2806,6 +2793,20 @@ function renderNodeManagement(clusterId) {
   `;
 }
 
+// macOS / mlx / mlx-vlm per node (GET .../node-versions, cached 5 min server
+// side). Fetched once per cluster when its editor first renders.
+function nodeVersions(clusterId) {
+  state.node_versions = state.node_versions || {};
+  const cur = state.node_versions[clusterId];
+  if (cur === undefined) {
+    state.node_versions[clusterId] = { loading: true };
+    getJson(`/admin/clusters/${encodeURIComponent(clusterId)}/node-versions`)
+      .then(v => { state.node_versions[clusterId] = v; render(); })
+      .catch(() => { state.node_versions[clusterId] = { nodes: [], mismatch: [] }; render(); });
+  }
+  return state.node_versions[clusterId];
+}
+
 function renderNodeTable(clusterId, draft, poolLoaded) {
   const nodes = draft?.nodes || [];
   const isVlm = false;
@@ -2814,6 +2815,16 @@ function renderNodeTable(clusterId, draft, poolLoaded) {
 
   const rdmaHeader = isVlm ? "Port" : "RDMA ports";
   const onlyOne = nodes.length <= 1;
+  const ver = nodeVersions(clusterId);
+  const verCell = (host, key) => {
+    const n = (ver?.nodes || []).find(v => v.host === host);
+    if (!n) return `<span style="color:var(--ink-3)">${ver?.loading ? "…" : "—"}</span>`;
+    if (n.error) return `<span style="color:var(--ink-3)" title="${escapeHtml(n.error)}">?</span>`;
+    const bad = (ver.mismatch || []).includes(key);
+    return `<span style="${bad ? "color:var(--rust-deep);font-weight:600" : ""}" title="${bad ? "differs across the nodes of this cluster" : ""}">${escapeHtml(n[key] || "none")}</span>`;
+  };
+  const verCols = (host) => ["macos", "mlx", "mlx_vlm"].map(k =>
+    `<div class="mono" style="width:72px;flex-shrink:0;font-size:12px">${host == null ? "" : verCell(host, k)}</div>`).join("");
 
   return `
     <div class="node-table">
@@ -2823,6 +2834,9 @@ function renderNodeTable(clusterId, draft, poolLoaded) {
         <span class="c-host cap">Host</span>
         <span class="c-ssh cap">SSH target</span>
         <span class="c-rdma cap">${rdmaHeader}</span>
+        <span class="cap" style="width:72px;flex-shrink:0">macOS</span>
+        <span class="cap" style="width:72px;flex-shrink:0">MLX</span>
+        <span class="cap" style="width:72px;flex-shrink:0">mlx-vlm</span>
         <span class="c-master cap">Master</span>
         <span class="c-del"></span>
       </div>
@@ -2839,6 +2853,7 @@ function renderNodeTable(clusterId, draft, poolLoaded) {
           <div class="host">${escapeHtml(n.host)}</div>
           <div class="ssh"><input class="ce-input mono" style="width:100%;font-size:12px;padding:4px 6px" value="${escapeHtml(n.ssh || sshDefault)}" ${poolLoaded?"disabled":""} data-act="cluster-edit-ssh" data-cluster="${clusterId}" data-idx="${idx}"/></div>
           <div style="width:130px;flex-shrink:0">${rdmaCell}</div>
+          ${verCols(n.host)}
           <div style="width:70px;flex-shrink:0;display:flex;justify-content:center">
             <input type="radio" name="master-${clusterId}" ${n.master?"checked":""} ${poolLoaded?"disabled":""} data-act="cluster-set-master" data-cluster="${clusterId}" data-idx="${idx}" title="Set as master"/>
           </div>
@@ -4333,9 +4348,36 @@ function renderTelemakLoadConfig(cid, modelsLoaded) {
 // at least one pool, with a "+ Add pool" button for spawning extras on
 // disjoint node subsets. The inline form (renderArgoAddPoolForm) toggles
 // below this when the user clicks Add.
+// Save / Load / Autostart (1.65.0). Save = the pools live now become the saved
+// set; Load = load the saved set; Autostart = restart, reboot and crash load
+// the saved set (off: nothing loads on its own).
+function renderSavedPoolsControls(cid) {
+  const cd = state.cluster_defs?.[cid];
+  if (!cd || !cid) return "";
+  const sp = cd.saved_pools || { pools: [] };
+  const list = (sp.pools || []).map(p => `${p.alias}: ${(p.model || "").split("/").pop()} (${p.nodes || "?"} node${p.nodes > 1 ? "s" : ""})`).join("\n");
+  const when = sp.saved_at ? new Date(sp.saved_at * 1000).toLocaleString() : "never saved (seeded from the last loaded pools)";
+  const tip = `Saved set — ${when}\n${list || "(empty)"}`;
+  return `
+    <div class="x-expert" style="display:flex;align-items:center;gap:6px" title="${escapeHtml(tip)}">
+      <button class="btn btn-sm" data-act="saved-pools-save" data-cluster="${cid}" title="${escapeHtml("Save the pools loaded now\n" + tip)}">Save</button>
+      <button class="btn btn-sm ${sp.pools?.length ? "" : "btn-disabled"}" data-act="saved-pools-load" data-cluster="${cid}" ${sp.pools?.length ? "" : "disabled"} title="${escapeHtml("Load the saved pools\n" + tip)}">Load (${(sp.pools || []).length})</button>
+      <label style="display:flex;align-items:center;gap:5px;font-size:12px;cursor:pointer" title="${escapeHtml("Autostart: load the saved pools after a container restart, a node reboot or a crash. Off: nothing loads on its own.\n" + tip)}">
+        <input type="checkbox" data-act="saved-pools-autostart" data-cluster="${cid}" ${cd.autostart !== false ? "checked" : ""}/>
+        <span>Autostart</span>
+      </label>
+    </div>`;
+}
+
 function renderArgoPoolsList(a) {
   const pools = a?.pools || [];
-  if (pools.length === 0) return "";  // load form covers the empty state
+  const cidSel = state.selected_cluster;
+  // The load form covers the empty state; the saved-set controls stay, so the
+  // saved pools can be loaded back with nothing up.
+  if (pools.length === 0) {
+    const ctl = renderSavedPoolsControls(cidSel);
+    return ctl ? `<div class="section" style="padding-top:0"><div class="section-head"><div class="section-stack"><div class="section-title">Pools (0)</div></div>${ctl}</div></div>` : "";
+  }
   const argoMax = a?.max_nodes || 4;
   const rows = pools.map((p) => {
     const hostNames = (p.topology || []).map(t => t.host || "?").join(" + ");
@@ -4436,7 +4478,10 @@ function renderArgoPoolsList(a) {
           }</div>
           <div class="section-sub x-simple">Models running on this cluster · Stop unloads one</div>
         </div>
-        <button class="btn btn-sm x-expert ${canAdd?'':'btn-disabled'}" data-act="default-add-toggle" ${canAdd?'':'disabled'}>${Icon.plus}<span>${f.default_add_open ? 'Cancel add' : 'Add pool'}</span></button>
+        <div style="display:flex;align-items:center;gap:10px">
+          ${renderSavedPoolsControls(cidSel)}
+          <button class="btn btn-sm x-expert ${canAdd?'':'btn-disabled'}" data-act="default-add-toggle" ${canAdd?'':'disabled'}>${Icon.plus}<span>${f.default_add_open ? 'Cancel add' : 'Add pool'}</span></button>
+        </div>
       </div>
       <div style="display:flex;flex-direction:column;gap:6px;margin-top:12px">
         ${rows}
@@ -6900,27 +6945,41 @@ async function handleAct(e) {
     }
     return;
   }
-  if (act === "cluster-toggle-reload-restart" || act === "cluster-toggle-reload-reboot") {
+  if (act === "saved-pools-save" || act === "saved-pools-load") {
     const cid = el.dataset.cluster;
-    const cfg = state.cluster_defs?.[cid];
-    if (!cfg) return;
-    const field = act === "cluster-toggle-reload-restart"
-      ? "reload_on_restart" : "reload_on_reboot";
-    const next = !(cfg[field] !== false);   // default ON, so first click turns OFF
+    const what = act === "saved-pools-save" ? "save" : "load";
+    try {
+      const r = await fetch(`/admin/clusters/${encodeURIComponent(cid)}/saved-pools/${what}`, {
+        method: "POST", headers: { ...authHeaders() } });
+      if (!r.ok) { const t = await r.text(); throw new Error(t.slice(0, 300)); }
+      const j = await r.json();
+      if (what === "save") {
+        toast(`${cid}: saved ${j.pools.length} pool${j.pools.length === 1 ? "" : "s"} (${j.pools.map(p => p.alias).join(", ") || "none"})`, "ok");
+      } else {
+        toast(j.loading.length ? `${cid}: loading ${j.loading.join(", ")}` : `${cid}: saved pools already up`, "ok");
+      }
+    } catch (err) {
+      toast(`${what} failed: ${err.message || err}`, "err");
+    }
+    refreshAll();
+    return;
+  }
+  if (act === "saved-pools-autostart") {
+    const cid = el.dataset.cluster;
+    const next = !!el.checked;
     try {
       const r = await fetch(`/admin/clusters/${encodeURIComponent(cid)}`, {
         method: "PUT",
         headers: { "content-type": "application/json", ...authHeaders() },
-        body: JSON.stringify({ [field]: next }),
+        body: JSON.stringify({ autostart: next }),
       });
       if (!r.ok) { const t = await r.text(); throw new Error(t.slice(0, 300)); }
-      const saved = await r.json();
-      state.cluster_defs[cid] = saved;
-      const label = field === "reload_on_restart" ? "restart" : "reboot";
-      toast(`${cid}: auto-reload on ${label} ${next ? "ON" : "OFF"}`, "ok");
+      state.cluster_defs[cid] = await r.json();
+      toast(`${cid}: autostart ${next ? "ON" : "OFF"}`, "ok");
       render();
     } catch (err) {
-      toast(`Toggle failed: ${err.message || err}`, "err");
+      toast(`Autostart toggle failed: ${err.message || err}`, "err");
+      el.checked = !next;
     }
     return;
   }
