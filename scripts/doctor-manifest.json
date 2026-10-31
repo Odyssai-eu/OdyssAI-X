@@ -9,8 +9,8 @@
   "runner.py": "789d94a6b6c706f815ea367b07631077",
   "vlm_runner.py": "c39a344cf6554bff154367252153cda5"
  },
- "jaccl_sha256": "cb2c4638c7a89cbf082e297e222a734c3d2988d6edf801b9680ebb26da9d858b",
- "jaccl_sha256_16": "cb2c4638c7a89cbf",
+ "jaccl_sha256": null,
+ "jaccl_sha256_16": null,
  "mlx": "0.32.4",
  "mlx_lm": "0.32.2",
  "modules": {
@@ -27,7 +27,7 @@
   "kimi_k3.py": "ad77659e0a26d0f5efc2001b99483844",
   "laguna.py": "6616f947b928ba0014d32c5645e8b19d",
   "lfm3.py": "595ceb2d90392e2b22ca83b647945a97",
-  "mistral_large4.py": "b697e10d1c304a4afbdb6fd35cf08569",
+  "mistral_large4.py": "2312718dfa4b81f987f90c0f17845fed",
   "qwen4_exp.py": "b4c1744ba4d770b4cfeb730f6b717189"
  },
  "patches": {
