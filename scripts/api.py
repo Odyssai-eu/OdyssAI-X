@@ -8759,7 +8759,7 @@ def _initial_default_config() -> Optional[dict]:
 #   major (1.7.2 → 2.0.0) — breaking API or topology change
 #
 # Use `./scripts/bump-version.sh patch|minor|major` to bump + auto-commit.
-APP_VERSION = "1.65.0"
+APP_VERSION = "1.65.1"
 
 app = FastAPI(
     title="OdyssAI-X (odyssai.eu)",
@@ -9765,7 +9765,10 @@ def _layout_probe_py(p: str, models_dir: Optional[str]) -> str:
     deleted on purpose (Mistral's consolidated.safetensors). Presence is the
     index's job: every shard listed in model.safetensors.index.json must be on
     disk (the only check a dir without manifest gets: models converted locally,
-    or fetched before 1.62.9).
+    or fetched before 1.62.9). A repo that ships no index at all
+    (ibm-granite/granite-4.2-8b-q8-mlx) is checked from its shard names: every
+    `-k-of-N` for k in 1..N must be on disk. Sharded files without that naming
+    and without an index still fail INCOMPLETE_INDEX.
     Until 1.62.9 the completeness half also refused `*.hfdl` markers, which
     nothing ever wrote: that check never fired and is gone."""
     return (
@@ -9788,9 +9791,15 @@ def _layout_probe_py(p: str, models_dir: Optional[str]) -> str:
         "ix=os.path.join(d,'model.safetensors.index.json')\n"
         "sharded=any('-of-' in os.path.basename(f) for f in st) or len(st)>1\n"
         "if sharded:\n"
-        " if not (os.path.isfile(ix) and os.path.getsize(ix)>0): print('INCOMPLETE_INDEX'); sys.exit()\n"
-        " want=set(json.load(open(ix)).get('weight_map',{}).values())\n"
         " have=set(os.path.basename(f) for f in st)\n"
+        " if os.path.isfile(ix) and os.path.getsize(ix)>0:\n"
+        "  want=set(json.load(open(ix)).get('weight_map',{}).values())\n"
+        " else:\n"
+        "  import re\n"
+        "  sh=[re.fullmatch(r'(.*)-(\\d+)-of-(\\d+)\\.safetensors',f) for f in have]\n"
+        "  if not all(sh): print('INCOMPLETE_INDEX'); sys.exit()\n"
+        "  want=set('%s-%s-of-%s.safetensors'%(m.group(1),str(i).zfill(len(m.group(2))),m.group(3)) "
+        "for m in sh for i in range(1,int(m.group(3))+1))\n"
         " if want-have: print('INCOMPLETE_SHARDS:%d'%len(want-have)); sys.exit()\n"
         "print('OK')\n"
     )
@@ -18483,6 +18492,9 @@ async def _telemak_proxy_chat_completion(
     # So for MiniMax (and any other model in the ignore list), keep the
     # filter on regardless of the flag.
     # Shared decision with the local-pool path — see _should_filter_think.
+    # Omitted flag → the server default, forwarded (see the VL proxy).
+    if body.get("enable_thinking") is None:
+        body = {**body, "enable_thinking": get_enable_thinking_default()}
     auto_think = _should_filter_think(upstream_model, body.get("enable_thinking"))
     forward_body = dict(body)
     # Per-model reasoning_effort default (Step-3.7 → minimal) when the client
@@ -18847,6 +18859,13 @@ async def _vlm_pool_proxy_chat_completion(pool, body: dict, stream: bool,
         raise HTTPException(400, f"VL pool {pool.alias!r}: missing upstream URL")
     label = label or pool.alias              # response `model` the client sees
     upstream_model = await _vlm_upstream_model_id(upstream, pool.model)
+    # Omitted flag → the server default, forwarded explicitly so the filter and
+    # the upstream template agree (same fix as the local path, 2026-07-15).
+    # mlx_vlm renders an omitted flag as OFF while _should_filter_think read
+    # None as ON: Qwen3.5-9B on tiny-replica answered "51" into
+    # reasoning_content with empty content (2026-10-31).
+    if body.get("enable_thinking") is None:
+        body = {**body, "enable_thinking": get_enable_thinking_default()}
     # Shared think-filter decision with the telemak path + local pool.
     auto_think = _should_filter_think(upstream_model, body.get("enable_thinking"))
     forward_body = dict(body)
