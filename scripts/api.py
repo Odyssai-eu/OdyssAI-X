@@ -8759,7 +8759,7 @@ def _initial_default_config() -> Optional[dict]:
 #   major (1.7.2 → 2.0.0) — breaking API or topology change
 #
 # Use `./scripts/bump-version.sh patch|minor|major` to bump + auto-commit.
-APP_VERSION = "1.65.1"
+APP_VERSION = "1.65.2"
 
 app = FastAPI(
     title="OdyssAI-X (odyssai.eu)",
@@ -18533,6 +18533,12 @@ async def _telemak_proxy_chat_completion(
         if auto_think:
             for choice in out.get("choices", []) or []:
                 msg = choice.get("message") or {}
+                if msg.get("reasoning_content") or msg.get("reasoning"):
+                    # The upstream's own reasoning parser already split the
+                    # reply: its content is the answer. Re-splitting it with a
+                    # seeded in_think moved "51" into reasoning and dropped the
+                    # real reasoning (Qwen3.5-9B, tiny-replica, 2026-10-31).
+                    continue
                 raw = msg.get("content") or ""
                 _om, _cm = _model_think_markers(upstream_model)
                 # Seed in_think only when the model auto-opens AND the raw output
@@ -18942,6 +18948,12 @@ async def _vlm_pool_proxy_chat_completion(pool, body: dict, stream: bool,
         if auto_think:
             for choice in out.get("choices", []) or []:
                 msg = choice.get("message") or {}
+                if msg.get("reasoning_content") or msg.get("reasoning"):
+                    # The upstream's own reasoning parser already split the
+                    # reply: its content is the answer. Re-splitting it with a
+                    # seeded in_think moved "51" into reasoning and dropped the
+                    # real reasoning (Qwen3.5-9B, tiny-replica, 2026-10-31).
+                    continue
                 raw = msg.get("content") or ""
                 _om, _cm = _model_think_markers(upstream_model)
                 # Seed in_think only when the model auto-opens AND the raw output
@@ -19255,7 +19267,12 @@ def _telemak_filter_sse_line(line: bytes, state: dict, cluster_id: str) -> Optio
         choice0 = choices[0]
         delta = choice0.get("delta") or {}
         content = delta.get("content")
-        if not isinstance(content, str) or content == "":
+        if delta.get("reasoning_content") or delta.get("reasoning"):
+            # The upstream splits reasoning itself (mlx_vlm reasoning parser):
+            # its deltas are authoritative for the rest of the stream.
+            state["upstream_split"] = True
+            state["in_think"] = False
+        if state.get("upstream_split") or not isinstance(content, str) or content == "":
             # Pass through (role-only chunk, finish_reason chunk, etc.)
             obj["model"] = cluster_id
             return (b"data: " + json.dumps(obj, ensure_ascii=False).encode() + b"\n")
