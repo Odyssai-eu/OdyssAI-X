@@ -934,6 +934,10 @@ TENSOR_CAPABLE_MODEL_TYPES = frozenset({
     # dim). Keyed on the mlx-lm MODULE, not the config model_type: Ling-3.1 says
     # bailing_hybrid like Ring-2.5 / Ling-2.6, which have no shard().
     "bailing_moe_v3",
+    # mistral_large4 (2026-10-31): the module's own shard() (64 heads -> 16 on
+    # 4 ranks, MoE in place). kv_a stays replicated, so the latent that layers
+    # 39..71 read from layer 35 is whole on every rank.
+    "mistral_large4",
 })
 
 # Mirror of mlx_lm.utils.MODEL_ARCHITECTURE_REMAPPING (mlx-lm 0.32.2): a

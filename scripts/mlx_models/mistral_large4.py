@@ -27,6 +27,7 @@ from typing import Any, Dict, List, Optional
 
 import mlx.core as mx
 import mlx.nn as nn
+from mlx.nn.layers.distributed import shard_inplace, shard_linear, sum_gradients
 
 from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
 from .deepseek_v3 import DeepseekV3MLP
@@ -266,8 +267,11 @@ class MoE(nn.Module):
         self.shared_experts = DeepseekV3MLP(
             args, intermediate_size=args.moe_intermediate_size * args.n_shared_experts
         )
+        self.sharding_group = None
 
     def __call__(self, x: mx.array) -> mx.array:
+        if self.sharding_group is not None:
+            x = sum_gradients(self.sharding_group)(x)
         inds, scores = mistral4_expert_select(
             self.gate(x),
             self.num_experts_per_tok,
@@ -279,6 +283,8 @@ class MoE(nn.Module):
         y = self.switch_mlp(x, inds)
         y = (y * scores[..., None]).sum(axis=-2).astype(y.dtype)
         y = y + self.shared_experts(x)
+        if self.sharding_group is not None:
+            y = mx.distributed.all_sum(y, group=self.sharding_group)
         return y
 
 
@@ -495,6 +501,51 @@ class Model(nn.Module):
 
     def make_cache(self):
         return self.model.make_cache()
+
+    def shard(self, group: Optional[mx.distributed.Group] = None):
+        """Tensor parallel by attention heads (mistral4.shard + ssmax).
+
+        kv_a stays replicated: the latent is head-independent, so every rank
+        computes and caches it whole and the KV-sharing layers (39..71 -> 35)
+        read their local copy, no cross-rank traffic."""
+        group = group or mx.distributed.init()
+        N = group.size()
+
+        for layer in self.model.layers:
+            attn = layer.self_attn
+            attn.q_proj = shard_linear(attn.q_proj, "all-to-sharded", group=group)
+
+            attn.num_heads //= N
+            sh = group.rank() * attn.num_heads
+            eh = sh + attn.num_heads
+
+            def shard_heads(w):
+                return w[sh:eh]
+
+            attn.embed_q.apply(shard_heads)
+            attn.unembed_out.apply(shard_heads)
+            attn.ssmax_scale = attn.ssmax_scale[sh:eh]
+            attn.ssmax_bias = attn.ssmax_bias[sh:eh]
+
+            attn.o_proj = shard_linear(attn.o_proj, "sharded-to-all", group=group)
+
+            if isinstance(layer.mlp, DeepseekV3MLP):
+                layer.mlp.gate_proj = shard_linear(
+                    layer.mlp.gate_proj, "all-to-sharded", group=group
+                )
+                layer.mlp.down_proj = shard_linear(
+                    layer.mlp.down_proj, "sharded-to-all", group=group
+                )
+                layer.mlp.up_proj = shard_linear(
+                    layer.mlp.up_proj, "all-to-sharded", group=group
+                )
+            else:
+                # Shard in place: the MoE aggregates the partial sums itself.
+                layer.mlp.sharding_group = group
+                for m in (layer.mlp.shared_experts, layer.mlp.switch_mlp):
+                    shard_inplace(m.gate_proj, "all-to-sharded", group=group)
+                    shard_inplace(m.down_proj, "sharded-to-all", group=group)
+                    shard_inplace(m.up_proj, "all-to-sharded", group=group)
 
     def quant_predicate(self, path, module):
         if path in (
