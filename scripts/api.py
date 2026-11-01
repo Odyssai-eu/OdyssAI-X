@@ -6505,7 +6505,16 @@ _MODELS_AUTO_OPEN_THINK = ("minimax", "qwen3.5", "qwen3.6", "step-3.7", "step3p7
                            # K2-Horizon : le template pré-ouvre <ifm|think> ;
                            # raisonnement + </ifm|think> partaient dans `content`
                            # (vérifié 2026-11-01 sur Argo).
-                           "k2-horizon")
+                           "k2-horizon",
+                           # Groot-*-261023 (GrootTeam) : fine-tunes élagués de
+                           # Qwen3.8-Flash-Next (65B, template identique), GLM-5.3-Flash
+                           # (238B) et DeepSeek-V4.1-Flash-1017 (280B) ; mêmes
+                           # templates que leurs bases, mais le chemin ne contient
+                           # aucune de leurs sous-chaînes. Vérifié 2026-11-01 sur
+                           # Hades : raisonnement + `</think>` dans `content`, témoin
+                           # TMB du Bench T en échec (65B). Le 19B passe par le
+                           # chemin VL, qui sépare déjà.
+                           "groot-65b", "groot-238b", "groot-280b")
 # Subset of _MODELS_AUTO_OPEN_THINK that IGNORES the `enable_thinking`
 # kwarg and always wraps reasoning in <think>...</think>. Per MiniMax M2
 # docs (2026-05-20 update): "The model's reasoning is wrapped in <think>
@@ -6544,6 +6553,9 @@ _MODELS_IGNORE_ENABLE_THINKING_FLAG = ("minimax-m2", "step-3.7", "step3p7",
                                        # Vérifié 2026-08-29: enable_thinking défaut off,
                                        # raisonnement émis quand même.
                                        "glm-5.3", "glm-5-3",
+                                       # Groot-238B : fine-tune de GLM-5.3-Flash, même
+                                       # logique de template (reasoning_effort seulement).
+                                       "groot-238b",
                                        # Hy4-preview : pas d'enable_thinking dans le template
                                        # (reasoning_effort no_think/high seulement), il pense
                                        # donc quand même avec enable_thinking=false.
@@ -6605,6 +6617,10 @@ _MODELS_REASONING_EFFORT_MAP = {
     # (2026-09-26, replica pool qwen3-8-flash-next). "high" has no equivalent
     # short of the top bucket; map it there. "minimal" -> low.
     "qwen3.8-flash-next": {"minimal": "low", "high": "xhigh"},
+    # Groot fine-tunes: same templates as their bases (65B's chat_template.jinja is
+    # byte-identical to Qwen3.8-Flash-Next's, 238B keeps GLM-5.3's effort logic).
+    "groot-65b": {"minimal": "low", "high": "xhigh"},
+    "groot-238b": {"minimal": "low", "medium": "max"},
     # Mistral-Large-4: template raises on anything outside low/medium/high.
     "mistral-large-4": {"minimal": "low", "none": "low", "xhigh": "high", "max": "high"},
     # K2-Horizon's template raises on anything but high/medium/low.
@@ -8775,7 +8791,7 @@ def _initial_default_config() -> Optional[dict]:
 #   major (1.7.2 → 2.0.0) — breaking API or topology change
 #
 # Use `./scripts/bump-version.sh patch|minor|major` to bump + auto-commit.
-APP_VERSION = "1.65.3"
+APP_VERSION = "1.65.4"
 
 app = FastAPI(
     title="OdyssAI-X (odyssai.eu)",
