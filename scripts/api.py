@@ -6333,6 +6333,10 @@ _THINK_MARKERS = {
     # Mistral-Large-4: [THINK]…[/THINK], written by the model itself (the
     # template prefills nothing, chat_template.jinja checked 2026-10-30).
     "mistral-large-4": ("[THINK]", "[/THINK]"),
+    # K2-Horizon: the template prefills <ifm|think> (effort high, its default);
+    # medium and low use <ifm|think_fast> / <ifm|think_faster> — see
+    # _model_think_markers (checked 2026-11-01, "…</ifm|think>391" in content).
+    "k2-horizon": ("<ifm|think>", "</ifm|think>"),
 }
 
 
@@ -6359,8 +6363,14 @@ def _model_think_strips(model_id: Optional[str]) -> tuple:
     return ()
 
 
-def _model_think_markers(model_id: Optional[str]) -> tuple[str, str]:
+_K2_THINK_TAG_BY_EFFORT = {"medium": "ifm|think_fast", "low": "ifm|think_faster"}
+
+
+def _model_think_markers(model_id: Optional[str], effort=None) -> tuple[str, str]:
     needle = (model_id or "").lower()
+    if "k2-horizon" in needle:
+        tag = _K2_THINK_TAG_BY_EFFORT.get(_map_reasoning_effort(model_id, effort), "ifm|think")
+        return f"<{tag}>", f"</{tag}>"
     for key, pair in _THINK_MARKERS.items():
         if key in needle:
             return pair
@@ -6491,7 +6501,11 @@ _MODELS_AUTO_OPEN_THINK = ("minimax", "qwen3.5", "qwen3.6", "step-3.7", "step3p7
                            # Mistral-Large-4 : [THINK]…[/THINK] écrit par le modèle,
                            # qui partait tel quel dans `content` (vérifié 2026-10-30,
                            # « [THINK]17 × 23 = 391.[/THINK]17 × 23 = 391. »).
-                           "mistral-large-4")
+                           "mistral-large-4",
+                           # K2-Horizon : le template pré-ouvre <ifm|think> ;
+                           # raisonnement + </ifm|think> partaient dans `content`
+                           # (vérifié 2026-11-01 sur Argo).
+                           "k2-horizon")
 # Subset of _MODELS_AUTO_OPEN_THINK that IGNORES the `enable_thinking`
 # kwarg and always wraps reasoning in <think>...</think>. Per MiniMax M2
 # docs (2026-05-20 update): "The model's reasoning is wrapped in <think>
@@ -6548,7 +6562,7 @@ _MODELS_IGNORE_ENABLE_THINKING_FLAG = ("minimax-m2", "step-3.7", "step3p7",
                                        # Mistral-Large-4 : pas d'enable_thinking dans le
                                        # template, reasoning_effort low/medium/high
                                        # (défaut high) ; il raisonne dans tous les modes.
-                                       "mistral-large-4")
+                                       "mistral-large-4", "k2-horizon")
 # LFM3-1.7B volontairement HORS de cette liste (2026-10-29) : en
 # enable_thinking=false il raisonne PARFOIS (puis `</think>`), PARFOIS répond
 # directement. L'y mettre vidait `content` dans le second cas (TMB A, 4 réponses
@@ -6593,6 +6607,8 @@ _MODELS_REASONING_EFFORT_MAP = {
     "qwen3.8-flash-next": {"minimal": "low", "high": "xhigh"},
     # Mistral-Large-4: template raises on anything outside low/medium/high.
     "mistral-large-4": {"minimal": "low", "none": "low", "xhigh": "high", "max": "high"},
+    # K2-Horizon's template raises on anything but high/medium/low.
+    "k2-horizon": {"minimal": "low", "none": "low", "xhigh": "high", "max": "high"},
 }
 
 
@@ -8759,7 +8775,7 @@ def _initial_default_config() -> Optional[dict]:
 #   major (1.7.2 → 2.0.0) — breaking API or topology change
 #
 # Use `./scripts/bump-version.sh patch|minor|major` to bump + auto-commit.
-APP_VERSION = "1.65.2"
+APP_VERSION = "1.65.3"
 
 app = FastAPI(
     title="OdyssAI-X (odyssai.eu)",
@@ -12793,7 +12809,8 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
         # enable_thinking=False (MiniMax/Step-3.7). model_id is pool.model,
         # the concrete HF path, so the family match holds for pool aliases.
         if _should_filter_think(model_id, req.enable_thinking) and content:
-            open_m, close_m = _model_think_markers(model_id)
+            open_m, close_m = _model_think_markers(
+                model_id, req.reasoning_effort or _default_reasoning_effort(model_id))
             # Seed in_think=True only when the open tag was PREFILLED into the
             # prompt (output begins mid-thought, no leading open). If the model
             # emitted its own open — M3 adaptive mode — seed False and let the
@@ -12880,7 +12897,8 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
             # auto-OPEN (prefilled tag) → seed True; M3 adaptive emits its own
             # open → seed False (see _seed_in_think). _should_filter_think
             # already excludes the honor-flag-thinking-off ghost case.
-            _open_m, _close_m = _model_think_markers(model_id)
+            _open_m, _close_m = _model_think_markers(
+                model_id, req.reasoning_effort or _default_reasoning_effort(model_id))
             think_state: dict = {
                 "in_think": think_filter_active and _seed_in_think(model_id, req.enable_thinking),
                 "carry": "", "open": _open_m, "close": _close_m,

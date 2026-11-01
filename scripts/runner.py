@@ -2170,6 +2170,22 @@ def _normalize_messages_for_template(messages):
     return out
 
 
+_THINKING_FIELDS = ("think", "reasoning", "reasoning_content", "think_fast", "think_faster")
+
+
+def _pad_thinking_fields(tokenizer, messages):
+    """Give every assistant turn an empty `reasoning_content` when the chat
+    template refuses one without a thinking field (K2-Horizon raises "Assistant
+    message is missing a thinking field" — clients never send one back, so any
+    multi-turn request killed the rank, 2026-11-01). Other templates untouched."""
+    if "missing a thinking field" not in (getattr(tokenizer, "chat_template", None) or ""):
+        return messages
+    return [dict(m, reasoning_content="")
+            if isinstance(m, dict) and m.get("role") == "assistant"
+            and not any(isinstance(m.get(k), str) for k in _THINKING_FIELDS) else m
+            for m in messages]
+
+
 def _resolve_eos_token_seqs(tokenizer) -> list[list[int]]:
     """Return the EOS / end-of-turn token id(s) as a list-of-singleton-lists.
     BatchGenerator's stop_tokens param expects sequences; we wrap singletons.
@@ -3033,7 +3049,7 @@ def _run_legacy_main(model, tokenizer, repo: str, kv_q8_default: bool,
         # Hy3-preview's chat template iterates `arguments.items()`, so the
         # OpenAI-wire JSON-string form crashes Jinja. Normalize once here and
         # reuse the result for both string + token templating below.
-        messages = _normalize_messages_for_template(messages)
+        messages = _pad_thinking_fields(tokenizer, _normalize_messages_for_template(messages))
 
         chat_kwargs = {"add_generation_prompt": True, "tokenize": False}
         if enable_thinking is not None:
@@ -3059,7 +3075,17 @@ def _run_legacy_main(model, tokenizer, repo: str, kv_q8_default: bool,
         chat_kwargs["clear_thinking"] = bool(req.get("clear_thinking", True))
         if tools:
             chat_kwargs["tools"] = tools
-        templated, _dropped = _render_chat_template(tokenizer, messages, chat_kwargs)
+        # Same rule as the batched loop (#94): a template that still fails
+        # rejects this request alone — it must never kill the rank.
+        try:
+            templated, _dropped = _render_chat_template(tokenizer, messages, chat_kwargs)
+        except Exception as e:
+            log(f"req {req_id}: chat template render failed ({type(e).__name__}: {e}) "
+                f"— request rejected")
+            emit(rank, {"event": "done", "id": req_id, "ntoks": 0, "elapsed_s": 0.0,
+                        "tps": 0.0, "finish_reason": "error",
+                        "error": f"chat_template: {e}"[:200]})
+            continue
         if "tools" in _dropped:
             tools = None
         effort_dropped = "reasoning_effort" in _dropped
@@ -3845,7 +3871,7 @@ def _run_batched_main(model, tokenizer, repo: str, kv_q8_default: bool,
 
             # See note in single-stream branch: Hy3 chat template expects
             # `tool_calls[*].function.arguments` as a dict, not a JSON string.
-            messages_in = _normalize_messages_for_template(messages_in)
+            messages_in = _pad_thinking_fields(tokenizer, _normalize_messages_for_template(messages_in))
 
             chat_kwargs = {"add_generation_prompt": True, "tokenize": False}
             if enable_thinking is not None:
