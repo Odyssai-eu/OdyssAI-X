@@ -110,6 +110,22 @@ for pv, ro, backend, venv in (("d1-v1", "d1-answer-slot", "d1", ".venv-mlxvlm"),
         check(f"probe: {pv} → backend {backend}", (p["ok"], p["backend"]) == (True, backend), p)
         check(f"probe: {backend} runs in {venv}", p["venv"].endswith("/" + venv), p["venv"])
 with tempfile.TemporaryDirectory() as d:
+    json.dump({"format_id": "d3-code-readout-v1", "format_version": 1, "prompt": "d3",
+               "attention_mode": "prefix_bidir", "codes": ["A"] * 255},
+              open(os.path.join(d, "decision_config.json"), "w"))
+    p = ds.probe(d)
+    check("probe: d3 package declares its own format → backend d3 in .venv-mlxvlm",
+          (p["ok"], p["backend"], p["install"]) == (True, "d3", "mlxvlm") and p["venv"].endswith("/.venv-mlxvlm"), p)
+    check("probe: d3 answer stays small (no codes list)", "codes" not in p and p["attention_mode"] == "prefix_bidir", p)
+    json.dump({"format": "vela3/3", "size": {"name": "Vela-3.0-4B"}}, open(os.path.join(d, "vela3_config.json"), "w"))
+    p = ds.probe(d)
+    check("probe: d3 base + vela3_config.json → backend vela3 in .venv-mlxvlm",
+          (p["ok"], p["backend"], p["size"]) == (True, "vela3", "Vela-3.0-4B") and p["venv"].endswith("/.venv-mlxvlm"), p)
+    json.dump({"format": "vela3/4"}, open(os.path.join(d, "vela3_config.json"), "w"))
+    check("probe: unknown Vela format refused", ds.probe(d)["ok"] is False)
+    json.dump({"format_id": "d3-code-readout-v1", "format_version": 2}, open(os.path.join(d, "decision_config.json"), "w"))
+    check("probe: unknown d3 format_version refused", ds.probe(d)["ok"] is False)
+with tempfile.TemporaryDirectory() as d:
     json.dump({"model_type": "lfm2_vl", "auto_map": {"AutoModel": "modeling_d1.D1Model"}},
               open(os.path.join(d, "config.json"), "w"))
     p = ds.probe(d)
@@ -208,6 +224,98 @@ if _mx is not None:
     check("clef: input tokens counted once", sum(v[1] for v in res.values()) == 99)
 else:
     print("SKIP clef backend tests (no mlx)")
+
+# --- d3 backend (fake runtime: the real one needs the mlxvlm venv) -------------------------------
+from types import SimpleNamespace as _NS  # noqa: E402
+
+
+class FakeD3:
+    """d3_runtime.D3's prepare / run contract: keys in d3's order, noul as (false, true)."""
+
+    def __init__(self):
+        self.backbone, self.seen = object(), None
+
+    def prepare(self, state, questions):
+        self.seen = questions
+        qs, errors = {}, {}
+        for k, q in questions.items():
+            if q["type"] == "noul":
+                qs[k] = _NS(kind="noul", keys=["false", "true"])
+            elif q["type"] == "score":
+                qs[k] = _NS(kind="score", keys=[str(i) for i in range(len(q["criteria"]))])
+            elif q["type"] == "choice":
+                qs[k] = _NS(kind="choice", keys=list(q["criteria"]))
+            else:
+                errors[k] = {"type": q["type"], "error": "invalid_question", "message": "unsupported question type"}
+        return _NS(questions=qs, errors=errors)
+
+    def run(self, prepared):
+        probs = {k: [0.1] * (len(q.keys) - 1) + [1 - 0.1 * (len(q.keys) - 1)] for k, q in prepared.questions.items()}
+        return probs, 77   # the last key of each question wins
+
+
+f3 = FakeD3()
+w3 = ds.Worker("/x", True, factory=lambda: ds.D3Backend(f3, decision_core))
+w3.start(); w3.ready.wait(5)
+check("d3: --sym switched off (d3 reads options in its own order)", w3.sym is False and w3.error is None, w3.error)
+res = w3.submit("I was charged twice", {
+    "refund": {"type": "noul", "instructions": "Refund?"},
+    "legacy": {"type": "boolean", "instructions": "Legacy noul?"},
+    "team": {"type": "choice", "instructions": "Team?", "criteria": {"billing": "Charges", "tech": "Bugs"}},
+    "urgency": {"type": "score", "instructions": "Urgency?", "criteria": ["Can wait", "Today", "Now"]},
+})
+check("d3: the whole request goes in at once, under its own IDs", list(f3.seen) == ["refund", "legacy", "team", "urgency"], f3.seen)
+check("d3: boolean is read as noul", f3.seen["legacy"]["type"] == "noul", f3.seen["legacy"])
+check("d3: noul (false, true) → P(yes) = P(true)", res["refund"][0]["probability"] == 0.9, res["refund"])
+check("d3: choice keeps its keys", res["team"][0]["choice"] == "tech", res["team"])
+check("d3: score levels by index", res["urgency"][0]["score"] == 2, res["urgency"])
+check("d3: input tokens counted once", sum(v[1] for v in res.values()) == 77, [v[1] for v in res.values()])
+try:
+    w3.submit("x", {"box": {"type": "choice", "criteria": {"a": "", "b": ""}}, "bad": {"type": "box", "criteria": ["a", "b"]}})
+    check("d3: a question d3 refuses → 422 with its reason", False)
+except Exception as e:  # noqa: BLE001
+    check("d3: a question d3 refuses → 422 with its reason", "bad: unsupported" in str(e), e)
+
+# --- Vela backend (fake Vela: decide_probs over FakeD3's contract + span answers) ------------------
+class FakeVela:
+    def __init__(self):
+        self.d3, self.rt = FakeD3(), _NS(backbone=object())
+        self.span_seen = []
+
+    def decide_probs(self, state, questions):
+        prepared = self.d3.prepare(state, questions)
+        probs, tokens = self.d3.run(prepared)
+        return prepared, probs, tokens
+
+    def span_answer(self, state, q):
+        self.span_seen.append(q)
+        if not q.get("criteria"):
+            raise ValueError("span questions need criteria")
+        return {"type": "span", "target": "user", "spans": [{"start": 0, "end": 4, "label": "PERSON"}]}
+
+    def span_error(self, message):
+        return {"type": "span", "error": "invalid_question", "message": message}
+
+
+fv = FakeVela()
+w4 = ds.Worker("/x", False, factory=lambda: ds.VelaBackend(fv, decision_core))
+w4.start(); w4.ready.wait(5)
+check("vela: loads", w4.error is None, w4.error)
+res = w4.submit("Anna called", {
+    "pii": {"type": "span", "criteria": {"PERSON": None}},
+    "factcheck": {"type": "choice", "instructions": "Check?", "criteria": {"NO": "", "YES": ""}},
+    "one": {"type": "span", "criteria": ["PERSON"]},
+    "bad": {"type": "span"},
+    "ok": {"type": "noul", "instructions": "Fine?"},
+})
+check("vela: span answers kept as Vela gives them (one label is fine)",
+      res["pii"][0]["spans"][0]["label"] == "PERSON" and res["one"][0]["type"] == "span", res["pii"])
+check("vela: a bad span question is an error answer, the others still answered",
+      res["bad"][0]["error"] == "invalid_question" and res["ok"][0]["value"] is True, res["bad"])
+check("vela: choice / noul take the server's format", res["factcheck"][0]["choice"] == "YES"
+      and res["ok"][0]["probability"] == 0.9, res["factcheck"])
+check("vela: answers in request order, tokens once", list(res) == ["pii", "factcheck", "one", "bad", "ok"]
+      and sum(v[1] for v in res.values()) == 77, [v[1] for v in res.values()])
 
 # --- answer format (same as upstream serve.py) ----------------------------------------------
 a = ds.format_answer({"type": "noul"}, {"yes": 0.8, "no": 0.2})

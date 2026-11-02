@@ -18,6 +18,16 @@ routes: `POST /v1/systemone` (and `/v1/evaluate`), `GET /health`. Model formats:
   the vendored, byte-identical `clef/clef_mlx.py` (Apache-2.0).
   d1 and Clef ship no format declaration of their own: the operator writes the folder's
   `decision_config.json` (`prompt_version` / `readout` of FORMATS below).
+- `d3` (MLX): vLLM Semantic Router d3 (Decision 3.0), a Qwen3.5 backbone converted by mlx-vlm
+  + the package's 255-way code readout. Prompting, batching and temperature are the vendored,
+  byte-identical upstream `d3/d3_runtime.py` (Apache-2.0); the forward is ours on MLX
+  (`d3/d3_mlx.py`). The package's own `decision_config.json` declares
+  `format_id: d3-code-readout-v1`.
+- `vela3` (MLX): vLLM Semantic Router Vela 3.0, a d3 base with gated LoRA adapters, span heads and
+  label definitions; answers choice / noul / score (router questions on their adapter) and
+  `span` questions. Upstream's pure logic is extracted verbatim (`vela3/`), the adapters, heads and
+  definition writer run on MLX (`vela3/vela3_mlx.py`). The folder is the converted d3 base plus the
+  package's `vela3_config.json` (format `vela3/3`) and adapter files.
 
 Nothing is imported from the model folder (see UPSTREAM.md). An unknown format is refused
 at start instead of being answered with a format the weights were not trained on. The
@@ -61,9 +71,13 @@ DECLARED_FORMATS = {
 # mlx and transformers versions the Julia pins exclude, so d1 and Clef get their own
 # (install-decision.sh backend `mlxvlm`).
 BACKEND_VENV = {"letter": ".venv", "julia": ".venv", "clm": ".venv",
-                "d1": ".venv-mlxvlm", "clef": ".venv-mlxvlm"}
+                "d1": ".venv-mlxvlm", "clef": ".venv-mlxvlm", "d3": ".venv-mlxvlm", "vela3": ".venv-mlxvlm"}
 BACKEND_INSTALL = {"letter": "mlx", "julia": "julia", "clm": "clm",  # install-decision.sh backends
-                   "d1": "mlxvlm", "clef": "mlxvlm"}
+                   "d1": "mlxvlm", "clef": "mlxvlm", "d3": "mlxvlm", "vela3": "mlxvlm"}
+# Package formats declared by the model's own files: decision_config.json `format_id` (d3) and
+# vela3_config.json `format` (Vela 3.0 on a d3 base).
+D3_FORMAT_ID = "d3-code-readout-v1"
+VELA3_FORMAT = "vela3/3"
 MAX_BODY = 8 * 1024 * 1024
 JOB_TIMEOUT_S = float(os.environ.get("DECISION_JOB_TIMEOUT_S", "600"))
 # Backpressure: beyond this many waiting requests the server answers 503 at once
@@ -103,6 +117,20 @@ def detect_format(model_dir: str) -> dict:
     path = os.path.join(model_dir, "decision_config.json")
     if os.path.exists(path):
         cfg = _json_file(path)
+        if cfg.get("format_id") == D3_FORMAT_ID:
+            if cfg.get("format_version") != 1 or cfg.get("prompt", "d3") != "d3":
+                raise ValueError(f"unsupported d3 package: format_version={cfg.get('format_version')!r} "
+                                 f"prompt={cfg.get('prompt')!r}")
+            vpath = os.path.join(model_dir, "vela3_config.json")
+            if os.path.exists(vpath):
+                vc = _json_file(vpath)
+                if vc.get("format") != VELA3_FORMAT:
+                    raise ValueError(f"unsupported Vela package: format={vc.get('format')!r} (known: {VELA3_FORMAT})")
+                return {"backend": "vela3", "prompt_version": "d3", "readout": VELA3_FORMAT,
+                        "attention_mode": cfg.get("attention_mode", "causal"),
+                        "size": (vc.get("size") or {}).get("name")}
+            return {"backend": "d3", "prompt_version": "d3", "readout": D3_FORMAT_ID,
+                    "attention_mode": cfg.get("attention_mode", "causal")}
         pv, ro = cfg.get("prompt_version"), cfg.get("readout")
         backend = DECLARED_FORMATS.get((pv, ro))
         if backend is None:
@@ -450,6 +478,90 @@ def _load_clef(model_dir: str, cfg: dict):
     return ClefBackend(clef_mlx.load(model_dir), decision_core)
 
 
+class D3Backend:
+    """vLLM Semantic Router d3 (MLX, vendored runtime): the request's questions go in together,
+    under their own IDs, as d3 reads a request (the temperature and the header-v1 layout depend
+    on the whole set). Probabilities as d3 publishes them: code-readout softmax, no calibration."""
+    device = "mlx"
+    symmetric = False  # d3 reads options in its own order (permutation average is d3's own option)
+    takes_names = True
+    NOUL = {"true": "yes", "false": "no"}
+
+    def __init__(self, runtime, dc):
+        self.runtime, self.dc = runtime, dc
+        self.model = runtime.backbone
+
+    def dist_items(self, state, items, names=None):
+        names = list(names or (f"q{i}" for i in range(len(items))))
+        questions = {}
+        for name, (q, _opts) in zip(names, items):
+            questions[name] = {**q, "type": "noul"} if q.get("type") == "boolean" else q
+        rt = self.runtime
+        prepared = rt.prepare(state, questions)
+        if prepared.errors:
+            name, err = next(iter(prepared.errors.items()))
+            raise ValueError(f"{name}: {err['message']}")
+        probs, tokens = rt.run(prepared)
+        out = []
+        for i, name in enumerate(names):
+            q = prepared.questions[name]
+            labels = [self.NOUL[k] for k in q.keys] if q.kind == "noul" else q.keys
+            # d3 counts the state of every question; the request's total goes on its first question
+            out.append((dict(zip(labels, probs[name])), tokens if i == 0 else 0, {}))
+        return out
+
+
+def _load_d3(model_dir: str, cfg: dict):
+    from d3 import d3_mlx  # vendored, never the copy shipped in the model folder
+    import decision_core
+    return D3Backend(d3_mlx.load(model_dir), decision_core)
+
+
+class VelaBackend:
+    """vLLM Semantic Router Vela 3.0 (MLX): the request in one go, as Vela reads it. Choice / noul /
+    score questions come back as probabilities and take this server's answer format (router
+    questions on their adapter, the others as d3); `span` questions keep Vela's own answer
+    (spans with offsets, labels and scores), or its per-question error."""
+    device = "mlx"
+    symmetric = False
+
+    def __init__(self, vela, dc):
+        self.vela, self.dc = vela, dc
+        self.model = vela.rt.backbone
+
+    def answer_all(self, state, questions: dict) -> dict:
+        if not isinstance(questions, dict) or not questions:
+            raise ValueError("'questions' must be a non-empty object")
+        span = {k: q for k, q in questions.items() if isinstance(q, dict) and q.get("type") == "span"}
+        rest = {k: ({**q, "type": "noul"} if q.get("type") == "boolean" else q) for k, q in questions.items()
+                if k not in span and isinstance(q, dict)}
+        if len(span) + len(rest) != len(questions):
+            raise ValueError("every question must be an object")
+        out, tokens = {}, 0
+        if rest:
+            prepared, probs, tokens = self.vela.decide_probs(state, rest)
+            if prepared.errors:
+                name, err = next(iter(prepared.errors.items()))
+                raise ValueError(f"{name}: {err['message']}")
+            for name in rest:
+                q = prepared.questions[name]
+                labels = [D3Backend.NOUL[k] for k in q.keys] if q.kind == "noul" else q.keys
+                out[name] = format_answer(questions[name], dict(zip(labels, probs[name])))
+        for name, q in span.items():
+            try:
+                out[name] = self.vela.span_answer(state, q)
+            except ValueError as e:
+                out[name] = self.vela.span_error(str(e))
+        first = next(iter(questions))
+        return {name: (out[name], tokens if name == first else 0) for name in questions}
+
+
+def _load_vela3(model_dir: str, cfg: dict):
+    from vela3 import vela3_mlx  # ours + upstream's pure logic extracted verbatim; never the model folder's code
+    import decision_core
+    return VelaBackend(vela3_mlx.load(model_dir), decision_core)
+
+
 def _load_julia(model_dir: str, cfg: dict):
     import hashlib
     import torch
@@ -493,7 +605,7 @@ class Worker(threading.Thread):
             t0 = time.perf_counter()
             if self._factory:
                 made = self._factory()
-                self.backend = made if hasattr(made, "dist_items") else LetterBackend(*made)
+                self.backend = made if hasattr(made, "dist_items") or hasattr(made, "answer_all") else LetterBackend(*made)
             elif self.cfg.get("backend") == "julia":
                 self.backend = _load_julia(self.model_dir, self.cfg)
             elif self.cfg.get("backend") == "clm":
@@ -505,6 +617,12 @@ class Worker(threading.Thread):
             elif self.cfg.get("backend") == "clef":
                 self.backend = _load_clef(self.model_dir, self.cfg)
                 self._pin_weights(self.backend.model.backbone)
+            elif self.cfg.get("backend") == "d3":
+                self.backend = _load_d3(self.model_dir, self.cfg)
+                self._pin_weights(self.backend.model)
+            elif self.cfg.get("backend") == "vela3":
+                self.backend = _load_vela3(self.model_dir, self.cfg)
+                self._pin_weights(self.backend.model)
             else:
                 from mlx_decide import MLXDecider  # sets PROMPT_STYLE, then imports decision_core
                 import decision_core
@@ -572,6 +690,8 @@ class Worker(threading.Thread):
     def _decide_all(self, state, questions: dict) -> dict:
         """Same batching as upstream serve.py decide_all: every question of the request in one
         pass over a shared prefix (the state is processed once)."""
+        if hasattr(self.backend, "answer_all"):  # a backend with answer types of its own (Vela spans)
+            return self.backend.answer_all(state, questions)
         if not isinstance(questions, dict) or not questions:
             raise ValueError("'questions' must be a non-empty object")
         items, idx, names = [], [], []

@@ -3,7 +3,7 @@
 #   scripts/decision/install-decision.sh <admin@host> [backends]
 #     backends: mlx (default, letter readout — Eikos), julia (PyTorch — Julia-1),
 #               clm (MLX Qwen3-8B encoder + torch heads — CLM-v0.1-8B),
-#               mlxvlm (mlx-vlm 0.7.x — LiquidAI d1, Cloudflare Clef), comma-separated
+#               mlxvlm (mlx-vlm 0.7.x — LiquidAI d1, Cloudflare Clef, vLLM-SR d3 and Vela 3.0), comma-separated
 # Creates ~/odyssai/decision/.venv (python 3.12, pinned deps, its own venv so a cluster-venv
 # upgrade never changes the readout) and copies the server + the vendored readouts. mlxvlm
 # goes in ~/odyssai/decision/.venv-mlxvlm: mlx-vlm 0.7.x needs mlx and transformers versions
@@ -48,6 +48,10 @@ fi
 if [ -n "$VLM" ]; then
   ssh $HOST "rm -rf ~/odyssai/decision/clef && mkdir -p ~/odyssai/decision/clef" || exit 1
   scp -q "$DIR"/clef/*.py "$DIR"/clef/LICENSE $HOST:odyssai/decision/clef/ || exit 1
+  ssh $HOST "rm -rf ~/odyssai/decision/d3 && mkdir -p ~/odyssai/decision/d3" || exit 1
+  scp -q "$DIR"/d3/*.py "$DIR"/d3/LICENSE-APACHE-2.0.txt "$DIR"/d3/NOTICE $HOST:odyssai/decision/d3/ || exit 1
+  ssh $HOST "rm -rf ~/odyssai/decision/vela3 && mkdir -p ~/odyssai/decision/vela3" || exit 1
+  scp -q "$DIR"/vela3/*.py $HOST:odyssai/decision/vela3/ || exit 1
 fi
 # Smoke: each installed backend imports (no model loaded).
 if [ -n "$PKGS" ]; then
@@ -73,7 +77,9 @@ import importlib.metadata as md
 import mlx.core as mx
 import mlx_vlm.models.d1.d1 as d1  # noqa: F401
 from clef import clef_mlx  # noqa: F401
+from d3 import d3_mlx  # noqa: F401
+from vela3 import vela3_mlx  # noqa: F401
 print(f"decision server installed (mlxvlm): mlx {mx.__version__} mlx-vlm {md.version('mlx-vlm')} "
-      f"transformers {md.version('transformers')}; d1 + clef import")
+      f"transformers {md.version('transformers')}; d1 + clef + d3 + vela3 import")
 PY
 fi
