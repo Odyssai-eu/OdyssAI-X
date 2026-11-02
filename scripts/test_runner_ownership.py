@@ -36,14 +36,15 @@ def check(label, got, want):
         FAILS.append(label)
 
 
-if subprocess.run(["pgrep", "-f", "[m]lx-cluster/(vlm_)?runner.py"],
+if subprocess.run(["pgrep", "-f", "[m]lx-cluster/(vlm_)?runner.py|[m]lx_vlm.server"],
                   capture_output=True).returncode == 0:
     sys.exit("a runner-like process already runs here — refusing to test")
 
 ROOT = tempfile.mkdtemp()
 os.makedirs(os.path.join(ROOT, "mlx-cluster"))
-for name in ("runner.py", "vlm_runner.py"):
-    open(os.path.join(ROOT, "mlx-cluster", name), "w").write(
+os.makedirs(os.path.join(ROOT, "bin"))
+for name in ("mlx-cluster/runner.py", "mlx-cluster/vlm_runner.py", "bin/mlx_vlm.server"):
+    open(os.path.join(ROOT, name), "w").write(
         "import signal, time\nsignal.signal(signal.SIGTERM, lambda *a: exit(0))\n"
         "while True: time.sleep(1)\n")
 PROCS = []
@@ -53,7 +54,8 @@ def fake(token, script="runner.py"):
     env = {k: v for k, v in os.environ.items() if k != "RUNNER_LAUNCH_ID"}
     if token is not None:
         env["RUNNER_LAUNCH_ID"] = token
-    p = subprocess.Popen([sys.executable, os.path.join(ROOT, "mlx-cluster", script)], env=env)
+    path = os.path.join(ROOT, "bin" if script == "mlx_vlm.server" else "mlx-cluster", script)
+    p = subprocess.Popen([sys.executable, path], env=env)
     PROCS.append(p)
     return p
 
@@ -150,6 +152,32 @@ try:
     check("full sweep command: only the unclaimed own runner died",
           (alive(own_free), alive(own_claimed), alive(foreign)), (False, True, True))
     cleanup()
+
+    # mlx_vlm.server of a VL pool (2026-11-02): own token reaped at boot only;
+    # an untagged one (odyssai-services, manual) or another orchestrator's never
+    vown, vuntag, vforeign = (fake("testorch/vlm/gemma/9999", "mlx_vlm.server"),
+                              fake(None, "mlx_vlm.server"),
+                              fake("devorch/vlm/gemma/8888", "mlx_vlm.server"))
+    time.sleep(0.5)
+    orig = (api.get_cluster_def, api.subprocess.run, api._mark_cluster_degraded)
+    api.get_cluster_def = lambda cid: {"kind": "replica", "nodes": [{"host": "local", "ssh": "x"}]}
+    api.subprocess.run = lambda argv, **kw: orig[1](["zsh", "-c", argv[-1]], **kw)
+    api._mark_cluster_degraded = lambda *a, **k: None
+    try:
+        res = api._sweep_orphan_runners("tiny")["swept"][0]
+        time.sleep(0.3)
+        check("unload sweep leaves every mlx_vlm.server alone",
+              (res["result"], alive(vown), alive(vuntag), alive(vforeign)),
+              ("no orphan", True, True, True))
+        res = api._sweep_orphan_runners("tiny", include_untagged=True)["swept"][0]
+    finally:
+        api.get_cluster_def, api.subprocess.run, api._mark_cluster_degraded = orig
+    time.sleep(0.3)
+    check("boot sweep: result line names the server",
+          res["result"], "no orphan; mlx_vlm.server cleaned (SIGTERM)")
+    check("boot sweep: own server killed, untagged and foreign spared",
+          (alive(vown), alive(vuntag), alive(vforeign)), (False, True, True))
+    cleanup()
 finally:
     cleanup()
 
@@ -162,6 +190,10 @@ check("remote_cmd puts the token in the runner env", "RUNNER_LAUNCH_ID=testorch/
 vcmd = api.remote_vlm_cmd({"rank": 0, "ssh": "admin@198.51.100.1"},
                           [{"rank": 0, "ssh": "admin@198.51.100.1"}], "/m/x", 5556,
                           backend="ring", launch_id="testorch/c/v/5678")
+lcmd = api._vlm_launch_cmd("gemma", "/v", "/m/x", 8080, launch_id="testorch/vlm/g/1")
+check("_vlm_launch_cmd exports the token", "RUNNER_LAUNCH_ID=testorch/vlm/g/1 PATH=" in lcmd, True)
+check("_vlm_launch_cmd without token: no var",
+      "RUNNER_LAUNCH_ID" in api._vlm_launch_cmd("gemma", "/v", "/m/x", 8080), False)
 check("remote_vlm_cmd too", "RUNNER_LAUNCH_ID=testorch/c/v/5678 " in vcmd, True)
 lid = api._new_launch_id("fith", "argo:minimax m3")
 check("token: orchestrator/cluster/alias/nonce, no blank",

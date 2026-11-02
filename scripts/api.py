@@ -243,6 +243,10 @@ VLM_RUNNER_REMOTE = env_get("VLM_RUNNER_REMOTE", f"{REMOTE_CLUSTER_DIR}/vlm_runn
 VLM_PYTHON_REMOTE = env_get("VLM_PYTHON_REMOTE", "$HOME/.venvs/mlx-vlm/bin/python")
 VLM_RUNNER_MATCH_PATTERN = env_get("VLM_RUNNER_MATCH_PATTERN", "[m]lx-cluster/vlm_runner.py")
 VLM_DISTRIBUTED_ENABLED = env_get("VLM_DISTRIBUTED_ENABLED", "0") == "1"
+# mlx_vlm.server launched by a pool (_launch_vlm_server) carries this
+# orchestrator's RUNNER_LAUNCH_ID; only those are ever swept (boot only). An
+# untagged server (odyssai-services, a manual launch) is never touched.
+VLM_SERVER_MATCH_PATTERN = env_get("VLM_SERVER_MATCH_PATTERN", "[m]lx_vlm.server")
 # #78 — the ONLY model types vlm_runner.py knows how to split across nodes,
 # and the splits each one supports; the first is the default when the load
 # request does not name a mode. Any other VL type would get a sharder written
@@ -1756,13 +1760,14 @@ def _new_launch_id(cluster: str, alias: str) -> str:
     return f"{_launch_prefix(cluster, alias)}/{uuid.uuid4().hex[:8]}"
 
 
-def _runner_sel_sh(case_arms: str) -> str:
+def _runner_sel_sh(case_arms: str, patterns=None) -> str:
     """Shell defining `lid PID` (the process's RUNNER_LAUNCH_ID, empty if none)
-    and `sel` (the runner.py / vlm_runner.py PIDs whose token `t` matches one of
-    `case_arms`, a `case "$t" in … esac` body). The pgrep patterns keep their
-    bracketed first letter, so the shell running this never matches itself."""
+    and `sel` (the runner.py / vlm_runner.py PIDs — or `patterns` — whose token
+    `t` matches one of `case_arms`, a `case "$t" in … esac` body). The pgrep
+    patterns keep their bracketed first letter, so the shell running this never
+    matches itself."""
     pg = "; ".join(f"pgrep -f {shlex.quote(p)}"
-                   for p in (RUNNER_MATCH_PATTERN, VLM_RUNNER_MATCH_PATTERN))
+                   for p in (patterns or (RUNNER_MATCH_PATTERN, VLM_RUNNER_MATCH_PATTERN)))
     return ("lid() { ps -Eww -o command= -p \"$1\" 2>/dev/null | tr ' ' '\\n' "
             "| sed -n 's/^RUNNER_LAUNCH_ID=//p' | head -1; }; "
             f"sel() {{ for p in $({pg}); do t=$(lid $p); "
@@ -1789,6 +1794,15 @@ def _sel_orphans(claimed, include_untagged: bool) -> str:
     if include_untagged:
         arms += "'') echo $p ;;"
     return _runner_sel_sh(arms)
+
+
+def _sel_vlm_server_orphans() -> str:
+    """mlx_vlm.server carrying this orchestrator's token. Boot only: no pool is
+    live yet, so every such server is one a previous container life launched
+    and forgot (2026-11-02: four gemma servers held the tiny-replica minis,
+    invisible to odyssai). Untagged servers are never selected."""
+    return _runner_sel_sh(f"{shlex.quote(_orchestrator_id() + '/')}*) echo $p ;;",
+                          patterns=(VLM_SERVER_MATCH_PATTERN,))
 
 
 def _foreign_count_sh() -> str:
@@ -3484,8 +3498,15 @@ def _sweep_orphan_runners(cluster_id: str,
     kill_line = (_sel_orphans(claimed, include_untagged) + _foreign_count_sh()
                  + "res=$(" + _kill_sel_sh("no orphan") + " 2>/dev/null | tail -1); "
                  "if [ \"$foreign\" != 0 ]; then "
-                 "echo \"$res ($foreign of another orchestrator spared)\"; "
-                 "else echo \"$res\"; fi; ")
+                 "res=\"$res ($foreign of another orchestrator spared)\"; fi; ")
+    # Boot only: the pool's mlx_vlm.server a previous container life left
+    # running (a VL pool has no runner.py; its server would stay loaded,
+    # unseen, until someone killed it by hand).
+    if include_untagged:
+        kill_line += (_sel_vlm_server_orphans()
+                      + "vres=$(" + _kill_sel_sh("none") + " 2>/dev/null | tail -1); "
+                      "[ \"$vres\" != none ] && res=\"$res; mlx_vlm.server $vres\"; ")
+    kill_line += "echo \"$res\"; "
     cmd = (
         # ── phase 1: kill ────────────────────────────────────────────
         kill_line +
@@ -8791,7 +8812,7 @@ def _initial_default_config() -> Optional[dict]:
 #   major (1.7.2 → 2.0.0) — breaking API or topology change
 #
 # Use `./scripts/bump-version.sh patch|minor|major` to bump + auto-commit.
-APP_VERSION = "1.65.4"
+APP_VERSION = "1.65.5"
 
 app = FastAPI(
     title="OdyssAI-X (odyssai.eu)",
@@ -20194,7 +20215,8 @@ async def _vlm_trust_remote_code(ssh_target: str, model_path: str) -> bool:
 
 def _vlm_launch_cmd(vlm_id: str, venv: str, model_path: str, port: int,
                    max_num_seqs: Optional[int] = None,
-                   trust_remote_code: bool = True) -> str:
+                   trust_remote_code: bool = True,
+                   launch_id: Optional[str] = None) -> str:
     """Build the proven nohup launch command with a full exported env block.
 
     Mirrors the manual launch that ran on .29 tonight: export a clean env
@@ -20219,7 +20241,8 @@ def _vlm_launch_cmd(vlm_id: str, venv: str, model_path: str, port: int,
     return (
         f"export HOME=\"${{HOME:-/Users/$(id -un)}}\" USER=\"$(id -un)\" TMPDIR=/tmp "
         f"MLX_VLM_MAX_NUM_SEQS={max_seqs} "
-        f"PATH={_remote_path(venv_bin)}:/usr/bin:/bin:/usr/sbin:/sbin && "
+        + (f"RUNNER_LAUNCH_ID={shlex.quote(launch_id)} " if launch_id else "")
+        + f"PATH={_remote_path(venv_bin)}:/usr/bin:/bin:/usr/sbin:/sbin && "
         f"nohup {_remote_path(server_bin)} "
         f"--model {shlex.quote(model_path)} "
         f"--host 0.0.0.0 --port {int(port)} "
@@ -20454,8 +20477,11 @@ async def _launch_vlm_server(
     server log so the caller can surface WHY (OOM, bad checkpoint, import err).
     """
     ip = _vlm_ip_from_ssh(ssh_target)
+    # The token lets the next boot sweep reap this server if the container
+    # restarts without restoring its pool; the server is still stopped by port.
     launch = _vlm_launch_cmd(log_id, venv, model_path, port, max_num_seqs,
-                             await _vlm_trust_remote_code(ssh_target, model_path))
+                             await _vlm_trust_remote_code(ssh_target, model_path),
+                             launch_id=_new_launch_id("vlm", log_id))
     launched_pid: Optional[str] = None
     rc, out, err = await asyncio.to_thread(_ssh_exec, ssh_target, launch, 20)
     if rc != 0:
