@@ -8861,7 +8861,7 @@ def _initial_default_config() -> Optional[dict]:
 #   major (1.7.2 → 2.0.0) — breaking API or topology change
 #
 # Use `./scripts/bump-version.sh patch|minor|major` to bump + auto-commit.
-APP_VERSION = "1.65.7"
+APP_VERSION = "1.65.8"
 
 app = FastAPI(
     title="OdyssAI-X (odyssai.eu)",
@@ -16266,6 +16266,19 @@ async def _coresidence_free_by_index(cluster_id: str, per_node: list[dict],
     return free
 
 
+async def _model_present_on(model: str) -> Optional[list[str]]:
+    """Hosts holding this model, per the sync matrix. Matched on the folder name,
+    so a bare name and a full path find the same model. None if unknown."""
+    name = model.rstrip("/").split("/")[-1]
+    try:
+        matrix = await asyncio.wait_for(admin_sync_matrix(), timeout=20)
+    except Exception:
+        return None
+    return sorted({h for m in matrix.get("models", [])
+                   if m.get("name", "").split("/")[-1] == name
+                   for h in m.get("present_on", [])})
+
+
 async def _gather_preflight(cluster_id: str, model: str,
                             draft: Optional[str] = None,
                             nodes: Optional[int] = None,
@@ -16302,6 +16315,9 @@ async def _gather_preflight(cluster_id: str, model: str,
     abspath = _resolve_model_abspath(model, base_dir)
     cfg = await _read_raw_config(rank0, abspath)
     size = await get_model_size_bytes(rank0, abspath)
+    target_node = next((n.get("host") for n in detail.get("nodes", [])
+                        if n.get("ssh") == rank0), None)
+    present_on = await _model_present_on(model) if size <= 0 else None
     # Decision models (#95): judged on their own terms, never as a VL chat model
     # (their config may carry a vision_config).
     _gb = lambda b: round(b / 1024 ** 3, 1)
@@ -16320,7 +16336,7 @@ async def _gather_preflight(cluster_id: str, model: str,
             if not _decision_format_ok(_dcfg):
                 _blk.append(f"format de décision refusé par le node : {_dcfg.get('error')}")
             if size <= 0:
-                _blk.append("taille 0 — modèle absent du node cible ou volume non monté")
+                _blk.append(preflight.absent_reason(target_node, present_on))
             elif per_node:
                 _bud = int(per_node[0].get("wired_limit_bytes")
                            or (per_node[0].get("ram_bytes", 0) * 0.75))
@@ -16364,8 +16380,7 @@ async def _gather_preflight(cluster_id: str, model: str,
         _gb = lambda b: round(b / 1024 ** 3, 1)
         _blk = []
         if size <= 0:
-            _blk.append("taille 0 — modèle absent du/des node(s) cible(s) "
-                        "(à synchroniser sur TOUS les nodes) ou volume non monté")
+            _blk.append(preflight.absent_reason(target_node, present_on))
         elif _need > _min_budget:
             _blk.append(f"replica: {_gb(size)} GB ne tient pas sur le plus petit "
                         f"node ({_gb(_min_budget)} GB de budget wired) — chaque "
@@ -16390,7 +16405,8 @@ async def _gather_preflight(cluster_id: str, model: str,
         config=cfg, size_bytes=size, capacity_by_nodes=cap, max_nodes=max_nodes,
         per_node=per_node, free_by_index=free_by_index,
         vlm_venv_present=vlm_present,
-        draft_config=draft_cfg, draft_size_bytes=draft_size or 0)
+        draft_config=draft_cfg, draft_size_bytes=draft_size or 0,
+        target_node=target_node, present_on=present_on)
 
 
 @app.get("/admin/clusters/{cluster_id}/preflight")
@@ -17603,7 +17619,12 @@ async def admin_cluster_load(cluster_id: str, req: ArgoLoadRequest):
                 "blockers": _pf.get("blockers"),
                 "warnings": _pf.get("warnings"),
                 "plan": _pf.get("plan"),
-                "hint": "corrige la cause, ou relance avec force=true pour outrepasser",
+                # force only overrides a guard; it can't place an absent model or
+                # split it on a node count that doesn't work.
+                "hint": ("corrige la cause, ou relance avec force=true pour outrepasser"
+                         if (_pf.get("model") or {}).get("size_bytes", 0) > 0
+                         and (_pf.get("plan") or {}).get("ok")
+                         else "corrige la cause"),
             })
     # Block reload if the cluster is currently flagged degraded — a JACCL
     # queue-pair stuck in TIME_WAIT or a wired-memory leak makes the next

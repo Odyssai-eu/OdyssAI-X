@@ -122,6 +122,36 @@ def _fits_pipeline(meta: dict, cap_n: dict, n: int) -> bool:
     return budget > 0 and meta["size_bytes"] <= budget
 
 
+def nodes_needed(meta: dict, capacity_by_nodes: dict, max_nodes: int) -> Optional[int]:
+    """How many nodes of this cluster's size the model would take, past
+    max_nodes. None when no count works (no even split, or no capacity known)."""
+    cap = capacity_by_nodes.get(str(max_nodes)) or capacity_by_nodes.get(max_nodes) or {}
+    size, kvh = meta["size_bytes"], meta.get("num_key_value_heads")
+    tensor = int(cap.get("max_loadable_bytes", 0)) / max(max_nodes, 1)
+    pipeline = int(cap.get("max_loadable_pipeline_bytes", 0)) / max(max_nodes, 1)
+    for n in range(max_nodes + 1, 257):
+        if tensor > 0 and size <= n * tensor and (not kvh or kvh % n == 0):
+            return n
+        if pipeline > 0 and meta.get("pipeline_capable") and size <= n * pipeline:
+            return n
+    return None
+
+
+def absent_reason(node: Optional[str],
+                  present_on: Optional[list[str]]) -> str:
+    """Why the target node read size 0, from what the sync matrix knows."""
+    where = node or "le node cible"
+    if present_on is None:
+        return f"modèle introuvable sur {where} : absent, ou volume des modèles non monté"
+    if node in present_on:
+        return (f"modèle illisible sur {where}, qui l'a pourtant : "
+                f"volume des modèles non monté, ou chemin erroné")
+    if present_on:
+        return (f"ce modèle n'est pas sur ce cluster (absent de {where}) ; "
+                f"il est sur : {', '.join(present_on)}")
+    return f"ce modèle n'est sur aucun node (absent de {where}) : à télécharger"
+
+
 def plan_nodes(meta: dict, capacity_by_nodes: dict, max_nodes: int) -> dict:
     """Smallest node count (+ mode) that fits, plus the full menu of options.
 
@@ -151,20 +181,19 @@ def plan_nodes(meta: dict, capacity_by_nodes: dict, max_nodes: int) -> dict:
                    int(cap_max.get("max_loadable_bytes", 0)))
         gap = round((meta["size_bytes"] - best) / 1024**3, 1)
         kvh = meta.get("num_key_value_heads")
+        needed = nodes_needed(meta, capacity_by_nodes, max_nodes)
+        why = []
         if gap > 0:
-            reason = (f"ne tient sur aucune topologie (jusqu'à {max_nodes} nodes) : "
-                      f"{meta['size_gb']} GB > {round(best/1024**3,1)} GB de budget max "
-                      f"(manque {gap} GB)")
-        else:
-            # Fits in memory: what is missing is a split mode (pipeline not
-            # supported, tensor ruled out by the KV heads or the even split).
-            reason = (f"aucun mode de répartition possible (jusqu'à {max_nodes} nodes) : "
-                      f"{meta['size_gb']} GB tiendraient en pipeline "
-                      f"({round(best/1024**3,1)} GB de budget), mais "
-                      f"{meta.get('model_type')} n'a pas de chemin pipeline")
+            why.append(f"{meta['size_gb']} GB pour {round(best/1024**3,1)} GB de budget")
         if kvh and not meta.get("pipeline_capable"):
-            reason += (f" — et tensor-only avec kv_heads={kvh} limite les world_size "
-                       f"aux diviseurs de {kvh}")
+            why.append(f"ses {kvh} têtes se répartissent à parts égales, le nombre de "
+                       f"nodes doit diviser {kvh}")
+        if needed:
+            reason = (f"il faut {needed} nodes de cette taille, ce cluster en a "
+                      f"{max_nodes} : " + " ; ".join(why))
+        else:
+            reason = (f"aucun nombre de nodes ne convient à ce modèle (ce cluster en a "
+                      f"{max_nodes}) : " + " ; ".join(why))
         return {"ok": False, "nodes": None, "mode": None, "indices": None,
                 "options": [], "reason": reason}
 
@@ -291,20 +320,20 @@ def evaluate(*, config: dict, size_bytes: int, capacity_by_nodes: dict,
              free_by_index: Optional[dict] = None,
              vlm_venv_present: Optional[bool] = None,
              draft_config: Optional[dict] = None,
-             draft_size_bytes: int = 0) -> dict:
+             draft_size_bytes: int = 0,
+             target_node: Optional[str] = None,
+             present_on: Optional[list[str]] = None) -> dict:
     """Full pre-flight verdict + load plan. Pure — feed it gathered data."""
     meta = read_model_meta(config, size_bytes)
     warnings: list[str] = []
     blockers: list[str] = []
 
     # A serious loader never says "fits" when it doesn't know the size. du=0
-    # means the model dir isn't on the target node (not synced yet) or the
-    # models volume isn't mounted — refuse rather than load blind.
+    # means the model isn't readable on the target node: refuse, and say where
+    # it actually is. An absent model has no config either: one cause, one line.
     if meta["size_bytes"] <= 0:
-        blockers.append(
-            "taille 0 — modèle absent du node cible (à synchroniser) ou "
-            "volume /Volumes/models non monté ; refus de charger à l'aveugle")
-    if not config:
+        blockers.append(absent_reason(target_node, present_on))
+    elif not config:
         blockers.append("config.json illisible/absente sur le node cible")
     if not meta["supported"]:
         warnings.append(

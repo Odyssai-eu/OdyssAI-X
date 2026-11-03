@@ -1231,7 +1231,13 @@ async function postJson(url, body) {
     body: body == null ? undefined : JSON.stringify(body),
   });
   if (r.status === 401) { handleUnauthorized(); throw new Error("401 " + url); }
-  if (!r.ok) { const t = await r.text(); throw new Error("HTTP " + r.status + ": " + t.slice(0, 200)); }
+  if (!r.ok) {
+    const t = await r.text();
+    // A refusal carries its reason in detail.summary: show that, not cut-off JSON.
+    let summary = null;
+    try { summary = JSON.parse(t)?.detail?.summary; } catch {}
+    throw new Error(summary || ("HTTP " + r.status + ": " + t.slice(0, 200)));
+  }
   return r.json();
 }
 async function delJson(url) {
