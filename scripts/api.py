@@ -8812,7 +8812,7 @@ def _initial_default_config() -> Optional[dict]:
 #   major (1.7.2 → 2.0.0) — breaking API or topology change
 #
 # Use `./scripts/bump-version.sh patch|minor|major` to bump + auto-commit.
-APP_VERSION = "1.65.5"
+APP_VERSION = "1.65.6"
 
 app = FastAPI(
     title="OdyssAI-X (odyssai.eu)",
@@ -14734,6 +14734,7 @@ def _pivot_matrix(per_host: list[dict]) -> dict:
 
 _telemetry_cache: dict = {"ts": 0.0, "data": None}
 _TELEMETRY_TTL_S = 4.0  # short cache since the dashboard polls every 5s
+_telemetry_task: Optional[asyncio.Task] = None
 
 
 async def _probe_telemetry(host: dict) -> dict:
@@ -14906,17 +14907,37 @@ async def _probe_telemetry(host: dict) -> dict:
     return out
 
 
-@app.get("/admin/nodes/telemetry")
-async def admin_nodes_telemetry(fresh: bool = False):
-    """Per-host RAM usage + SSH latency. Cached for 4 s."""
+async def _refresh_telemetry() -> dict:
     now = time.time()
-    if (not fresh) and _telemetry_cache["data"] and (now - _telemetry_cache["ts"] < _TELEMETRY_TTL_S):
-        return _telemetry_cache["data"]
     results = await asyncio.gather(*[_probe_telemetry(h) for h in HOSTS_REGISTRY])
     payload = {"hosts": results, "ts": now}
     _telemetry_cache["data"] = payload
     _telemetry_cache["ts"] = now
     return payload
+
+
+def _telemetry_refresh_task() -> asyncio.Task:
+    """The one probe in flight: concurrent callers share it. Each dashboard poll
+    used to start its own 14-host ssh round, and with a node off the network a
+    round outlasts the 4 s TTL, so rounds piled up on the thread pool and the
+    page waited 20 s for this endpoint (2026-11-03, four minis offline)."""
+    global _telemetry_task
+    if _telemetry_task is None or _telemetry_task.done():
+        _telemetry_task = asyncio.create_task(_refresh_telemetry())
+    return _telemetry_task
+
+
+@app.get("/admin/nodes/telemetry")
+async def admin_nodes_telemetry(fresh: bool = False):
+    """Per-host RAM usage + SSH latency. Past the 4 s TTL the last snapshot is
+    returned at once and a refresh runs behind it; only the first call (empty
+    cache) or ?fresh=1 waits for the probe."""
+    data = _telemetry_cache["data"]
+    if fresh or data is None:
+        return await asyncio.shield(_telemetry_refresh_task())
+    if time.time() - _telemetry_cache["ts"] >= _TELEMETRY_TTL_S:
+        _telemetry_refresh_task()
+    return data
 
 
 @app.get("/admin/sync/matrix")
