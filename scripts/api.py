@@ -4058,6 +4058,16 @@ class RunnerPool:
     def alive_count(self) -> int:
         return sum(1 for r in self.runners if r.proc.poll() is None)
 
+    def _report_replica_failure(self, reason: str) -> bool:
+        """Tell the parent ReplicaPool this child failed mid-generation. False
+        for a distributed pool, which has no parent and keeps its cluster-wide
+        handling."""
+        parent = getattr(self, "_replica_parent", None)
+        if parent is None:
+            return False
+        parent._on_child_failed(self, reason)
+        return True
+
     def _rank0_alive(self) -> bool:
         """True if the rank-0 runner (the sole event producer for `submit`)
         is still running. Once it dies, no further events will ever arrive."""
@@ -4295,22 +4305,34 @@ class RunnerPool:
                 # emitting no tokens past the budget.
                 if stalled >= deadline and self._rank0_alive():
                     phase = "decode" if seen_token else "prefill"
+                    # A replica child is one independent node: its parent
+                    # quarantines and restarts it, the other replicas keep
+                    # serving. No cluster-wide degraded, no recovery ladder.
+                    replica_scoped = self._report_replica_failure(
+                        f"no token for {stalled:.0f}s in {phase} phase")
                     # Mark degraded FIRST (refuses new loads 409 + flags this
                     # pool), best-effort cancel, then fire the recovery ladder
                     # DETACHED — it stops+sweeps this very pool, so it cannot be
                     # awaited from inside this pool's own generator — and fail.
-                    self.degraded = True
-                    self.degraded_reason = "gen no-progress watchdog"
-                    self.degraded_at = time.time()
-                    _mark_cluster_degraded(
-                        self.cluster, "gen no-progress watchdog",
-                        {"phase": phase, "no_progress_s": round(stalled, 1),
-                         "request_id": req_id, "alias": self.alias},
-                    )
+                    if not replica_scoped:
+                        self.degraded = True
+                        self.degraded_reason = "gen no-progress watchdog"
+                        self.degraded_at = time.time()
+                        _mark_cluster_degraded(
+                            self.cluster, "gen no-progress watchdog",
+                            {"phase": phase, "no_progress_s": round(stalled, 1),
+                             "request_id": req_id, "alias": self.alias},
+                        )
                     try:
                         await self.cancel(req_id)
                     except Exception:
                         pass
+                    if replica_scoped:
+                        raise RuntimeError(
+                            f"runner wedged mid-generation: no token for "
+                            f"{stalled:.0f}s in {phase} phase — replica "
+                            f"quarantined, restart scheduled"
+                        )
                     # One recovery ladder per cluster at a time; concurrent
                     # wedged requests just fail without spawning duplicates.
                     if self.cluster not in _WATCHDOG_RECOVERY_BY_CLUSTER:
@@ -4338,12 +4360,14 @@ class RunnerPool:
                         # pool onto possibly-poisoned nodes. Mark pool+cluster
                         # degraded first so the gates catch the cascade; the
                         # reset ladder / operator clears it after inspection.
-                        self.degraded = True
-                        self.degraded_reason = "rank-0 died mid-generation"
-                        self.degraded_at = time.time()
-                        _mark_cluster_degraded(
-                            self.cluster, "rank-0 died mid-generation",
-                            {"alias": self.alias, "request_id": req_id})
+                        # A replica child stays out of this: its parent handles it.
+                        if not self._report_replica_failure("rank-0 died mid-generation"):
+                            self.degraded = True
+                            self.degraded_reason = "rank-0 died mid-generation"
+                            self.degraded_at = time.time()
+                            _mark_cluster_degraded(
+                                self.cluster, "rank-0 died mid-generation",
+                                {"alias": self.alias, "request_id": req_id})
                         _r0 = next((r for r in self.runners if r.node.get("rank") == 0), None)
                         _r0_tail = _r0.stderr_tail(25) if _r0 is not None else ""
                         raise RuntimeError(
@@ -4373,7 +4397,9 @@ class RunnerPool:
                     # clean afterwards, so a reload is the right recovery).
                     controlled = (("peer is gone" in tail) or ("[jaccl] no progress in" in tail)
                                   or str(getattr(self, "degraded_reason", "") or "").startswith("rdma link down"))
-                    if not controlled:
+                    # A replica child stays out of this: its parent handles it.
+                    if (not self._report_replica_failure(f"rank-0 exited (rc={ev.get('rc')})")
+                            and not controlled):
                         self.degraded = True
                         self.degraded_reason = "rank-0 died mid-generation"
                         self.degraded_at = time.time()
@@ -5536,6 +5562,8 @@ class ReplicaPool(RunnerPool):
             )
             for i, idx in enumerate(node_indices)
         ]
+        for child in self._replicas:
+            child._replica_parent = self    # mid-generation failures stay per replica
         self._live: set[int] = set()                  # indices that started OK
         self._affinity: dict[str, tuple[int, float]] = {}   # sid -> (idx, ts)
         self._dispatch_lock = asyncio.Lock()
@@ -5649,7 +5677,7 @@ class ReplicaPool(RunnerPool):
                     yield chunk
                 return
             except Exception as e:
-                if emitted or len(tried) >= len(self._live):
+                if emitted or not (self._live - tried):
                     raise
                 # No token yet and another replica may serve — drop affinity and
                 # retry on a different one.
@@ -5732,6 +5760,25 @@ class ReplicaPool(RunnerPool):
             h["next_at"] = float("inf")      # _heal_tick's `now < next_at` skips it
         else:
             h["next_at"] = time.time() + self._backoff(h["attempts"])
+
+    def _on_child_failed(self, child, reason: str) -> None:
+        """A child failed mid-generation. Take it out of the routing and force
+        a restart: a wedged runner keeps its ssh alive, so `_child_alive` alone
+        would re-admit it. Idempotent: its in-flight requests fail together, and
+        the exits caused by our own restart arrive while `restarting` is set."""
+        i = next((n for n, rp in enumerate(self._replicas) if rp is child), None)
+        if i is None or self._stopping:
+            return
+        h = self._heal[i]
+        if h.get("restarting") or h.get("quarantined"):
+            return
+        h["quarantined"] = True
+        self._live.discard(i)
+        self._note_failure(i, reason)
+        sys.stderr.write(
+            f"[replica-pool] {self.cluster}[{self.alias}] replica {i} "
+            f"(node {self.node_indices[i]}) quarantined: {reason} — restart in "
+            f"{h['next_at'] - time.time():.0f}s\n")
 
     def mark_capacity_fatal(self, breaches: dict) -> None:
         """Freeze the replicas the load-time RSS guard stopped, keyed by host."""
@@ -5846,7 +5893,8 @@ class ReplicaPool(RunnerPool):
                     f"[replica-pool] {self.cluster}[{self.alias}] replica {i} "
                     f"(node {self.node_indices[i]}) died — restart in "
                     f"{self._heal[i]['next_at'] - now:.0f}s\n")
-            elif i not in self._live and alive and not self._heal[i].get("restarting"):
+            elif (i not in self._live and alive and not self._heal[i].get("restarting")
+                  and not self._heal[i].get("quarantined")):
                 # Discarded after a pre-first-token failure but the runner is
                 # up: put it back. If it fails again, submit() discards it again
                 # and the attempt counter grows the backoff.
@@ -5859,7 +5907,8 @@ class ReplicaPool(RunnerPool):
             return                                   # one restart in flight
         for i in range(len(self._replicas)):
             h = self._heal[i]
-            if i in self._live or self._child_alive(i) or now < h["next_at"]:
+            if (i in self._live or now < h["next_at"]
+                    or (self._child_alive(i) and not h.get("quarantined"))):
                 continue
             await self._restart_replica(i)
             return                                   # one per tick
@@ -5885,7 +5934,7 @@ class ReplicaPool(RunnerPool):
                 f"(node {self.node_indices[i]}) restart attempt {h['attempts']}\n")
             await asyncio.wait_for(rp.start(), timeout=REPLICA_RESTART_TIMEOUT_S)
             self._live.add(i)
-            h.update({"attempts": 0, "next_at": 0.0, "last_error": None,
+            h.update({"attempts": 0, "next_at": 0.0, "last_error": None, "quarantined": False,
                       "died_at": None, "restarts": h.get("restarts", 0) + 1})
             sys.stderr.write(
                 f"[replica-pool] {self.cluster}[{self.alias}] replica {i} back in "
@@ -8812,7 +8861,7 @@ def _initial_default_config() -> Optional[dict]:
 #   major (1.7.2 → 2.0.0) — breaking API or topology change
 #
 # Use `./scripts/bump-version.sh patch|minor|major` to bump + auto-commit.
-APP_VERSION = "1.65.6"
+APP_VERSION = "1.65.7"
 
 app = FastAPI(
     title="OdyssAI-X (odyssai.eu)",
