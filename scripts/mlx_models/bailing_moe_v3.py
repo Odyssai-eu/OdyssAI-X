@@ -3,11 +3,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from math import gcd
 from typing import Any
 
 import mlx.core as mx
 from mlx import nn
-from mlx.nn.layers.distributed import shard_inplace, shard_linear
 
 from .activations import swiglu
 from .base import (
@@ -400,57 +400,123 @@ class BailingKDA(nn.Module):
         return self.o_proj(output.reshape(batch, length, -1))
 
 
-def _shard_kda(attention: BailingKDA, group: mx.distributed.Group) -> None:
-    rank = group.rank()
-    attention.num_heads //= group.size()
-    attention.projection_size //= group.size()
-    heads = slice(rank * attention.num_heads, (rank + 1) * attention.num_heads)
-    channels = slice(
-        rank * attention.projection_size, (rank + 1) * attention.projection_size
-    )
-    for name in ("q_proj", "k_proj", "v_proj", "f_proj", "g_proj", "b_proj"):
-        projection = getattr(attention, name)
-        setattr(
-            attention, name, shard_linear(projection, "all-to-sharded", group=group)
+# Tensor sharding, for any rank count. MLX's shard_linear only splits evenly, and
+# 64 heads don't divide by 3, so a rank's part is cut here: 64 heads on 3 ranks
+# are 22/21/21. Rows of an "input" projection go per rank; columns of an "output"
+# projection go per rank and the ranks' results are summed, which is the full
+# product whatever the sizes of the parts.
+QUANT_PARAMS = ("weight", "scales", "biases")
+
+
+def _rank_span(units: int, group: mx.distributed.Group) -> tuple[int, int]:
+    size, rank = group.size(), group.rank()
+    base, extra = divmod(units, size)
+    start = rank * base + min(rank, extra)
+    return start, start + base + (1 if rank < extra else 0)
+
+
+def _params(module: nn.Module) -> list[tuple[str, mx.array]]:
+    return [
+        (name, module[name])
+        for name in QUANT_PARAMS
+        if isinstance(module.get(name), mx.array)
+    ]
+
+
+def _cut(module: nn.Module, axis: int, start: int, stop: int, units: int) -> None:
+    for name, value in _params(module):
+        per_unit, rest = divmod(value.shape[axis], units)
+        if rest:
+            raise ValueError(f"{name} {value.shape} does not cut into {units} units")
+        key = [slice(None)] * value.ndim
+        key[axis] = slice(start * per_unit, stop * per_unit)
+        setattr(module, name, mx.contiguous(value[tuple(key)]))
+
+
+def _shard_block(
+    inputs: list[nn.Module],
+    outputs: list[nn.Module],
+    group: mx.distributed.Group,
+    units: int | None = None,
+) -> tuple[int, int, int]:
+    """Cut a block on a boundary every parameter shares (a quantized column
+    group, a head). Returns (start, stop, units) of this rank."""
+    if units is None:
+        units = gcd(
+            *(p.shape[-2] for m in inputs for _, p in _params(m)),
+            *(p.shape[-1] for m in outputs for _, p in _params(m)),
         )
+    start, stop = _rank_span(units, group)
+    for module in inputs:
+        _cut(module, -2, start, stop, units)
+    for module in outputs:
+        _cut(module, -1, start, stop, units)
+    return start, stop, units
+
+
+class _SummedLinear(nn.Module):
+    """A rank's columns of a linear layer; the ranks' products add up to the
+    whole layer's output."""
+
+    def __init__(self, linear: nn.Module, group: mx.distributed.Group):
+        super().__init__()
+        self.linear = linear
+        self.group = group
+
+    def __call__(self, x: mx.array) -> mx.array:
+        return mx.distributed.all_sum(self.linear(x), group=self.group)
+
+
+def _shard_kda(attention: BailingKDA, group: mx.distributed.Group) -> None:
+    start, stop, _ = _shard_block(
+        [
+            attention.q_proj,
+            attention.k_proj,
+            attention.v_proj,
+            attention.f_proj,
+            attention.g_proj,
+            attention.b_proj,
+        ],
+        [attention.o_proj],
+        group,
+        units=attention.num_heads,
+    )
+    heads = slice(start, stop)
+    channels = slice(start * attention.head_dim, stop * attention.head_dim)
+    attention.num_heads = stop - start
+    attention.projection_size = attention.num_heads * attention.head_dim
     for conv in (attention.q_conv1d, attention.k_conv1d, attention.v_conv1d):
-        conv.weight = conv.weight[channels]
+        conv.weight = mx.contiguous(conv.weight[channels])
         conv.groups = attention.projection_size
-    attention.A_log = attention.A_log[heads]
-    attention.dt_bias = attention.dt_bias[channels]
-    attention.o_proj = shard_linear(attention.o_proj, "sharded-to-all", group=group)
+    attention.A_log = mx.contiguous(attention.A_log[heads])
+    attention.dt_bias = mx.contiguous(attention.dt_bias[channels])
+    attention.o_proj = _SummedLinear(attention.o_proj, group)
 
 
 def _shard_mla(attention: BailingMLA, group: mx.distributed.Group) -> None:
-    rank = group.rank()
-    if attention.q_lora_rank is None:
-        attention.q_proj = shard_linear(
-            attention.q_proj, "all-to-sharded", group=group
-        )
-    else:
-        attention.q_b_proj = shard_linear(
-            attention.q_b_proj, "all-to-sharded", group=group
-        )
-    attention.num_heads //= group.size()
-    heads = slice(rank * attention.num_heads, (rank + 1) * attention.num_heads)
-    attention.embed_q.weight = attention.embed_q.weight[heads]
-    attention.unembed_out.weight = attention.unembed_out.weight[heads]
-    attention.g_proj = shard_linear(attention.g_proj, "all-to-sharded", group=group)
-    attention.dense = shard_linear(attention.dense, "sharded-to-all", group=group)
+    query = attention.q_proj if attention.q_lora_rank is None else attention.q_b_proj
+    start, stop, _ = _shard_block(
+        [query, attention.g_proj],
+        [attention.dense],
+        group,
+        units=attention.num_heads,
+    )
+    heads = slice(start, stop)
+    attention.num_heads = stop - start
+    attention.embed_q.weight = mx.contiguous(attention.embed_q.weight[heads])
+    attention.unembed_out.weight = mx.contiguous(attention.unembed_out.weight[heads])
+    attention.dense = _SummedLinear(attention.dense, group)
 
 
 def _shard_mlp(mlp: nn.Module, group: mx.distributed.Group) -> None:
     if isinstance(mlp, BailingMLP):
-        mlp.gate_proj = shard_linear(mlp.gate_proj, "all-to-sharded", group=group)
-        mlp.up_proj = shard_linear(mlp.up_proj, "all-to-sharded", group=group)
-        mlp.down_proj = shard_linear(mlp.down_proj, "sharded-to-all", group=group)
+        _shard_block([mlp.gate_proj, mlp.up_proj], [mlp.down_proj], group)
+        mlp.down_proj = _SummedLinear(mlp.down_proj, group)
         return
     # The MoE sums the routed and shared experts before reducing across ranks.
     mlp.sharding_group = group
     for experts in (mlp.shared_experts, mlp.switch_mlp):
-        shard_inplace(experts.gate_proj, "all-to-sharded", group=group)
-        shard_inplace(experts.up_proj, "all-to-sharded", group=group)
-        shard_inplace(experts.down_proj, "sharded-to-all", group=group)
+        _shard_block([experts.gate_proj, experts.up_proj], [experts.down_proj], group)
 
 
 class BailingDecoderLayer(nn.Module):
