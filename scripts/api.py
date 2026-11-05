@@ -20361,8 +20361,10 @@ def _vlm_launch_cmd(vlm_id: str, venv: str, model_path: str, port: int,
         f"export HOME=\"${{HOME:-/Users/$(id -un)}}\" USER=\"$(id -un)\" TMPDIR=/tmp "
         f"MLX_VLM_MAX_NUM_SEQS={max_seqs} "
         # mlx_vlm's prefix cache is off unless asked for: without it an agent
-        # repays its whole history at every step. Memory only, no disk tier.
-        f"APC_ENABLED=1 APC_DISK_ENABLED=0 "
+        # repays its whole history at every step. Memory only, no disk tier. Its
+        # default of 2 checkpoints makes parallel conversations evict each other
+        # (MiniMax, 4 sub-agents: 37-54 s a round, 5 s with 16).
+        f"APC_ENABLED=1 APC_DISK_ENABLED=0 APC_CHECKPOINT_ENTRIES=16 "
         + (f"RUNNER_LAUNCH_ID={shlex.quote(launch_id)} " if launch_id else "")
         + f"PATH={_remote_path(venv_bin)}:/usr/bin:/bin:/usr/sbin:/sbin && "
         f"nohup {_remote_path(server_bin)} "
