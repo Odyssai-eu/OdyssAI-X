@@ -43,6 +43,7 @@ def check(label, got, want):
 CMD = lambda n=None: api._vlm_launch_cmd("t", "/v/mlx-vlm", "/m/MiMo Q9", 8080, n)
 check("sans cap: MLX_VLM_MAX_NUM_SEQS exporté VIDE", "MLX_VLM_MAX_NUM_SEQS= " in CMD(), True)
 check("sans cap: aucun drapeau CLI", "--max-num-seqs" in CMD(), False)
+check("cache de préfixe mlx_vlm activé, mémoire seule", "APC_ENABLED=1 APC_DISK_ENABLED=0 " in CMD(), True)
 check("avec 16: MLX_VLM_MAX_NUM_SEQS=16", "MLX_VLM_MAX_NUM_SEQS=16 " in CMD(16), True)
 check("le reste de la commande est intact (model quoté, port, PID)",
       ("--model '/m/MiMo Q9'" in CMD() and "--port 8080" in CMD()
