@@ -629,8 +629,11 @@ def _autostart(cluster_id: str) -> bool:
     """The one gate for every automatic load on this cluster (1.65.0): container
     restart, reboot-all and the self-heal after a runner crash all load the
     SAVED pools when on, and load nothing when off. A cluster that never stored
-    the flag inherits its old reload_on_restart toggle."""
+    the flag inherits its old reload_on_restart toggle. A disabled cluster loads
+    nothing on its own, whatever its saved set holds."""
     cd = get_cluster_def(cluster_id)
+    if not _cluster_enabled(cluster_id):
+        return False
     if "autostart" in cd:
         return cd["autostart"] is not False
     return _reload_on_restart(cluster_id)
@@ -8880,7 +8883,7 @@ def _initial_default_config() -> Optional[dict]:
 #   major (1.7.2 → 2.0.0) — breaking API or topology change
 #
 # Use `./scripts/bump-version.sh patch|minor|major` to bump + auto-commit.
-APP_VERSION = "1.65.9"
+APP_VERSION = "1.65.10"
 
 app = FastAPI(
     title="OdyssAI-X (odyssai.eu)",

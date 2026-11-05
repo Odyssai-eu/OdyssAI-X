@@ -69,6 +69,10 @@ check("seed is written once", api.saved_pools_file_for(CID).exists(), True)
 
 # Autostart inherits reload_on_restart until set.
 check("autostart defaults on", api._autostart(CID), True)
+api.save_cluster_def(CID, {"enabled": False})
+check("a disabled cluster never loads on its own", api._autostart(CID), False)
+api.save_cluster_def(CID, {"enabled": True})
+check("re-enabled, it does again", api._autostart(CID), True)
 api.save_cluster_def(CID, {"reload_on_restart": False})
 check("autostart follows an old reload_on_restart=false", api._autostart(CID), False)
 api.save_cluster_def(CID, {"autostart": True})
