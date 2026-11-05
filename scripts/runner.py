@@ -87,7 +87,8 @@ except Exception:
 #
 # Invariants:
 #   - only one entry per session (overwrites on each turn)
-#   - bound: TTL 1h, max 32 sessions, evicted LRU
+#   - a request that hits owns the entry: out of the store until its generation ends
+#   - bound: TTL 1h, max 64 sessions, byte budget, evicted LRU
 #   - invalidated when the loaded model changes (model_id mismatch)
 #   - dropped on prefix divergence (user backtracks / system prompt changes)
 #
@@ -577,6 +578,23 @@ _SESSION_MIN_PREFIX = 32  # don't bother caching shorter prefixes
 _SESSION_BUDGET_BYTES = int(os.environ.get("RUNNER_CACHE_BUDGET_BYTES",
                                            str(40 * 1024 * 1024 * 1024)))  # 40 GB
 _SESSION_MAX = int(os.environ.get("RUNNER_CACHE_MAX_SESSIONS", "64"))
+
+
+def _cap_session_budget() -> None:
+    """Every conversation keeps a cache now, on any node: once the model is
+    loaded, hold the store to a quarter of what the GPU has left. 40 GB does
+    not exist on a 16 GB mini."""
+    global _SESSION_BUDGET_BYTES
+    try:
+        import mlx.core as mx  # type: ignore
+        total = int(mx.metal.device_info()["max_recommended_working_set_size"])
+        left = max(total - int(mx.get_active_memory()), 0)
+    except Exception as e:
+        sys.stderr.write(f"[cache] budget left at default: {e}\n")
+        return
+    _SESSION_BUDGET_BYTES = min(_SESSION_BUDGET_BYTES, left // 4)
+    sys.stderr.write(f"[cache] session budget "
+                     f"{_SESSION_BUDGET_BYTES / 1024**3:.1f} GB\n")
 
 # Prewarm cache: a single prefilled cache for a configured system prefix
 # (system prompt + tools + wiki context, anything that's constant across
@@ -1154,12 +1172,9 @@ def _session_lookup(session_id: str, model_id: str, prompt_tokens: list[int]):
         if common < _SESSION_MIN_PREFIX:
             del _session_store[session_id]
             return None, None, "divergent"
-        if common == len(prompt_tokens):
-            # Re-submitting the exact same prompt with no extension — nothing to
-            # generate over a hit. Treat as miss so we regenerate from scratch
-            # (cheap insurance vs. weird cache state).
-            del _session_store[session_id]
-            return None, None, "fresh"
+        # A prompt that adds nothing (a client's retry, a step replayed) still
+        # needs one token to generate from: rewind to just before its last one.
+        common = min(common, len(prompt_tokens) - 1)
         cache = entry["cache"]
         if common < len(stored_tokens):
             # The stored tokens went further than what the new prompt agrees
@@ -1176,13 +1191,16 @@ def _session_lookup(session_id: str, model_id: str, prompt_tokens: list[int]):
                 if snap and snap_tokens:
                     sc = _common_prefix_len(snap_tokens, prompt_tokens)
                     if sc == len(snap_tokens) and sc < len(prompt_tokens):
-                        entry["last_used"] = time.time()
                         restored = _restore_from_snap(cache, snap)
+                        del _session_store[session_id]
                         return restored, prompt_tokens[sc:], "snap-hit"
                 del _session_store[session_id]
                 return None, None, "non-truncatable"
             _truncate_cache_to(cache, common)
-        entry["last_used"] = time.time()
+        # The request now owns this cache and writes into it: it leaves the
+        # store until the generation puts it back. A second request of the same
+        # conversation in flight (batched loop) finds nothing and starts cold.
+        del _session_store[session_id]
         kind = "hit" if common == len(stored_tokens) else "hit-truncated"
         return cache, prompt_tokens[common:], kind
 
@@ -2801,6 +2819,8 @@ def main() -> None:
         except Exception as e:
             log(f"disk cache restore failed: {e}")
 
+    _cap_session_budget()
+
     # ── Loop dispatcher ──────────────────────────────────────────────────────
     # size == 1: BatchGenerator-driven main loop (concurrent serving). Multi-
     # rank stays on the legacy single-stream loop so JACCL collectives stay
@@ -3644,6 +3664,7 @@ def _run_batched_main(model, tokenizer, repo: str, kv_q8_default: bool,
     }
     if eos_seqs:
         bg_kwargs["stop_tokens"] = eos_seqs
+    _rewinds = _truncatable_cache(_build_prompt_cache(model, False) or [])
     bg = BatchGenerator(model, **bg_kwargs)
 
     in_q: queue.Queue = queue.Queue()
@@ -3772,7 +3793,9 @@ def _run_batched_main(model, tokenizer, repo: str, kv_q8_default: bool,
             if cache_obj is not None:
                 _session_store_after_gen(s["session_id"], repo, cache_obj,
                                          cum_tokens,
-                                         rank=rank, world=world_size)
+                                         rank=rank, world=world_size,
+                                         snap=s.get("snap"),
+                                         snap_tokens=s.get("snap_tokens"))
             else:
                 log(f"session {s['session_id']}: cache unavailable post-gen, not stored")
         done_event: dict = {
@@ -3961,6 +3984,28 @@ def _run_batched_main(model, tokenizer, repo: str, kv_q8_default: bool,
                 _session_lookup(session_id, repo, prompt_tokens_full)
                 if session_id else (None, None, "no-session")
             )
+            # Caches that can't rewind keep a snapshot at the end of the prompt,
+            # as on the legacy loop: the next step diverges inside this reply as
+            # soon as the client sends it back in another form. The prefill runs
+            # here, so the other slots of this runner wait for it.
+            snap_pending = snap_tokens_pending = None
+            reused_tokens = (len(prompt_tokens_full) - len(suffix_tokens)
+                             if cached_cache is not None else 0)
+            if session_id and not _rewinds:
+                try:
+                    if cached_cache is None:
+                        cached_cache = _build_prompt_cache(model, False)
+                        suffix_tokens = prompt_tokens_full
+                    if len(suffix_tokens) > 1:
+                        _manual_prefill(model, cached_cache, suffix_tokens[:-1])
+                    snap_pending = _snap_cache(cached_cache)
+                    snap_tokens_pending = prompt_tokens_full[:-1]
+                    suffix_tokens = prompt_tokens_full[-1:]
+                except Exception as e:
+                    log(f"req {req_id}: prefill failed ({type(e).__name__}: {e})")
+                    emit(rank, {"event": "done", "id": req_id, "ntoks": 0, "elapsed_s": 0.0,
+                                "tps": 0.0, "finish_reason": "error", "error": str(e)[:200]})
+                    continue
             # In batched mode, kv_q8 is NOT supported (mlx-lm's
             # QuantizedKVCache "does not yet support batching with history").
             # If a cached session cache contains any Q8 layer, drop it and
@@ -4021,7 +4066,9 @@ def _run_batched_main(model, tokenizer, repo: str, kv_q8_default: bool,
                 "req_id": req_id,
                 "effort_dropped": effort_dropped,
                 "prompt_tokens_full": prompt_tokens_full,
-                "cached_tokens": slot_cache_hit,
+                "cached_tokens": reused_tokens if snap_pending is not None else slot_cache_hit,
+                "snap": snap_pending,
+                "snap_tokens": snap_tokens_pending,
                 "gen_token_ids": [],
                 "buf": [],
                 "full_text_parts": [],

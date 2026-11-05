@@ -6282,10 +6282,25 @@ _SESSION_STALE_S = 3600.0
 _active_sessions: dict[tuple[str, str], dict] = {}
 
 
+def _conversation_key(model: str, messages: list, tools=None) -> Optional[str]:
+    """Prefix-cache and replica-affinity key of a client that sends no id: what
+    stays the same at every step of a conversation, its tools and its messages
+    up to the first user message. Agents usually get a task of their own there."""
+    first_user = next((i for i, m in enumerate(messages)
+                       if m.get("role") == "user"), None)
+    if first_user is None:
+        return None
+    start = json.dumps([model, tools, messages[:first_user + 1]], sort_keys=True,
+                       default=lambda o: getattr(o, "model_dump", lambda: str(o))())
+    return "auto-" + hashlib.sha256(start.encode()).hexdigest()[:16]
+
+
 def _touch_session(cluster: str, sess: dict, model: str) -> None:
     sid = sess.get("id")
     if not sid:
         return
+    if len(_active_sessions) > 1000:   # every client has a key now, not just a few
+        _active_sessions.clear()
     _active_sessions[(cluster, sid)] = {
         "session_id": sid,
         "cluster": cluster,
@@ -8865,7 +8880,7 @@ def _initial_default_config() -> Optional[dict]:
 #   major (1.7.2 → 2.0.0) — breaking API or topology change
 #
 # Use `./scripts/bump-version.sh patch|minor|major` to bump + auto-commit.
-APP_VERSION = "1.65.8"
+APP_VERSION = "1.65.9"
 
 app = FastAPI(
     title="OdyssAI-X (odyssai.eu)",
@@ -12732,7 +12747,9 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
     _refuse_image_on_text_pool(req.model, pool, req.messages)
     if getattr(pool, "is_vlm_replica", False):
         body = req.model_dump(exclude_none=True)
-        _vr_sid = (request.headers.get("x-session-id") or req.session_id)
+        _vr_sid = (request.headers.get("x-session-id") or req.session_id
+                   or _conversation_key(req.model, body.get("messages") or [],
+                                        body.get("tools")))
         return await pool.dispatch(body, bool(req.stream), session_id=_vr_sid)
     if (getattr(pool, "is_vlm", False) and getattr(pool, "vlm_proxy", True)) \
             or getattr(pool, "is_dflash", False):
@@ -12769,7 +12786,8 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
     # Prefix cache: header takes precedence over body field; both are optional.
     session_id = (request.headers.get("x-session-id")
                   or request.headers.get("X-Session-Id")
-                  or req.session_id)
+                  or req.session_id
+                  or _conversation_key(model_id, messages, req.tools))
     session_meta: dict = {"id": session_id} if session_id else {}
 
     # Resolve enable_thinking to the effective server default (cluster
@@ -13789,7 +13807,8 @@ async def anthropic_messages(req: AnthropicMessagesRequest, request: Request):
     session_id = (request.headers.get("x-session-id")
                   or request.headers.get("X-Session-Id")
                   or (req.metadata or {}).get("user_id")
-                  or (req.metadata or {}).get("session_id"))
+                  or (req.metadata or {}).get("session_id")
+                  or _conversation_key(model_id, oa_messages, oa_tools))
 
     if not req.stream:
         text_parts: list[str] = []
