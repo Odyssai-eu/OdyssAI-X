@@ -688,9 +688,8 @@ def _truncatable_cache(cache) -> bool:
 def _snap_cache(cache) -> list:
     """O(1) snapshot de l'etat d'un prompt cache — refs `vars()` par couche.
 
-    Les arrays MLX sont immutables : toute mutation ulterieure (generation)
-    REBIND les attributs des objets cache sur de nouveaux arrays, les refs
-    capturees ici restent l'etat exact du moment. C'est le pattern prouve du
+    Voir _own_state : ce que la generation reecrit sur place est detenu par le
+    snapshot, qui reste l'etat exact du moment. C'est le pattern prouve du
     rollback spec-decode (dv_c2, saga DSpark) applique au serving : il donne
     un prefix-cache aux modeles dont le cache n'est PAS trimmable (V4
     PoolingCache/CacheList) — au tour suivant on RESTAURE au lieu de
@@ -698,10 +697,46 @@ def _snap_cache(cache) -> list:
     out = []
     for c in cache:
         if _CacheListCls is not None and isinstance(c, _CacheListCls):
-            out.append(("l", [dict(vars(x)) for x in c.caches]))
+            out.append(("l", [_own_state(x, vars(x)) for x in c.caches]))
         else:
-            out.append(("o", dict(vars(c))))
+            out.append(("o", _own_state(c, vars(c))))
     return out
+
+
+def _own_value(value):
+    """Same contents, under objects nobody else can change. `a[i] = x` rewrites
+    the Python array object itself, and `list[i] = x` the list."""
+    import mlx.core as mx  # type: ignore
+    if isinstance(value, mx.array):
+        return mx.array(value)
+    if isinstance(value, (list, tuple)):
+        return type(value)(_own_value(v) for v in value)
+    if isinstance(value, dict):
+        return {k: _own_value(v) for k, v in value.items()}
+    if _is_nested_cache(value):
+        clone = value.__class__.__new__(value.__class__)
+        clone.__dict__.update(_own_state(value, vars(value)))
+        return clone
+    return value
+
+
+def _is_nested_cache(value) -> bool:
+    """A cache held inside a layer's cache (qwen4_exp `_AttnCache.indexer`)."""
+    from mlx_lm.models.cache import _BaseCache  # type: ignore
+    return isinstance(value, _BaseCache)
+
+
+def _own_state(cache_layer, state: dict) -> dict:
+    """A layer's state, safe from what generation does next. A KVCache only
+    writes past its offset, so its big buffers can stay shared (one list level
+    aside, for QuantizedKVCache). Everything else overwrites what it holds:
+    ArraysCache replaces entries of its list, RotatingKVCache writes over its
+    window, and a snapshot sharing them holds the state AFTER the reply."""
+    if _truncatable_cache([cache_layer]):
+        return {k: list(v) if isinstance(v, list)
+                else _own_value(v) if _is_nested_cache(v) else v
+                for k, v in state.items()}
+    return {k: _own_value(v) for k, v in state.items()}
 
 
 def _restore_from_snap(template_cache, snap) -> list:
@@ -724,7 +759,8 @@ def _restore_from_snap(template_cache, snap) -> list:
             subs = []
             for sub, d in zip(c.caches, st):
                 obj = sub.__class__.__new__(sub.__class__)
-                obj.__dict__.update({k: v for k, v in d.items() if k not in _skip})
+                obj.__dict__.update({k: v for k, v in _own_state(sub, d).items()
+                                     if k not in _skip})
                 subs.append(obj)
             cl = c.__class__.__new__(c.__class__)
             cl.__dict__.update({k: v for k, v in vars(c).items() if k not in _skip})
@@ -732,7 +768,8 @@ def _restore_from_snap(template_cache, snap) -> list:
             fresh.append(cl)
         else:
             obj = c.__class__.__new__(c.__class__)
-            obj.__dict__.update({k: v for k, v in st.items() if k not in _skip})
+            obj.__dict__.update({k: v for k, v in _own_state(c, st).items()
+                                 if k not in _skip})
             fresh.append(obj)
     if _CACHE_PIN_VALUES:
         _pin_cache_values(fresh)
