@@ -6307,7 +6307,10 @@ def record_metric(client: str, ntoks: int, elapsed_s: float, ttft_s: Optional[fl
                   cluster: Optional[str] = None,
                   tool_calls: int = 0,
                   session_kind: Optional[str] = None,
-                  status: str = "completed") -> None:
+                  status: str = "completed",
+                  prompt_tokens: Optional[int] = None) -> None:
+    # Generation speed: the prefill before the first token is not generation.
+    gen_s = elapsed_s - ttft_s if ttft_s and 0 < ttft_s < elapsed_s else elapsed_s
     row = {
         "ts": time.time(),
         "client": client,
@@ -6316,8 +6319,9 @@ def record_metric(client: str, ntoks: int, elapsed_s: float, ttft_s: Optional[fl
         "ntoks": ntoks,
         "elapsed_s": round(elapsed_s, 3),
         "ttft_s": round(ttft_s, 3) if ttft_s is not None else None,
-        "tps": round(ntoks / elapsed_s, 2) if elapsed_s > 0 else 0.0,
+        "tps": round(ntoks / gen_s, 2) if gen_s > 0 else 0.0,
         "prompt_chars": prompt_chars,
+        "prompt_tokens": prompt_tokens,
         "tool_calls": tool_calls,
         "session_kind": session_kind,
         "status": status,
@@ -12878,7 +12882,7 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
         record_metric(client_ip, ntoks, elapsed_s, ttft_s, prompt_chars, model_id,
                       cluster=pool.cluster, tool_calls=len(tool_calls),
                       session_kind=session_meta.get("cache_kind"),
-                      status=run_status)
+                      status=run_status, prompt_tokens=nstream_prompt_tokens)
         content = "".join(text_parts)
         if tool_calls:
             content = (content.strip() if nstream_markup_withheld
@@ -12958,6 +12962,7 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
         ttft_s: Optional[float] = None
         t_start = time.time()
         ntoks_total = 0
+        stream_prompt_tokens: Optional[int] = None
         elapsed_total = 0.0
         tool_calls_count = 0
         sess: dict = {}
@@ -13092,6 +13097,7 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
                     sess = ev.get("session", {}) or {}
                     # Prompt tokens from runner if available; cheap fallback otherwise.
                     p_tokens = ev.get("prompt_tokens")
+                    stream_prompt_tokens = p_tokens
                     if p_tokens is None:
                         p_tokens = max(1, prompt_chars // 4)  # ~OpenAI rule of thumb
                     cached_toks = int(ev.get("cached_tokens") or 0)
@@ -13160,7 +13166,7 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
             record_metric(client_ip, ntoks_total, elapsed_total, ttft_s, prompt_chars, model_id,
                           cluster=pool.cluster, tool_calls=tool_calls_count,
                           session_kind=sess.get("cache_kind"),
-                          status=run_status)
+                          status=run_status, prompt_tokens=stream_prompt_tokens)
 
     return StreamingResponse(stream(), media_type="text/event-stream")
 

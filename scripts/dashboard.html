@@ -6109,7 +6109,7 @@ function renderActivityRow(m) {
   const ntoks = m.ntoks ?? m.output_tokens ?? 0;
   const promptChars = m.prompt_chars || 0;
   // Approximate prompt tokens from chars (~4 chars/token avg)
-  const promptTokensApprox = promptChars ? Math.round(promptChars / 4) : 0;
+  const promptTokensApprox = m.prompt_tokens ?? (promptChars ? Math.round(promptChars / 4) : 0);
   const tps = m.tps ?? m.tok_per_s;
   const ttftMs = m.ttft_s != null ? Math.round(m.ttft_s * 1000)
                : (m.ttft_ms != null ? m.ttft_ms : null);
