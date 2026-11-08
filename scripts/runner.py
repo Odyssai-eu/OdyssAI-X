@@ -2411,12 +2411,16 @@ def _pin_cache_values(caches) -> int:
         if callable(getattr(c, "update_and_fetch", None)) and not getattr(c, "_oxpin", False):
             _orig = c.update_and_fetch
 
-            def _pinned(_k, _v, _o=_orig):
-                _out = _o(_k, _v)
-                try:
-                    mx.async_eval(_out[1])
-                except Exception:
-                    pass
+            # Signature libre : PoolingCache (dsv4_cache) prend un seul tableau
+            # et rend un tableau, pas un couple (keys, values). Seul un couple
+            # porte la chaine `values` a collapser.
+            def _pinned(*_a, _o=_orig, **_kw):
+                _out = _o(*_a, **_kw)
+                if isinstance(_out, tuple) and len(_out) == 2:
+                    try:
+                        mx.async_eval(_out[1])
+                    except Exception:
+                        pass
                 return _out
 
             c.update_and_fetch = _pinned
