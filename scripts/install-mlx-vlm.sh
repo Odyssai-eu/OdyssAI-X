@@ -457,6 +457,16 @@ PYEOF
 PATCH_SCRIPT="${PATCH_SCRIPT//VENV_PLACEHOLDER/$VLM_VENV}"
 ssh -o ConnectTimeout=10 -o BatchMode=yes "$SSH_TARGET" "$VLM_VENV/bin/python -" <<<"$PATCH_SCRIPT"
 
+# 10. ATEM call marker (#221; idempotent). Upstream Muse tool calls start at
+#     `to=self<|message|>`; a model that answers without a reasoning turn emits
+#     `to=<tool><|message|><atem:function_calls>` and the call is lost. Start at
+#     the envelope, and for models with a response template strip the routing
+#     headers with the tokenizer parser, as the stream does.
+echo "[install-mlx-vlm] applying ATEM call marker patch"
+PATCH_SCRIPT="$(cat "$SCRIPT_DIR/patches/mlx_vlm_atem_call_marker.py")"
+PATCH_SCRIPT="${PATCH_SCRIPT//VENV_PLACEHOLDER/$VLM_VENV}"
+ssh -o ConnectTimeout=10 -o BatchMode=yes "$SSH_TARGET" "$VLM_VENV/bin/python -" <<<"$PATCH_SCRIPT"
+
 # 9. Vendored model packages. Each UPSTREAM.md names the mlx-vlm pin it was
 #    checked against (`overlays-pin:`); on any other pin it is not installed,
 #    since a newer mlx-vlm may ship the package itself.
