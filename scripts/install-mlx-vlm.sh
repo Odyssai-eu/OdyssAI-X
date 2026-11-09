@@ -15,7 +15,8 @@
 #   8. server: evaluate the processor outputs on the request thread (cross-thread
 #      lazy graphs, "There is no Stream(gpu, N) in current thread")
 #   9. vendored model packages (scripts/mlx_vlm_models/*: unlimited_ocr from PR #2601,
-#      Unlimited-OCR-2) over mlx_vlm/models/, only over the pin they were checked on
+#      Unlimited-OCR-2; muse_glimmer with the DFlash target hooks) over
+#      mlx_vlm/models/, only over the pin they were checked on
 #
 # Idempotent: re-running skips venv creation if it already imports cleanly,
 # skips pip entirely when mlx-vlm is already at MLX_VLM_REF (direct_url.json),
