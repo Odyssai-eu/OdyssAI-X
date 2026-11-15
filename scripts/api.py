@@ -263,19 +263,21 @@ VLM_DIST_SUPPORTED: dict[str, tuple[str, ...]] = {
 # dir-name mismatch would silently misroute venv/FAST_SYNCH, and FAST_SYNCH on
 # a sensitive model is the documented reboot-the-node wedge (MiniMax-M3.1,
 # 2026-10-24). The load branch resolves it fail-closed; an explicit jaccl
-# request for a ring-forced type is refused (the segfault kills ranks).
+# request for a ring-forced type (none today) is refused.
 #   inkling2 (2026-11-15): the mlx_lm PR#2061 module lives only in the
-#   dedicated py3.12 venv on the nodes. jaccl SIGSEGVs (RingGroup::all_reduce)
-#   on this model's volumes -> ring/TCP only; MLX_METAL_FAST_SYNCH hangs the
-#   shard; ring TCP takes CPU buffers only -> the venv's patched
-#   shard_experts_inplace keeps experts CPU-wired under INF_CPU=1, the only
-#   validated configuration (INTEGRATION-MOTEUR-inkling2.md). CPU
-#   load+shard+eval runs 4-7 min/rank, over the fixed 900s default.
+#   dedicated py3.12 venv on the nodes. MLX_METAL_FAST_SYNCH hangs the shard.
+#   INF_CPU=1 steers the venv's patched shard_experts_inplace (experts stay in
+#   CPU-made buffers); the forward runs on the GPU with the MLX wired limit
+#   set by vlm_runner._inkling2_load — 17.48 tok/s on jaccl TP4, against
+#   under 1 tok/s for the CPU forward this entry used to force. No forced
+#   backend any more: the "jaccl SIGSEGVs" and "ring takes CPU buffers only"
+#   claims did not reproduce with the validated load recipe, so the pool
+#   default (jaccl) applies and ring stays available on request. CPU
+#   load+shard+eval runs 4-10 min/rank, over the fixed 900s default.
 VLM_TYPE_RUNTIME: dict[str, dict] = {
     "inkling2": {
         "venv": "$HOME/.venvs/inkling2",
         "no_fast_synch": True,
-        "backend": "ring",
         "env": {"INF_CPU": "1"},
         "load_timeout_s": 1800,
     },
@@ -4615,7 +4617,7 @@ class VLMDistPool(RunnerPool):
         self.runtime = dict(runtime or {})
         # JACCL unless the load explicitly asked for ring (Sophie, 2026-09:
         # no ring for distributed models) — or the model type's runtime
-        # config forces ring (inkling2: jaccl SIGSEGVs on this model).
+        # config forces a backend (none today).
         self.backend = self.runtime.get("backend") or backend or "jaccl"
         self.load_timeout_s = float(self.runtime.get("load_timeout_s") or 900)
 
@@ -8865,7 +8867,7 @@ def _initial_default_config() -> Optional[dict]:
 #   major (1.7.2 → 2.0.0) — breaking API or topology change
 #
 # Use `./scripts/bump-version.sh patch|minor|major` to bump + auto-commit.
-APP_VERSION = "1.65.12"
+APP_VERSION = "1.65.13"
 
 app = FastAPI(
     title="OdyssAI-X (odyssai.eu)",
@@ -18150,15 +18152,14 @@ async def admin_cluster_load(cluster_id: str, req: ArgoLoadRequest):
                       "`kind: replica` cluster (one full copy per node).")
             # Per-type runtime (model_type-keyed, fail-closed — see
             # VLM_TYPE_RUNTIME). An explicit jaccl for a ring-forced type is
-            # refused: on inkling2 that segfault is a rank-killer, not an error.
+            # refused (no type forces ring today).
             _vd_rt = VLM_TYPE_RUNTIME.get(_vd_mt) or {}
             if (req.backend or "").strip().lower() == "jaccl" and \
                     _vd_rt.get("backend") == "ring":
                 raise HTTPException(
                     409,
                     f"{cluster_id}: {req.model} (model_type {_vd_mt}) must load over "
-                    f"ring/TCP — jaccl segfaults (RingGroup::all_reduce) on this "
-                    f"model. Retry without the backend field."
+                    f"ring/TCP. Retry without the backend field."
                 )
             vlm_model_path = _vlm_resolve_model_path(req.model, base_dir)
             # Same loading-progress state as the single-node VL path below

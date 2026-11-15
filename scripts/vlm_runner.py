@@ -41,9 +41,9 @@ Config via env (no argparse, same contract as runner.py):
   RUNNER_EMIT_BATCH  tokens coalesced per stdout token event (default 10)
   RUNNER_MAX_IMAGE_MB  per-image / per-audio decoded cap, safety valve (default 64)
   RUNNER_INK_PREFILL_CHUNK / RUNNER_INK_BREATHE_S  inkling2-only: prefill
-                     chunk size (default 1 = the validated token-by-token CPU
-                     prefill) and the ring-TCP breathing pause between steps
-                     (default 0.05s)
+                     chunk size (default 1 = the validated token-by-token
+                     prefill) and the breathing pause between steps (default
+                     0.05s on ring/TCP, 0 on jaccl)
 """
 
 import base64
@@ -68,7 +68,7 @@ from mlx.nn.layers.distributed import shard_inplace, shard_linear
 # Bumped on every change. Logged at boot and stamped on the ready event so a
 # node running a stale copy after a missed sync is visible in the engine logs
 # instead of surfacing as a mysterious rank behavior difference.
-RUNNER_VERSION = "2026-11-15.1"
+RUNNER_VERSION = "2026-11-15.2"
 
 # ── stdout/stderr contract ────────────────────────────────────────────────────
 
@@ -500,21 +500,27 @@ def _inkling2_load(path: str, group, config: dict):
     """Load + tensor-shard an inkling2 checkpoint (mlx_lm PR#2061 module).
 
     `config` is the raw config.json dict — Processor.from_config needs plain
-    nested dicts (model.config.to_dict keeps ModelArgs objects). Validated
-    recipe (INTEGRATION-MOTEUR-inkling2.md, TP4 on .29-.32, 2026-11-15):
-    lazy CPU load, model.shard(group) — the module's own shard does
-    everything —, CPU eval of ALL params (a full GPU eval times out Metal),
-    then a GPU default for inference — unless INF_CPU=1, in which case the
-    venv's patched shard_experts_inplace keeps the experts CPU-wired and the
-    default device stays CPU. INF_CPU=1 is the only validated ring/TCP
-    configuration (GPU buffers on the ring EFAULT).
+    nested dicts (model.config.to_dict keeps ModelArgs objects). Recipe
+    (INTEGRATION-MOTEUR-inkling2.md, TP4 on .29-.32, 2026-11-15): lazy CPU
+    load, model.shard(group) — the module's own shard does everything —,
+    CPU eval of ALL params (a full GPU eval times out Metal), then the GPU
+    as inference device WITH the MLX wired limit set.
+
+    The wired limit is the whole point: MLX defaults it to 0, mlx_lm sets it
+    inside stream_generate (generate.wired_limit), and _inkling2_stream calls
+    the model directly — so nothing set it, the ~175 GB per rank was never
+    kept resident for the GPU and every layer re-paid the wiring on every
+    token. Measured on jaccl TP4 (2026-11-15): 0.14 tok/s on GPU without it,
+    1.23 tok/s on the CPU forward, 17.48 tok/s on GPU with it, same text.
+    INF_CPU=1 (engine runtime env) only steers the venv's patched
+    shard_experts_inplace: the experts stay in CPU-made buffers, the measured
+    configuration.
     """
     import mlx_lm
     try:
         mx.metal.set_cache_limit(256 * 1024 * 1024)
     except Exception:
         pass
-    cpu_mode = os.environ.get("INF_CPU", "0") == "1"
     # Load+shard en CPU : evite les commandes Metal monolithiques (timeout).
     mx.set_default_device(mx.cpu)
     log(f"loading inkling2 (lazy, CPU) from {path}")
@@ -525,9 +531,14 @@ def _inkling2_load(path: str, group, config: dict):
     # CPU : materialise TOUT (tour vision incluse) avant le forward, sinon
     # le 1er forward = un eval monstrueux au milieu des collectives.
     mx.eval(model.parameters())
-    log(f"inkling2 shard+eval done (cpu_mode={cpu_mode})")
-    if not cpu_mode:
-        mx.set_default_device(mx.gpu)
+    log("inkling2 shard+eval done")
+    mx.set_default_device(mx.gpu)
+    # device_info() only reports the recommended working set with the GPU as
+    # default device — hence after the switch, never before.
+    rec = int(mx.device_info()["max_recommended_working_set_size"])
+    prev = mx.set_wired_limit(rec)
+    log(f"inkling2 wired limit {rec / 2**30:.1f}G (was {prev / 2**30:.1f}G), "
+        f"active {mx.get_active_memory() / 2**30:.1f}G")
     processor = None
     if config.get("vision_config"):
         try:
@@ -631,7 +642,11 @@ def _inkling2_stream(model, tokenizer, processor, config, messages, images,
     # (token-by-token validated; chunk size and the breathing window are
     # env-tunable for the future GPU-forward experiments).
     chunk = max(1, int(os.environ.get("RUNNER_INK_PREFILL_CHUNK", "1")))
-    breathe = float(os.environ.get("RUNNER_INK_BREATHE_S", "0.05"))
+    # The pause exists for ring/TCP only; on jaccl it would cap the decode
+    # under 20 tok/s for nothing.
+    _ring = os.environ.get("RUNNER_BACKEND", "ring").strip().lower() == "ring"
+    breathe = float(os.environ.get("RUNNER_INK_BREATHE_S",
+                                   "0.05" if _ring else "0"))
     cache = model.make_cache()
     logits = None
     if pixel_values is not None:
