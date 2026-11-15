@@ -274,11 +274,18 @@ VLM_DIST_SUPPORTED: dict[str, tuple[str, ...]] = {
 #   claims did not reproduce with the validated load recipe, so the pool
 #   default (jaccl) applies and ring stays available on request. CPU
 #   load+shard+eval runs 4-10 min/rank, over the fixed 900s default.
+#   MLX_METAL_RESIDENCY_REFRESH_INTERVAL_MS: macOS drops the GPU residency
+#   ~10 s after the last request despite the standing request (MLX says so in
+#   backend/metal/resident.cpp); the next request then re-wires 175 GB per
+#   rank inside one command buffer, which hit the Metal timeout twice on
+#   2026-11-15 and got the rank's GPU submissions ignored for good. MLX's own
+#   refresh thread re-requests residency at this interval.
 VLM_TYPE_RUNTIME: dict[str, dict] = {
     "inkling2": {
         "venv": "$HOME/.venvs/inkling2",
         "no_fast_synch": True,
-        "env": {"INF_CPU": "1"},
+        "env": {"INF_CPU": "1",
+                "MLX_METAL_RESIDENCY_REFRESH_INTERVAL_MS": "2000"},
         "load_timeout_s": 1800,
     },
 }
@@ -8867,7 +8874,7 @@ def _initial_default_config() -> Optional[dict]:
 #   major (1.7.2 → 2.0.0) — breaking API or topology change
 #
 # Use `./scripts/bump-version.sh patch|minor|major` to bump + auto-commit.
-APP_VERSION = "1.65.13"
+APP_VERSION = "1.65.14"
 
 app = FastAPI(
     title="OdyssAI-X (odyssai.eu)",
