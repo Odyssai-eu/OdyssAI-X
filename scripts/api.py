@@ -256,6 +256,29 @@ VLM_DIST_SUPPORTED: dict[str, tuple[str, ...]] = {
     "minimax_m3_vl": ("tensor",),
     "qwen3_5_moe": ("pipeline",),
     "mimo_v2": ("tensor", "pipeline"),
+    "inkling2": ("tensor",),
+}
+# Per-model_type runtime config for the distributed VL path — keyed by the
+# PROBED model_type (get_model_arch_meta), never by checkpoint dir name: a
+# dir-name mismatch would silently misroute venv/FAST_SYNCH, and FAST_SYNCH on
+# a sensitive model is the documented reboot-the-node wedge (MiniMax-M3.1,
+# 2026-10-24). The load branch resolves it fail-closed; an explicit jaccl
+# request for a ring-forced type is refused (the segfault kills ranks).
+#   inkling2 (2026-11-15): the mlx_lm PR#2061 module lives only in the
+#   dedicated py3.12 venv on the nodes. jaccl SIGSEGVs (RingGroup::all_reduce)
+#   on this model's volumes -> ring/TCP only; MLX_METAL_FAST_SYNCH hangs the
+#   shard; ring TCP takes CPU buffers only -> the venv's patched
+#   shard_experts_inplace keeps experts CPU-wired under INF_CPU=1, the only
+#   validated configuration (INTEGRATION-MOTEUR-inkling2.md). CPU
+#   load+shard+eval runs 4-7 min/rank, over the fixed 900s default.
+VLM_TYPE_RUNTIME: dict[str, dict] = {
+    "inkling2": {
+        "venv": "$HOME/.venvs/inkling2",
+        "no_fast_synch": True,
+        "backend": "ring",
+        "env": {"INF_CPU": "1"},
+        "load_timeout_s": 1800,
+    },
 }
 # SIGTERM->SIGKILL grace for remote pkills/sweeps, in seconds (0.5s polls).
 # 12s default: big-model clean exits need the room for free_metal; ranks stuck
@@ -3118,7 +3141,10 @@ def remote_vlm_cmd(node: dict, nodes: list[dict], model: str, port: int,
                    emit_batch: int = 10, backend: str = "jaccl",
                    devices_json: str = "", shard_mode: str = "",
                    ram_weights_csv: Optional[str] = None,
-                   launch_id: Optional[str] = None) -> str:
+                   launch_id: Optional[str] = None,
+                   venv: Optional[str] = None,
+                   extra_env: Optional[dict] = None,
+                   no_fast_synch: bool = False) -> str:
     """Per-node command for the distributed VLM runner.
 
     Same transport env as remote_cmd: JACCL (coordinator + RDMA devices json)
@@ -3126,7 +3152,9 @@ def remote_vlm_cmd(node: dict, nodes: list[dict], model: str, port: int,
     an explicit ring override. Launches vlm_runner.py with the mlx-vlm venv
     python. `shard_mode` ("" = the model type's default, "tensor",
     "pipeline") and `ram_weights_csv` (per-rank wired-limit bytes for the
-    capacity-aware pipeline split) are forwarded as RUNNER_* env."""
+    capacity-aware pipeline split) are forwarded as RUNNER_* env. `venv` /
+    `extra_env` / `no_fast_synch` come from a per-type runtime config
+    (VLM_TYPE_RUNTIME) and override the checkpoint-name defaults when set."""
     env = {
         "MLX_RANK": str(node["rank"]),
         "MLX_WORLD_SIZE": str(len(nodes)),
@@ -3155,16 +3183,19 @@ def remote_vlm_cmd(node: dict, nodes: list[dict], model: str, port: int,
             env["JACCL_PROGRESS_TIMEOUT_S"] = os.environ["JACCL_PROGRESS_TIMEOUT_S"]
         write_prefix = (f"echo {shlex.quote(devices_json)} > "
                         f"{env['MLX_IBV_DEVICES']}")
-    if _vlm_model_name(model) in VLM_NO_FAST_SYNCH:
+    if _vlm_model_name(model) in VLM_NO_FAST_SYNCH or no_fast_synch:
         del env["MLX_METAL_FAST_SYNCH"]
+    if extra_env:
+        env.update({k: str(v) for k, v in extra_env.items()})
     env_str = " ".join(f"{k}={shlex.quote(v)}" for k, v in env.items())
     cd_prefix = ""
     if not model.startswith("/"):
         node_models_dir = node.get("models_dir") or DEFAULT_MODELS_DIR
         cd_prefix = f"cd {shlex.quote(node_models_dir)} && "
     # A checkpoint mapped to its own mlx-vlm venv (VLM_MODEL_VENVS) runs the
-    # distributed runner from that venv too.
-    venv = _vlm_venv_for(model)
+    # distributed runner from that venv too; a per-type runtime config
+    # (VLM_TYPE_RUNTIME, e.g. inkling2's mlx_lm PR#2061 venv) wins when given.
+    venv = venv or _vlm_venv_for(model)
     python = VLM_PYTHON_REMOTE if venv == VLM_DEFAULT_VENV else f"{venv}/bin/python"
     return f"{write_prefix} && {cd_prefix}{env_str} {python} {VLM_RUNNER_REMOTE}"
 
@@ -4567,7 +4598,8 @@ class VLMDistPool(RunnerPool):
 
     def __init__(self, model: str, cluster: str, alias: str,
                  node_indices: list[int], shard_mode: str = "",
-                 backend: Optional[str] = None):
+                 backend: Optional[str] = None,
+                 runtime: Optional[dict] = None):
         # shard_mode "" = the model type's default split (vlm_runner decides);
         # an entry persisted before 2026-09-29 has none and restores that way.
         super().__init__(model=model,
@@ -4577,9 +4609,15 @@ class VLMDistPool(RunnerPool):
                          kv_q8=False, draft_model=None, alias=alias,
                          node_indices=list(node_indices))
         self.shard_mode = shard_mode
+        # Per-type runtime config (VLM_TYPE_RUNTIME): venv, extra env,
+        # FAST_SYNCH opt-out, forced backend, load timeout. None = legacy
+        # entry (pre-inkling2) -> historic defaults everywhere.
+        self.runtime = dict(runtime or {})
         # JACCL unless the load explicitly asked for ring (Sophie, 2026-09:
-        # no ring for distributed models).
-        self.backend = backend or "jaccl"
+        # no ring for distributed models) — or the model type's runtime
+        # config forces ring (inkling2: jaccl SIGSEGVs on this model).
+        self.backend = self.runtime.get("backend") or backend or "jaccl"
+        self.load_timeout_s = float(self.runtime.get("load_timeout_s") or 900)
 
     async def _start(self):
         """Mirror of RunnerPool._start() for the VLM runner: same model-layout
@@ -4651,13 +4689,17 @@ class VLMDistPool(RunnerPool):
                                  devices_json=devices_json,
                                  shard_mode=self.shard_mode,
                                  ram_weights_csv=ram_weights_csv,
-                                 launch_id=self.launch_id)
+                                 launch_id=self.launch_id,
+                                 venv=self.runtime.get("venv"),
+                                 extra_env=self.runtime.get("env"),
+                                 no_fast_synch=bool(
+                                     self.runtime.get("no_fast_synch")))
             self.runners.append(RunnerProc(
                 node, cmd, self._on_event, cluster=self.cluster,
                 launch_id=self.launch_id,
             ))
         rank0 = next(r for r in self.runners if r.node["rank"] == 0)
-        load_timeout_s = 900.0   # 327GB Q6 loads in ~75-90s warm; cold FS
+        load_timeout_s = self.load_timeout_s   # 900 default; per-type override
         no_progress_grace_s = 60.0
         deaths: list[tuple[int, int, str]] = []
         while True:
@@ -6016,6 +6058,10 @@ def save_cluster_state_v2(cluster_id: str, *,
                 "nodes": pool.nodes_count,
                 "vlm_shard_mode": getattr(pool, "shard_mode", ""),
                 "backend": getattr(pool, "backend", "jaccl"),
+                # Per-type runtime (venv/env/fast_synch/timeout) — persisted
+                # so an engine restart relaunches identically, without
+                # re-probing the model type.
+                "vlm_runtime": getattr(pool, "runtime", None) or {},
             })
             continue
         # VL pools (Argo-VLM fold): a single-node mlx_vlm.server proxied under
@@ -7569,6 +7615,7 @@ async def _restore_cluster_pools(cid: str, leaked_hosts: Optional[set] = None,
                     node_indices=indices,
                     shard_mode=entry.get("vlm_shard_mode") or "",
                     backend=entry.get("backend"),
+                    runtime=entry.get("vlm_runtime") or None,
                 )
                 await vdpool.start()
                 set_pool(cid, alias, vdpool)
@@ -18101,6 +18148,18 @@ async def admin_cluster_load(cluster_id: str, req: ArgoLoadRequest):
                     + ", ".join(f"{k} ({'/'.join(v)})" for k, v in VLM_DIST_SUPPORTED.items())
                     + ". Load it on ONE node (mlx_vlm.server) if it fits, or on a "
                       "`kind: replica` cluster (one full copy per node).")
+            # Per-type runtime (model_type-keyed, fail-closed — see
+            # VLM_TYPE_RUNTIME). An explicit jaccl for a ring-forced type is
+            # refused: on inkling2 that segfault is a rank-killer, not an error.
+            _vd_rt = VLM_TYPE_RUNTIME.get(_vd_mt) or {}
+            if (req.backend or "").strip().lower() == "jaccl" and \
+                    _vd_rt.get("backend") == "ring":
+                raise HTTPException(
+                    409,
+                    f"{cluster_id}: {req.model} (model_type {_vd_mt}) must load over "
+                    f"ring/TCP — jaccl segfaults (RingGroup::all_reduce) on this "
+                    f"model. Retry without the backend field."
+                )
             vlm_model_path = _vlm_resolve_model_path(req.model, base_dir)
             # Same loading-progress state as the single-node VL path below
             # (2026-07-08 fix): without it /status reports `loading: null` for
@@ -18133,7 +18192,7 @@ async def admin_cluster_load(cluster_id: str, req: ArgoLoadRequest):
                     vdpool = VLMDistPool(
                         model=vlm_model_path, cluster=cluster_id, alias=alias,
                         node_indices=node_indices, shard_mode=_vd_mode,
-                        backend=req.backend,
+                        backend=req.backend, runtime=_vd_rt,
                     )
                     try:
                         await vdpool.start()
@@ -18161,6 +18220,17 @@ async def admin_cluster_load(cluster_id: str, req: ArgoLoadRequest):
             }
         # Clamp to a single node. Prefer the first requested index; when the
         # request gave none (empty cluster case), that's index 0 = the master.
+        # A type with a forced multi-node runtime config (inkling2: 744 GB,
+        # mlx_lm-only) cannot be served by the single-node mlx_vlm.server
+        # path — refuse instead of dying as a confusing mlx_vlm load error.
+        _cl_mt = (arch.get("model_type") or "").lower()
+        if _cl_mt in VLM_TYPE_RUNTIME:
+            raise HTTPException(
+                409,
+                f"{cluster_id}: {req.model} (model_type {_cl_mt}) needs a "
+                f"multi-node load — it does not fit on one node and the "
+                f"single-node VL path cannot serve this model_type."
+            )
         vlm_index = node_indices[0]
         vlm_topo = build_topology_from_indices(cluster_id, [vlm_index])
         vlm_ssh = vlm_topo[0]["ssh"]

@@ -40,6 +40,10 @@ Config via env (no argparse, same contract as runner.py):
   MLX_WORLD_SIZE     "1" => no distributed init (single-node bypass)
   RUNNER_EMIT_BATCH  tokens coalesced per stdout token event (default 10)
   RUNNER_MAX_IMAGE_MB  per-image / per-audio decoded cap, safety valve (default 64)
+  RUNNER_INK_PREFILL_CHUNK / RUNNER_INK_BREATHE_S  inkling2-only: prefill
+                     chunk size (default 1 = the validated token-by-token CPU
+                     prefill) and the ring-TCP breathing pause between steps
+                     (default 0.05s)
 """
 
 import base64
@@ -60,6 +64,11 @@ import mlx.nn as nn
 
 from loop_detect import LoopGuard  # one anti-loop with runner.py / mlx_vlm (#113)
 from mlx.nn.layers.distributed import shard_inplace, shard_linear
+
+# Bumped on every change. Logged at boot and stamped on the ready event so a
+# node running a stale copy after a missed sync is visible in the engine logs
+# instead of surfacing as a mysterious rank behavior difference.
+RUNNER_VERSION = "2026-11-15.1"
 
 # ── stdout/stderr contract ────────────────────────────────────────────────────
 
@@ -428,6 +437,22 @@ def _shard_lm_pipeline(model, group, num_layers: int):
 
 
 def sharded_vlm_load(path: str, group):
+    # Branch on the checkpoint's model_type BEFORE any mlx_vlm import: the
+    # inkling2 venv (mlx_lm PR#2061) ships no mlx_vlm, and mlx_lm-native
+    # checkpoints follow an entirely different load recipe. The engine
+    # always passes a local directory (RUNNER_MODEL is a resolved path).
+    model_type = ""
+    cfg_json = Path(path) / "config.json"
+    if cfg_json.is_file():
+        try:
+            model_type = (json.loads(cfg_json.read_text())
+                          .get("model_type") or "").strip().lower()
+        except Exception as e:
+            log(f"could not read {cfg_json} ({e}); defaulting to mlx_vlm load")
+    if model_type == "inkling2":
+        model, tokenizer, processor, config = _inkling2_load(
+            path, group, json.loads(cfg_json.read_text()))
+        return model, processor, config, model_type, tokenizer
     from mlx_vlm.utils import (get_model_path, load_image_processor,
                                load_model, load_processor)
     shard_mode = os.environ.get("RUNNER_SHARD_MODE", "").strip().lower()
@@ -468,7 +493,217 @@ def sharded_vlm_load(path: str, group):
     log("materializing vision tower + projector (replicated)")
     mx.eval(model.parameters())
     model.eval()
-    return model, processor, config
+    return model, processor, config, model_type, None
+
+
+def _inkling2_load(path: str, group, config: dict):
+    """Load + tensor-shard an inkling2 checkpoint (mlx_lm PR#2061 module).
+
+    `config` is the raw config.json dict — Processor.from_config needs plain
+    nested dicts (model.config.to_dict keeps ModelArgs objects). Validated
+    recipe (INTEGRATION-MOTEUR-inkling2.md, TP4 on .29-.32, 2026-11-15):
+    lazy CPU load, model.shard(group) — the module's own shard does
+    everything —, CPU eval of ALL params (a full GPU eval times out Metal),
+    then a GPU default for inference — unless INF_CPU=1, in which case the
+    venv's patched shard_experts_inplace keeps the experts CPU-wired and the
+    default device stays CPU. INF_CPU=1 is the only validated ring/TCP
+    configuration (GPU buffers on the ring EFAULT).
+    """
+    import mlx_lm
+    try:
+        mx.metal.set_cache_limit(256 * 1024 * 1024)
+    except Exception:
+        pass
+    cpu_mode = os.environ.get("INF_CPU", "0") == "1"
+    # Load+shard en CPU : evite les commandes Metal monolithiques (timeout).
+    mx.set_default_device(mx.cpu)
+    log(f"loading inkling2 (lazy, CPU) from {path}")
+    model, tokenizer = mlx_lm.load(path, lazy=True)
+    if group is not None and group.size() > 1:
+        log(f"rank {group.rank()} sharding inkling2 (tensor)")
+        model.shard(group)
+    # CPU : materialise TOUT (tour vision incluse) avant le forward, sinon
+    # le 1er forward = un eval monstrueux au milieu des collectives.
+    mx.eval(model.parameters())
+    log(f"inkling2 shard+eval done (cpu_mode={cpu_mode})")
+    if not cpu_mode:
+        mx.set_default_device(mx.gpu)
+    processor = None
+    if config.get("vision_config"):
+        try:
+            from mlx_lm.processors.inkling2 import Processor
+            processor = Processor.from_config(config)
+        except Exception as e:
+            log(f"inkling2 Processor unavailable ({e}) — image input disabled")
+    return model, tokenizer, processor, config
+
+
+def _inkling2_stream(model, tokenizer, processor, config, messages, images,
+                     gen_kwargs):
+    """mlx_lm-native streaming generator for inkling2, mimicking the
+    stream_generate result shape (.text/.token/.token_ids/.prompt_tokens/
+    .finish_reason) the engine's loop consumes.
+
+    Prompt rules (INTEGRATION-MOTEUR-inkling2.md §6): apply_chat_template
+    returns ids in mlx_lm 0.32 and does NOT add the generation prefix —
+    [message_model, content_thinking] are appended by hand. EOS is
+    <|end_message|> (200010), never tokenizer.eos_token_id. Reasoning
+    output lives between <|content_thinking|> and <|content_text|>; those
+    markers are counted and stripped from the emitted text.
+
+    Images (§7): the Processor pads to 40px blocks and expands one
+    <|unused_200054|> per block; pixel_values feed model.embed_inputs ONCE
+    for the whole sequence and the prefill forwards input_embeddings slice
+    by slice — never pixel_values on a 1-token forward.
+    """
+    import mlx_lm.sample_utils as _su
+
+    eos = tokenizer.convert_tokens_to_ids("<|end_message|>") or 200010
+    msg_model = tokenizer.convert_tokens_to_ids("<|message_model|>") or 200001
+    content_thinking = (tokenizer.convert_tokens_to_ids("<|content_thinking|>")
+                        or 200008)
+    # Verified on the checkpoint's tokenizer (2026-11-15): <|content_text|>
+    # is 200004, NOT the 200009 the handoff guessed ("200009 environ").
+    content_text = (tokenizer.convert_tokens_to_ids("<|content_text|>")
+                    or 200004)
+
+    def _build_ids(msgs):
+        p = tokenizer.apply_chat_template(msgs, add_generation_prompt=True,
+                                          return_dict=False)
+        if isinstance(p, dict):
+            return tokenizer.encode(p.get("prompt", ""))
+        if isinstance(p, str):
+            return tokenizer.encode(p)
+        if isinstance(p, (list, tuple)):
+            if len(p) and isinstance(p[0], str):
+                return tokenizer.encode(p[0])
+            return list(p)          # deja des ids (mlx_lm 0.32)
+        raise TypeError(f"unexpected apply_chat_template return: {type(p)}")
+
+    text_messages = [dict(m) for m in messages]
+    pixel_values = None
+    if images:
+        if processor is None:
+            raise ImageExtractionError(
+                "inkling2 image input but the Processor is unavailable")
+        # v0 shape: every image-token block lands on the LAST user message
+        # (the single-turn vision shape the TP4 bench validated).
+        for m in reversed(text_messages):
+            if m.get("role") == "user":
+                m["content"] = (m.get("content") or "") \
+                    + processor.image_token * len(images)
+                break
+        else:
+            text_messages.append({"role": "user",
+                                  "content": processor.image_token
+                                  * len(images)})
+        import numpy as np
+        try:
+            from PIL import Image
+        except ImportError:
+            raise ImageExtractionError(
+                "inkling2 images need Pillow in the runner venv")
+        arrs = []
+        for p in images:
+            with Image.open(p) as im:
+                arrs.append(np.asarray(im.convert("RGB"), dtype=np.uint8))
+        expanded, pixel_values = processor(text_messages[-1]["content"],
+                                           images=arrs)
+        for m in reversed(text_messages):
+            if m.get("role") == "user":
+                m["content"] = expanded
+                break
+
+    prompt_ids = _build_ids(text_messages) + [msg_model, content_thinking]
+    ids = mx.array([prompt_ids])
+    plen = len(prompt_ids)
+
+    sampler = _su.make_sampler(
+        temp=float(gen_kwargs.get("temperature") or 0.0),
+        top_p=float(gen_kwargs.get("top_p") or 0.0),
+        min_p=float(gen_kwargs.get("min_p") or 0.0),
+        top_k=int(gen_kwargs.get("top_k") or 0),
+    )
+    logits_processors = _su.make_logits_processors(
+        repetition_penalty=gen_kwargs.get("repetition_penalty"))
+
+    # Prefill par petits morceaux : le ring TCP respire entre les etapes
+    # (token-by-token validated; chunk size and the breathing window are
+    # env-tunable for the future GPU-forward experiments).
+    chunk = max(1, int(os.environ.get("RUNNER_INK_PREFILL_CHUNK", "1")))
+    breathe = float(os.environ.get("RUNNER_INK_BREATHE_S", "0.05"))
+    cache = model.make_cache()
+    logits = None
+    if pixel_values is not None:
+        # Splice image+texte UNE fois, puis forward par tranches
+        # d'embeddings — jamais pixel_values sur un forward 1-token.
+        emb = model.embed_inputs(ids, pixel_values=pixel_values)
+        mx.eval(emb)
+        dummy = mx.zeros((1, 1), dtype=mx.int32)
+        n = emb.shape[1]
+        i = 0
+        while i < n:
+            step = min(chunk, n - i)
+            logits = model(dummy, cache=cache,
+                           input_embeddings=emb[:, i:i + step])
+            mx.eval(logits)
+            i += step
+            if breathe:
+                time.sleep(breathe)
+    else:
+        n = ids.shape[1]
+        i = 0
+        while i < n:
+            step = min(chunk, n - i)
+            logits = model(ids[:, i:i + step], cache=cache)
+            mx.eval(logits)
+            i += step
+            if breathe:
+                time.sleep(breathe)
+
+    toks = list(prompt_ids)
+
+    def _sample(last_logits):
+        lg = last_logits[:, -1, :]
+        if logits_processors:
+            generated = toks[len(prompt_ids):]
+            for proc in logits_processors:
+                lg = proc(generated, lg)
+        return sampler(lg)
+
+    from types import SimpleNamespace as _NS
+    tok = _sample(logits)
+    n_gen = 0
+    reasoning_tokens = 0
+    max_tokens = int(gen_kwargs.get("max_tokens") or 0) or (2 ** 31 - 1)
+    while True:
+        tid = int(tok.item())
+        toks.append(tid)
+        if tid == eos:
+            yield _NS(text="", token=tid, token_ids=[tid],
+                      prompt_tokens=plen, finish_reason="stop",
+                      reasoning_tokens=reasoning_tokens or None)
+            break
+        text_out = ""
+        if tid == content_thinking:
+            reasoning_tokens += 1
+        elif tid == content_text:
+            pass                    # marqueur de fin de raisonnement
+        else:
+            text_out = tokenizer.decode([tid])
+        n_gen += 1
+        terminal = n_gen >= max_tokens
+        yield _NS(text=text_out, token=tid, token_ids=[tid],
+                  prompt_tokens=plen,
+                  finish_reason="stop" if terminal else None,
+                  reasoning_tokens=reasoning_tokens or None)
+        if terminal:
+            break
+        logits = model(tok.reshape(1, 1), cache=cache)
+        mx.eval(logits)
+        if breathe:
+            time.sleep(breathe)
+        tok = _sample(logits)
 
 
 # ── media transport: pull image/audio sources out of OpenAI-shape messages ───
@@ -595,6 +830,7 @@ def main() -> None:
     if not repo:
         log("RUNNER_MODEL is required")
         sys.exit(2)
+    log(f"vlm_runner version {RUNNER_VERSION}")
 
     stop_requested = {"flag": False}
 
@@ -616,7 +852,7 @@ def main() -> None:
         log(f"rank {rank}/{size} group ready in {time.time()-t0:.2f}s")
 
     t1 = time.time()
-    model, processor, config = sharded_vlm_load(repo, group)
+    model, processor, config, model_type, tokenizer = sharded_vlm_load(repo, group)
 
     if size > 1:
         log(f"rank {rank} barrier before ready")
@@ -626,10 +862,12 @@ def main() -> None:
     log(f"rank {rank} model loaded in {load_s:.1f}s "
         f"(active {_active_gb():.1f} GB)")
     emit(rank, {"event": "ready", "rank": rank, "size": size,
-                "load_s": load_s, "is_vlm": True})
+                "load_s": load_s, "is_vlm": True, "version": RUNNER_VERSION})
 
-    from mlx_vlm.generate import stream_generate
-    from mlx_vlm.prompt_utils import apply_chat_template
+    # mlx_vlm is absent from the inkling2 venv — import it only on that path.
+    if model_type != "inkling2":
+        from mlx_vlm.generate import stream_generate
+        from mlx_vlm.prompt_utils import apply_chat_template
 
     # Reader thread: parse every stdin line, intercept cancel immediately
     # (between stream_generate yields), queue everything else in order.
@@ -734,8 +972,13 @@ def main() -> None:
             reasoning_effort = req.get("reasoning_effort", None)
             if reasoning_effort:
                 chat_kwargs["reasoning_effort"] = reasoning_effort
-            formatted = apply_chat_template(
-                processor, config, tmpl_messages, **chat_kwargs)
+            formatted = None
+            if model_type != "inkling2":
+                formatted = apply_chat_template(
+                    processor, config, tmpl_messages, **chat_kwargs)
+            elif audios:
+                raise ImageExtractionError(
+                    "inkling2 does not take audio input")
 
             gen_kwargs: dict = {"max_tokens": max_tokens}
             for k in ("temperature", "top_p", "top_k", "min_p",
@@ -772,9 +1015,14 @@ def main() -> None:
             last = None
             # Same token ids on every rank → same verdict at the same token.
             loop_guard, loop_hit = LoopGuard(), None
-            for res in stream_generate(model, processor, formatted,
-                                       image=images or None,
-                                       audio=audios or None, **gen_kwargs):
+            if model_type == "inkling2":
+                stream = _inkling2_stream(model, tokenizer, processor, config,
+                                          tmpl_messages, images, gen_kwargs)
+            else:
+                stream = stream_generate(model, processor, formatted,
+                                         image=images or None,
+                                         audio=audios or None, **gen_kwargs)
+            for res in stream:
                 buf.append(res.text)
                 ntoks += 1
                 last = res
@@ -808,6 +1056,9 @@ def main() -> None:
                 "elapsed_s": elapsed,
                 "tps": tps,
             }
+            _rtoks = getattr(last, "reasoning_tokens", None)
+            if _rtoks:
+                done_event["reasoning_tokens"] = _rtoks
             if cancelled_mid_gen:
                 done_event["finish_reason"] = "cancelled"
             elif loop_hit:
