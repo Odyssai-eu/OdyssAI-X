@@ -6,8 +6,8 @@
   "inference_pipe.py": "724481326118b013eaa8a8512de47596",
   "loop_detect.py": "9f98f55e476c9d59f59de8053b0eb1fc",
   "persistence.py": "2095c0bf6c1763f0abc83ef8cd37bfae",
-  "runner.py": "789d94a6b6c706f815ea367b07631077",
-  "vlm_runner.py": "c39a344cf6554bff154367252153cda5"
+  "runner.py": "548975f8756d8f1612e683d54774314d",
+  "vlm_runner.py": "ed851632cf6df74fc49763d5648cfee9"
  },
  "jaccl_sha256": "cb2c4638c7a89cbf082e297e222a734c3d2988d6edf801b9680ebb26da9d858b",
  "jaccl_sha256_16": "cb2c4638c7a89cbf",
@@ -41,6 +41,7 @@
   "mimo_v2_alias.py": "2ff38dc53fde4171f7e7f207ab1c2e7c",
   "minimax_m3_alias.py": "323029f936a5c333019e93d69a794dff",
   "minimax_m3_model.py": "d6c6d5def7827485479578344ba298cb",
+  "mlx_vlm_atem_call_marker.py": "379b1dbe928408076d050d6154f3956e",
   "pipeline_split_coverage.py": "ac445a8810aab49c45656b54cc1e5949",
   "standard_yarn_rope.py": "ffcc5fee24c9300d40dedb565a0e3758"
  }
