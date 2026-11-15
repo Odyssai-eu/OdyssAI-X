@@ -68,7 +68,7 @@ from mlx.nn.layers.distributed import shard_inplace, shard_linear
 # Bumped on every change. Logged at boot and stamped on the ready event so a
 # node running a stale copy after a missed sync is visible in the engine logs
 # instead of surfacing as a mysterious rank behavior difference.
-RUNNER_VERSION = "2026-11-15.2"
+RUNNER_VERSION = "2026-11-15.3"
 
 # ── stdout/stderr contract ────────────────────────────────────────────────────
 
@@ -558,9 +558,9 @@ def _inkling2_stream(model, tokenizer, processor, config, messages, images,
     Prompt rules (INTEGRATION-MOTEUR-inkling2.md §6): apply_chat_template
     returns ids in mlx_lm 0.32 and does NOT add the generation prefix —
     [message_model, content_thinking] are appended by hand. EOS is
-    <|end_message|> (200010), never tokenizer.eos_token_id. Reasoning
-    output lives between <|content_thinking|> and <|content_text|>; those
-    markers are counted and stripped from the emitted text.
+    <|content_model_end_sampling|> (200006), never tokenizer.eos_token_id
+    (None). The reasoning/answer envelope is emitted verbatim for the
+    engine's think filter.
 
     Images (§7): the Processor pads to 40px blocks and expands one
     <|unused_200054|> per block; pixel_values feed model.embed_inputs ONCE
@@ -569,14 +569,20 @@ def _inkling2_stream(model, tokenizer, processor, config, messages, images,
     """
     import mlx_lm.sample_utils as _su
 
-    eos = tokenizer.convert_tokens_to_ids("<|end_message|>") or 200010
+    # A reply is TWO messages (chat_template.jinja):
+    #   <|content_thinking|>REASONING<|end_message|>
+    #   <|message_model|><|content_text|>ANSWER<|end_message|>
+    #   <|content_model_end_sampling|>
+    # so the stop token is <|content_model_end_sampling|> (config.json
+    # eos_token_id, 200006). Stopping on <|end_message|> cut every reply at
+    # the end of the reasoning, before the answer (seen 2026-11-15).
+    eos = (int(config.get("eos_token_id") or 0)
+           or tokenizer.convert_tokens_to_ids("<|content_model_end_sampling|>")
+           or 200006)
+    end_message = tokenizer.convert_tokens_to_ids("<|end_message|>") or 200010
     msg_model = tokenizer.convert_tokens_to_ids("<|message_model|>") or 200001
     content_thinking = (tokenizer.convert_tokens_to_ids("<|content_thinking|>")
                         or 200008)
-    # Verified on the checkpoint's tokenizer (2026-11-15): <|content_text|>
-    # is 200004, NOT the 200009 the handoff guessed ("200009 environ").
-    content_text = (tokenizer.convert_tokens_to_ids("<|content_text|>")
-                    or 200004)
 
     def _build_ids(msgs):
         p = tokenizer.apply_chat_template(msgs, add_generation_prompt=True,
@@ -690,22 +696,28 @@ def _inkling2_stream(model, tokenizer, processor, config, messages, images,
     tok = _sample(logits)
     n_gen = 0
     reasoning_tokens = 0
+    # The envelope goes out VERBATIM: the engine's "inkling" think filter
+    # (_THINK_MARKERS / _THINK_STRIP in api.py) splits reasoning from answer
+    # on these tags, for stream and non-stream alike. The prompt prefilled
+    # <|content_thinking|>, so the open tag is restored on the first chunk.
+    pending_open = "<|content_thinking|>"
+    in_thinking = True
     max_tokens = int(gen_kwargs.get("max_tokens") or 0) or (2 ** 31 - 1)
     while True:
         tid = int(tok.item())
         toks.append(tid)
         if tid == eos:
-            yield _NS(text="", token=tid, token_ids=[tid],
+            yield _NS(text=pending_open, token=tid, token_ids=[tid],
                       prompt_tokens=plen, finish_reason="stop",
                       reasoning_tokens=reasoning_tokens or None)
             break
-        text_out = ""
-        if tid == content_thinking:
-            reasoning_tokens += 1
-        elif tid == content_text:
-            pass                    # marqueur de fin de raisonnement
-        else:
-            text_out = tokenizer.decode([tid])
+        if in_thinking:
+            if tid == end_message:
+                in_thinking = False
+            else:
+                reasoning_tokens += 1
+        text_out = pending_open + tokenizer.decode([tid])
+        pending_open = ""
         n_gen += 1
         terminal = n_gen >= max_tokens
         yield _NS(text=text_out, token=tid, token_ids=[tid],
