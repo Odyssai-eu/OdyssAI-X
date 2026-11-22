@@ -1317,7 +1317,8 @@ def _model_load_overhead_factor() -> float:
 
 
 def _cluster_total_ram_bytes(cluster: str, nodes_count: int,
-                             topo: Optional[list[dict]] = None) -> tuple[int, list[dict]]:
+                             topo: Optional[list[dict]] = None,
+                             probe: bool = True) -> tuple[int, list[dict]]:
     """Sum RAM across the nodes that would be used for a load of `cluster`
     at `nodes_count`. Uses the cached telemetry probe data; falls back to
     a static map per known hardware when telemetry hasn't yet probed a node.
@@ -1332,6 +1333,10 @@ def _cluster_total_ram_bytes(cluster: str, nodes_count: int,
 
     `topo` overrides the contiguous-from-0 selection with the pool's actual
     nodes (a pool built from node_indices).
+
+    `probe=False` skips the blocking ssh fallback: read-only callers on the
+    event loop (the dashboard's polled cluster GET) must never wait on a
+    powered-off node. Load paths keep `probe=True` and run off the loop.
     """
     if topo is None:
         try:
@@ -1364,7 +1369,7 @@ def _cluster_total_ram_bytes(cluster: str, nodes_count: int,
         # split → the 256 GB rank OOM'd at 82% with no traceback). Probe the
         # node's real iogpu.wired_limit_mb + hw.memsize directly over ssh. Cheap
         # (once per load), and it's the ACTUAL Metal ceiling the split needs.
-        if (not ram or not wired_limit) and ssh:
+        if probe and (not ram or not wired_limit) and ssh:
             try:
                 rc, probe_out, _ = _ssh_exec(
                     ssh, "sysctl -n iogpu.wired_limit_mb hw.memsize", 8)
@@ -3928,8 +3933,8 @@ class RunnerPool:
         ram_weights_csv: Optional[str] = None
         if self.nodes_count > 1 and self.mode == "pipeline":
             try:
-                _total, per_node = _cluster_total_ram_bytes(
-                    self.cluster, self.nodes_count
+                _total, per_node = await asyncio.to_thread(
+                    _cluster_total_ram_bytes, self.cluster, self.nodes_count
                 )
                 # _cluster_total_ram_bytes returns entries in rank order
                 # (builds via build_topology). Use wired_limit when set,
@@ -4676,8 +4681,8 @@ class VLMDistPool(RunnerPool):
         # so .29 (460 GiB) takes proportionally more layers than a 256 GB node.
         ram_weights_csv: Optional[str] = None
         if self.shard_mode == "pipeline" and len(self.nodes) > 1:
-            _total, per_node = _cluster_total_ram_bytes(
-                self.cluster, len(self.nodes),
+            _total, per_node = await asyncio.to_thread(
+                _cluster_total_ram_bytes, self.cluster, len(self.nodes),
                 topo=sorted(self.nodes, key=lambda x: x["rank"]))
             weights = [int(e.get("wired_limit_bytes") or e.get("ram_bytes") or 0)
                        for e in per_node]
@@ -8874,7 +8879,7 @@ def _initial_default_config() -> Optional[dict]:
 #   major (1.7.2 → 2.0.0) — breaking API or topology change
 #
 # Use `./scripts/bump-version.sh patch|minor|major` to bump + auto-commit.
-APP_VERSION = "1.65.15"
+APP_VERSION = "1.65.16"
 
 app = FastAPI(
     title="OdyssAI-X (odyssai.eu)",
@@ -16149,6 +16154,15 @@ async def admin_clusters_list():
 
 @app.get("/admin/clusters/{cluster_id}")
 async def admin_cluster_get(cluster_id: str):
+    # Polled by the dashboard for every cluster: cached telemetry only, never
+    # the blocking ssh probe (it froze the whole event loop with nodes off).
+    return _cluster_detail(cluster_id, probe=False)
+
+
+def _cluster_detail(cluster_id: str, probe: bool) -> dict:
+    """Cluster definition + capacity table. Sync and, with `probe=True`,
+    blocking (ssh per node without telemetry): call it with probe=True only
+    through asyncio.to_thread, as the load preflight does."""
     if not cluster_exists(cluster_id):
         raise HTTPException(404, f"unknown cluster {cluster_id}")
     cd = get_cluster_def(cluster_id)
@@ -16161,7 +16175,7 @@ async def admin_cluster_get(cluster_id: str):
     capacity_by_nodes: dict[int, dict] = {}
     for n in range(1, effective_max + 1):
         try:
-            total, per_node = _cluster_total_ram_bytes(cluster_id, n)
+            total, per_node = _cluster_total_ram_bytes(cluster_id, n, probe=probe)
             # Per-rank ceiling honors actual wired_limit_mb when telemetry has
             # it, else falls back to 0.75×RAM. Mirrors _validate_load_fits().
             node_budgets = []
@@ -16310,7 +16324,9 @@ async def _gather_preflight(cluster_id: str, model: str,
     rank0 (busy with another pool) may not even have it rsynced. Without this
     the preflight reported 'config absent' against the wrong node."""
     import preflight
-    detail = await admin_cluster_get(cluster_id)
+    # The load gate needs real capacity even when telemetry has not probed a
+    # node yet: keep the ssh fallback here, off the event loop.
+    detail = await asyncio.to_thread(_cluster_detail, cluster_id, True)
     cap = detail.get("capacity_by_nodes", {})
     max_nodes = int(detail.get("max_nodes", 1) or 1)
     per_node = (cap.get(str(max_nodes)) or {}).get("per_node") or []
@@ -17431,7 +17447,8 @@ async def admin_cluster_load_options(cluster_id: str, model: str):
         modes = ["solo"] if n == 1 else ["pipeline", "tensor"]
         for mode in modes:
             # Fit is mode-dependent: pipeline gets the capacity-aware split.
-            fit_ok, fit_reason, fit_detail = _validate_load_fits(
+            fit_ok, fit_reason, fit_detail = await asyncio.to_thread(
+                _validate_load_fits,
                 size_bytes, cluster_id, n,
                 mode="pipeline" if mode in ("solo", "pipeline") else mode,
                 arch=arch)
@@ -17873,7 +17890,8 @@ async def admin_cluster_load(cluster_id: str, req: ArgoLoadRequest):
         # model-dependent (DeepSeek V4: 146 GiB on disk, 271 GB resident, while
         # MiniMax M2.7 at 173 GiB loads fine) — that case is caught later by the
         # load-time RSS guard. force=true overrides, like the VLM/RAM checks.
-        _rep_caps = _node_load_ceilings(cluster_id, len(_rep_indices))
+        _rep_caps = await asyncio.to_thread(
+            _node_load_ceilings, cluster_id, len(_rep_indices))
         if _rep_size and not getattr(req, "force", False):
             _tight = [c for c in _rep_caps if c["ceiling"] and _rep_size > c["ceiling"]]
             if _tight:
@@ -18367,8 +18385,9 @@ async def admin_cluster_load(cluster_id: str, req: ArgoLoadRequest):
         req.use_ap = True
 
     size_bytes = await get_model_size_bytes(rank0_ssh, model_abspath)
-    ok, reason, detail = _validate_load_fits(size_bytes, cluster_id, nodes_count,
-                                             mode=req.mode, arch=arch)
+    ok, reason, detail = await asyncio.to_thread(
+        _validate_load_fits, size_bytes, cluster_id, nodes_count,
+        mode=req.mode, arch=arch)
     if not ok and not getattr(req, "force", False):
         raise HTTPException(400, {
             "error": "model_too_big_for_cluster",
@@ -20615,7 +20634,7 @@ async def _load_vlm_replica(cluster_id: str, alias: str, req, model_path: str,
     port = int(getattr(req, "vlm_port", None) or VLM_DEFAULT_PORT)
     venv = _vlm_venv_for(model_path, getattr(req, "venv", None))
     size = await get_model_size_bytes(rank0_ssh, model_path)
-    caps = _node_load_ceilings(cluster_id, len(indices))
+    caps = await asyncio.to_thread(_node_load_ceilings, cluster_id, len(indices))
     if size and not getattr(req, "force", False):
         tight = [c for c in caps if c["ceiling"] and size > c["ceiling"]]
         if tight:
