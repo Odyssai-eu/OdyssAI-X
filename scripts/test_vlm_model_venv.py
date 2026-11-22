@@ -44,6 +44,15 @@ check("request venv wins", api._vlm_venv_for("MiniMaxAI/MiniMax-M3.1-Flash", " /
 check("blank request venv ignored", api._vlm_venv_for("MiniMaxAI/MiniMax-M3.1-Flash", "  "), M31)
 check("empty model -> default venv", api._vlm_venv_for(""), api.VLM_DEFAULT_VENV)
 
+# Inkling-2-Mini (inkling2_loop): the native thinkingmachines checkpoint runs
+# from mlx-vlm main; the third-party conversions stay on the default venv.
+INK = "$HOME/.venvs/mlx-vlm-inkling2-mini"
+check("inkling2 mini native checkpoint", api._vlm_venv_for(
+    "/Volumes/models/odysseus/thinkingmachines/Inkling-2-Mini"), INK)
+check("inkling2 mini relative id", api._vlm_venv_for("thinkingmachines/Inkling-2-Mini"), INK)
+check("inkling2 mini mlx-lm conversion stays on the default venv",
+      api._vlm_venv_for("pipenetwork/Inkling-2-Mini-MLX-bf16"), api.VLM_DEFAULT_VENV)
+
 # Every mlx_vlm.server launch site and the preflight probe go through the map.
 for fn in (api._gather_preflight, api.admin_cluster_load, api._load_vlm_replica,
            api.admin_vlm_load):

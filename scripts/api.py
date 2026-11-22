@@ -8874,7 +8874,7 @@ def _initial_default_config() -> Optional[dict]:
 #   major (1.7.2 → 2.0.0) — breaking API or topology change
 #
 # Use `./scripts/bump-version.sh patch|minor|major` to bump + auto-commit.
-APP_VERSION = "1.65.14"
+APP_VERSION = "1.65.15"
 
 app = FastAPI(
     title="OdyssAI-X (odyssai.eu)",
@@ -20204,8 +20204,18 @@ VLM_DEFAULT_PORT = int(env_get("VLM_PORT", "8080") or "8080")
 # (8779e8c4) on mlx 0.32.4 loads the released checkpoint unchanged, text and
 # image. Only the source checkpoint: the mlx-lm repack (-nvfp4h16) is not in
 # the layout mlx-vlm reads.
+#
+# Inkling-2-Mini (2026-11-22): model_type inkling2_loop is unknown to the
+# default venv's mlx-vlm (87020830): "No module named
+# mlx_vlm.speculative.drafters.inkling2_loop". mlx-vlm main since #2778
+# (111ac668) maps inkling2_loop to its inkling2 module and loads the native
+# thinkingmachines checkpoint as released (NVFP4/MXFP8 experts, keep
+# hf_quant_config.json). ~/.venvs/mlx-vlm-inkling2-mini pins mlx-vlm f1618d6d
+# on mlx 0.32.4. Only the native checkpoint: the mlx-lm#2086 and inferencerlabs
+# conversions are in layouts mlx-vlm does not read.
 VLM_MODEL_VENVS: dict[str, str] = {
     "MiniMax-M3.1-Flash": "$HOME/.venvs/mlx-vlm-m31",
+    "Inkling-2-Mini": "$HOME/.venvs/mlx-vlm-inkling2-mini",
 }
 # Checkpoints whose distributed runner must NOT get MLX_METAL_FAST_SYNCH=1.
 # MiniMax-M3.1-Flash TP2 on .30+.31 (2026-10-24, mlx 0.32.4): the first
