@@ -31,12 +31,14 @@
   "qwen4_exp.py": "b4c1744ba4d770b4cfeb730f6b717189"
  },
  "patches": {
-  "__init__.py": "e95fddc1792922b8d42d3a73a8b3cf46",
+  "__init__.py": "872cd807783859a67a4b01b6473d8ab1",
   "bailing_hybrid_alias.py": "109154fa41427bcccf6c9cb8cab9d244",
   "bailing_hybrid_model.py": "3f4d65717cfad083c2c874c97dfa9da9",
   "g9v3_alias.py": "eab0efadecf3ce9f31eb1637e6b73db6",
   "g9v3_model.py": "a7624bb491a6c91cdc37001ba3b1579a",
   "glm_moe_dsa_model.py": "ab413a6fa47cebbe20343dbbdada0bd7",
+  "k2_horizon_alias.py": "431efc19242bf13599653a6131f226ec",
+  "k2_horizon_model.py": "5886439cc970889b1689f0003906d655",
   "longcat2_pipeline.py": "8b5885a2e265ec31564a7990eed8b022",
   "mimo_v2_alias.py": "2ff38dc53fde4171f7e7f207ab1c2e7c",
   "minimax_m3_alias.py": "323029f936a5c333019e93d69a794dff",

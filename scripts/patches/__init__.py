@@ -21,6 +21,7 @@ import sys
 
 from .bailing_hybrid_alias import apply_bailing_hybrid
 from .g9v3_alias import apply_g9v3
+from .k2_horizon_alias import apply_k2_horizon
 from .minimax_m3_alias import apply_minimax_m3
 from .mimo_v2_alias import apply_mimo_v2_alias
 from .pipeline_split_coverage import apply_pipeline_split_fix
@@ -74,6 +75,7 @@ def apply_mlx_patches() -> None:
     apply_bailing_hybrid()
     apply_minimax_m3()
     apply_g9v3()
+    apply_k2_horizon()
     # apply_glm_dsa()  # DEBRANCHE 2026-08-29: venv glm_moe_dsa = PR#1410 head (coherent full/shared), le patch Option A (juin, GLM-5.2) mixait mal avec le snapshot -> 3 bugs multi-node. Re-brancher SEULEMENT si regression GLM-5.2.
     if apply_longcat2_pipeline is not None:
         apply_longcat2_pipeline()
