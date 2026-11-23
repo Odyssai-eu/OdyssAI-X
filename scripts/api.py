@@ -8891,7 +8891,7 @@ def _initial_default_config() -> Optional[dict]:
 #   major (1.7.2 → 2.0.0) — breaking API or topology change
 #
 # Use `./scripts/bump-version.sh patch|minor|major` to bump + auto-commit.
-APP_VERSION = "1.65.17"
+APP_VERSION = "1.65.18"
 
 app = FastAPI(
     title="OdyssAI-X (odyssai.eu)",
@@ -20646,8 +20646,12 @@ async def _load_vlm_replica(cluster_id: str, alias: str, req, model_path: str,
     one mlx_vlm.server per node under the cluster admin lock."""
     port = int(getattr(req, "vlm_port", None) or VLM_DEFAULT_PORT)
     venv = _vlm_venv_for(model_path, getattr(req, "venv", None))
-    draft_path = (_vlm_resolve_model_path(req.draft, base_dir)
-                  if getattr(req, "draft", None) else None)
+    draft = getattr(req, "draft", None)
+    if not draft and getattr(req, "use_drafter", None) is not False:
+        # Same model→drafter association the single-node VL load applies: this
+        # branch returns before that block runs.
+        draft = (_drafter_for_model(model_path) or {}).get("draft")
+    draft_path = _vlm_resolve_model_path(draft, base_dir) if draft else None
     size = await get_model_size_bytes(rank0_ssh, model_path)
     caps = await asyncio.to_thread(_node_load_ceilings, cluster_id, len(indices))
     if size and not getattr(req, "force", False):
