@@ -4769,7 +4769,7 @@ function renderArgoHeader(a) {
   const def = state.cluster_defs?.[cid];
   const clusterName = CLUSTERS.find(c => c.id === cid)?.name || cid || "Cluster";
   const loaded = !!a.loaded;
-  const topo = (a.topology || []).map(n => n.ssh.split("@")[1].split(".").pop()).map(s => "." + s).join(" / ") || "—";
+  const topo = (a.topology || []).map(n => (n.ssh || "").split("@").pop().split(".").pop() || "?").map(s => "." + s).join(" / ") || "—";
   const pillCls = loaded ? "" : "idle";
   const pillLabel = loaded ? "Loaded" : "Idle";
   // Derive backend label from the cluster def so the sub line matches

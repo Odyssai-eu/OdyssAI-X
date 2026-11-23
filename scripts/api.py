@@ -839,6 +839,16 @@ def validate_cluster_def(cluster_id: str, new_def: dict) -> Optional[str]:
     masters = [n for n in nodes if n.get("master")]
     if len(masters) != 1:
         return f"exactly 1 master required (got {len(masters)})"
+    # Fill a missing ssh from the host inventory — before the per-kind returns
+    # below: replica and decision clusters used to skip it and persist a node
+    # with ssh=None (dead replica, dashboard render crash, 2026-11-23).
+    for n in nodes:
+        if not n.get("ssh"):
+            host_id = n.get("host")
+            inv = next((h for h in _inventory_hosts() if h["id"] == host_id), None)
+            if not inv:
+                return f"unknown host: {host_id}"
+            n["ssh"] = inv["ssh"]
 
     # Telemak (single-Mac native runtime) — http-proxy passthrough to a Swift
     # binary running on a Mac on the LAN. The OdyssAI-X orchestrator does not
@@ -879,14 +889,6 @@ def validate_cluster_def(cluster_id: str, new_def: dict) -> Optional[str]:
                 if src == dst: continue
                 if not RDMA_WIRING.get(src, {}).get(dst):
                     return f"no RDMA wiring from {src} to {dst}"
-    # Ensure ssh field is filled (look up the host inventory if missing)
-    for n in nodes:
-        if not n.get("ssh"):
-            host_id = n.get("host")
-            inv = next((h for h in _inventory_hosts() if h["id"] == host_id), None)
-            if not inv:
-                return f"unknown host: {host_id}"
-            n["ssh"] = inv["ssh"]
     return None
 
 
@@ -8909,7 +8911,7 @@ def _initial_default_config() -> Optional[dict]:
 #   major (1.7.2 → 2.0.0) — breaking API or topology change
 #
 # Use `./scripts/bump-version.sh patch|minor|major` to bump + auto-commit.
-APP_VERSION = "1.65.19"
+APP_VERSION = "1.65.20"
 
 app = FastAPI(
     title="OdyssAI-X (odyssai.eu)",

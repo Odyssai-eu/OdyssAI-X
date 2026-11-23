@@ -54,5 +54,18 @@ check("a current member's ssh wins over the remembered one",
 check("non-cluster keys are not read as hosts",
       sorted(api._load_cluster_config()["known_hosts"]), ["node-a", "node-b"])
 
+# A node named by id only gets its ssh from the inventory, for every kind:
+# replica and decision returned before the fill and persisted ssh=None.
+for kind in ("replica", "decision", "mlx-distributed"):
+    d = {"kind": kind, "backend": "ring",
+         "nodes": [{"host": "node-a", "master": True}]}
+    err = api.validate_cluster_def("c9", d)
+    check(f"{kind}: id-only node validates", err, None)
+    check(f"{kind}: id-only node gets its ssh", d["nodes"][0].get("ssh"), "admin@192.0.2.1")
+check("unknown id-only host is refused",
+      api.validate_cluster_def("c9", {"kind": "replica", "backend": "ring",
+                                      "nodes": [{"host": "nope", "master": True}]}),
+      "unknown host: nope")
+
 print("all OK" if not FAILS else f"{len(FAILS)} FAILED: {FAILS}")
 sys.exit(1 if FAILS else 0)
