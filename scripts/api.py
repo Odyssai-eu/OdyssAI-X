@@ -408,12 +408,30 @@ def _load_cluster_config() -> dict:
         return copy.deepcopy(cfg)
 
 
+def _remember_hosts(cfg: dict, before: dict) -> None:
+    """Keep every host a cluster has had in cfg["known_hosts"] ({id: ssh}).
+    The inventory used to be the nodes of the current clusters only, so a host
+    removed from its last cluster vanished from "+ Add node" with no way back
+    (m4pro-24, 2026-11-23). Reads the entries as they were on disk too: the
+    save that drops a node is the last one that can still see it."""
+    known = cfg.get("known_hosts")
+    if not isinstance(known, dict):
+        known = cfg["known_hosts"] = {}
+    for src in (before, cfg):
+        for entry in src.values():
+            nodes = entry.get("nodes") if isinstance(entry, dict) else None
+            for n in nodes if isinstance(nodes, list) else []:
+                if isinstance(n, dict) and n.get("host") and n.get("ssh"):
+                    known[n["host"]] = n["ssh"]
+
+
 def _save_cluster_config(cfg: dict) -> None:
     """Persist atomically (tmp + os.replace) under the config lock and refresh
     the cache. Prefer `_cluster_config_txn()` for read-modify-write so the
     read and write share one lock hold (no lost updates)."""
     global _config_cache, _config_cache_ts
     with _config_lock:
+        _remember_hosts(cfg, _read_cluster_config_from_disk())
         try:
             tmp = CLUSTER_CONFIG_FILE.with_name(CLUSTER_CONFIG_FILE.name + ".tmp")
             tmp.write_text(json.dumps(cfg, indent=2))
@@ -8891,7 +8909,7 @@ def _initial_default_config() -> Optional[dict]:
 #   major (1.7.2 → 2.0.0) — breaking API or topology change
 #
 # Use `./scripts/bump-version.sh patch|minor|major` to bump + auto-commit.
-APP_VERSION = "1.65.18"
+APP_VERSION = "1.65.19"
 
 app = FastAPI(
     title="OdyssAI-X (odyssai.eu)",
@@ -14681,6 +14699,12 @@ def _inventory_hosts() -> list[dict]:
             out.append({"id": h["id"], "ssh": h["ssh"], "rdma_wired": False,
                         "label": h.get("label") or h["id"]})
             seen.add(h["id"])
+    known = _load_cluster_config().get("known_hosts")
+    for host_id, ssh in (known.items() if isinstance(known, dict) else []):
+        if host_id not in seen:
+            out.append({"id": host_id, "ssh": ssh, "rdma_wired": False,
+                        "label": host_id})
+            seen.add(host_id)
     return out
 
 # In-memory cache: { "matrix": {...}, "ts": epoch }.
