@@ -4944,7 +4944,8 @@ class VLMReplicaPool:
     def __init__(self, model_path: str, cluster: str, alias: str,
                  node_indices: list[int], port: int, venv: str,
                  max_num_seqs: Optional[int] = None,
-                 ready_timeout: Optional[float] = None):
+                 ready_timeout: Optional[float] = None,
+                 draft_model: Optional[str] = None):
         self.model = model_path
         self.model_path = model_path
         self.cluster = cluster
@@ -4960,7 +4961,7 @@ class VLMReplicaPool:
         self.batch = True
         # Per-replica concurrency cap exported to the servers (None = unbounded).
         self.max_num_seqs = int(max_num_seqs) if max_num_seqs else None
-        self.draft_model: Optional[str] = None
+        self.draft_model: Optional[str] = draft_model
         self.num_draft_tokens = 4
         self.runners: list = []
         self.backend = "http-proxy"
@@ -4980,7 +4981,8 @@ class VLMReplicaPool:
             self.children.append(VLMPool(
                 model_path=model_path, cluster=cluster, alias=self.alias,
                 node_indices=[idx], upstream=f"http://{ip}:{self.port}",
-                port=self.port, ssh_target=ssh, host=host, pid=None, venv=venv))
+                port=self.port, ssh_target=ssh, host=host, pid=None, venv=venv,
+                draft_model=draft_model))
         self._live: set[int] = set()
         self._inflight: dict[int, int] = {i: 0 for i in range(len(self.children))}
         self._affinity: dict[str, tuple[int, float]] = {}
@@ -5023,6 +5025,13 @@ class VLMReplicaPool:
                         f"{c.host}:{c.port} already serves this model (adopted) — "
                         f"cannot apply max_num_seqs={self.max_num_seqs}; "
                         f"unload the pool first")
+                if self.draft_model:
+                    # Same reason: an adopted server may run without the
+                    # drafter while the pool reports one.
+                    raise RuntimeError(
+                        f"{c.host}:{c.port} already serves this model (adopted) — "
+                        f"cannot attach drafter {self.draft_model}; "
+                        f"unload the pool first")
                 sys.stderr.write(
                     f"[vlm-replica] {self.cluster}[{self.alias}] replica {i} "
                     f"({c.host}): {c.upstream} already serves this model — adopted\n")
@@ -5032,7 +5041,8 @@ class VLMReplicaPool:
                 f"not touching it")
         ready, pid, tail = await _launch_vlm_server(
             c.ssh_target, self._log_id(i), c.model_path, c.port, c.venv,
-            self.ready_timeout, max_num_seqs=self.max_num_seqs)
+            self.ready_timeout, max_num_seqs=self.max_num_seqs,
+            draft_model=self.draft_model)
         if not ready:
             try:
                 await c.stop()
@@ -6050,6 +6060,7 @@ def save_cluster_state_v2(cluster_id: str, *,
                 "port": pool.port,
                 "venv": getattr(pool, "venv", None),
                 "max_num_seqs": getattr(pool, "max_num_seqs", None),
+                "draft_model": getattr(pool, "draft_model", None),
             })
             continue
         if getattr(pool, "is_replica", False):
@@ -7597,7 +7608,8 @@ async def _restore_cluster_pools(cid: str, leaked_hosts: Optional[set] = None,
                     venv=entry.get("venv") or VLM_DEFAULT_VENV,
                     # .get, never entry[...]: entries saved before #108 have
                     # no key — restore unbounded (3-amigos, GLM-2/Kimi-3).
-                    max_num_seqs=entry.get("max_num_seqs"))
+                    max_num_seqs=entry.get("max_num_seqs"),
+                    draft_model=entry.get("draft_model"))
                 await vrpool.start()
                 set_pool(cid, alias, vrpool)
                 restored.append(alias)
@@ -8879,7 +8891,7 @@ def _initial_default_config() -> Optional[dict]:
 #   major (1.7.2 → 2.0.0) — breaking API or topology change
 #
 # Use `./scripts/bump-version.sh patch|minor|major` to bump + auto-commit.
-APP_VERSION = "1.65.16"
+APP_VERSION = "1.65.17"
 
 app = FastAPI(
     title="OdyssAI-X (odyssai.eu)",
@@ -17871,7 +17883,7 @@ async def admin_cluster_load(cluster_id: str, req: ArgoLoadRequest):
                      "(vision checkpoint on a kind=replica cluster)")
         if _rep_arch.get("is_vision") and not getattr(req, "force", False):
             return await _load_vlm_replica(cluster_id, alias, req, model_abspath,
-                                           _rep_indices, rank0_ssh)
+                                           _rep_indices, rank0_ssh, base_dir=base_dir)
         # Feed the SAME loading-progress state the distributed and VLM paths
         # use (mirror of the 2026-07-08 VLM fix). Without it /status reports
         # `loading: null` for the whole fan-out, so the dashboard shows no
@@ -20627,12 +20639,15 @@ def _vlm_pool_log_id(cluster_id: str, alias: str) -> str:
 
 
 async def _load_vlm_replica(cluster_id: str, alias: str, req, model_path: str,
-                            indices: list[int], rank0_ssh: str) -> dict:
+                            indices: list[int], rank0_ssh: str,
+                            base_dir: Optional[str] = None) -> dict:
     """Load path for #76: a vision model on a `kind: replica` cluster. Same
     capacity floor as the text replica (every node holds a full copy), then
     one mlx_vlm.server per node under the cluster admin lock."""
     port = int(getattr(req, "vlm_port", None) or VLM_DEFAULT_PORT)
     venv = _vlm_venv_for(model_path, getattr(req, "venv", None))
+    draft_path = (_vlm_resolve_model_path(req.draft, base_dir)
+                  if getattr(req, "draft", None) else None)
     size = await get_model_size_bytes(rank0_ssh, model_path)
     caps = await asyncio.to_thread(_node_load_ceilings, cluster_id, len(indices))
     if size and not getattr(req, "force", False):
@@ -20671,7 +20686,8 @@ async def _load_vlm_replica(cluster_id: str, alias: str, req, model_path: str,
                 model_path=model_path, cluster=cluster_id, alias=alias,
                 node_indices=indices, port=port, venv=venv,
                 max_num_seqs=getattr(req, "vlm_max_num_seqs", None),
-                ready_timeout=float(getattr(req, "ready_timeout_s", None) or VLM_READY_TIMEOUT_S))
+                ready_timeout=float(getattr(req, "ready_timeout_s", None) or VLM_READY_TIMEOUT_S),
+                draft_model=draft_path)
             try:
                 await vrpool.start()
             except RuntimeError as e:
@@ -20684,6 +20700,7 @@ async def _load_vlm_replica(cluster_id: str, alias: str, req, model_path: str,
         "loaded": True, "cluster": cluster_id, "alias": alias,
         "is_vlm": True, "is_vlm_replica": True, "dispatched": "vlm-replica-pool",
         "model": model_path, "nodes": len(indices), "port": port,
+        "draft_model": draft_path,
         "replicas": vrpool.replica_stats(), "load_s": vrpool.load_s,
         "note": (f"{req.model} servi en REPLICA VISION sur {len(indices)} nodes — "
                  f"un mlx_vlm.server par node, affinité de session puis moins chargé."),
