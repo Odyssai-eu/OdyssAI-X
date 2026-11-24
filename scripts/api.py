@@ -7112,6 +7112,28 @@ class ChatMessage(BaseModel):
     name: Optional[str] = None
     tool_calls: Optional[list[dict]] = None
     tool_call_id: Optional[str] = None
+    # Reasoning of a past assistant turn, sent back by agents so the chat
+    # template can render it (Inkling <|content_thinking|>). Undeclared, pydantic
+    # dropped it silently and the template saw no reasoning at all.
+    reasoning_content: Optional[str] = None
+    reasoning: Optional[str] = None
+
+
+# Upstream providers reject fields they do not know; the reasoning fields above
+# only mean something to the local chat template. Strip them before any cloud
+# or telemak relay. mlx-vlm / dflash relays keep them.
+_LOCAL_ONLY_MESSAGE_FIELDS = ("reasoning_content", "reasoning")
+
+
+def _strip_local_message_fields(body: dict) -> dict:
+    msgs = body.get("messages")
+    if isinstance(msgs, list):
+        body["messages"] = [
+            {k: v for k, v in m.items() if k not in _LOCAL_ONLY_MESSAGE_FIELDS}
+            if isinstance(m, dict) else m
+            for m in msgs
+        ]
+    return body
 
 
 def _thinking_from_aliases(d: dict) -> Optional[bool]:
@@ -12704,7 +12726,7 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
         if tele_cluster and cluster_exists(tele_cluster):
             cd_t = get_cluster_def(tele_cluster)
             if cd_t.get("kind") == "telemak":
-                body = req.model_dump(exclude_none=True)
+                body = _strip_local_message_fields(req.model_dump(exclude_none=True))
                 return await _telemak_proxy_chat_completion(
                     tele_cluster, cd_t, body, bool(req.stream),
                     requested_short_id=tele_short,
@@ -12717,7 +12739,7 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
     if cloud:
         prov_id, prov, entry = cloud
         _refuse_decision_alias(req.model, prov_id, prov)
-        body = req.model_dump(exclude_none=True)
+        body = _strip_local_message_fields(req.model_dump(exclude_none=True))
         return await _proxy_chat_completion(prov_id, prov, entry, body)
 
     # 2. Local pool route (existing behaviour).
@@ -12730,7 +12752,7 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
             fb_cloud = find_cloud_alias(fb_alias)
             if fb_cloud and _provider_protocol(fb_cloud[1]) != "systemone":
                 prov_id, prov, entry = fb_cloud
-                body = req.model_dump(exclude_none=True)
+                body = _strip_local_message_fields(req.model_dump(exclude_none=True))
                 sys.stderr.write(
                     f"[fallback] {req.model!r} unavailable → routing to "
                     f"cloud alias {fb_alias!r} ({prov_id})\n"
