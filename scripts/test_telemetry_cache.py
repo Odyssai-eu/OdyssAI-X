@@ -40,7 +40,7 @@ async def slow_probe(host):
     return {"id": host["id"], "round": len(probes)}
 
 
-api.HOSTS_REGISTRY = [{"id": "a", "ssh": "admin@198.51.100.1"}]
+api._build_hosts_registry = lambda: [{"id": "a", "ssh": "admin@198.51.100.1"}]
 api._probe_telemetry = slow_probe
 
 

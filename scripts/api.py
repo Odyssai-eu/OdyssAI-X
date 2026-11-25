@@ -2693,7 +2693,7 @@ async def _dl_restart(dl_id: str, d: dict) -> dict:
                  "a fresh download")
     resolved = []
     for tid in d.get("targets", []):
-        h = next((x for x in HOSTS_REGISTRY if x["id"] == tid), None)
+        h = next((x for x in _build_hosts_registry() if x["id"] == tid), None)
         if h:
             resolved.append(h)
     if not resolved:
@@ -2924,7 +2924,7 @@ async def _dl_reattach() -> None:
         j["_hf_token"] = None       # never persisted; resume of a gated repo needs a new POST
         j["hf_token_set"] = False
         _downloads.setdefault(j["id"], j)
-    hosts = list(HOSTS_REGISTRY)
+    hosts = _build_hosts_registry()
     scans = await asyncio.gather(*[asyncio.to_thread(_dl_scan_host, h) for h in hosts],
                                  return_exceptions=True)
     live: dict[tuple, dict] = {}
@@ -8933,7 +8933,7 @@ def _initial_default_config() -> Optional[dict]:
 #   major (1.7.2 → 2.0.0) — breaking API or topology change
 #
 # Use `./scripts/bump-version.sh patch|minor|major` to bump + auto-commit.
-APP_VERSION = "1.65.21"
+APP_VERSION = "1.65.22"
 
 app = FastAPI(
     title="OdyssAI-X (odyssai.eu)",
@@ -14355,7 +14355,7 @@ async def admin_metrics(cluster: Optional[str] = None, limit: int = 50,
 class HFDownloadRequest(BaseModel):
     repo: str  # "org/name[/subfolder]" — normalised by _normalize_hf_repo
     hf_token: Optional[str] = None
-    # Host ids from HOSTS_REGISTRY. Each target uses its own models_dir.
+    # Host ids from the host registry. Each target uses its own models_dir.
     # Empty list means "first configured host" so open-source installs do
     # not inherit any author's LAN target.
     targets: list[str] = Field(default_factory=list)
@@ -14374,12 +14374,13 @@ async def admin_downloads_create(req: HFDownloadRequest):
         repo = _normalize_hf_repo(req.repo)
     except ValueError as e:
         raise HTTPException(400, str(e))
-    targets = req.targets or ([HOSTS_REGISTRY[0]["id"]] if HOSTS_REGISTRY else [])
+    registry = _build_hosts_registry()
+    targets = req.targets or ([registry[0]["id"]] if registry else [])
     if not targets:
         raise HTTPException(400, "at least one configured target required")
     resolved = []
     for tid in targets:
-        h = next((x for x in HOSTS_REGISTRY if x["id"] == tid), None)
+        h = next((x for x in registry if x["id"] == tid), None)
         if not h:
             raise HTTPException(400, f"unknown target {tid}")
         resolved.append(h)
@@ -14703,11 +14704,10 @@ def _build_hosts_registry() -> list[dict]:
     return [h for h in by_id.values() if h.get("ssh")]
 
 
-# Module-import snapshot. The matrix endpoint calls _build_hosts_registry()
-# fresh so UI-added clusters (cluster-config.json) are picked up without a
-# container restart — this constant is kept for legacy callers that may
-# import HOSTS_REGISTRY directly.
-HOSTS_REGISTRY = _build_hosts_registry()
+# No module-import snapshot of the registry: every caller builds it fresh, so a
+# node added to a cluster while the engine runs is probed by telemetry and is a
+# valid download target at once. The former HOSTS_REGISTRY constant left a new
+# node without telemetry (0 GB in the dashboard) until the next restart.
 
 
 def _inventory_hosts() -> list[dict]:
@@ -15042,7 +15042,7 @@ async def _probe_telemetry(host: dict) -> dict:
 
 async def _refresh_telemetry() -> dict:
     now = time.time()
-    results = await asyncio.gather(*[_probe_telemetry(h) for h in HOSTS_REGISTRY])
+    results = await asyncio.gather(*[_probe_telemetry(h) for h in _build_hosts_registry()])
     payload = {"hosts": results, "ts": now}
     _telemetry_cache["data"] = payload
     _telemetry_cache["ts"] = now

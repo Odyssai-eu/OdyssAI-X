@@ -32,7 +32,7 @@ def check(label, got, want):
 
 MD = "/volumes/models/odysseus"
 HOST = {"id": "ultra-512", "ssh": "admin@node", "models_dir": MD}
-api.HOSTS_REGISTRY[:] = [HOST]
+api._build_hosts_registry = lambda: [HOST]
 api._resolve_host = lambda hid: HOST if hid == HOST["id"] else None
 BIN = "/Users/admin/mlx-cluster/.venv/bin/hf"
 api.HF_BIN_REMOTE = "$HOME/mlx-cluster/.venv/bin/hf"
