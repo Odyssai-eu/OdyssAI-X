@@ -78,8 +78,17 @@ mimo = {"alias": "mimo-v2-6-pro-rl-q9h16", "model": "/Volumes/models/odysseus/od
         "is_vlm_dist": True, "node_indices": [0, 1, 2, 3], "backend": "jaccl"}
 check("distributed VL pool (is_vlm_dist) is not rebuilt as a text pool", run_with_state([mimo]), [])
 check("… and leaves the pending queue", ("argo", mimo["alias"]) in api._AUTO_RELOAD_PENDING, False)
-check("single-node VL pool (is_vlm) skipped too",
+restored = []
+
+
+async def fake_restore(cid, leaked_hosts=None, restore_down=True, entries=None):
+    restored.extend(e["alias"] for e in entries or [])
+    return [e["alias"] for e in entries or []]
+
+api._restore_cluster_pools = fake_restore
+check("single-node VL pool (is_vlm) is not rebuilt as a text pool",
       run_with_state([{"alias": "v", "model": "/m", "is_vlm": True, "node_indices": [0]}]), [])
+check("… it comes back through the startup restore path", restored, ["v"])
 text = {"alias": "glm", "model": "/m/GLM", "mode": "pipeline", "node_indices": [0], "backend": "ring"}
 check("a text pool is still auto-reloaded", run_with_state([text]), ["glm"])
 

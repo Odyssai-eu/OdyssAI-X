@@ -4862,13 +4862,14 @@ class VLMPool:
         self.degraded_reason: Optional[str] = None
         self.degraded_at: Optional[float] = None
 
+    probe_dead = False
+
     def alive_count(self) -> int:
         """A VL pool has no local runner children — its server is an external
-        mlx_vlm.server. Report 1 so the dead-pool sweeper (which purges pools
-        with alive_count()==0 by probing LOCAL runner procs) never mistakes it
-        for a crashed distributed pool. Actual VL liveness is checked lazily by
-        the routing proxy (upstream unreachable → 502)."""
-        return 1
+        mlx_vlm.server. 1 until _probe_external_pools finds its port closed
+        twice in a row, then 0 so the dead-pool sweeper purges it and
+        auto-reload brings it back (node reboot, 2026-11-26)."""
+        return 0 if self.probe_dead else 1
 
     async def stop(self):
         """Kill the mlx_vlm.server on this pool's node. Mirrors admin_vlm_unload
@@ -5328,11 +5329,12 @@ class DFlashPool:
         self.degraded_reason: Optional[str] = None
         self.degraded_at: Optional[float] = None
 
+    probe_dead = False
+
     def alive_count(self) -> int:
-        """No local runner children — the mlx-dspark server is external. Report
-        1 so the dead-pool sweeper never mistakes it for a crashed pool (mirror
-        VLMPool.alive_count)."""
-        return 1
+        """No local runner children — the mlx-dspark server is external: 0 only
+        once _probe_external_pools found its port closed (mirror VLMPool)."""
+        return 0 if self.probe_dead else 1
 
     async def stop(self):
         """Kill the mlx-dspark serve on this pool's node (SIGTERM → grace →
@@ -5406,10 +5408,12 @@ class DecisionPool:
         self.degraded_reason: Optional[str] = None
         self.degraded_at: Optional[float] = None
 
+    probe_dead = False
+
     def alive_count(self) -> int:
-        """External server, no local runner children: report 1 so the dead-pool
-        sweeper never purges it (same as DFlashPool)."""
-        return 1
+        """External server, no local runner children: 0 only once
+        _probe_external_pools found its port closed (same as VLMPool)."""
+        return 0 if self.probe_dead else 1
 
     async def stop(self):
         """SIGTERM → grace → SIGKILL of the decision server on THIS port."""
@@ -5475,8 +5479,10 @@ class InklingPool:
         self.degraded_reason: Optional[str] = None
         self.degraded_at: Optional[float] = None
 
+    probe_dead = False
+
     def alive_count(self) -> int:
-        return 1
+        return 0 if self.probe_dead else 1
 
     async def stop(self):
         try:
@@ -8047,7 +8053,9 @@ async def _auto_reload_purged(cid: str, purged: list) -> None:
     Guards: (a) never resurrect an alias the operator explicitly unloaded (gone
     from desired-state); (b) skip while a node is unreachable — retry next sweep,
     no retry burned; (c) cap real failures so a permanently-broken node doesn't
-    reload-loop; (d) RunnerPool text pools only (VLM restore lives elsewhere)."""
+    reload-loop; (d) single-node external-server pools (VL, decision, dflash)
+    come back through _restore_cluster_pools, the container-startup path; a
+    distributed VL pool is left to the operator."""
     # NB: the emptiness check is AFTER the merge with the pending queue below —
     # the sweeper calls this with an empty list on retry ticks (link-cut test
     # #2 of 2026-09-18 found the guard here, and no retry ever ran).
@@ -8096,9 +8104,10 @@ async def _auto_reload_purged(cid: str, purged: list) -> None:
         # sent MiMo-V2.6-Pro back through the text runner, whose ranks died
         # (no mimo_v2 in mlx_lm), and each death's leak recovery rebooted the
         # Argo nodes again (2026-09-29/30).
-        if entry.get("is_vlm") or entry.get("is_vlm_dist") or entry.get("vlm_distributed"):
+        if entry.get("is_vlm_dist") or entry.get("vlm_distributed"):
             _AUTO_RELOAD_PENDING.pop(key, None)
             continue
+        external = bool(entry.get("is_vlm") or entry.get("is_decision") or entry.get("is_dflash"))
         if _AUTO_RELOAD_RETRIES.get(key, 0) >= _AUTO_RELOAD_MAX:
             if _AUTO_RELOAD_PENDING.pop(key, None) is not None:
                 sys.stderr.write(f"[auto-reload] {cid}[{alias}]: giving up after "
@@ -8107,7 +8116,7 @@ async def _auto_reload_purged(cid: str, purged: list) -> None:
         indices = entry.get("node_indices") or list(range(int(entry.get("nodes") or 1)))
         # A node that leaked wired memory after a traceless rank death cannot
         # serve again until it reboots — do it now, wait for it next ticks.
-        if entry.get("backend", "jaccl") == "jaccl" and len(indices) > 1:
+        if not external and entry.get("backend", "jaccl") == "jaccl" and len(indices) > 1:
             if await _reboot_leaked_pool_nodes(cid, alias, cd_nodes, indices):
                 continue
         ssh_targets = [cd_nodes[i].get("ssh") for i in indices
@@ -8120,16 +8129,23 @@ async def _auto_reload_purged(cid: str, purged: list) -> None:
                 if alias in {a for a, _ in list_pools(cid)}:
                     _AUTO_RELOAD_RETRIES.pop(key, None)
                     continue
-                pool = RunnerPool(
-                    model=entry["model"], mode=entry.get("mode", "pipeline"),
-                    use_ap=bool(entry.get("use_ap", True)), nodes_count=len(indices),
-                    cluster=cid, kv_q8=bool(entry.get("kv_q8", False)),
-                    draft_model=entry.get("draft_model"),
-                    num_draft_tokens=int(entry.get("num_draft_tokens") or 4),
-                    mtp=entry.get("mtp"), alias=alias, node_indices=indices,
-                    backend=entry.get("backend"))
-                await pool.start()
-                set_pool(cid, alias, pool)
+                if external:
+                    # Adopts the server if it is back, else relaunches it, and
+                    # registers the pool (same as a container restart).
+                    if alias not in await _restore_cluster_pools(cid, entries=[entry]):
+                        raise RuntimeError("restore did not bring the server back "
+                                           "(see the restore line above)")
+                else:
+                    pool = RunnerPool(
+                        model=entry["model"], mode=entry.get("mode", "pipeline"),
+                        use_ap=bool(entry.get("use_ap", True)), nodes_count=len(indices),
+                        cluster=cid, kv_q8=bool(entry.get("kv_q8", False)),
+                        draft_model=entry.get("draft_model"),
+                        num_draft_tokens=int(entry.get("num_draft_tokens") or 4),
+                        mtp=entry.get("mtp"), alias=alias, node_indices=indices,
+                        backend=entry.get("backend"))
+                    await pool.start()
+                    set_pool(cid, alias, pool)
             _AUTO_RELOAD_RETRIES.pop(key, None)
             waited = time.time() - _AUTO_RELOAD_PENDING.pop(key, now_ts)
             # The purge stamped this entry `down: true` in desired state; a
@@ -8259,6 +8275,47 @@ async def _rdma_link_watch_loop() -> None:
             sys.stderr.write(f"[link-watch] tick error: {e}\n")
 
 
+# Single-node pools served by an external server (mlx_vlm.server, the decision
+# server, mlx-dspark, the Inkling server) have no local runner child, so the
+# sweeper's `proc.poll()` cannot see them die. When their node rebooted, the
+# server was gone and the pool stayed "loaded" behind a 502 until someone
+# reloaded it by hand (max-64 and ultra-96c, 2026-11-26: d3-mini, OCR, Inkling).
+# Each sweep tick connects to their port; a port closed on
+# EXTERNAL_POOL_CONFIRM_TICKS consecutive ticks marks the pool dead, so the
+# purge and auto-reload below treat it like a text pool whose ranks died.
+# A TCP connect is answered by the kernel even during a long prefill, so a busy
+# server is never mistaken for a dead one.
+_EXTERNAL_POOL_CONFIRM_TICKS = int(os.environ.get("EXTERNAL_POOL_CONFIRM_TICKS", "2"))
+_external_pool_misses: dict[tuple, int] = {}
+
+
+def _external_server_pool(pool) -> bool:
+    return isinstance(pool, (VLMPool, DecisionPool, DFlashPool, InklingPool))
+
+
+async def _probe_external_pools() -> None:
+    for cid, alias, pool in list_all_pools():
+        if not _external_server_pool(pool) or pool.probe_dead:
+            continue
+        if cid in _WATCHDOG_RECOVERY_BY_CLUSTER:
+            continue
+        key = (cid, alias)
+        host = urlparse(pool.upstream or "").hostname
+        if not host or await _tcp_port_open(host, int(pool.port)):
+            _external_pool_misses.pop(key, None)
+            continue
+        n = _external_pool_misses.get(key, 0) + 1
+        _external_pool_misses[key] = n
+        if n < _EXTERNAL_POOL_CONFIRM_TICKS:
+            sys.stderr.write(f"[dead-pool-sweeper] {cid}[{alias}]: {pool.upstream} not "
+                             f"listening ({n}/{_EXTERNAL_POOL_CONFIRM_TICKS})\n")
+            continue
+        _external_pool_misses.pop(key, None)
+        pool.probe_dead = True
+        sys.stderr.write(f"[dead-pool-sweeper] {cid}[{alias}]: {pool.upstream} down on "
+                         f"{n} ticks — pool marked dead\n")
+
+
 async def _dead_pool_sweeper() -> None:
     """Every 30s, scan every cluster for pools whose runners have all
     died and drop them. Same purge as the at-load path (#5 issue), just
@@ -8279,6 +8336,7 @@ async def _dead_pool_sweeper() -> None:
     while True:
         try:
             await asyncio.sleep(30)
+            await _probe_external_pools()
             seen_clusters = set()
             for cid, _alias, _pool in list_all_pools():
                 seen_clusters.add(cid)
@@ -8933,7 +8991,7 @@ def _initial_default_config() -> Optional[dict]:
 #   major (1.7.2 → 2.0.0) — breaking API or topology change
 #
 # Use `./scripts/bump-version.sh patch|minor|major` to bump + auto-commit.
-APP_VERSION = "1.65.22"
+APP_VERSION = "1.65.23"
 
 app = FastAPI(
     title="OdyssAI-X (odyssai.eu)",
