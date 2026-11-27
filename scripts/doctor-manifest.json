@@ -14,7 +14,7 @@
  "mlx": "0.32.4",
  "mlx_lm": "0.32.2",
  "modules": {
-  "bailing_moe_v3.py": "c9faadebf2501e6d23d0d90c35a02aff",
+  "bailing_moe_v3.py": "d6157f6ff927798bb916914e7a106bb1",
   "deepseek_v4.py": "e5ec120854b4e799cf42179759f2ae10",
   "dsv4_cache.py": "fe867f467ceb5ef34d24512bf0aa0103",
   "dsv4_hyper_connection.py": "3a2064a6d517b7134af741d537c0f11a",

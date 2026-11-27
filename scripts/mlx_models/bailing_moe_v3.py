@@ -57,6 +57,29 @@ class ModelArgs(BaseModelArgs):
     max_position_embeddings: int = 131072
     rope_interleave: bool = True
     tie_word_embeddings: bool = False
+    expert_swiglu_limit_list: list[float] | None = None
+    share_expert_swiglu_limit_list: list[float] | None = None
+
+
+def _swiglu_limit(limits: list[float] | None, layer_index: int) -> float | None:
+    # Reference BailingMoeV3SparseMoeBlock._get_swiglu_limit: 0 means no clamp.
+    if limits is None or not 0 <= layer_index < len(limits):
+        return None
+    return limits[layer_index] or None
+
+
+def _clamped_swiglu(gate: mx.array, x: mx.array, limit: float) -> mx.array:
+    # Reference BailingMoeV3MLP: act(gate).clamp(max=limit) * up.clamp(-limit, limit).
+    return mx.minimum(nn.silu(gate), limit) * mx.clip(x, -limit, limit)
+
+
+class ClampedSwiGLU(nn.Module):
+    def __init__(self, limit: float):
+        super().__init__()
+        self.limit = limit
+
+    def __call__(self, x: mx.array, gate: mx.array) -> mx.array:
+        return _clamped_swiglu(gate, x, self.limit)
 
 
 def _is_kda_layer(
@@ -77,14 +100,23 @@ def _is_mtp_weight(key: str, num_hidden_layers: int) -> bool:
 
 
 class BailingMLP(nn.Module):
-    def __init__(self, args: ModelArgs, intermediate_size: int):
+    def __init__(
+        self,
+        args: ModelArgs,
+        intermediate_size: int,
+        swiglu_limit: float | None = None,
+    ):
         super().__init__()
         self.gate_proj = nn.Linear(args.hidden_size, intermediate_size, bias=False)
         self.up_proj = nn.Linear(args.hidden_size, intermediate_size, bias=False)
         self.down_proj = nn.Linear(intermediate_size, args.hidden_size, bias=False)
+        self.swiglu_limit = swiglu_limit
 
     def __call__(self, x: mx.array) -> mx.array:
-        return self.down_proj(swiglu(self.gate_proj(x), self.up_proj(x)))
+        gate, up = self.gate_proj(x), self.up_proj(x)
+        if self.swiglu_limit is None:
+            return self.down_proj(swiglu(gate, up))
+        return self.down_proj(_clamped_swiglu(gate, up, self.swiglu_limit))
 
 
 def _group_expert_select(
@@ -140,16 +172,25 @@ class BailingGate(nn.Module):
 
 
 class BailingSparseMoE(nn.Module):
-    def __init__(self, args: ModelArgs):
+    def __init__(self, args: ModelArgs, layer_index: int):
         super().__init__()
         self.gate = BailingGate(args)
+        expert_limit = _swiglu_limit(args.expert_swiglu_limit_list, layer_index)
+        switch_kwargs = {}
+        if expert_limit is not None:
+            switch_kwargs["activation"] = ClampedSwiGLU(expert_limit)
         self.switch_mlp = SwitchGLU(
             args.hidden_size,
             args.moe_intermediate_size,
             args.num_experts,
+            **switch_kwargs,
         )
         shared_size = args.moe_shared_expert_intermediate_size * args.num_shared_experts
-        self.shared_experts = BailingMLP(args, shared_size)
+        self.shared_experts = BailingMLP(
+            args,
+            shared_size,
+            _swiglu_limit(args.share_expert_swiglu_limit_list, layer_index),
+        )
         self.sharding_group = None
 
     def __call__(self, x: mx.array) -> mx.array:
@@ -461,7 +502,7 @@ class BailingDecoderLayer(nn.Module):
         )
         self.attention = BailingKDA(args) if self.is_linear else BailingMLA(args)
         if layer_index >= args.first_k_dense_replace:
-            self.mlp = BailingSparseMoE(args)
+            self.mlp = BailingSparseMoE(args, layer_index)
         else:
             self.mlp = BailingMLP(args, args.intermediate_size)
         self.input_layernorm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
