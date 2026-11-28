@@ -8996,7 +8996,7 @@ def _initial_default_config() -> Optional[dict]:
 #   major (1.7.2 → 2.0.0) — breaking API or topology change
 #
 # Use `./scripts/bump-version.sh patch|minor|major` to bump + auto-commit.
-APP_VERSION = "1.65.25"
+APP_VERSION = "1.65.26"
 
 app = FastAPI(
     title="OdyssAI-X (odyssai.eu)",
@@ -9395,6 +9395,7 @@ _TOOLS_SUPPORTED_PREFIXES = (
     "qwen", "llama", "mistral", "mixtral", "ministral",
     "deepseek", "glm", "phi", "gemma",
     "hy_v", "minimax", "command", "yi",
+    "inkling",   # inkling2_loop: tool calls verified through the gateway (2026-11-24)
 )
 
 
@@ -9410,9 +9411,13 @@ def _enrich_caps_from_config(caps: dict, config: dict) -> None:
     text_cfg = config.get("text_config") or {}
     lang_cfg = (text_cfg.get("language_model")
                 or config.get("language_model") or {})
+    # Inkling 2 has no max_position_embeddings: its window is
+    # text_config.model_max_length (1048576).
     ctx = (config.get("max_position_embeddings")
            or text_cfg.get("max_position_embeddings")
-           or lang_cfg.get("max_position_embeddings"))
+           or lang_cfg.get("max_position_embeddings")
+           or config.get("model_max_length")
+           or text_cfg.get("model_max_length"))
     if ctx:
         caps["context_length"] = int(ctx)
 
