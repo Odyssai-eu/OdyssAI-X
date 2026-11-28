@@ -1706,6 +1706,14 @@ function vlmPill(id) {
 }
 
 function pickCluster(id) {
+  // A model choice belongs to ONE cluster. Carried over, the picker shows the
+  // new cluster's first model while Load sends the previous cluster's one
+  // (2026-11-28: Melenas showed Nanbeige, Load sent a mini-16c model).
+  if (id !== state.selected_cluster && state.pending_form) {
+    state.pending_form.default_model = null;
+    state.pending_form.default_draft = "";
+    state.pending_form.default_dflash = false;
+  }
   state.selected_cluster = id;
   localStorage.setItem('odyssai-cluster', id);
   // Sync the back-compat aliases that the cluster-card renderers read from
